@@ -1,6 +1,11 @@
 package containers
 
 import (
+	"os"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/cilium/ebpf/link"
 	"github.com/coroot/coroot-node-agent/cgroup"
 	"github.com/coroot/coroot-node-agent/common"
@@ -17,10 +22,6 @@ import (
 	"github.com/vishvananda/netns"
 	"inet.af/netaddr"
 	"k8s.io/klog/v2"
-	"os"
-	"strings"
-	"sync"
-	"time"
 )
 
 var (
@@ -586,7 +587,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	if timestamp != 0 && conn.Timestamp != timestamp {
 		return
 	}
-	stats := c.l7Stats.get(r.Protocol, conn.Dest, conn.ActualDest)
+	stats := c.l7Stats.get(r.Protocol, conn.Dest, conn.ActualDest, r)
 	trace := tracing.NewTrace(string(c.id), conn.ActualDest)
 	switch r.Protocol {
 	case l7.ProtocolHTTP:

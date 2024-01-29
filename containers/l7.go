@@ -1,11 +1,12 @@
 package containers
 
 import (
+	"time"
+
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/prometheus/client_golang/prometheus"
 	"inet.af/netaddr"
 	"k8s.io/klog/v2"
-	"time"
 )
 
 type L7Metrics struct {
@@ -35,7 +36,7 @@ func (m *L7Metrics) observe(status, method string, duration time.Duration) {
 
 type L7Stats map[l7.Protocol]map[AddrPair]*L7Metrics // protocol -> dst:actual_dst -> metrics
 
-func (s L7Stats) get(protocol l7.Protocol, destination, actualDestination netaddr.IPPort) *L7Metrics {
+func (s L7Stats) get(protocol l7.Protocol, destination, actualDestination netaddr.IPPort, r *l7.RequestData) *L7Metrics {
 	if protocol == l7.ProtocolHTTP2 {
 		protocol = l7.ProtocolHTTP
 	}
@@ -54,6 +55,10 @@ func (s L7Stats) get(protocol l7.Protocol, destination, actualDestination netadd
 		switch protocol {
 		case l7.ProtocolRabbitmq, l7.ProtocolNats:
 			labels = append(labels, "method")
+		case l7.ProtocolHTTP:
+			method, path := l7.ParseHttp(r.Payload)
+			constLabels["path"] = path
+			constLabels["method"] = method
 		default:
 			hOpts := L7Latency[protocol]
 			m.Latency = prometheus.NewHistogram(
