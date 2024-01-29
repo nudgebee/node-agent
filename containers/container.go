@@ -572,7 +572,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	if timestamp != 0 && conn.Timestamp != timestamp {
 		return
 	}
-	stats := c.l7Stats.get(r.Protocol, conn.Dest, conn.ActualDest)
+	stats := c.l7Stats.get(r.Protocol, conn.Dest, conn.ActualDest, r)
 	trace := tracing.NewTrace(string(c.id), conn.ActualDest)
 	switch r.Protocol {
 	case l7.ProtocolHTTP:
