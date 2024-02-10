@@ -5,7 +5,7 @@ go 1.19
 require (
 	cloud.google.com/go/compute/metadata v0.2.3
 	github.com/agoda-com/opentelemetry-logs-go v0.4.1
-	github.com/cilium/cilium v1.13.2
+	github.com/cilium/cilium v1.13.7
 	github.com/cilium/ebpf v0.11.0
 	github.com/containerd/cgroups v1.0.3
 	github.com/containerd/containerd v1.5.17
@@ -123,7 +123,7 @@ require (
 	github.com/samber/lo v1.38.1 // indirect
 	github.com/sasha-s/go-deadlock v0.3.1 // indirect
 	github.com/shirou/gopsutil/v3 v3.22.10 // indirect
-	github.com/sirupsen/logrus v1.9.0 // indirect
+	github.com/sirupsen/logrus v1.9.2 // indirect
 	github.com/spf13/afero v1.9.2 // indirect
 	github.com/spf13/cast v1.5.0 // indirect
 	github.com/spf13/cobra v1.6.1 // indirect
