@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cilium/ebpf/link"
 	"github.com/coroot/coroot-node-agent/cgroup"
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer"
