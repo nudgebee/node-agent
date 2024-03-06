@@ -3,9 +3,10 @@ package l7
 import (
 	"bytes"
 	"encoding/binary"
+	"testing"
+
 	"github.com/stretchr/testify/assert"
 	"go.mongodb.org/mongo-driver/bson"
-	"testing"
 )
 
 func TestParseHttp(t *testing.T) {
@@ -66,6 +67,7 @@ func TestParseMongo(t *testing.T) {
 	buf := bytes.NewBuffer(nil)
 	v := bson.M{"a": "bssssssssssssssssssssssssssssssssssssssssss"}
 	data, err := bson.Marshal(v)
+	assert.NoError(t, err)
 
 	h := mongoHeader{
 		MessageLength: 16 + 4 + 1 + int32(len(data)),

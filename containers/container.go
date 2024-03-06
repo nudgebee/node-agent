@@ -6,7 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cilium/ebpf/link"
 	"github.com/coroot/coroot-node-agent/cgroup"
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer"
@@ -84,20 +83,6 @@ type ActiveConnection struct {
 type ListenDetails struct {
 	ClosedAt time.Time
 	NsIPs    []netaddr.IP
-}
-
-type Process struct {
-	Pid       uint32
-	StartedAt time.Time
-	NetNsId   string
-
-	uprobes               []link.Link
-	goTlsUprobesChecked   bool
-	openSslUprobesChecked bool
-}
-
-func (p *Process) isHostNs() bool {
-	return p.NetNsId == hostNetNsId
 }
 
 type PidFd struct {
@@ -329,7 +314,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 
 	appTypes := map[string]struct{}{}
 	seenJvms := map[string]bool{}
-	for pid := range c.processes {
+	for pid, process := range c.processes {
 		cmdline := proc.GetCmdline(pid)
 		if len(cmdline) == 0 {
 			continue
@@ -338,7 +323,8 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		if appType != "" {
 			appTypes[appType] = struct{}{}
 		}
-		if isJvm(cmdline) {
+		switch {
+		case isJvm(cmdline):
 			jvm, jMetrics := jvmMetrics(pid)
 			if len(jMetrics) > 0 && !seenJvms[jvm] {
 				seenJvms[jvm] = true
@@ -346,6 +332,9 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 					ch <- m
 				}
 			}
+		case process.dotNetMonitor != nil:
+			appTypes["dotnet"] = struct{}{}
+			process.dotNetMonitor.Collect(ch)
 		}
 	}
 	for appType := range appTypes {
@@ -368,13 +357,11 @@ func (c *Container) onProcessStart(pid uint32) *Process {
 	if err != nil {
 		return nil
 	}
-	ns, err := proc.GetNetNs(pid)
-	if err != nil {
+	c.zombieAt = time.Time{}
+	p := NewProcess(pid, stats)
+	if p == nil {
 		return nil
 	}
-	defer ns.Close()
-	c.zombieAt = time.Time{}
-	p := &Process{Pid: pid, StartedAt: stats.BeginTime, NetNsId: ns.UniqueId()}
 	c.processes[pid] = p
 
 	if c.startedAt.IsZero() {
@@ -398,9 +385,7 @@ func (c *Container) onProcessExit(pid uint32, oomKill bool) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	if p := c.processes[pid]; p != nil {
-		for _, u := range p.uprobes {
-			_ = u.Close()
-		}
+		p.Close()
 	}
 	delete(c.processes, pid)
 	if len(c.processes) == 0 {
@@ -637,6 +622,8 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		stats.observe(r.Status.String(), "", r.Duration)
 	case l7.ProtocolRabbitmq, l7.ProtocolNats:
 		stats.observe(r.Status.String(), r.Method.String(), 0)
+	case l7.ProtocolDubbo2:
+		stats.observe(r.Status.String(), "", r.Duration)
 	}
 }
 
