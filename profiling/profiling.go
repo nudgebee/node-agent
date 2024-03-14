@@ -3,8 +3,16 @@ package profiling
 import (
 	"bytes"
 	"fmt"
+	"hash/fnv"
+	"io"
+	"net/http"
+	"net/url"
+	"sync"
+	"time"
+
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/containers"
+	"github.com/coroot/coroot-node-agent/flags"
 	"github.com/go-kit/log"
 	ebpfspy "github.com/grafana/pyroscope/ebpf"
 	"github.com/grafana/pyroscope/ebpf/metrics"
@@ -14,15 +22,7 @@ import (
 	"github.com/grafana/pyroscope/ebpf/symtab/elf"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/model/labels"
-	"hash/fnv"
-	"io"
 	"k8s.io/klog/v2"
-	"net/http"
-	"net/url"
-	"os"
-	"strconv"
-	"sync"
-	"time"
 )
 
 const (
@@ -32,7 +32,8 @@ const (
 )
 
 var (
-	httpClient = http.Client{
+	constLabels labels.Labels
+	httpClient  = http.Client{
 		Timeout: UploadTimeout,
 	}
 	endpointUrl  *url.URL
@@ -42,24 +43,24 @@ var (
 	}
 )
 
-func Init() chan<- containers.ProcessInfo {
-	endpoint := os.Getenv("PROFILES_ENDPOINT")
-	if endpoint == "" {
+func Init(hostId, hostName string) chan<- containers.ProcessInfo {
+	endpointUrl = *flags.ProfilesEndpoint
+	if endpointUrl == nil {
 		klog.Infoln("no profiles endpoint configured")
 		return nil
 	}
-	klog.Infoln("profiles endpoint:", endpoint)
+	klog.Infoln("profiles endpoint:", endpointUrl.String())
 
-	var err error
-	endpointUrl, err = url.Parse(endpoint)
-	if err != nil {
-		klog.Exitln(err)
+	constLabels = labels.Labels{
+		{Name: "host.name", Value: hostName},
+		{Name: "host.id", Value: hostId},
+		{Name: "profile.source", Value: "ebpf"},
 	}
 
 	reg := prometheus.NewRegistry()
 	so := ebpfspy.SessionOptions{
 		CollectUser:               true,
-		CollectKernel:             true,
+		CollectKernel:             false,
 		UnknownSymbolModuleOffset: true,
 		UnknownSymbolAddress:      false,
 		PythonEnabled:             true,
@@ -88,6 +89,7 @@ func Init() chan<- containers.ProcessInfo {
 		},
 		SampleRate: SampleRate,
 	}
+	var err error
 	session, err = ebpfspy.NewSession(log.NewNopLogger(), targetFinder, so)
 	if err != nil {
 		klog.Errorln(err)
@@ -124,18 +126,20 @@ func Stop() {
 func collect() {
 	ticker := time.NewTicker(CollectInterval)
 	defer ticker.Stop()
-	tPrev := time.Now()
 	for t := range ticker.C {
-		tCurr := t
 		session.UpdateTargets(sd.TargetsOptions{})
 		bs := pprof.NewProfileBuilders(SampleRate)
-		err := session.CollectProfiles(func(target *sd.Target, stack []string, value uint64, pid uint32) {
-			p := targetFinder.get(pid)
-			if p == nil {
+		err := session.CollectProfiles(func(target *sd.Target, stack []string, value uint64, pid uint32, aggregation ebpfspy.SampleAggregation) {
+			pi := targetFinder.get(pid)
+			if pi == nil {
 				return
 			}
-			b := bs.BuilderForTarget(p.hash, labels.Labels{{Value: p.labels}})
-			b.AddSample(stack, value)
+			b := bs.BuilderForTarget(pi.hash, pi.labels)
+			if aggregation == ebpfspy.SampleAggregated {
+				b.CreateSample(stack, value)
+			} else {
+				b.CreateSampleOrAddValue(stack, value)
+			}
 		})
 		klog.Infof("collected %d profiles in %s", len(bs.Builders), time.Since(t).Truncate(time.Millisecond))
 		if err != nil {
@@ -144,7 +148,7 @@ func collect() {
 		t = time.Now()
 		var uploaded int
 		for _, b := range bs.Builders {
-			err = upload(b, tPrev, tCurr)
+			err = upload(b)
 			if err != nil {
 				klog.Errorln(err)
 				break
@@ -152,26 +156,18 @@ func collect() {
 			uploaded++
 		}
 		klog.Infof("uploaded %d profiles in %s", uploaded, time.Since(t).Truncate(time.Millisecond))
-		tPrev = tCurr
 	}
 }
 
-func upload(b *pprof.ProfileBuilder, from, until time.Time) error {
+func upload(b *pprof.ProfileBuilder) error {
 	u := *endpointUrl
 	q := u.Query()
-	q.Set("name", "ebpf"+b.Labels[0].Value)
-	q.Set("format", "pprof")
-	q.Set("from", strconv.Itoa(int(from.Unix())))
-	q.Set("until", strconv.Itoa(int(until.Unix())))
-	q.Set("spyName", "coroot-node-agent")
+	for _, l := range append(b.Labels, constLabels...) {
+		q.Set(l.Name, l.Value)
+	}
 	u.RawQuery = q.Encode()
 
-	b.Profile.SampleType[0].Type = "samples"
-	b.Profile.SampleType[0].Unit = "samples"
-	for _, s := range b.Profile.Sample {
-		s.Value[0] = s.Value[0] / b.Profile.Period
-	}
-
+	b.Profile.DurationNanos = CollectInterval.Nanoseconds()
 	body := bytes.NewBuffer(nil)
 	_, err := b.Write(body)
 	if err != nil {
@@ -182,18 +178,18 @@ func upload(b *pprof.ProfileBuilder, from, until time.Time) error {
 	if err != nil {
 		return err
 	}
-
+	for k, v := range common.AuthHeaders() {
+		req.Header.Set(k, v)
+	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
-
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("failed to upload %d: %s", resp.StatusCode, string(respBody))
 	}
@@ -260,7 +256,7 @@ func (tf *TargetFinder) Update(_ sd.TargetsOptions) {
 type processInfo struct {
 	containerId string
 	startedAt   time.Time
-	labels      string
+	labels      labels.Labels
 	hash        uint64
 }
 
@@ -268,15 +264,8 @@ func (pi *processInfo) calcHashAndLabels() {
 	hash := fnv.New64a()
 	_, _ = hash.Write([]byte(pi.containerId))
 	pi.hash = hash.Sum64()
-	var buf bytes.Buffer
-	buf.WriteByte('{')
-	buf.WriteString("container_id")
-	buf.WriteByte('=')
-	buf.WriteString(pi.containerId)
-	buf.WriteByte(',')
-	buf.WriteString("service_name")
-	buf.WriteByte('=')
-	buf.WriteString(common.ContainerIdToOtelServiceName(pi.containerId))
-	buf.WriteByte('}')
-	pi.labels = buf.String()
+	pi.labels = labels.Labels{
+		{Name: "service.name", Value: common.ContainerIdToOtelServiceName(pi.containerId)},
+		{Name: "container.id", Value: pi.containerId},
+	}
 }

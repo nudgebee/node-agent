@@ -5,9 +5,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
-	"inet.af/netaddr"
 	"net"
 	"os"
+
+	"inet.af/netaddr"
 )
 
 const (
@@ -63,7 +64,7 @@ func readSockets(src string) ([]Sock, error) {
 		_, b = nextField(b)
 		_, b = nextField(b)
 		_, b = nextField(b)
-		inode, b := nextField(b)
+		inode, _ := nextField(b)
 		res = append(res, Sock{SAddr: decodeAddr(local), DAddr: decodeAddr(remote), Listen: state == stateListen, Inode: string(inode)})
 	}
 	return res, nil
