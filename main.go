@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"log"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -22,6 +23,8 @@ import (
 	"golang.org/x/mod/semver"
 	"golang.org/x/sys/unix"
 	"golang.org/x/time/rate"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 )
 
@@ -95,12 +98,33 @@ func whitelistNodeExternalNetworks() {
 	}
 }
 
+func getClientSet() (*kubernetes.Clientset, error) {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, err
+	}
+	return clientset, nil
+}
+
 func main() {
 	klog.LogToStderr(false)
 	klog.SetOutput(&RateLimitedLogOutput{limiter: rate.NewLimiter(rate.Limit(*flags.LogPerSecond), *flags.LogBurst)})
 
 	klog.Infoln("agent version:", version)
 
+	clientset, err := getClientSet()
+	if err != nil {
+		log.Fatalf("Error getting kubernetes clientset: %v", err)
+	}
+	resolver, err := common.NewK8sIPResolver(clientset, *flags.ResolveDns)
+	if err != nil {
+		log.Fatalf("Error creating resolver: %v", err)
+	}
 	hostname, kv, err := uname()
 	if err != nil {
 		klog.Exitln("failed to get uname:", err)
@@ -133,7 +157,7 @@ func main() {
 
 	processInfoCh := profiling.Init(machineId, hostname)
 
-	cr, err := containers.NewRegistry(registerer, kv, processInfoCh)
+	cr, err := containers.NewRegistry(registerer, kv, processInfoCh, resolver)
 	if err != nil {
 		klog.Exitln(err)
 	}

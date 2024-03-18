@@ -44,9 +44,10 @@ type Registry struct {
 	containersByPid      map[uint32]*Container
 
 	processInfoCh chan<- ProcessInfo
+	ip_resolver   *common.K8sIPResolver
 }
 
-func NewRegistry(reg prometheus.Registerer, kernelVersion string, processInfoCh chan<- ProcessInfo) (*Registry, error) {
+func NewRegistry(reg prometheus.Registerer, kernelVersion string, processInfoCh chan<- ProcessInfo, ip_resolver *common.K8sIPResolver) (*Registry, error) {
 	ns, err := proc.GetSelfNetNs()
 	if err != nil {
 		return nil, err
@@ -100,7 +101,8 @@ func NewRegistry(reg prometheus.Registerer, kernelVersion string, processInfoCh 
 
 		processInfoCh: processInfoCh,
 
-		tracer: ebpftracer.NewTracer(kernelVersion, *flags.DisableL7Tracing),
+		tracer:      ebpftracer.NewTracer(kernelVersion, *flags.DisableL7Tracing),
+		ip_resolver: &ip_resolver,
 	}
 
 	go r.handleEvents(r.events)
@@ -303,7 +305,7 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		r.containersByCgroupId[cg.Id] = c
 		return c
 	}
-	c, err := NewContainer(id, cg, md, r.hostConntrack, pid)
+	c, err := NewContainer(id, cg, md, r.hostConntrack, pid, r.ip_resolver)
 	if err != nil {
 		klog.Warningf("failed to create container pid=%d cg=%s id=%s: %s", pid, cg.Id, id, err)
 		return nil
