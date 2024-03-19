@@ -63,17 +63,21 @@ func (p *LogParser) Stop() {
 }
 
 type AddrPair struct {
-	src netaddr.IPPort
-	dst netaddr.IPPort
+	src         netaddr.IPPort
+	dst         netaddr.IPPort
+	srcWorkload common.Workload
+	dstWorkload common.Workload
 }
 
 type ActiveConnection struct {
-	Dest       netaddr.IPPort
-	ActualDest netaddr.IPPort
-	Pid        uint32
-	Fd         uint64
-	Timestamp  uint64
-	Closed     time.Time
+	Dest        netaddr.IPPort
+	ActualDest  netaddr.IPPort
+	srcWorkload common.Workload
+	dstWorkload common.Workload
+	Pid         uint32
+	Fd          uint64
+	Timestamp   uint64
+	Closed      time.Time
 
 	http2Parser    *l7.Http2Parser
 	postgresParser *l7.PostgresParser
@@ -129,10 +133,11 @@ type Container struct {
 
 	lock sync.RWMutex
 
-	done chan struct{}
+	done        chan struct{}
+	ip_resolver IPResolver
 }
 
-func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, hostConntrack *Conntrack, pid uint32) (*Container, error) {
+func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, hostConntrack *Conntrack, pid uint32, ip_resolver IPResolver) (*Container, error) {
 	netNs, err := proc.GetNetNs(pid)
 	if err != nil {
 		return nil, err
@@ -164,7 +169,8 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, host
 
 		hostConntrack: hostConntrack,
 
-		done: make(chan struct{}),
+		done:        make(chan struct{}),
+		ip_resolver: ip_resolver,
 	}
 
 	for _, n := range md.networks {
@@ -485,6 +491,9 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPP
 	if dst.IP().IsLoopback() && !p.isHostNs() {
 		return
 	}
+	srcWorkload := c.ip_resolver.ResolveIP(netaddr.IPPort(src).IP().String())
+	dstWorkload := c.ip_resolver.ResolveIP(netaddr.IPPort(dst).IP().String())
+
 	actualDst, err := c.getActualDestination(p, src, dst)
 	if err != nil {
 		if !common.IsNotExist(err) {
@@ -508,13 +517,15 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPP
 	} else {
 		c.connectsSuccessful[AddrPair{src: dst, dst: *actualDst}]++
 		connection := &ActiveConnection{
-			Dest:       dst,
-			ActualDest: *actualDst,
-			Pid:        pid,
-			Fd:         fd,
-			Timestamp:  timestamp,
+			Dest:        dst,
+			ActualDest:  *actualDst,
+			Pid:         pid,
+			Fd:          fd,
+			Timestamp:   timestamp,
+			srcWorkload: srcWorkload,
+			dstWorkload: dstWorkload,
 		}
-		c.connectionsActive[AddrPair{src: src, dst: dst}] = connection
+		c.connectionsActive[AddrPair{src: src, dst: dst, srcWorkload: srcWorkload, dstWorkload: dstWorkload}] = connection
 		c.connectionsByPidFd[PidFd{Pid: pid, Fd: fd}] = connection
 	}
 	c.connectLastAttempt[dst] = time.Now()
@@ -572,7 +583,8 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	if timestamp != 0 && conn.Timestamp != timestamp {
 		return
 	}
-	stats := c.l7Stats.get(r.Protocol, conn.Dest, conn.ActualDest, r)
+
+	stats := c.l7Stats.get(r.Protocol, conn.Dest, conn.ActualDest, r, conn.srcWorkload, conn.dstWorkload)
 	trace := tracing.NewTrace(string(c.id), conn.ActualDest)
 	switch r.Protocol {
 	case l7.ProtocolHTTP:

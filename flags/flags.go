@@ -32,7 +32,8 @@ var (
 	ApiKey           = kingpin.Flag("api-key", "Coroot API key").Envar("API_KEY").String()
 	ScrapeInterval   = kingpin.Flag("scrape-interval", "How often to gather metrics from the agent").Default("15s").Envar("SCRAPE_INTERVAL").Duration()
 
-	WalDir = kingpin.Flag("wal-dir", "Path to where the agent stores data (e.g. the metrics Write-Ahead Log)").Default("/tmp/coroot-node-agent").Envar("WAL_DIR").String()
+	WalDir     = kingpin.Flag("wal-dir", "Path to where the agent stores data (e.g. the metrics Write-Ahead Log)").Default("/tmp/coroot-node-agent").Envar("WAL_DIR").String()
+	ResolveDns = kingpin.Flag("resolve-dns", "should resolve DNS").Default("true").Envar("RESOLVE_DNS").Bool()
 )
 
 func GetString(fl *string) string {
