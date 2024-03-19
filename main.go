@@ -125,6 +125,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error creating resolver: %v", err)
 	}
+	err = resolver.StartWatching()
+	if err != nil {
+		log.Fatalf("Error watching cluster's state: %v", err)
+	}
 	hostname, kv, err := uname()
 	if err != nil {
 		klog.Exitln("failed to get uname:", err)

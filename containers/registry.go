@@ -31,6 +31,12 @@ type ProcessInfo struct {
 	StartedAt   time.Time
 }
 
+type IPResolver interface {
+	ResolveIP(string) common.Workload
+	StartWatching() error
+	StopWatching()
+}
+
 type Registry struct {
 	reg prometheus.Registerer
 
@@ -44,7 +50,7 @@ type Registry struct {
 	containersByPid      map[uint32]*Container
 
 	processInfoCh chan<- ProcessInfo
-	ip_resolver   *common.K8sIPResolver
+	ip_resolver   IPResolver
 }
 
 func NewRegistry(reg prometheus.Registerer, kernelVersion string, processInfoCh chan<- ProcessInfo, ip_resolver *common.K8sIPResolver) (*Registry, error) {
@@ -102,7 +108,7 @@ func NewRegistry(reg prometheus.Registerer, kernelVersion string, processInfoCh 
 		processInfoCh: processInfoCh,
 
 		tracer:      ebpftracer.NewTracer(kernelVersion, *flags.DisableL7Tracing),
-		ip_resolver: &ip_resolver,
+		ip_resolver: ip_resolver,
 	}
 
 	go r.handleEvents(r.events)

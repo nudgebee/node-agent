@@ -5,8 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/groundcover-com/caretta/pkg/k8s"
-
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	appsv1 "k8s.io/api/apps/v1"
@@ -191,7 +189,7 @@ type testStep struct {
 	modifiedPods              []podDescriptor
 	modifiedNodes             []nodeDescriptor
 	modifiedWorkloadResources []workloadResourceDescriptor
-	expectedResolves          map[string]k8s.Workload
+	expectedResolves          map[string]Workload
 }
 
 type testScenario struct {
@@ -329,7 +327,7 @@ func runTest(t *testing.T, test testScenario) {
 	fakeClient := testclient.NewSimpleClientset(originalObjs...)
 	fakeWatchers := createPrependWatchers(fakeClient)
 
-	resolver, err := k8s.NewK8sIPResolver(fakeClient, false)
+	resolver, err := NewK8sIPResolver(fakeClient, false)
 	assert.NoError(err)
 
 	// Act 1: process initial state
@@ -397,7 +395,7 @@ func TestResolving(t *testing.T) {
 				newPods: []podDescriptor{
 					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.New().String()), nil},
 				},
-				expectedResolves: map[string]k8s.Workload{
+				expectedResolves: map[string]Workload{
 					"1.1.1.2": {
 						Name:      "1.1.1.2",
 						Namespace: "external",
@@ -413,7 +411,7 @@ func TestResolving(t *testing.T) {
 				newPods: []podDescriptor{
 					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.New().String()), nil},
 				},
-				expectedResolves: map[string]k8s.Workload{
+				expectedResolves: map[string]Workload{
 					"1.1.1.1": {
 						Name:      "pod1",
 						Namespace: "namespaceA",
@@ -431,7 +429,7 @@ func TestResolving(t *testing.T) {
 					{"pod2", "namespaceA", "1.1.1.2", v1.PodRunning, types.UID(uuid.New().String()), nil},
 					{"pod3", "namespaceA", "1.1.1.3", v1.PodRunning, types.UID(uuid.New().String()), nil},
 				},
-				expectedResolves: map[string]k8s.Workload{
+				expectedResolves: map[string]Workload{
 					"1.1.1.1": {
 						Name:      "pod1",
 						Namespace: "namespaceA",
@@ -454,7 +452,7 @@ func TestResolving(t *testing.T) {
 			description: "empty initial 1 pod added resolve to pod",
 			initialState: testStep{
 				shouldWait: false,
-				expectedResolves: map[string]k8s.Workload{
+				expectedResolves: map[string]Workload{
 					"1.1.1.1": {
 						Name:      "1.1.1.1",
 						Namespace: "external",
@@ -468,7 +466,7 @@ func TestResolving(t *testing.T) {
 					newPods: []podDescriptor{
 						{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.New().String()), nil},
 					},
-					expectedResolves: map[string]k8s.Workload{
+					expectedResolves: map[string]Workload{
 						"1.1.1.1": {
 							Name:      "pod1",
 							Namespace: "namespaceA",
@@ -482,7 +480,7 @@ func TestResolving(t *testing.T) {
 			description: "empty initial 1 node added resolve to node",
 			initialState: testStep{
 				shouldWait: false,
-				expectedResolves: map[string]k8s.Workload{
+				expectedResolves: map[string]Workload{
 					"1.1.1.0": {
 						Name:      "1.1.1.0",
 						Namespace: "external",
@@ -496,7 +494,7 @@ func TestResolving(t *testing.T) {
 					newNodes: []nodeDescriptor{
 						{"Node1", "1.1.1.0", types.UID(uuid.NewString())},
 					},
-					expectedResolves: map[string]k8s.Workload{
+					expectedResolves: map[string]Workload{
 						"1.1.1.0": {
 							Name:      "Node1",
 							Namespace: "node",
@@ -510,7 +508,7 @@ func TestResolving(t *testing.T) {
 			description: "empty initial 1 node, 1 pod added resolve to each",
 			initialState: testStep{
 				shouldWait: false,
-				expectedResolves: map[string]k8s.Workload{
+				expectedResolves: map[string]Workload{
 					"1.1.1.0": {
 						Name:      "1.1.1.0",
 						Namespace: "external",
@@ -527,7 +525,7 @@ func TestResolving(t *testing.T) {
 					newNodes: []nodeDescriptor{
 						{"Node1", "1.1.1.0", types.UID(uuid.NewString())},
 					},
-					expectedResolves: map[string]k8s.Workload{
+					expectedResolves: map[string]Workload{
 						"1.1.1.0": {
 							Name:      "Node1",
 							Namespace: "node",
@@ -549,7 +547,7 @@ func TestResolving(t *testing.T) {
 				newPods: []podDescriptor{
 					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.New().String()), nil},
 				},
-				expectedResolves: map[string]k8s.Workload{
+				expectedResolves: map[string]Workload{
 					"1.1.1.1": {
 						Name:      "pod1",
 						Namespace: "namespaceA",
@@ -568,7 +566,7 @@ func TestResolving(t *testing.T) {
 					modifiedPods: []podDescriptor{
 						{"pod1", "namespaceA", "1.1.1.2", v1.PodRunning, types.UID(uuid.New().String()), nil},
 					},
-					expectedResolves: map[string]k8s.Workload{
+					expectedResolves: map[string]Workload{
 						"1.1.1.1": { // the resolver shouldn't delete old not-reused entries
 							Name:      "pod1",
 							Namespace: "namespaceA",
@@ -590,7 +588,7 @@ func TestResolving(t *testing.T) {
 				newPods: []podDescriptor{
 					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID("1"), nil},
 				},
-				expectedResolves: map[string]k8s.Workload{
+				expectedResolves: map[string]Workload{
 					"1.1.1.1": {
 						Name:      "pod1",
 						Namespace: "namespaceA",
@@ -609,14 +607,14 @@ func TestResolving(t *testing.T) {
 					modifiedPods: []podDescriptor{
 						{"pod1", "namespaceA", "1.1.1.2", v1.PodRunning, types.UID("1"), nil},
 					},
-					expectedResolves: map[string]k8s.Workload{},
+					expectedResolves: map[string]Workload{},
 				},
 				{
 					shouldWait: true,
 					newPods: []podDescriptor{
 						{"pod2", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.New().String()), nil},
 					},
-					expectedResolves: map[string]k8s.Workload{
+					expectedResolves: map[string]Workload{
 						"1.1.1.1": {
 							Name:      "pod2",
 							Namespace: "namespaceA",
@@ -638,7 +636,7 @@ func TestResolving(t *testing.T) {
 				newPods: []podDescriptor{
 					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID("1"), nil},
 				},
-				expectedResolves: map[string]k8s.Workload{
+				expectedResolves: map[string]Workload{
 					"1.1.1.1": {
 						Name:      "pod1",
 						Namespace: "namespaceA",
@@ -657,14 +655,14 @@ func TestResolving(t *testing.T) {
 					modifiedPods: []podDescriptor{
 						{"pod1", "namespaceA", "1.1.1.2", v1.PodRunning, types.UID("1"), nil},
 					},
-					expectedResolves: map[string]k8s.Workload{},
+					expectedResolves: map[string]Workload{},
 				},
 				{
 					shouldWait: true,
 					newNodes: []nodeDescriptor{
 						{"Node1", "1.1.1.1", types.UID(uuid.NewString())},
 					},
-					expectedResolves: map[string]k8s.Workload{
+					expectedResolves: map[string]Workload{
 						"1.1.1.1": {
 							Name:      "Node1",
 							Namespace: "node",
@@ -687,7 +685,7 @@ func TestResolving(t *testing.T) {
 				newNodes: []nodeDescriptor{
 					{"Node1", "1.1.1.0", types.UID("1")},
 				},
-				expectedResolves: map[string]k8s.Workload{},
+				expectedResolves: map[string]Workload{},
 			},
 			updateSteps: []testStep{
 				{
@@ -696,7 +694,7 @@ func TestResolving(t *testing.T) {
 						{"Node1", "1.1.2.0", types.UID("1")},
 					},
 					modifiedWorkloadResources: []workloadResourceDescriptor{},
-					expectedResolves: map[string]k8s.Workload{
+					expectedResolves: map[string]Workload{
 						"1.1.1.0": { // resolver isn't expected to delete old not-reused entries
 							Name:      "Node1",
 							Namespace: "node",
@@ -718,7 +716,7 @@ func TestResolving(t *testing.T) {
 				newNodes: []nodeDescriptor{
 					{"Node1", "1.1.1.0", types.UID("1")},
 				},
-				expectedResolves: map[string]k8s.Workload{},
+				expectedResolves: map[string]Workload{},
 			},
 			updateSteps: []testStep{
 				{
@@ -726,7 +724,7 @@ func TestResolving(t *testing.T) {
 					modifiedNodes: []nodeDescriptor{
 						{"Node1", "1.1.2.0", types.UID("1")},
 					},
-					expectedResolves: map[string]k8s.Workload{},
+					expectedResolves: map[string]Workload{},
 				},
 				{
 					shouldWait: true,
@@ -736,7 +734,7 @@ func TestResolving(t *testing.T) {
 					modifiedNodes: []nodeDescriptor{
 						{"Node1", "1.1.2.0", types.UID("1")},
 					},
-					expectedResolves: map[string]k8s.Workload{
+					expectedResolves: map[string]Workload{
 						"1.1.1.0": {
 							Name:      "Node2",
 							Namespace: "node",
@@ -758,7 +756,7 @@ func TestResolving(t *testing.T) {
 				newNodes: []nodeDescriptor{
 					{"Node1", "1.1.1.0", types.UID(uuid.NewString())},
 				},
-				expectedResolves: map[string]k8s.Workload{},
+				expectedResolves: map[string]Workload{},
 			},
 			updateSteps: []testStep{
 				{
@@ -766,7 +764,7 @@ func TestResolving(t *testing.T) {
 					newPods: []podDescriptor{
 						{"pod1", "namespaceA", "1.1.1.0", v1.PodRunning, types.UID(uuid.New().String()), nil},
 					},
-					expectedResolves: map[string]k8s.Workload{
+					expectedResolves: map[string]Workload{
 						"1.1.1.0": {
 							Name:      "Node1",
 							Namespace: "node",
@@ -794,7 +792,7 @@ func TestControllersResolving(t *testing.T) {
 					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), &testDeployment},
 				},
 				newWorkloadResource: []workloadResourceDescriptor{testDeployment},
-				expectedResolves: map[string]k8s.Workload{
+				expectedResolves: map[string]Workload{
 					"1.1.1.1": {
 						Name:      testDeployment.Name,
 						Namespace: testDeployment.Namespace,
@@ -811,7 +809,7 @@ func TestControllersResolving(t *testing.T) {
 					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), &testReplicaSet},
 				},
 				newWorkloadResource: []workloadResourceDescriptor{testReplicaSet},
-				expectedResolves: map[string]k8s.Workload{
+				expectedResolves: map[string]Workload{
 					"1.1.1.1": {
 						Name:      testReplicaSet.Name,
 						Namespace: testReplicaSet.Namespace,
@@ -828,7 +826,7 @@ func TestControllersResolving(t *testing.T) {
 					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), &testDaemonSet},
 				},
 				newWorkloadResource: []workloadResourceDescriptor{testDaemonSet},
-				expectedResolves: map[string]k8s.Workload{
+				expectedResolves: map[string]Workload{
 					"1.1.1.1": {
 						Name:      testDaemonSet.Name,
 						Namespace: testDaemonSet.Namespace,
@@ -845,7 +843,7 @@ func TestControllersResolving(t *testing.T) {
 					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), &testStatefulSet},
 				},
 				newWorkloadResource: []workloadResourceDescriptor{testStatefulSet},
-				expectedResolves: map[string]k8s.Workload{
+				expectedResolves: map[string]Workload{
 					"1.1.1.1": {
 						Name:      testStatefulSet.Name,
 						Namespace: testStatefulSet.Namespace,
@@ -862,7 +860,7 @@ func TestControllersResolving(t *testing.T) {
 					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), &testJob},
 				},
 				newWorkloadResource: []workloadResourceDescriptor{testJob},
-				expectedResolves: map[string]k8s.Workload{
+				expectedResolves: map[string]Workload{
 					"1.1.1.1": {
 						Name:      testJob.Name,
 						Namespace: testJob.Namespace,
@@ -879,7 +877,7 @@ func TestControllersResolving(t *testing.T) {
 					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), &testCronjob},
 				},
 				newWorkloadResource: []workloadResourceDescriptor{testCronjob},
-				expectedResolves: map[string]k8s.Workload{
+				expectedResolves: map[string]Workload{
 					"1.1.1.1": {
 						Name:      testCronjob.Name,
 						Namespace: testCronjob.Namespace,

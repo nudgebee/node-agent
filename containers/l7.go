@@ -3,6 +3,7 @@ package containers
 import (
 	"time"
 
+	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/prometheus/client_golang/prometheus"
 	"inet.af/netaddr"
@@ -36,7 +37,7 @@ func (m *L7Metrics) observe(status, method string, duration time.Duration) {
 
 type L7Stats map[l7.Protocol]map[AddrPair]*L7Metrics // protocol -> dst:actual_dst -> metrics
 
-func (s L7Stats) get(protocol l7.Protocol, destination, actualDestination netaddr.IPPort, r *l7.RequestData) *L7Metrics {
+func (s L7Stats) get(protocol l7.Protocol, destination, actualDestination netaddr.IPPort, r *l7.RequestData, srcWorkload common.Workload, dstWorkload common.Workload) *L7Metrics {
 	if protocol == l7.ProtocolHTTP2 {
 		protocol = l7.ProtocolHTTP
 	}
@@ -50,7 +51,7 @@ func (s L7Stats) get(protocol l7.Protocol, destination, actualDestination netadd
 	if m == nil {
 		m = &L7Metrics{}
 		protoStats[dest] = m
-		constLabels := map[string]string{"destination": destination.String(), "actual_destination": actualDestination.String()}
+		constLabels := map[string]string{"destination": destination.String(), "actual_destination": actualDestination.String(), "dest_kind": dstWorkload.Kind, "dest_workload_name": dstWorkload.Name, "dest_workload_namespace": dstWorkload.Namespace, "src_kind": srcWorkload.Kind, "src_workload_name": srcWorkload.Name, "src_workload_namespace": srcWorkload.Namespace}
 		labels := []string{"status"}
 		switch protocol {
 		case l7.ProtocolRabbitmq, l7.ProtocolNats:

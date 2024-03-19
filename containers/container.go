@@ -134,10 +134,10 @@ type Container struct {
 	lock sync.RWMutex
 
 	done        chan struct{}
-	ip_resolver *common.K8sIPResolver
+	ip_resolver IPResolver
 }
 
-func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, hostConntrack *Conntrack, pid uint32, ip_resolver *common.K8sIPResolver) (*Container, error) {
+func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, hostConntrack *Conntrack, pid uint32, ip_resolver IPResolver) (*Container, error) {
 	netNs, err := proc.GetNetNs(pid)
 	if err != nil {
 		return nil, err
@@ -169,7 +169,8 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, host
 
 		hostConntrack: hostConntrack,
 
-		done: make(chan struct{}),
+		done:        make(chan struct{}),
+		ip_resolver: ip_resolver,
 	}
 
 	for _, n := range md.networks {
@@ -582,7 +583,8 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	if timestamp != 0 && conn.Timestamp != timestamp {
 		return
 	}
-	stats := c.l7Stats.get(r.Protocol, conn.Dest, conn.ActualDest, r)
+
+	stats := c.l7Stats.get(r.Protocol, conn.Dest, conn.ActualDest, r, conn.srcWorkload, conn.dstWorkload)
 	trace := tracing.NewTrace(string(c.id), conn.ActualDest)
 	switch r.Protocol {
 	case l7.ProtocolHTTP:

@@ -11,6 +11,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
 
 	lrucache "github.com/hashicorp/golang-lru/v2"
 	"github.com/prometheus/client_golang/prometheus"
@@ -158,9 +159,10 @@ func (resolver *K8sIPResolver) StartWatching() error {
 
 	cronJobsWatcher, err := resolver.startCronjobWatcher()
 	if err != nil {
+		klog.Errorf("failed to init watcher %v", err)
 		return fmt.Errorf("error watching cronjobs changes - %v", err)
 	}
-
+	log.Printf("registered IP watcher")
 	// invoke a watching function
 	go func() {
 		for {
@@ -178,6 +180,7 @@ func (resolver *K8sIPResolver) StartWatching() error {
 				return
 			case podEvent, ok := <-podsWatcher.ResultChan():
 				{
+
 					if !ok {
 						watchResetsCounter.WithLabelValues("pod").Inc()
 						podsWatcher, err = resolver.clientset.CoreV1().Pods("").Watch(context.Background(), metav1.ListOptions{})
@@ -490,11 +493,13 @@ func (resolver *K8sIPResolver) handleCronJobsWatchEvent(cronjobsEvent *watch.Eve
 }
 
 func (resolver *K8sIPResolver) getResolvedClusterSnapshot() error {
+	log.Printf("Generating full cluster snapshot")
 	err := resolver.getFullClusterSnapshot()
 	if err != nil {
 		return err
 	}
 	resolver.updateIpMapping()
+	log.Printf("Generated full cluster snapshot")
 	return nil
 }
 
@@ -504,6 +509,8 @@ func (resolver *K8sIPResolver) getFullClusterSnapshot() error {
 	if err != nil {
 		return errors.New("error getting pods, aborting snapshot update")
 	}
+	log.Printf("loaded pods data %d", pods.Size())
+
 	for _, pod := range pods.Items {
 		resolver.snapshot.Pods.Store(pod.UID, pod)
 	}
