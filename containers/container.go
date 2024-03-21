@@ -291,14 +291,31 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
+	//"src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind"
 	for d, count := range c.connectsSuccessful {
-		ch <- counter(metrics.NetConnectsSuccessful, float64(count), d.src.String(), d.dst.String())
+		workload_src := d.srcWorkload
+		workload_dest := d.dstWorkload
+
+		if d.srcWorkload.Name == "" || len(d.srcWorkload.Name) == 0 {
+			workload_src = c.ip_resolver.ResolveIP(d.src.IP().String())
+			workload_dest = c.ip_resolver.ResolveIP(d.dst.IP().String())
+			klog.Warningln("Resolving ip %s to %s", d.src.IP().String(), workload_src.Name)
+		}
+		ch <- counter(metrics.NetConnectsSuccessful, float64(count), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind)
 	}
 	for dst, count := range c.connectsFailed {
-		ch <- counter(metrics.NetConnectsFailed, float64(count), dst.String())
+		workload := c.ip_resolver.ResolveIP(dst.IP().String())
+		ch <- counter(metrics.NetConnectsFailed, float64(count), dst.String(), workload.Name, workload.Namespace, workload.Kind)
 	}
 	for d, count := range c.retransmits {
-		ch <- counter(metrics.NetRetransmits, float64(count), d.src.String(), d.dst.String())
+		workload_src := d.srcWorkload
+		workload_dest := d.dstWorkload
+
+		if d.srcWorkload.Name == "" || len(d.srcWorkload.Name) == 0 {
+			workload_src = c.ip_resolver.ResolveIP(d.src.IP().String())
+			workload_dest = c.ip_resolver.ResolveIP(d.dst.IP().String())
+		}
+		ch <- counter(metrics.NetRetransmits, float64(count), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind)
 	}
 
 	connections := map[AddrPair]int{}
@@ -306,15 +323,19 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		if !conn.Closed.IsZero() {
 			continue
 		}
-		connections[AddrPair{src: addrPair.dst, dst: conn.ActualDest}]++
+		workload_src := c.ip_resolver.ResolveIP(addrPair.dst.IP().String())
+		workload_dest := c.ip_resolver.ResolveIP(conn.ActualDest.IP().String())
+		connections[AddrPair{src: addrPair.dst, dst: conn.ActualDest, srcWorkload: workload_src, dstWorkload: workload_dest}]++
 	}
 	for d, count := range connections {
-		ch <- gauge(metrics.NetConnectionsActive, float64(count), d.src.String(), d.dst.String())
+		ch <- gauge(metrics.NetConnectionsActive, float64(count), d.src.String(), d.dst.String(), d.srcWorkload.Name, d.srcWorkload.Namespace, d.srcWorkload.Kind, d.dstWorkload.Name, d.dstWorkload.Namespace, d.dstWorkload.Kind)
 	}
 
 	for source, p := range c.logParsers {
 		for _, c := range p.parser.GetCounters() {
-			ch <- counter(metrics.LogMessages, float64(c.Messages), source, c.Level.String(), c.Hash, c.Sample)
+			if c.Level == logparser.LevelCritical || c.Level == logparser.LevelError {
+				ch <- counter(metrics.LogMessages, float64(c.Messages), source, c.Level.String(), c.Hash, c.Sample)
+			}
 		}
 	}
 
@@ -491,9 +512,6 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPP
 	if dst.IP().IsLoopback() && !p.isHostNs() {
 		return
 	}
-	srcWorkload := c.ip_resolver.ResolveIP(netaddr.IPPort(src).IP().String())
-	dstWorkload := c.ip_resolver.ResolveIP(netaddr.IPPort(dst).IP().String())
-
 	actualDst, err := c.getActualDestination(p, src, dst)
 	if err != nil {
 		if !common.IsNotExist(err) {
@@ -515,7 +533,10 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPP
 	if failed {
 		c.connectsFailed[dst]++
 	} else {
-		c.connectsSuccessful[AddrPair{src: dst, dst: *actualDst}]++
+		srcWorkload := c.ip_resolver.ResolveIP(src.IP().String())
+		dstWorkload := c.ip_resolver.ResolveIP(actualDst.IP().String())
+		c.connectsSuccessful[AddrPair{src: dst, dst: *actualDst, srcWorkload: srcWorkload,
+			dstWorkload: dstWorkload}]++
 		connection := &ActiveConnection{
 			Dest:        dst,
 			ActualDest:  *actualDst,
@@ -646,7 +667,9 @@ func (c *Container) onRetransmit(srcDst AddrPair) bool {
 	if !ok {
 		return false
 	}
-	c.retransmits[AddrPair{src: srcDst.dst, dst: conn.ActualDest}]++
+	src_workload := c.ip_resolver.ResolveIP(srcDst.dst.IP().String())
+	dst_workload := c.ip_resolver.ResolveIP(conn.ActualDest.IP().String())
+	c.retransmits[AddrPair{src: srcDst.dst, dst: conn.ActualDest, srcWorkload: src_workload, dstWorkload: dst_workload}]++
 	return true
 }
 

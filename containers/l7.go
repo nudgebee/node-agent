@@ -46,12 +46,13 @@ func (s L7Stats) get(protocol l7.Protocol, destination, actualDestination netadd
 		protoStats = map[AddrPair]*L7Metrics{}
 		s[protocol] = protoStats
 	}
-	dest := AddrPair{src: destination, dst: actualDestination}
+	dest := AddrPair{src: destination, dst: actualDestination, srcWorkload: srcWorkload, dstWorkload: dstWorkload}
 	m := protoStats[dest]
 	if m == nil {
 		m = &L7Metrics{}
 		protoStats[dest] = m
-		constLabels := map[string]string{"destination": destination.String(), "actual_destination": actualDestination.String(), "dest_kind": dstWorkload.Kind, "dest_workload_name": dstWorkload.Name, "dest_workload_namespace": dstWorkload.Namespace, "src_kind": srcWorkload.Kind, "src_workload_name": srcWorkload.Name, "src_workload_namespace": srcWorkload.Namespace}
+
+		constLabels := map[string]string{"destination": destination.String(), "actual_destination": actualDestination.String(), "destination_workload_kind": dstWorkload.Kind, "destination_workload_name": dstWorkload.Name, "destination_workload_namespace": dstWorkload.Namespace, "src_kind": srcWorkload.Kind, "src_workload_name": srcWorkload.Name, "src_workload_namespace": srcWorkload.Namespace}
 		labels := []string{"status"}
 		switch protocol {
 		case l7.ProtocolRabbitmq, l7.ProtocolNats:
@@ -60,6 +61,10 @@ func (s L7Stats) get(protocol l7.Protocol, destination, actualDestination netadd
 			method, path := l7.ParseHttp(r.Payload)
 			constLabels["path"] = path
 			constLabels["method"] = method
+			hOpts := L7Latency[protocol]
+			m.Latency = prometheus.NewHistogram(
+				prometheus.HistogramOpts{Name: hOpts.Name, Help: hOpts.Help, ConstLabels: constLabels},
+			)
 		default:
 			hOpts := L7Latency[protocol]
 			m.Latency = prometheus.NewHistogram(
