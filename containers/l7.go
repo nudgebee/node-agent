@@ -51,7 +51,6 @@ func (s L7Stats) get(protocol l7.Protocol, destination, actualDestination netadd
 	if m == nil {
 		m = &L7Metrics{}
 		protoStats[dest] = m
-
 		constLabels := map[string]string{"destination": destination.String(), "actual_destination": actualDestination.String(), "destination_workload_kind": dstWorkload.Kind, "destination_workload_name": dstWorkload.Name, "destination_workload_namespace": dstWorkload.Namespace, "src_kind": srcWorkload.Kind, "src_workload_name": srcWorkload.Name, "src_workload_namespace": srcWorkload.Namespace}
 		labels := []string{"status"}
 		switch protocol {
