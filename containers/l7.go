@@ -37,7 +37,7 @@ func (m *L7Metrics) observe(status, method string, duration time.Duration) {
 
 type L7Stats map[l7.Protocol]map[AddrPair]*L7Metrics // protocol -> dst:actual_dst -> metrics
 
-func (s L7Stats) get(protocol l7.Protocol, destination, actualDestination netaddr.IPPort, r *l7.RequestData, srcWorkload common.Workload, dstWorkload common.Workload) *L7Metrics {
+func (s L7Stats) get(protocol l7.Protocol, destination, actualDestination netaddr.IPPort, r *l7.RequestData, srcWorkload common.Workload, dstWorkload common.Workload, actualDstWorkload common.Workload) *L7Metrics {
 	if protocol == l7.ProtocolHTTP2 {
 		protocol = l7.ProtocolHTTP
 	}
@@ -46,12 +46,23 @@ func (s L7Stats) get(protocol l7.Protocol, destination, actualDestination netadd
 		protoStats = map[AddrPair]*L7Metrics{}
 		s[protocol] = protoStats
 	}
-	dest := AddrPair{src: destination, dst: actualDestination, srcWorkload: srcWorkload, dstWorkload: dstWorkload}
+	dest := AddrPair{src: destination, dst: actualDestination, srcWorkload: srcWorkload, dstWorkload: dstWorkload, actualDestWorkload: actualDstWorkload}
 	m := protoStats[dest]
 	if m == nil {
 		m = &L7Metrics{}
 		protoStats[dest] = m
-		constLabels := map[string]string{"destination": destination.String(), "actual_destination": actualDestination.String(), "destination_workload_kind": dstWorkload.Kind, "destination_workload_name": dstWorkload.Name, "destination_workload_namespace": dstWorkload.Namespace, "src_kind": srcWorkload.Kind, "src_workload_name": srcWorkload.Name, "src_workload_namespace": srcWorkload.Namespace}
+		constLabels := map[string]string{"destination": destination.String(),
+			"actual_destination":                    actualDestination.String(),
+			"destination_workload_kind":             dstWorkload.Kind,
+			"destination_workload_name":             dstWorkload.Name,
+			"destination_workload_namespace":        dstWorkload.Namespace,
+			"src_kind":                              srcWorkload.Kind,
+			"src_workload_name":                     srcWorkload.Name,
+			"src_workload_namespace":                srcWorkload.Namespace,
+			"actual_destination_workload_kind":      actualDstWorkload.Kind,
+			"actual_destination_workload_name":      actualDstWorkload.Name,
+			"actual_destination_workload_namespace": actualDstWorkload.Namespace,
+		}
 		labels := []string{"status"}
 		switch protocol {
 		case l7.ProtocolRabbitmq, l7.ProtocolNats:
