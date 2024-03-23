@@ -55,6 +55,7 @@ type K8sIPResolver struct {
 	stopSignal       chan bool
 	shouldResolveDns bool
 	dnsResolvedIps   *lrucache.Cache[string, string]
+	podIpsMap        sync.Map
 }
 
 type Workload struct {
@@ -81,11 +82,40 @@ func NewK8sIPResolver(clientset kubernetes.Interface, resolveDns bool) (*K8sIPRe
 		stopSignal:       make(chan bool),
 		shouldResolveDns: resolveDns,
 		dnsResolvedIps:   dnsCache,
+		podIpsMap:        sync.Map{},
 	}, nil
 }
 
 // resolve the given IP from the resolver's cache
 // if not available, return the IP itself.
+func (resolver *K8sIPResolver) ResolveActualIP(ip string) Workload {
+	if val, ok := resolver.podIpsMap.Load(ip); ok {
+		entry, ok := val.(Workload)
+		if ok {
+			return entry
+		}
+	}
+	host := ip
+
+	if resolver.shouldResolveDns {
+		val, ok := resolver.dnsResolvedIps.Get(ip)
+		if ok {
+			host = val
+		} else {
+			hosts, err := net.LookupAddr(ip)
+			if err == nil && len(hosts) > 0 {
+				host = hosts[0]
+			}
+			resolver.dnsResolvedIps.Add(ip, host)
+		}
+	}
+	return Workload{
+		Name:      host,
+		Namespace: "external",
+		Kind:      "external",
+	}
+}
+
 func (resolver *K8sIPResolver) ResolveIP(ip string) Workload {
 	if val, ok := resolver.ipsMap.Load(ip); ok {
 		entry, ok := val.(Workload)
@@ -93,6 +123,13 @@ func (resolver *K8sIPResolver) ResolveIP(ip string) Workload {
 			return entry
 		}
 		log.Printf("type confusion in ipsMap")
+	}
+
+	if val, ok := resolver.podIpsMap.Load(ip); ok {
+		entry, ok := val.(Workload)
+		if ok {
+			return entry
+		}
 	}
 	host := ip
 
@@ -334,6 +371,12 @@ func (resolver *K8sIPResolver) handlePodWatchEvent(podEvent *watch.Event) {
 		entry := resolver.resolvePodDescriptor(pod)
 		for _, podIp := range pod.Status.PodIPs {
 			resolver.storeWorkloadsIP(podIp.IP, &entry)
+			podWorkload := Workload{
+				Name:      pod.Name,
+				Namespace: pod.Namespace,
+				Kind:      "pod",
+			}
+			resolver.storePodsIP(podIp.IP, &podWorkload)
 		}
 	case watch.Modified:
 		pod, ok := podEvent.Object.(*v1.Pod)
@@ -344,6 +387,12 @@ func (resolver *K8sIPResolver) handlePodWatchEvent(podEvent *watch.Event) {
 		entry := resolver.resolvePodDescriptor(pod)
 		for _, podIp := range pod.Status.PodIPs {
 			resolver.storeWorkloadsIP(podIp.IP, &entry)
+			podWorkload := Workload{
+				Name:      pod.Name,
+				Namespace: pod.Namespace,
+				Kind:      "pod",
+			}
+			resolver.storePodsIP(podIp.IP, &podWorkload)
 		}
 	case watch.Deleted:
 		if val, ok := podEvent.Object.(*v1.Pod); ok {
@@ -627,6 +676,12 @@ func (resolver *K8sIPResolver) updateIpMapping() {
 		for _, podIp := range pod.Status.PodIPs {
 			// if ip is already in the map, override only if current pod is running
 			resolver.storeWorkloadsIP(podIp.IP, &entry)
+			podWorkload := Workload{
+				Name:      pod.Name,
+				Namespace: pod.Namespace,
+				Kind:      "pod",
+			}
+			resolver.storePodsIP(podIp.IP, &podWorkload)
 		}
 		return true
 	})
@@ -661,6 +716,10 @@ func (resolver *K8sIPResolver) storeWorkloadsIP(ip string, newWorkload *Workload
 		}
 	}
 	resolver.ipsMap.Store(ip, *newWorkload)
+}
+
+func (resolver *K8sIPResolver) storePodsIP(ip string, newWorkload *Workload) {
+	resolver.podIpsMap.Store(ip, *newWorkload)
 }
 
 // an ugly function to go up one level in hierarchy. maybe there's a better way to do it

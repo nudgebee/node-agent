@@ -33,6 +33,7 @@ type ProcessInfo struct {
 
 type IPResolver interface {
 	ResolveIP(string) common.Workload
+	ResolveActualIP(string) common.Workload
 	StartWatching() error
 	StopWatching()
 }
