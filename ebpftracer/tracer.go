@@ -350,6 +350,7 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 				Duration:    time.Duration(v.Duration),
 				Method:      l7.Method(v.Method),
 				StatementId: v.StatementId,
+				PayloadSize: v.PayloadSize,
 			}
 			switch {
 			case v.PayloadSize == 0:

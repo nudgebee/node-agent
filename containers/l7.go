@@ -68,7 +68,10 @@ func (s L7Stats) get(protocol l7.Protocol, destination, actualDestination netadd
 		case l7.ProtocolRabbitmq, l7.ProtocolNats:
 			labels = append(labels, "method")
 		case l7.ProtocolHTTP:
-			method, path := l7.ParseHttp(r.Payload)
+			method, path, payload := l7.ParseHttpAndRest(r.Payload)
+			if r.Status == l7.StatusFailed {
+				constLabels["payload"] = payload
+			}
 			constLabels["path"] = path
 			constLabels["method"] = method
 			hOpts := L7Latency[protocol]

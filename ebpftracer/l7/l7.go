@@ -119,4 +119,5 @@ type RequestData struct {
 	Method      Method
 	StatementId uint32
 	Payload     []byte
+	PayloadSize uint64
 }
