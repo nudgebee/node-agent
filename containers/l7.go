@@ -71,7 +71,7 @@ func (s L7Stats) get(protocol l7.Protocol, destination, actualDestination netadd
 		case l7.ProtocolHTTP:
 			method, path, payload := l7.ParseHttpAndRest(r.Payload)
 			if r.Status.Http() == "400" || r.Status.Http() == "500" {
-				log.Println("Captured failed request actual body %s, converted body %s, status %s", string(r.Payload), payload, r.Status.Http())
+				log.Printf("Captured failed request actual body %s, converted body %s, status %s", string(r.Payload), payload, r.Status.Http())
 				constLabels["payload"] = payload
 			}
 			constLabels["path"] = path
