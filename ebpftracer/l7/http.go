@@ -3,6 +3,7 @@ package l7
 import (
 	"bytes"
 	"encoding/base64"
+	"log"
 	"regexp"
 	"strings"
 )
@@ -66,7 +67,9 @@ func SanitizeString(input string) string {
 	for _, pattern := range sensitivePatterns {
 		sanitized = pattern.ReplaceAllStringFunc(sanitized, func(match string) string {
 			// Only replace the sensitive part, keeping the structure intact
-			return strings.Repeat("*", len(match))
+			sanitized_string := strings.Repeat("*", len(match))
+			log.Printf("Replacing %s with %s , using pattern %s", match, sanitized_string, pattern)
+			return sanitized_string
 		})
 	}
 
