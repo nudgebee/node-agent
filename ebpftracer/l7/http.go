@@ -23,19 +23,30 @@ func ParseHttp(payload []byte) (string, string) {
 	return string(method), string(uri)
 }
 
-func ParseHttpAndRest(payload []byte) (string, string, string) {
-	method, rest, ok := bytes.Cut(payload, space)
+func ParseHttpAndRest(payload []byte) (string, string, string, string) {
+	data := string(payload)
+	data = strings.ReplaceAll(data, "\\n\\n", "\n\n")
+	split := strings.Split(data, "\n\n")
+	rest := []byte(split[0])
+	d := split[1]
+	method, rest, ok := bytes.Cut(rest, space)
 	if !ok {
-		return "", "", ""
+		return "", "", "", ""
 	}
 	if !isHttpMethod(string(method)) {
-		return "", "", ""
+		return "", "", "", ""
 	}
 	uri, rest, ok := bytes.Cut(rest, space)
 	if !ok {
 		uri = append(uri, []byte("...")...)
 	}
-	return string(method), string(uri), SanitizeString(string(rest))
+
+	_, headers, ok := bytes.Cut(rest, []byte{'\n'})
+	if !ok {
+		uri = append(uri, []byte("...")...)
+	}
+	log.Printf("data %s", headers)
+	return string(method), string(uri), string(headers), string(d)
 }
 
 func SanitizeString(input string) string {

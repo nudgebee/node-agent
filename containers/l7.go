@@ -1,7 +1,6 @@
 package containers
 
 import (
-	"log"
 	"time"
 
 	"github.com/coroot/coroot-node-agent/common"
@@ -69,11 +68,7 @@ func (s L7Stats) get(protocol l7.Protocol, destination, actualDestination netadd
 		case l7.ProtocolRabbitmq, l7.ProtocolNats:
 			labels = append(labels, "method")
 		case l7.ProtocolHTTP:
-			method, path, payload := l7.ParseHttpAndRest(r.Payload)
-			if r.Status.Http() == "400" || r.Status.Http() == "500" {
-				log.Printf("Captured failed request actual body %s, converted body %s, status %s", string(r.Payload), payload, r.Status.Http())
-				constLabels["payload"] = payload
-			}
+			method, path := l7.ParseHttp(r.Payload)
 			constLabels["path"] = path
 			constLabels["method"] = method
 			hOpts := L7Latency[protocol]
