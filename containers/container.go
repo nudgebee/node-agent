@@ -24,8 +24,9 @@ import (
 )
 
 var (
-	gcInterval  = 10 * time.Minute
-	pingTimeout = 300 * time.Millisecond
+	gcInterval       = 10 * time.Minute
+	pingTimeout      = 300 * time.Millisecond
+	payloadThreshold = 1024 * 2
 )
 
 type ContainerID string
@@ -75,7 +76,7 @@ type ActiveConnection struct {
 	ActualDest         netaddr.IPPort
 	srcWorkload        common.Workload
 	dstWorkload        common.Workload
-	actialDestWorkload common.Workload
+	actualDestWorkload common.Workload
 	Pid                uint32
 	Fd                 uint64
 	Timestamp          uint64
@@ -536,9 +537,9 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPP
 	} else {
 		srcWorkload := c.ip_resolver.ResolveIP(src.IP().String())
 		dstWorkload := c.ip_resolver.ResolveIP(dst.IP().String())
-		actialDestWorkload := c.ip_resolver.ResolveActualIP(actualDst.IP().String())
+		actualDestWorkload := c.ip_resolver.ResolveActualIP(actualDst.IP().String())
 		c.connectsSuccessful[AddrPair{src: dst, dst: *actualDst, srcWorkload: srcWorkload,
-			dstWorkload: dstWorkload, actualDestWorkload: actialDestWorkload}]++
+			dstWorkload: dstWorkload, actualDestWorkload: actualDestWorkload}]++
 		connection := &ActiveConnection{
 			Dest:               dst,
 			ActualDest:         *actualDst,
@@ -547,9 +548,9 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPP
 			Timestamp:          timestamp,
 			srcWorkload:        srcWorkload,
 			dstWorkload:        dstWorkload,
-			actialDestWorkload: actialDestWorkload,
+			actualDestWorkload: actualDestWorkload,
 		}
-		c.connectionsActive[AddrPair{src: src, dst: dst, srcWorkload: srcWorkload, dstWorkload: dstWorkload, actualDestWorkload: actialDestWorkload}] = connection
+		c.connectionsActive[AddrPair{src: src, dst: dst, srcWorkload: srcWorkload, dstWorkload: dstWorkload, actualDestWorkload: actualDestWorkload}] = connection
 		c.connectionsByPidFd[PidFd{Pid: pid, Fd: fd}] = connection
 	}
 	c.connectLastAttempt[dst] = time.Now()
@@ -608,12 +609,16 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		return
 	}
 
-	stats := c.l7Stats.get(r.Protocol, conn.Dest, conn.ActualDest, r, conn.srcWorkload, conn.dstWorkload, conn.actialDestWorkload)
-	trace := tracing.NewTrace(string(c.id), conn.ActualDest)
+	stats := c.l7Stats.get(r.Protocol, conn.Dest, conn.ActualDest, r, conn.srcWorkload, conn.dstWorkload, conn.actualDestWorkload)
+	trace := tracing.NewTrace(string(c.id), conn.ActualDest, conn.srcWorkload, conn.dstWorkload, conn.actualDestWorkload)
 	switch r.Protocol {
 	case l7.ProtocolHTTP:
 		stats.observe(r.Status.Http(), "", r.Duration)
-		method, path, payload := l7.ParseHttpAndRest(r.Payload)
+		method, path := l7.ParseHttp(r.Payload)
+		payload := ""
+		if int(r.PayloadSize) < 2048 {
+			payload = string(r.Payload)
+		}
 		trace.HttpRequest(method, path, r.Status, r.Duration, r.PayloadSize, payload)
 	case l7.ProtocolHTTP2:
 		if conn.http2Parser == nil {
@@ -622,7 +627,11 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		requests := conn.http2Parser.Parse(r.Method, r.Payload, uint64(r.Duration))
 		for _, req := range requests {
 			stats.observe(req.Status.Http(), "", req.Duration)
-			trace.Http2Request(req.Method, req.Path, req.Scheme, req.Status, req.Duration)
+			payload := ""
+			if int(r.PayloadSize) < payloadThreshold {
+				payload = string(r.Payload)
+			}
+			trace.Http2Request(req.Method, req.Path, req.Scheme, req.Status, req.Duration, string(payload))
 		}
 	case l7.ProtocolPostgres:
 		if r.Method != l7.MethodStatementClose {
