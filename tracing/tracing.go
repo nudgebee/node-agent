@@ -98,7 +98,7 @@ func (t *Trace) createSpan(name string, duration time.Duration, error bool, attr
 	span.End(trace.WithTimestamp(end))
 }
 
-func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time.Duration) {
+func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time.Duration, requestSize uint64, requestBody string) {
 	if t == nil || method == "" {
 		return
 	}
@@ -106,6 +106,8 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 		semconv.HTTPURL(fmt.Sprintf("http://%s%s", t.destination.String(), path)),
 		semconv.HTTPMethod(method),
 		semconv.HTTPStatusCode(int(status)),
+		semconv.HTTPRequestContentLength(int(requestSize)),
+		attribute.Key("http.request_body").String(requestBody),
 	)
 }
 
