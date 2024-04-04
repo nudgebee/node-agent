@@ -72,9 +72,9 @@ func (s L7Stats) get(protocol l7.Protocol, destination, actualDestination netadd
 			constLabels["path"] = path
 			constLabels["method"] = method
 			if dstWorkload.Namespace == "external" {
-				request, error := l7.ParseHttpRequest(string(r.Payload))
-				if error == nil {
-					constLabels["destination_workload_name"] = request.Host
+				host, err := l7.ParseHostFromHttpRequest(string(r.Payload))
+				if err == nil {
+					constLabels["destination_workload_name"] = host
 				}
 			}
 			hOpts := L7Latency[protocol]
