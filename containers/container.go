@@ -609,6 +609,12 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		return
 	}
 
+	if conn.dstWorkload.Namespace == "external" && (r.Protocol == l7.ProtocolHTTP || r.Protocol == l7.ProtocolHTTP2) {
+		request, error := l7.ParseHttpRequest(string(r.Payload))
+		if error == nil {
+			conn.dstWorkload.Name = request.Host
+		}
+	}
 	stats := c.l7Stats.get(r.Protocol, conn.Dest, conn.ActualDest, r, conn.srcWorkload, conn.dstWorkload, conn.actualDestWorkload)
 	trace := tracing.NewTrace(string(c.id), conn.ActualDest, conn.srcWorkload, conn.dstWorkload, conn.actualDestWorkload)
 	switch r.Protocol {
@@ -616,7 +622,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		stats.observe(r.Status.Http(), "", r.Duration)
 		method, path := l7.ParseHttp(r.Payload)
 		payload := ""
-		if int(r.PayloadSize) < 2048 {
+		if int(r.PayloadSize) < payloadThreshold {
 			payload = string(r.Payload)
 		}
 		trace.HttpRequest(method, path, r.Status, r.Duration, r.PayloadSize, payload)

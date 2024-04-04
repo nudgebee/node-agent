@@ -287,7 +287,6 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		return nil
 	}
 	id := calcId(cg, md)
-	klog.Infof("calculated container id %d -> %s -> %s", pid, cg.Id, id)
 	if id == "" {
 		if cg.Id == "/init.scope" && pid != 1 {
 			klog.InfoS("ignoring without persisting", "cg", cg.Id, "pid", pid)
@@ -318,7 +317,6 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		return nil
 	}
 
-	klog.InfoS("detected a new container", "pid", pid, "cg", cg.Id, "id", id)
 	if err := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(id)}, r.reg).Register(c); err != nil {
 		klog.Warningln("failed to register container:", err)
 		return nil

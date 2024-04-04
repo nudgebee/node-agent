@@ -88,3 +88,9 @@ func TestParseMongo(t *testing.T) {
 	binary.LittleEndian.PutUint32(payload[mongoHeaderLength+mongoSectionKindLength:], dataSize+1)
 	assert.Equal(t, `<truncated>`, ParseMongo(payload))
 }
+
+func TestParseRequest(t *testing.T) {
+	m, _ := ParseHttpRequest(`HEAD /1 HTTP/1.1\nHost: 127.0.0.1\nUser-Agent: curl/8.0.1\nAccept: */*\n\nxzxxxxxxzx`)
+	assert.Equal(t, "HEAD", m.Method)
+	assert.Equal(t, "127.0.0.1", m.Host)
+}

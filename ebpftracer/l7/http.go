@@ -1,9 +1,11 @@
 package l7
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/base64"
 	"log"
+	"net/http"
 	"regexp"
 	"strings"
 )
@@ -49,6 +51,14 @@ func ParseHttpAndRest(payload []byte) (string, string, string, string) {
 	return string(method), string(uri), string(headers), string(d)
 }
 
+func ParseHttpRequest(request string) (*http.Request, error) {
+	request = strings.ReplaceAll(request, "\\n", "\r\n")
+	req, err := http.ReadRequest(bufio.NewReader(strings.NewReader(request)))
+	if err != nil {
+		return nil, err
+	}
+	return req, nil
+}
 func SanitizeString(input string) string {
 	// Regular expression patterns to match various sensitive data formats
 	sensitivePatterns := []*regexp.Regexp{

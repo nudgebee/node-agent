@@ -71,6 +71,12 @@ func (s L7Stats) get(protocol l7.Protocol, destination, actualDestination netadd
 			method, path := l7.ParseHttp(r.Payload)
 			constLabels["path"] = path
 			constLabels["method"] = method
+			if dstWorkload.Namespace == "external" {
+				request, error := l7.ParseHttpRequest(string(r.Payload))
+				if error == nil {
+					constLabels["destination_workload_name"] = request.Host
+				}
+			}
 			hOpts := L7Latency[protocol]
 			m.Latency = prometheus.NewHistogram(
 				prometheus.HistogramOpts{Name: hOpts.Name, Help: hOpts.Help, ConstLabels: constLabels},
