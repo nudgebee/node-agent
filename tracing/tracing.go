@@ -66,7 +66,7 @@ func Init(machineId, hostname, version string) {
 				semconv.ContainerID(containerId),
 			)),
 		)
-		return provider.Tracer("coroot-node-agent", trace.WithInstrumentationVersion(version))
+		return provider.Tracer("nudgebee-node-agent", trace.WithInstrumentationVersion(version))
 	}
 }
 
