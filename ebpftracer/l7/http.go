@@ -3,7 +3,6 @@ package l7
 import (
 	"bytes"
 	"encoding/base64"
-	"errors"
 	"log"
 	"regexp"
 	"strings"
@@ -50,26 +49,24 @@ func ParseHttpAndRest(payload []byte) (string, string, string, string) {
 	return string(method), string(uri), string(headers), string(d)
 }
 
-func ParseHostFromHttpRequest(request string) (string, error) {
-	// Split the request string into lines
-	lines := strings.Split(request, "\n")
+func ParseHostFromHttpRequest(input string) (string, error) {
+	// Split the input string by newline characters
+	lines := strings.Split(input, "\r\n")
 
-	// Search for the Host header within the lines
+	// Initialize host variable
 	var host string
-	for _, line := range lines {
-		if strings.HasPrefix(line, "Host:") {
-			parts := strings.SplitN(line, ": ", 2)
-			if len(parts) == 2 {
-				host = parts[1]
-				break
-			}
-		}
-	}
 
-	// Check if the Host header is found
-	if host == "" {
-		err := errors.New("host header not found")
-		return "", err
+	// Iterate through each line
+	for _, line := range lines {
+		// Check if the line starts with "Host:"
+		if strings.HasPrefix(line, "Host:") {
+			// Split the line by colon and trim the leading/trailing whitespace
+			parts := strings.Split(line, ":")
+			if len(parts) == 2 {
+				host = strings.TrimSpace(parts[1])
+			}
+			break
+		}
 	}
 
 	return host, nil
