@@ -1,9 +1,12 @@
 package l7
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/base64"
+	"fmt"
 	"log"
+	"net/http"
 	"regexp"
 	"strings"
 )
@@ -23,30 +26,16 @@ func ParseHttp(payload []byte) (string, string) {
 	return string(method), string(uri)
 }
 
-func ParseHttpAndRest(payload []byte) (string, string, string, string) {
-	data := string(payload)
-	data = strings.ReplaceAll(data, "\\n\\n", "\n\n")
-	split := strings.Split(data, "\n\n")
-	rest := []byte(split[0])
-	d := split[1]
-	method, rest, ok := bytes.Cut(rest, space)
-	if !ok {
-		return "", "", "", ""
-	}
-	if !isHttpMethod(string(method)) {
-		return "", "", "", ""
-	}
-	uri, rest, ok := bytes.Cut(rest, space)
-	if !ok {
-		uri = append(uri, []byte("...")...)
-	}
+func ParseHTTPRequest(requestBytes []byte) (*http.Request, error) {
+	// Create a reader from the byte array
+	reader := bufio.NewReader(bytes.NewReader(requestBytes))
 
-	_, headers, ok := bytes.Cut(rest, []byte{'\n'})
-	if !ok {
-		uri = append(uri, []byte("...")...)
+	// Parse HTTP request
+	req, err := http.ReadRequest(reader)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing request: %v", err)
 	}
-	log.Printf("data %s", headers)
-	return string(method), string(uri), string(headers), string(d)
+	return req, nil
 }
 
 func ParseHostFromHttpRequest(input string) (string, error) {
@@ -70,6 +59,18 @@ func ParseHostFromHttpRequest(input string) (string, error) {
 	}
 
 	return host, nil
+}
+
+func ConvertHeadersToString(headers http.Header) string {
+	var headerStrings []string
+
+	for key, values := range headers {
+		for _, value := range values {
+			headerStrings = append(headerStrings, fmt.Sprintf("%s: %s", key, value))
+		}
+	}
+
+	return strings.Join(headerStrings, ", ")
 }
 
 func SanitizeString(input string) string {

@@ -88,3 +88,16 @@ func TestParseMongo(t *testing.T) {
 	binary.LittleEndian.PutUint32(payload[mongoHeaderLength+mongoSectionKindLength:], dataSize+1)
 	assert.Equal(t, `<truncated>`, ParseMongo(payload))
 }
+
+func TestParseHost(t *testing.T) {
+	requestString := "GET /latest/meta-data/public-hostname HTTP/1.1\r\nHost: 169.254.169.254\r\nUser-Agent: aws-sdk-go/1.44.216 (go1.20.10; linux; amd64)\r\nX-Aws-Ec2-Metadata-Token: AQAEAFUlJzNnMsa7JA5u9mJyJIgGQwSudnYZkp6-LjKeRNagn8umUQ==\r\nAccept-Encoding: gzip\r\n\r\n"
+	m, _ := ParseHostFromHttpRequest("GET /latest/meta-data/public-hostname HTTP/1.1\r\nHost: 169.254.169.254\r\nUser-Agent: aws-sdk-go/1.44.216 (go1.20.10; linux; amd64)\r\nX-Aws-Ec2-Metadata-Token: AQAEAFUlJzNnMsa7JA5u9mJyJIgGQwSudnYZkp6-LjKeRNagn8umUQ==\r\nAccept-Encoding: gzip\r\n\r\n")
+	assert.Equal(t, "169.254.169.254", m)
+
+	req, err := ParseHTTPRequest([]byte(requestString))
+	assert.Nil(t, nil, err)
+	assert.Equal(t, "169.254.169.254", req.Host)
+	assert.Equal(t, "GET", req.Method)
+	headers := ConvertHeadersToString(req.Header)
+	assert.NotNil(t, headers)
+}

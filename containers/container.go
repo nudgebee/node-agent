@@ -1,6 +1,7 @@
 package containers
 
 import (
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -620,12 +621,19 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	switch r.Protocol {
 	case l7.ProtocolHTTP:
 		stats.observe(r.Status.Http(), "", r.Duration)
-		method, path := l7.ParseHttp(r.Payload)
+		req, err := l7.ParseHTTPRequest(r.Payload)
+		if err != nil {
+			log.Printf("Failed to parse payload %s, %s", err, string(r.Payload))
+		}
 		payload := ""
-		if int(r.PayloadSize) < payloadThreshold {
+		if req.Body != nil && int(r.PayloadSize) < payloadThreshold {
 			payload = string(r.Payload)
 		}
-		trace.HttpRequest(method, path, r.Status, r.Duration, r.PayloadSize, payload)
+		headers := ""
+		if req.Header != nil {
+			headers = l7.ConvertHeadersToString(req.Header)
+		}
+		trace.HttpRequest(req.Method, req.RequestURI, r.Status, r.Duration, r.PayloadSize, payload, headers)
 	case l7.ProtocolHTTP2:
 		if conn.http2Parser == nil {
 			conn.http2Parser = l7.NewHttp2Parser()
