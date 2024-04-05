@@ -610,9 +610,9 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	}
 
 	if conn.dstWorkload.Namespace == "external" && (r.Protocol == l7.ProtocolHTTP || r.Protocol == l7.ProtocolHTTP2) {
-		request, error := l7.ParseHttpRequest(string(r.Payload))
+		host, error := l7.ParseHostFromHttpRequest(string(r.Payload))
 		if error == nil {
-			conn.dstWorkload.Name = request.Host
+			conn.dstWorkload.Name = host
 		}
 	}
 	stats := c.l7Stats.get(r.Protocol, conn.Dest, conn.ActualDest, r, conn.srcWorkload, conn.dstWorkload, conn.actualDestWorkload)

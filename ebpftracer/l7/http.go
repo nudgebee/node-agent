@@ -1,11 +1,10 @@
 package l7
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"log"
-	"net/http"
 	"regexp"
 	"strings"
 )
@@ -51,14 +50,31 @@ func ParseHttpAndRest(payload []byte) (string, string, string, string) {
 	return string(method), string(uri), string(headers), string(d)
 }
 
-func ParseHttpRequest(request string) (*http.Request, error) {
-	request = strings.ReplaceAll(request, "\\n", "\r\n")
-	req, err := http.ReadRequest(bufio.NewReader(strings.NewReader(request)))
-	if err != nil {
-		return nil, err
+func ParseHostFromHttpRequest(request string) (string, error) {
+	// Split the request string into lines
+	lines := strings.Split(request, "\n")
+
+	// Search for the Host header within the lines
+	var host string
+	for _, line := range lines {
+		if strings.HasPrefix(line, "Host:") {
+			parts := strings.SplitN(line, ": ", 2)
+			if len(parts) == 2 {
+				host = parts[1]
+				break
+			}
+		}
 	}
-	return req, nil
+
+	// Check if the Host header is found
+	if host == "" {
+		err := errors.New("host header not found")
+		return "", err
+	}
+
+	return host, nil
 }
+
 func SanitizeString(input string) string {
 	// Regular expression patterns to match various sensitive data formats
 	sensitivePatterns := []*regexp.Regexp{
