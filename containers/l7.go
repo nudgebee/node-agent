@@ -1,6 +1,7 @@
 package containers
 
 import (
+	"log"
 	"time"
 
 	"github.com/coroot/coroot-node-agent/common"
@@ -73,8 +74,10 @@ func (s L7Stats) get(protocol l7.Protocol, destination, actualDestination netadd
 			constLabels["method"] = method
 			if dstWorkload.Namespace == "external" {
 				host, err := l7.ParseHostFromHttpRequest(string(r.Payload))
-				if err == nil {
+				if host != "" {
 					constLabels["destination_workload_name"] = host
+				} else {
+					log.Printf("Failed to parse host %s , %q", host, err)
 				}
 			}
 			hOpts := L7Latency[protocol]
