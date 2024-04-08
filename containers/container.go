@@ -504,6 +504,20 @@ func (c *Container) onListenClose(pid uint32, addr netaddr.IPPort) {
 	}
 }
 
+func ignoreControlPlane(name string) bool {
+	if *flags.IgnoreControlPlane {
+		return false
+	}
+	keywords := []string{"karpenter", "loki", "prometheus", "grafana", "kubelet", "etcd", "apiserver"}
+	for _, keyword := range keywords {
+		if strings.Contains(strings.ToLower(name), keyword) {
+			klog.Warningln("Ignoring control plane ", name)
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPPort, timestamp uint64, failed bool) {
 	if common.PortFilter.ShouldBeSkipped(dst.Port()) {
 		return
@@ -513,6 +527,10 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPP
 		return
 	}
 	if dst.IP().IsLoopback() && !p.isHostNs() {
+		return
+	}
+	srcWorkload := c.ip_resolver.ResolveIP(src.IP().String())
+	if !ignoreControlPlane(srcWorkload.Namespace) {
 		return
 	}
 	actualDst, err := c.getActualDestination(p, src, dst)
@@ -621,19 +639,25 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	switch r.Protocol {
 	case l7.ProtocolHTTP:
 		stats.observe(r.Status.Http(), "", r.Duration)
+		payload := ""
+		headers := ""
+		method := ""
+		uri := ""
 		req, err := l7.ParseHTTPRequest(r.Payload)
 		if err != nil {
-			log.Printf("Failed to parse payload %s, %s", err, string(r.Payload))
+			log.Printf("Failed to parse payload %s, %q", err, string(r.Payload))
+			method, uri = l7.ParseHttp(r.Payload)
+		} else {
+			if req != nil && req.Body != nil && int(r.PayloadSize) < payloadThreshold {
+				payload = string(r.Payload)
+			}
+			if req != nil && req.Header != nil {
+				headers = l7.ConvertHeadersToString(req.Header)
+			}
+			method = req.Method
+			uri = req.URL.Path
 		}
-		payload := ""
-		if req.Body != nil && int(r.PayloadSize) < payloadThreshold {
-			payload = string(r.Payload)
-		}
-		headers := ""
-		if req.Header != nil {
-			headers = l7.ConvertHeadersToString(req.Header)
-		}
-		trace.HttpRequest(req.Method, req.RequestURI, r.Status, r.Duration, r.PayloadSize, payload, headers)
+		trace.HttpRequest(method, uri, r.Status, r.Duration, r.PayloadSize, payload, headers)
 	case l7.ProtocolHTTP2:
 		if conn.http2Parser == nil {
 			conn.http2Parser = l7.NewHttp2Parser()

@@ -24,7 +24,7 @@
 #define METHOD_HTTP2_CLIENT_FRAMES  5
 #define METHOD_HTTP2_SERVER_FRAMES  6
 
-#define MAX_PAYLOAD_SIZE 1024 // must be power of 2
+#define MAX_PAYLOAD_SIZE 1024 * 1024 // must be power of 2
 #define TRUNCATE_PAYLOAD_SIZE(size) ({                                  \
     size = MIN(size, MAX_PAYLOAD_SIZE-1);                               \
     asm volatile ("%0 &= %1" : "+r"(size) : "i"(MAX_PAYLOAD_SIZE-1));   \
@@ -427,7 +427,6 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     e->protocol = req->protocol;
     e->payload_size = req->payload_size;
     COPY_PAYLOAD(e->payload, req->payload_size, req->payload);
-
     bpf_map_delete_elem(&active_l7_requests, &k);
     if (e->protocol == PROTOCOL_HTTP) {
         response = is_http_response(payload, &e->status);
