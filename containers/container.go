@@ -530,7 +530,7 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPP
 		return
 	}
 	srcWorkload := c.ip_resolver.ResolveIP(src.IP().String())
-	if !ignoreControlPlane(srcWorkload.Namespace) {
+	if ignoreControlPlane(srcWorkload.Namespace) {
 		return
 	}
 	actualDst, err := c.getActualDestination(p, src, dst)
