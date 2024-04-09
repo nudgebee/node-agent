@@ -23,7 +23,7 @@ import (
 	"k8s.io/klog/v2"
 )
 
-const MaxPayloadSize = 1024
+const MaxPayloadSize = 1024 * 1024
 
 type EventType uint32
 type EventReason uint32
@@ -338,7 +338,8 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 		switch typ {
 		case perfMapTypeL7Events:
 			v := &l7Event{}
-			reader := bytes.NewBuffer(rec.RawSample)
+			data := rec.RawSample
+			reader := bytes.NewBuffer(data)
 			if err := binary.Read(reader, binary.LittleEndian, v); err != nil {
 				klog.Warningln("failed to read msg:", err)
 				continue
@@ -352,12 +353,13 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 				StatementId: v.StatementId,
 				PayloadSize: v.PayloadSize,
 			}
+			klog.Infof("Got request size %d, payload size %d, data size %d", v.PayloadSize, len(payload), len(data))
 			switch {
 			case v.PayloadSize == 0:
 			case v.PayloadSize > MaxPayloadSize:
 				req.Payload = payload[:MaxPayloadSize]
 			default:
-				req.Payload = payload[:v.PayloadSize]
+				req.Payload = payload
 			}
 			event = Event{Type: EventTypeL7Request, Pid: v.Pid, Fd: v.Fd, Timestamp: v.ConnectionTimestamp, L7Request: req}
 		case perfMapTypeFileEvents:

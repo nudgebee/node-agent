@@ -1,6 +1,7 @@
 package containers
 
 import (
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -27,7 +28,7 @@ import (
 var (
 	gcInterval       = 10 * time.Minute
 	pingTimeout      = 300 * time.Millisecond
-	payloadThreshold = 1024 * 2
+	payloadThreshold = 1024 * 1024
 )
 
 type ContainerID string
@@ -139,6 +140,7 @@ type Container struct {
 
 	done        chan struct{}
 	ip_resolver IPResolver
+	hostIpsMap  sync.Map
 }
 
 func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, hostConntrack *Conntrack, pid uint32, ip_resolver IPResolver) (*Container, error) {
@@ -175,6 +177,7 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, host
 
 		done:        make(chan struct{}),
 		ip_resolver: ip_resolver,
+		hostIpsMap:  sync.Map{},
 	}
 
 	for _, n := range md.networks {
@@ -303,6 +306,12 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 			workload_src = c.ip_resolver.ResolveIP(d.src.IP().String())
 			workload_dest = c.ip_resolver.ResolveIP(d.dst.IP().String())
 		}
+
+		if d.dstWorkload.Kind == "external" {
+			if host, ok := c.hostIpsMap.Load(d.dst); ok {
+				workload_dest = common.Workload{Name: host.(string), Namespace: "external", Kind: "external"}
+			}
+		}
 		ch <- counter(metrics.NetConnectsSuccessful, float64(count), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
 	}
 	for dst, count := range c.connectsFailed {
@@ -317,6 +326,11 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 			workload_src = c.ip_resolver.ResolveIP(d.src.IP().String())
 			workload_dest = c.ip_resolver.ResolveIP(d.dst.IP().String())
 		}
+		if d.dstWorkload.Kind == "external" {
+			if host, ok := c.hostIpsMap.Load(d.dst); ok {
+				workload_dest = common.Workload{Name: host.(string), Namespace: "external", Kind: "external"}
+			}
+		}
 		ch <- counter(metrics.NetRetransmits, float64(count), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind)
 	}
 
@@ -328,6 +342,11 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		workload_src := c.ip_resolver.ResolveIP(addrPair.dst.IP().String())
 		workload_dest := c.ip_resolver.ResolveIP(conn.ActualDest.IP().String())
 		actualDestWorkload := c.ip_resolver.ResolveActualIP(conn.ActualDest.IP().String())
+		if workload_dest.Kind == "external" {
+			if host, ok := c.hostIpsMap.Load(conn.ActualDest.IP().String()); ok {
+				workload_dest = common.Workload{Name: host.(string), Namespace: "external", Kind: "external"}
+			}
+		}
 		connections[AddrPair{src: addrPair.dst, dst: conn.ActualDest, srcWorkload: workload_src, dstWorkload: workload_dest, actualDestWorkload: actualDestWorkload}]++
 	}
 	for d, count := range connections {
@@ -530,7 +549,8 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPP
 		return
 	}
 	srcWorkload := c.ip_resolver.ResolveIP(src.IP().String())
-	if ignoreControlPlane(srcWorkload.Namespace) {
+	if ignoreControlPlane(srcWorkload.Name) {
+		klog.Warningln("Ignoring src workload %s, %s", src.IP().String(), srcWorkload.Name)
 		return
 	}
 	actualDst, err := c.getActualDestination(p, src, dst)
@@ -632,6 +652,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		host, error := l7.ParseHostFromHttpRequest(string(r.Payload))
 		if error == nil {
 			conn.dstWorkload.Name = host
+			c.hostIpsMap.Store(conn.ActualDest.IP().String(), host)
 		}
 	}
 	stats := c.l7Stats.get(r.Protocol, conn.Dest, conn.ActualDest, r, conn.srcWorkload, conn.dstWorkload, conn.actualDestWorkload)
@@ -648,8 +669,9 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 			log.Printf("Failed to parse payload %s, %q", err, string(r.Payload))
 			method, uri = l7.ParseHttp(r.Payload)
 		} else {
-			if req != nil && req.Body != nil && int(r.PayloadSize) < payloadThreshold {
-				payload = string(r.Payload)
+			if req != nil && req.Body != nil {
+				body, _ := io.ReadAll(req.Body)
+				payload = string(body)
 			}
 			if req != nil && req.Header != nil {
 				headers = l7.ConvertHeadersToString(req.Header)

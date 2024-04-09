@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -27,90 +28,72 @@ func ParseHttp(payload []byte) (string, string) {
 	return string(method), string(uri)
 }
 
-func ParseHTTPRequest(requestBytes []byte) (*http.Request, error) {
-	// Convert bytes to string
-	requestString := string(requestBytes)
-	requestString = strings.ReplaceAll(requestString, "\x00", "")
-	// Split the request into lines
-	lines := strings.Split(requestString, "\r\n")
-	// Find the index of the first empty line (indicating the end of the request line and headers)
-	var emptyLineIndex int
-	for i, line := range lines {
-		if line == "" {
-			emptyLineIndex = i
-			break
-		}
+func ParseHTTPRequest(data []byte) (*http.Request, error) {
+	method, rest, ok := bytes.Cut(data, space)
+	if !ok {
+		log.Printf("invalid metheod")
+		return nil, errors.New("invalid payload")
+	}
+	if !isHttpMethod(string(method)) {
+		log.Printf("invalid method")
+		return nil, errors.New("invalid payload")
+	}
+	uri, rest, ok := bytes.Cut(rest, space)
+	if !ok {
+		uri = append(uri, []byte("...")...)
 	}
 
-	// Check if an empty line was found
-	if emptyLineIndex == 0 || emptyLineIndex == len(lines)-1 {
-		return nil, errors.New("malformed HTTP request: invalid request line or headers")
+	httpVersion, rest, _ := bytes.Cut(rest, []byte{'\n'})
+	remaining := bytes.Split(rest, []byte{'\r', '\n', '\r', '\n'})
+	headers := remaining[0]
+	var body []byte
+	if len(remaining) > 1 {
+		body = remaining[1]
 	}
-
-	// Parse the request line
-	requestLine := lines[0]
-	parts := strings.Split(requestLine, " ")
-	if len(parts) != 3 {
-		return nil, errors.New("malformed HTTP request: invalid request line")
+	if !ok {
+		return nil, errors.New("invalid headers")
 	}
+	parsedURL, err := url.ParseRequestURI(string(uri))
 
-	method := parts[0]
-	uri := parts[1]
-	httpVersion := parts[2]
-
-	// Parse the URI to get the path and query
-	parsedURL, err := url.ParseRequestURI(uri)
 	if err != nil {
-		return nil, errors.New("malformed HTTP request: invalid URI")
-	}
-
-	// Parse the Host header
-	var host string
-	for _, line := range lines[1:emptyLineIndex] {
-		parts := strings.SplitN(line, ": ", 2)
-		if len(parts) != 2 {
-			return nil, errors.New("malformed HTTP request: invalid header line")
-		}
-		key := parts[0]
-		value := parts[1]
-		if strings.ToLower(key) == "host" {
-			host = value
-			break
-		}
-	}
-
-	// If Host header not found, use the host from the parsed URL
-	if host == "" {
-		host = parsedURL.Host
-	}
-
-	// Construct the URL
-	u := &url.URL{
-		Scheme:   parsedURL.Scheme,
-		Host:     host,
-		Path:     parsedURL.Path,
-		RawQuery: parsedURL.RawQuery,
-	}
-
-	// Create a new request
-	req := &http.Request{
-		Method:     method,
-		URL:        u,
-		Proto:      httpVersion,
-		ProtoMajor: 1,
-		ProtoMinor: 1,
-		Header:     http.Header{},
+		return nil, errors.New("invalid uri")
 	}
 
 	// Parse headers (skipping first line)
-	for _, line := range lines[1:emptyLineIndex] {
-		parts := strings.SplitN(line, ": ", 2)
-		if len(parts) != 2 {
-			return nil, errors.New("malformed HTTP request: invalid header line")
-		}
-		req.Header.Add(parts[0], parts[1])
+	u := &url.URL{
+		Scheme:   parsedURL.Scheme,
+		Path:     parsedURL.Path,
+		RawQuery: parsedURL.RawQuery,
 	}
+	var header = http.Header{}
+	var host = ""
+	headerLines := bytes.Split(headers, []byte("\n"))
 
+	for _, line := range headerLines {
+		part1, part2, ok := bytes.Cut(line, []byte(":"))
+		if !ok {
+			continue
+		}
+		if strings.HasPrefix(string(part1), "Host") {
+			host = strings.TrimSpace(string(part2))
+		}
+		key := strings.TrimSpace(string(part1))
+		val := strings.TrimSpace(string(part2))
+		header.Add(key, val)
+	}
+	req := &http.Request{
+		Method:     string(method),
+		URL:        u,
+		Proto:      string(httpVersion),
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Host:       host,
+		Header:     header,
+	}
+	if len(body) > 0 || body != nil {
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		defer req.Body.Close()
+	}
 	return req, nil
 }
 

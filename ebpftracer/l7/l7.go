@@ -113,11 +113,13 @@ func (s Status) Error() bool {
 }
 
 type RequestData struct {
-	Protocol    Protocol
-	Status      Status
-	Duration    time.Duration
-	Method      Method
-	StatementId uint32
-	Payload     []byte
-	PayloadSize uint64
+	Protocol     Protocol
+	Status       Status
+	Duration     time.Duration
+	Method       Method
+	StatementId  uint32
+	Payload      []byte
+	PayloadSize  uint64
+	ResponseSize uint64
+	Response     []byte
 }
