@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/coroot/coroot-node-agent/flags"
 )
 
 func ParseHttp(payload []byte) (string, string) {
@@ -126,7 +128,7 @@ func ConvertHeadersToString(headers http.Header) string {
 
 	for key, values := range headers {
 		for _, value := range values {
-			headerStrings = append(headerStrings, fmt.Sprintf("%s: %s", key, value))
+			headerStrings = append(headerStrings, fmt.Sprintf("%s: %s", key, SanitizeString(value)))
 		}
 	}
 
@@ -134,27 +136,19 @@ func ConvertHeadersToString(headers http.Header) string {
 }
 
 func SanitizeString(input string) string {
-	// Regular expression patterns to match various sensitive data formats
-	sensitivePatterns := []*regexp.Regexp{
-		// Authorization header (Bearer or Basic)
-		// Example: Authorization: Basic c3FhXzdhODNiZTRjY2Y0M2E2NzFhMTI0ODViYmMyY2I4ZGU4MDk0MDQyMzE6
-		// Reason: Matches common formats for authorization tokens.
-		regexp.MustCompile(`(?i)Authorization: (Bearer|Basic)\s+[a-zA-Z0-9\-_\.=]+`),
-
-		// API key
-		// Example: ApiKey abcdef1234567890
-		// Reason: Matches common formats for API keys.
-		regexp.MustCompile(`(?i)ApiKey\s+[a-zA-Z0-9\-_\.=]+`),
-
-		// JWT token
-		// Example: JWT eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
-		// Reason: Matches common formats for JWT tokens.
-		regexp.MustCompile(`(?i)JWT\s+[a-zA-Z0-9\-_\.=]+`),
-
-		// OAuth token
-		// Example: OAuth token1234567890
-		// Reason: Matches common formats for OAuth tokens.
-		regexp.MustCompile(`(?i)OAuth\s+[a-zA-Z0-9\-_\.=]+`),
+	if !*flags.SanitizeHeaders {
+		return input
+	}
+	patternList := strings.Split(*flags.SensitiveHeaderPattern, ",")
+	// Compile regex patterns
+	var sensitivePatterns []*regexp.Regexp
+	for _, pattern := range patternList {
+		// Trim leading and trailing whitespace from the pattern
+		pattern = strings.TrimSpace(pattern)
+		if len(pattern) > 0 {
+			// Compile each pattern and append to the list
+			sensitivePatterns = append(sensitivePatterns, regexp.MustCompile(pattern))
+		}
 	}
 
 	// Replace sensitive data with placeholder '*'
@@ -162,7 +156,7 @@ func SanitizeString(input string) string {
 	for _, pattern := range sensitivePatterns {
 		sanitized = pattern.ReplaceAllStringFunc(sanitized, func(match string) string {
 			// Only replace the sensitive part, keeping the structure intact
-			sanitized_string := strings.Repeat("*", len(match))
+			sanitized_string := strings.Repeat("*", min(len(match), 5))
 			log.Printf("Replacing %s with %s , using pattern %s", match, sanitized_string, pattern)
 			return sanitized_string
 		})

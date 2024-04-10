@@ -680,10 +680,12 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 				payload = string(base64String)
 			}
 			if req != nil && req.Header != nil {
-				headers = l7.ConvertHeadersToString(req.Header)
+				headersStr := l7.ConvertHeadersToString(req.Header)
+				headers = base64.StdEncoding.EncodeToString([]byte(headersStr))
 			}
 			method = req.Method
 			uri = req.URL.Path
+			host = req.Host
 		}
 		if r.Response != nil {
 			response = base64.StdEncoding.EncodeToString(r.Response)
