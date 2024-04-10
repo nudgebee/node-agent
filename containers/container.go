@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"encoding/base64"
+
 	"github.com/coroot/coroot-node-agent/cgroup"
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer"
@@ -524,10 +526,10 @@ func (c *Container) onListenClose(pid uint32, addr netaddr.IPPort) {
 }
 
 func ignoreControlPlane(name string) bool {
-	if *flags.IgnoreControlPlane {
+	keywords := strings.Split(*flags.IgnoreControlPlane, ",")
+	if len(keywords) == 0 {
 		return false
 	}
-	keywords := []string{"karpenter", "loki", "prometheus", "grafana", "kubelet", "etcd", "apiserver"}
 	for _, keyword := range keywords {
 		if strings.Contains(strings.ToLower(name), keyword) {
 			klog.Warningln("Ignoring control plane ", name)
@@ -550,7 +552,7 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPP
 	}
 	srcWorkload := c.ip_resolver.ResolveIP(src.IP().String())
 	if ignoreControlPlane(srcWorkload.Name) {
-		klog.Warningln("Ignoring src workload %s, %s", src.IP().String(), srcWorkload.Name)
+		klog.Warningf("Ignoring src workload %s, %s \n", src.IP().String(), srcWorkload.Name)
 		return
 	}
 	actualDst, err := c.getActualDestination(p, src, dst)
@@ -664,14 +666,18 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		headers := ""
 		method := ""
 		uri := ""
+		response := ""
+		host := ""
 		req, err := l7.ParseHTTPRequest(r.Payload)
 		if err != nil {
 			log.Printf("Failed to parse payload %s, %q", err, string(r.Payload))
 			method, uri = l7.ParseHttp(r.Payload)
+			host, _ = l7.ParseHostFromHttpRequest(string(r.Payload))
 		} else {
 			if req != nil && req.Body != nil {
 				body, _ := io.ReadAll(req.Body)
-				payload = string(body)
+				base64String := base64.StdEncoding.EncodeToString(body)
+				payload = string(base64String)
 			}
 			if req != nil && req.Header != nil {
 				headers = l7.ConvertHeadersToString(req.Header)
@@ -679,7 +685,10 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 			method = req.Method
 			uri = req.URL.Path
 		}
-		trace.HttpRequest(method, uri, r.Status, r.Duration, r.PayloadSize, payload, headers)
+		if r.Response != nil {
+			response = base64.StdEncoding.EncodeToString(r.Response)
+		}
+		trace.HttpRequest(method, uri, r.Status, r.Duration, r.PayloadSize, payload, headers, response, host)
 	case l7.ProtocolHTTP2:
 		if conn.http2Parser == nil {
 			conn.http2Parser = l7.NewHttp2Parser()

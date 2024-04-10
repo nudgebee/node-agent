@@ -99,7 +99,7 @@ func whitelistNodeExternalNetworks() {
 	}
 }
 
-func getClientset() (*kubernetes.Clientset, error) {
+func getClientSet() (*kubernetes.Clientset, error) {
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		kubeconfig :=

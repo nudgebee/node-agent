@@ -91,7 +91,8 @@ func ParseHTTPRequest(data []byte) (*http.Request, error) {
 		Header:     header,
 	}
 	if len(body) > 0 || body != nil {
-		req.Body = io.NopCloser(bytes.NewReader(body))
+		p := body
+		req.Body = io.NopCloser(bytes.NewReader(p))
 		defer req.Body.Close()
 	}
 	return req, nil

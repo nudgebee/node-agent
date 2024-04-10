@@ -107,17 +107,21 @@ func (t *Trace) createSpan(name string, duration time.Duration, error bool, attr
 	span.End(trace.WithTimestamp(end))
 }
 
-func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time.Duration, requestSize uint64, payload string, headers string) {
+func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time.Duration, requestSize uint64, payload string, headers string, response string, host string) {
 	if t == nil || method == "" {
 		return
 	}
+	if host == "" {
+		host = t.destination.String()
+	}
 	t.createSpan(method, duration, status >= 400,
-		semconv.HTTPURL(fmt.Sprintf("http://%s%s", t.destination.String(), path)),
+		semconv.HTTPURL(fmt.Sprintf("http://%s%s", host, path)),
 		semconv.HTTPMethod(method),
 		semconv.HTTPStatusCode(int(status)),
 		semconv.HTTPRequestContentLength(int(requestSize)),
 		attribute.Key("http.request_payload").String(payload),
 		attribute.Key("http.headers").String(headers),
+		attribute.Key("http.response").String(response),
 	)
 }
 

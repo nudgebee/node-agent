@@ -34,7 +34,7 @@ var (
 
 	WalDir             = kingpin.Flag("wal-dir", "Path to where the agent stores data (e.g. the metrics Write-Ahead Log)").Default("/tmp/coroot-node-agent").Envar("WAL_DIR").String()
 	ResolveDns         = kingpin.Flag("resolve-dns", "should resolve DNS").Default("true").Envar("RESOLVE_DNS").Bool()
-	IgnoreControlPlane = kingpin.Flag("ignore-control-plane", "ignore control plane like loki").Default("true").Envar("IGNORE_CONTROL_PLANE").Bool()
+	IgnoreControlPlane = kingpin.Flag("ignore-control-plane", "ignore control plane like loki").Default("karpenter,loki,prometheus,grafana,kubelet,etcd,apiserver,victoria").Envar("IGNORE_CONTROL_PLANE").String()
 )
 
 func GetString(fl *string) string {
