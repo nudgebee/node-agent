@@ -23,7 +23,7 @@ import (
 	"k8s.io/klog/v2"
 )
 
-const MaxPayloadSize = 1024
+const MaxPayloadSize = 1024 * 5
 
 type EventType uint32
 type EventReason uint32
@@ -318,6 +318,7 @@ type l7Event struct {
 	Padding             uint16
 	StatementId         uint32
 	PayloadSize         uint64
+	ResponseSize        uint64
 }
 
 func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapType) {
@@ -338,26 +339,36 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 		switch typ {
 		case perfMapTypeL7Events:
 			v := &l7Event{}
-			reader := bytes.NewBuffer(rec.RawSample)
+			data := rec.RawSample
+			reader := bytes.NewBuffer(data)
 			if err := binary.Read(reader, binary.LittleEndian, v); err != nil {
 				klog.Warningln("failed to read msg:", err)
 				continue
 			}
 			payload := reader.Bytes()
 			req := &l7.RequestData{
-				Protocol:    l7.Protocol(v.Protocol),
-				Status:      l7.Status(v.Status),
-				Duration:    time.Duration(v.Duration),
-				Method:      l7.Method(v.Method),
-				StatementId: v.StatementId,
-				PayloadSize: v.PayloadSize,
+				Protocol:     l7.Protocol(v.Protocol),
+				Status:       l7.Status(v.Status),
+				Duration:     time.Duration(v.Duration),
+				Method:       l7.Method(v.Method),
+				StatementId:  v.StatementId,
+				PayloadSize:  v.PayloadSize,
+				ResponseSize: v.ResponseSize,
 			}
 			switch {
 			case v.PayloadSize == 0:
+			case v.PayloadSize > MaxPayloadSize && v.ResponseSize > MaxPayloadSize:
+				req.Payload = payload[:MaxPayloadSize]
+				req.Response = payload[MaxPayloadSize:]
 			case v.PayloadSize > MaxPayloadSize:
 				req.Payload = payload[:MaxPayloadSize]
+				req.Response = payload[MaxPayloadSize : MaxPayloadSize+v.ResponseSize]
+			case v.ResponseSize > MaxPayloadSize:
+				req.Payload = payload[:v.PayloadSize]
+				req.Response = payload[MaxPayloadSize:]
 			default:
 				req.Payload = payload[:v.PayloadSize]
+				req.Response = payload[MaxPayloadSize : MaxPayloadSize+v.ResponseSize]
 			}
 			event = Event{Type: EventTypeL7Request, Pid: v.Pid, Fd: v.Fd, Timestamp: v.ConnectionTimestamp, L7Request: req}
 		case perfMapTypeFileEvents:

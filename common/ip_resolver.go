@@ -152,6 +152,15 @@ func (resolver *K8sIPResolver) ResolveIP(ip string) Workload {
 	}
 }
 
+func (resolver *K8sIPResolver) CacheDNS(ip string, dns string) Workload {
+	resolver.dnsResolvedIps.Add(ip, dns)
+	return Workload{
+		Name:      dns,
+		Namespace: "external",
+		Kind:      "external",
+	}
+}
+
 func (resolver *K8sIPResolver) StartWatching() error {
 	// register watchers
 	podsWatcher, err := resolver.clientset.CoreV1().Pods("").Watch(context.Background(), metav1.ListOptions{})

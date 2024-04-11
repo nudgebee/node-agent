@@ -34,6 +34,7 @@ type ProcessInfo struct {
 type IPResolver interface {
 	ResolveIP(string) common.Workload
 	ResolveActualIP(string) common.Workload
+	CacheDNS(string, string) common.Workload
 	StartWatching() error
 	StopWatching()
 }
