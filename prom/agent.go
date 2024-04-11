@@ -20,7 +20,7 @@ import (
 
 const (
 	RemoteFlushDeadline = time.Minute
-	jobName             = "coroot-node-agent"
+	jobName             = "nudgebee-node-agent"
 	RemoteWriteTimeout  = 30 * time.Second
 )
 

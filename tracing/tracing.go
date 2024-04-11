@@ -66,7 +66,7 @@ func Init(machineId, hostname, version string) {
 				semconv.ContainerID(containerId),
 			)),
 		)
-		return provider.Tracer("coroot-node-agent", trace.WithInstrumentationVersion(version))
+		return provider.Tracer("nudgebee-node-agent", trace.WithInstrumentationVersion(version))
 	}
 }
 
@@ -76,13 +76,22 @@ type Trace struct {
 	commonAttrs []attribute.KeyValue
 }
 
-func NewTrace(containerId string, destination netaddr.IPPort) *Trace {
+func NewTrace(containerId string, destination netaddr.IPPort, srcWorkload common.Workload, dstWorkload common.Workload, actualDstWorkload common.Workload) *Trace {
 	if tracer == nil {
 		return nil
 	}
 	return &Trace{containerId: containerId, destination: destination, commonAttrs: []attribute.KeyValue{
 		semconv.NetPeerName(destination.IP().String()),
 		semconv.NetPeerPort(int(destination.Port())),
+		attribute.Key("destination.workload_name").String(dstWorkload.Name),
+		attribute.Key("destination.workload_namespace").String(dstWorkload.Namespace),
+		attribute.Key("destination.workload_kind").String(dstWorkload.Kind),
+		attribute.Key("source.workload_name").String(srcWorkload.Name),
+		attribute.Key("source.workload_namespace").String(srcWorkload.Namespace),
+		attribute.Key("source.workload_kind").String(srcWorkload.Kind),
+		attribute.Key("destination.name").String(actualDstWorkload.Name),
+		attribute.Key("destination.namespace").String(actualDstWorkload.Namespace),
+		attribute.Key("destination.kind").String(actualDstWorkload.Kind),
 	}}
 }
 
@@ -98,18 +107,25 @@ func (t *Trace) createSpan(name string, duration time.Duration, error bool, attr
 	span.End(trace.WithTimestamp(end))
 }
 
-func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time.Duration) {
+func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time.Duration, requestSize uint64, payload string, headers string, response string, host string) {
 	if t == nil || method == "" {
 		return
 	}
+	if host == "" {
+		host = t.destination.String()
+	}
 	t.createSpan(method, duration, status >= 400,
-		semconv.HTTPURL(fmt.Sprintf("http://%s%s", t.destination.String(), path)),
+		semconv.HTTPURL(fmt.Sprintf("http://%s%s", host, path)),
 		semconv.HTTPMethod(method),
 		semconv.HTTPStatusCode(int(status)),
+		semconv.HTTPRequestContentLength(int(requestSize)),
+		attribute.Key("http.request_payload").String(payload),
+		attribute.Key("http.headers").String(headers),
+		attribute.Key("http.response").String(response),
 	)
 }
 
-func (t *Trace) Http2Request(method, path, scheme string, status l7.Status, duration time.Duration) {
+func (t *Trace) Http2Request(method, path, scheme string, status l7.Status, duration time.Duration, payload string) {
 	if t == nil {
 		return
 	}
@@ -126,6 +142,7 @@ func (t *Trace) Http2Request(method, path, scheme string, status l7.Status, dura
 		semconv.HTTPURL(fmt.Sprintf("%s://%s%s", scheme, t.destination.String(), path)),
 		semconv.HTTPMethod(method),
 		semconv.HTTPStatusCode(int(status)),
+		attribute.Key("http.request_payload").String(payload),
 	)
 }
 
