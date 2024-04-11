@@ -557,7 +557,7 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPP
 	}
 	actualDst, err := c.getActualDestination(p, src, dst)
 	dstWorkload := c.ip_resolver.ResolveIP(dst.IP().String())
-	actualDestWorkload := c.ip_resolver.ResolveActualIP(actualDst.IP().String())
+
 	if ignoreControlPlane(dstWorkload.Name) {
 		klog.Warningf("Ignoring src workload %s, %s \n", dst.IP().String(), dstWorkload.Name)
 		return
@@ -582,6 +582,7 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPP
 	if failed {
 		c.connectsFailed[dst]++
 	} else {
+		actualDestWorkload := c.ip_resolver.ResolveActualIP(actualDst.IP().String())
 		c.connectsSuccessful[AddrPair{src: dst, dst: *actualDst, srcWorkload: srcWorkload,
 			dstWorkload: dstWorkload, actualDestWorkload: actualDestWorkload}]++
 		connection := &ActiveConnection{
