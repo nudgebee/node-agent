@@ -24,7 +24,7 @@
 #define METHOD_HTTP2_CLIENT_FRAMES  5
 #define METHOD_HTTP2_SERVER_FRAMES  6
 
-#define MAX_PAYLOAD_SIZE 1024 // must be power of 2
+#define MAX_PAYLOAD_SIZE 1024 * 5 // must be power of 2
 #define TRUNCATE_PAYLOAD_SIZE(size) ({                                  \
     size = MIN(size, MAX_PAYLOAD_SIZE-1);                               \
     asm volatile ("%0 &= %1" : "+r"(size) : "i"(MAX_PAYLOAD_SIZE-1));   \
@@ -63,7 +63,9 @@ struct l7_event {
     __u16 padding;
     __u32 statement_id;
     __u64 payload_size;
+    __u64 response_size;
     char payload[MAX_PAYLOAD_SIZE];
+    char response[MAX_PAYLOAD_SIZE];
 };
 
 struct {
@@ -388,7 +390,8 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     e->method = METHOD_UNKNOWN;
     e->statement_id = 0;
     e->payload_size = 0;
-
+    e->response_size = ret;
+    COPY_PAYLOAD(e->response, ret, payload);
     if (is_rabbitmq_consume(payload, ret)) {
         e->protocol = PROTOCOL_RABBITMQ;
         e->method = METHOD_CONSUME;
@@ -427,7 +430,6 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     e->protocol = req->protocol;
     e->payload_size = req->payload_size;
     COPY_PAYLOAD(e->payload, req->payload_size, req->payload);
-
     bpf_map_delete_elem(&active_l7_requests, &k);
     if (e->protocol == PROTOCOL_HTTP) {
         response = is_http_response(payload, &e->status);

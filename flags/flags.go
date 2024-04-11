@@ -11,7 +11,7 @@ var (
 	ListenAddress     = kingpin.Flag("listen", "Listen address - ip:port or :port").Default("0.0.0.0:80").Envar("LISTEN").String()
 	CgroupRoot        = kingpin.Flag("cgroupfs-root", "The mount point of the host cgroupfs root").Default("/sys/fs/cgroup").Envar("CGROUPFS_ROOT").String()
 	DisableLogParsing = kingpin.Flag("disable-log-parsing", "Disable container log parsing").Default("false").Envar("DISABLE_LOG_PARSING").Bool()
-	DisablePinger     = kingpin.Flag("disable-pinger", "Don't ping upstreams").Default("false").Envar("DISABLE_PINGER").Bool()
+	DisablePinger     = kingpin.Flag("disable-pinger", "Don't ping upstreams").Default("true").Envar("DISABLE_PINGER").Bool()
 	DisableL7Tracing  = kingpin.Flag("disable-l7-tracing", "Disable L7 tracing").Default("false").Envar("DISABLE_L7_TRACING").Bool()
 
 	ExternalNetworksWhitelist = kingpin.Flag("track-public-network", "Allow track connections to the specified IP networks, all private networks are allowed by default (e.g., Y.Y.Y.Y/mask)").Envar("TRACK_PUBLIC_NETWORK").Strings()
@@ -32,8 +32,11 @@ var (
 	ApiKey           = kingpin.Flag("api-key", "Coroot API key").Envar("API_KEY").String()
 	ScrapeInterval   = kingpin.Flag("scrape-interval", "How often to gather metrics from the agent").Default("15s").Envar("SCRAPE_INTERVAL").Duration()
 
-	WalDir     = kingpin.Flag("wal-dir", "Path to where the agent stores data (e.g. the metrics Write-Ahead Log)").Default("/tmp/coroot-node-agent").Envar("WAL_DIR").String()
-	ResolveDns = kingpin.Flag("resolve-dns", "should resolve DNS").Default("true").Envar("RESOLVE_DNS").Bool()
+	WalDir                 = kingpin.Flag("wal-dir", "Path to where the agent stores data (e.g. the metrics Write-Ahead Log)").Default("/tmp/coroot-node-agent").Envar("WAL_DIR").String()
+	ResolveDns             = kingpin.Flag("resolve-dns", "should resolve DNS").Default("true").Envar("RESOLVE_DNS").Bool()
+	IgnoreControlPlane     = kingpin.Flag("ignore-control-plane", "ignore control plane like loki").Default("karpenter,loki,prometheus,grafana,kubelet,etcd,apiserver,victoria").Envar("IGNORE_CONTROL_PLANE").String()
+	SensitiveHeaderPattern = kingpin.Flag("sensitive-header-patterns", "sanitize headers using patterns").Default("(?i)Authorization: (Bearer|Basic)\\s+[a-zA-Z0-9\\-_\\.\\=]+, (?i)ApiKey\\s+[a-zA-Z0-9\\-_\\.\\=]+, (?i)JWT\\s+[a-zA-Z0-9\\-_\\.\\=]+, (?i)OAuth\\s+[a-zA-Z0-9\\-_\\.\\=]+").Envar("SENSITIVE_HEADER_PATTERN").String()
+	SanitizeHeaders        = kingpin.Flag("sanitize-headers", "should sanitize headers").Default("false").Envar("SANITIZE_HEADERS").Bool()
 )
 
 func GetString(fl *string) string {
