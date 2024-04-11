@@ -3,8 +3,8 @@ package l7
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -124,15 +124,22 @@ func ParseHostFromHttpRequest(input string) (string, error) {
 }
 
 func ConvertHeadersToString(headers http.Header) string {
-	var headerStrings []string
+	headerMap := make(map[string][]string)
 
 	for key, values := range headers {
+		var sanitizedValues []string
 		for _, value := range values {
-			headerStrings = append(headerStrings, fmt.Sprintf("%s: %s", key, SanitizeString(value)))
+			sanitizedValues = append(sanitizedValues, SanitizeString(value))
 		}
+		headerMap[key] = sanitizedValues
 	}
 
-	return strings.Join(headerStrings, ", ")
+	jsonString, err := json.Marshal(headerMap)
+	if err != nil {
+		return ""
+	}
+
+	return string(jsonString)
 }
 
 func SanitizeString(input string) string {
