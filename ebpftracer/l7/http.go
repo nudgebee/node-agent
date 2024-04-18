@@ -2,14 +2,12 @@ package l7
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strings"
 
 	"github.com/coroot/coroot-node-agent/flags"
@@ -70,7 +68,11 @@ func ParseHTTPRequest(data []byte) (*http.Request, error) {
 	var header = http.Header{}
 	var host = ""
 	headerLines := bytes.Split(headers, []byte("\n"))
-
+	sensitiveHeaders := make(map[string]bool)
+	sensitiveKeysList := strings.Split(*flags.SensitiveHeader, ",")
+	for _, key := range sensitiveKeysList {
+		sensitiveHeaders[strings.TrimSpace(key)] = true
+	}
 	for _, line := range headerLines {
 		part1, part2, ok := bytes.Cut(line, []byte(":"))
 		if !ok {
@@ -79,8 +81,12 @@ func ParseHTTPRequest(data []byte) (*http.Request, error) {
 		if strings.HasPrefix(string(part1), "Host") {
 			host = strings.TrimSpace(string(part2))
 		}
+
 		key := strings.TrimSpace(string(part1))
 		val := strings.TrimSpace(string(part2))
+		if sensitiveHeaders[key] {
+			val = SanitizeString(val)
+		}
 		header.Add(key, val)
 	}
 	req := &http.Request{
@@ -125,53 +131,22 @@ func ParseHostFromHttpRequest(input string) (string, error) {
 
 func ConvertHeadersToString(headers http.Header) string {
 	headerMap := make(map[string][]string)
-
 	for key, values := range headers {
-		var sanitizedValues []string
-		for _, value := range values {
-			sanitizedValues = append(sanitizedValues, SanitizeString(value))
-		}
-		headerMap[key] = sanitizedValues
+		headerMap[key] = values
 	}
-
 	jsonString, err := json.Marshal(headerMap)
 	if err != nil {
 		return ""
 	}
-
 	return string(jsonString)
 }
 
-func SanitizeString(input string) string {
+func SanitizeString(value string) string {
 	if !*flags.SanitizeHeaders {
-		return input
+		return value
 	}
-	patternList := strings.Split(*flags.SensitiveHeaderPattern, ",")
-	// Compile regex patterns
-	var sensitivePatterns []*regexp.Regexp
-	for _, pattern := range patternList {
-		// Trim leading and trailing whitespace from the pattern
-		pattern = strings.TrimSpace(pattern)
-		if len(pattern) > 0 {
-			// Compile each pattern and append to the list
-			sensitivePatterns = append(sensitivePatterns, regexp.MustCompile(pattern))
-		}
+	if len(value) <= 10 {
+		return strings.Repeat("*", len(value))
 	}
-
-	// Replace sensitive data with placeholder '*'
-	sanitized := input
-	for _, pattern := range sensitivePatterns {
-		sanitized = pattern.ReplaceAllStringFunc(sanitized, func(match string) string {
-			// Only replace the sensitive part, keeping the structure intact
-			sanitized_string := strings.Repeat("*", min(len(match), 5))
-			log.Printf("Replacing %s with %s , using pattern %s", match, sanitized_string, pattern)
-			return sanitized_string
-		})
-	}
-
-	byteData := []byte(sanitized)
-
-	// Encode byte slice to Base64
-	base64String := base64.StdEncoding.EncodeToString(byteData)
-	return base64String
+	return strings.Repeat("*", 10) + value[10:]
 }

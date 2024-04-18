@@ -32,11 +32,11 @@ var (
 	ApiKey           = kingpin.Flag("api-key", "Coroot API key").Envar("API_KEY").String()
 	ScrapeInterval   = kingpin.Flag("scrape-interval", "How often to gather metrics from the agent").Default("15s").Envar("SCRAPE_INTERVAL").Duration()
 
-	WalDir                 = kingpin.Flag("wal-dir", "Path to where the agent stores data (e.g. the metrics Write-Ahead Log)").Default("/tmp/coroot-node-agent").Envar("WAL_DIR").String()
-	ResolveDns             = kingpin.Flag("resolve-dns", "should resolve DNS").Default("true").Envar("RESOLVE_DNS").Bool()
-	IgnoreControlPlane     = kingpin.Flag("ignore-control-plane", "ignore control plane like loki").Default("karpenter,loki,prometheus,grafana,kubelet,etcd,apiserver,victoria").Envar("IGNORE_CONTROL_PLANE").String()
-	SensitiveHeaderPattern = kingpin.Flag("sensitive-header-patterns", "sanitize headers using patterns").Default("(?i)Authorization: (Bearer|Basic)\\s+[a-zA-Z0-9\\-_\\.\\=]+, (?i)ApiKey\\s+[a-zA-Z0-9\\-_\\.\\=]+, (?i)JWT\\s+[a-zA-Z0-9\\-_\\.\\=]+, (?i)OAuth\\s+[a-zA-Z0-9\\-_\\.\\=]+").Envar("SENSITIVE_HEADER_PATTERN").String()
-	SanitizeHeaders        = kingpin.Flag("sanitize-headers", "should sanitize headers").Default("false").Envar("SANITIZE_HEADERS").Bool()
+	WalDir             = kingpin.Flag("wal-dir", "Path to where the agent stores data (e.g. the metrics Write-Ahead Log)").Default("/tmp/coroot-node-agent").Envar("WAL_DIR").String()
+	ResolveDns         = kingpin.Flag("resolve-dns", "should resolve DNS").Default("true").Envar("RESOLVE_DNS").Bool()
+	IgnoreControlPlane = kingpin.Flag("ignore-control-plane", "ignore control plane like loki").Default("karpenter,loki,prometheus,grafana,kubelet,etcd,apiserver,victoria").Envar("IGNORE_CONTROL_PLANE").String()
+	SanitizeHeaders    = kingpin.Flag("sanitize-headers", "should sanitize headers").Default("true").Envar("SANITIZE_HEADERS").Bool()
+	SensitiveHeader    = kingpin.Flag("sensitive-headers", "sanitize headers using patterns").Default("Authorization, Cookie").Envar("SENSITIVE_HEADERS").String()
 )
 
 func GetString(fl *string) string {
