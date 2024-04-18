@@ -532,7 +532,6 @@ func ignoreControlPlane(name string) bool {
 	}
 	for _, keyword := range keywords {
 		if strings.Contains(strings.ToLower(name), keyword) {
-			klog.Warningln("Ignoring control plane ", name)
 			return true
 		}
 	}
