@@ -122,6 +122,7 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 		attribute.Key("http.request_payload").String(payload),
 		attribute.Key("http.headers").String(headers),
 		attribute.Key("http.response").String(response),
+		attribute.Key("http.path").String(path),
 	)
 }
 
