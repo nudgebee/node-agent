@@ -71,7 +71,7 @@ func ParseHTTPRequest(data []byte) (*http.Request, error) {
 	sensitiveHeaders := make(map[string]bool)
 	sensitiveKeysList := strings.Split(*flags.SensitiveHeader, ",")
 	for _, key := range sensitiveKeysList {
-		sensitiveHeaders[strings.TrimSpace(key)] = true
+		sensitiveHeaders[strings.ToLower(strings.TrimSpace(key))] = true
 	}
 	for _, line := range headerLines {
 		part1, part2, ok := bytes.Cut(line, []byte(":"))
@@ -84,7 +84,7 @@ func ParseHTTPRequest(data []byte) (*http.Request, error) {
 
 		key := strings.TrimSpace(string(part1))
 		val := strings.TrimSpace(string(part2))
-		if sensitiveHeaders[key] {
+		if sensitiveHeaders[strings.ToLower(key)] {
 			val = SanitizeString(val)
 		}
 		header.Add(key, val)
@@ -143,10 +143,8 @@ func ConvertHeadersToString(headers http.Header) string {
 
 func SanitizeString(value string) string {
 	if !*flags.SanitizeHeaders {
+
 		return value
 	}
-	if len(value) <= 10 {
-		return strings.Repeat("*", len(value))
-	}
-	return strings.Repeat("*", 10) + value[10:]
+	return strings.Repeat("*", len(value))
 }
