@@ -6,6 +6,7 @@ import (
 	"io"
 	"testing"
 
+	"github.com/coroot/coroot-node-agent/flags"
 	"github.com/stretchr/testify/assert"
 	"go.mongodb.org/mongo-driver/bson"
 )
@@ -91,12 +92,18 @@ func TestParseMongo(t *testing.T) {
 }
 
 func TestParseHost(t *testing.T) {
-	requestString := "HEAD /1 HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: curl/8.0.1\r\nAccept: */*\r\n\r\nxzxxxxxxzx"
+	SanitizeHeaders := "Authorization, cookie"
+	f := true
+	flags.SensitiveHeader = &SanitizeHeaders
+	flags.SanitizeHeaders = &f
+	requestString := "HEAD /1 HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: curl/8.0.1\r\nAuthorization: abcd\r\nCookie: abcd\r\nAccept: */*\r\n\r\nxzxxxxxxzx"
 	req, err := ParseHTTPRequest([]byte(requestString))
 	assert.Nil(t, nil, err)
 	assert.Equal(t, "/1", req.URL.Path)
 	assert.Equal(t, "127.0.0.1", req.Host)
 	assert.Equal(t, "HEAD", req.Method)
+	assert.Equal(t, "****", req.Header.Get("Authorization"))
+	assert.Equal(t, "****", req.Header.Get("Cookie"))
 	body, err := io.ReadAll(req.Body)
 	assert.Nil(t, nil, err)
 	assert.Equal(t, "xzxxxxxxzx", string(body))
