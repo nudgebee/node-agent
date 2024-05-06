@@ -735,7 +735,11 @@ func (resolver *K8sIPResolver) updateIpMapping() {
 				if ok {
 					region = meta.Region
 					zone = meta.Zone
+				} else {
+					log.Printf("failed to parse instance meta %v, node name %s , node info %v", pod.Name, pod.Spec.NodeName, meta)
 				}
+			} else {
+				log.Printf("no node info found for pod %v, node name %s", pod.Name, pod.Spec.NodeName)
 			}
 			podWorkload := Workload{
 				Name:      pod.Name,
