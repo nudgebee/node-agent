@@ -461,7 +461,7 @@ func (resolver *K8sIPResolver) handleNodeWatchEvent(nodeEvent *watch.Event) {
 				Region:    node.ObjectMeta.Labels["topology.kubernetes.io/region"],
 			})
 		}
-		nodeMetadata := &InstanceMeta{Name: node.Name, Zone: node.ObjectMeta.Labels["topology.kubernetes.io/zone"], Region: node.ObjectMeta.Annotations["topology.kubernetes.io/region"]}
+		nodeMetadata := InstanceMeta{Name: node.Name, Zone: node.ObjectMeta.Labels["topology.kubernetes.io/zone"], Region: node.ObjectMeta.Annotations["topology.kubernetes.io/region"]}
 		resolver.nodeInfoMap.Store(node.Name, nodeMetadata)
 	case watch.Deleted:
 		if val, ok := nodeEvent.Object.(*v1.Node); ok {
@@ -608,7 +608,7 @@ func (resolver *K8sIPResolver) getFullClusterSnapshot() error {
 		return errors.New("error getting nodes, aborting snapshot update")
 	}
 	for _, node := range nodes.Items {
-		nodeMetadata := &InstanceMeta{Name: node.Name, Zone: node.ObjectMeta.Labels["topology.kubernetes.io/zone"], Region: node.ObjectMeta.Labels["topology.kubernetes.io/region"]}
+		nodeMetadata := InstanceMeta{Name: node.Name, Zone: node.ObjectMeta.Labels["topology.kubernetes.io/zone"], Region: node.ObjectMeta.Labels["topology.kubernetes.io/region"]}
 		resolver.nodeInfoMap.Store(node.Name, nodeMetadata)
 		resolver.snapshot.Nodes.Store(node.UID, node)
 		log.Printf("parsed node meta %v, got annotations %v", nodeMetadata, node.ObjectMeta.Annotations)
