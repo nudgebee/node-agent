@@ -17,6 +17,7 @@ import (
 	"github.com/coroot/coroot-node-agent/flags"
 	"github.com/coroot/coroot-node-agent/logs"
 	"github.com/coroot/coroot-node-agent/node"
+	"github.com/coroot/coroot-node-agent/node/metadata"
 	"github.com/coroot/coroot-node-agent/pinger"
 	"github.com/coroot/coroot-node-agent/proc"
 	"github.com/coroot/coroot-node-agent/tracing"
@@ -140,12 +141,14 @@ type Container struct {
 
 	lock sync.RWMutex
 
-	done        chan struct{}
-	ip_resolver IPResolver
-	hostIpsMap  sync.Map
+	done             chan struct{}
+	ip_resolver      IPResolver
+	hostIpsMap       sync.Map
+	instanceMetadata *metadata.CloudMetadata
 }
 
 func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, hostConntrack *Conntrack, pid uint32, ip_resolver IPResolver) (*Container, error) {
+	instanceMetadata := metadata.GetInstanceMetadata()
 	netNs, err := proc.GetNetNs(pid)
 	if err != nil {
 		return nil, err
@@ -177,9 +180,10 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, host
 
 		hostConntrack: hostConntrack,
 
-		done:        make(chan struct{}),
-		ip_resolver: ip_resolver,
-		hostIpsMap:  sync.Map{},
+		done:             make(chan struct{}),
+		ip_resolver:      ip_resolver,
+		hostIpsMap:       sync.Map{},
+		instanceMetadata: instanceMetadata,
 	}
 
 	for _, n := range md.networks {
@@ -551,14 +555,12 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPP
 	}
 	srcWorkload := c.ip_resolver.ResolveIP(src.IP().String())
 	if ignoreControlPlane(srcWorkload.Name) {
-		klog.Warningf("Ignoring src workload %s, %s \n", src.IP().String(), srcWorkload.Name)
 		return
 	}
 	actualDst, err := c.getActualDestination(p, src, dst)
 	dstWorkload := c.ip_resolver.ResolveIP(dst.IP().String())
 
 	if ignoreControlPlane(dstWorkload.Name) {
-		klog.Warningf("Ignoring src workload %s, %s \n", dst.IP().String(), dstWorkload.Name)
 		return
 	}
 	if err != nil {
@@ -693,7 +695,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		if r.Response != nil {
 			response = base64.StdEncoding.EncodeToString(r.Response)
 		}
-		trace.HttpRequest(method, uri, r.Status, r.Duration, r.PayloadSize, payload, headers, response, host)
+		trace.HttpRequest(method, uri, r.Status, r.Duration, r.PayloadSize, payload, headers, response, host, *c.instanceMetadata, conn.actualDestWorkload)
 	case l7.ProtocolHTTP2:
 		if conn.http2Parser == nil {
 			conn.http2Parser = l7.NewHttp2Parser()
