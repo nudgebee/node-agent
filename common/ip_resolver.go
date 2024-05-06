@@ -735,6 +735,8 @@ func (resolver *K8sIPResolver) updateIpMapping() {
 				if ok {
 					region = meta.Region
 					zone = meta.Zone
+				} else {
+					log.Printf("invalid object found %v", nodeInfo)
 				}
 			}
 			podWorkload := Workload{
