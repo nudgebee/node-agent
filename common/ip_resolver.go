@@ -618,6 +618,8 @@ func (resolver *K8sIPResolver) getFullClusterSnapshot() error {
 		return errors.New("error getting nodes, aborting snapshot update")
 	}
 	for _, node := range nodes.Items {
+		nodeMetadata := &InstanceMeta{Zone: node.ObjectMeta.Annotations["topology.kubernetes.io/zone"], Region: node.ObjectMeta.Annotations["topology.kubernetes.io/region"]}
+		resolver.nodeInfoMap.Store(node.Name, nodeMetadata)
 		resolver.snapshot.Nodes.Store(node.UID, node)
 	}
 
