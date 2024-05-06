@@ -461,7 +461,7 @@ func (resolver *K8sIPResolver) handleNodeWatchEvent(nodeEvent *watch.Event) {
 				Region:    node.ObjectMeta.Labels["topology.kubernetes.io/region"],
 			})
 		}
-		nodeMetadata := &InstanceMeta{Zone: node.ObjectMeta.Labels["topology.kubernetes.io/zone"], Region: node.ObjectMeta.Annotations["topology.kubernetes.io/region"]}
+		nodeMetadata := &InstanceMeta{Name: node.Name, Zone: node.ObjectMeta.Labels["topology.kubernetes.io/zone"], Region: node.ObjectMeta.Annotations["topology.kubernetes.io/region"]}
 		resolver.nodeInfoMap.Store(node.Name, nodeMetadata)
 	case watch.Deleted:
 		if val, ok := nodeEvent.Object.(*v1.Node); ok {
@@ -608,7 +608,7 @@ func (resolver *K8sIPResolver) getFullClusterSnapshot() error {
 		return errors.New("error getting nodes, aborting snapshot update")
 	}
 	for _, node := range nodes.Items {
-		nodeMetadata := &InstanceMeta{Zone: node.ObjectMeta.Labels["topology.kubernetes.io/zone"], Region: node.ObjectMeta.Labels["topology.kubernetes.io/region"]}
+		nodeMetadata := &InstanceMeta{Name: node.Name, Zone: node.ObjectMeta.Labels["topology.kubernetes.io/zone"], Region: node.ObjectMeta.Labels["topology.kubernetes.io/region"]}
 		resolver.nodeInfoMap.Store(node.Name, nodeMetadata)
 		resolver.snapshot.Nodes.Store(node.UID, node)
 		log.Printf("parsed node meta %v, got annotations %v", nodeMetadata, node.ObjectMeta.Annotations)
@@ -739,6 +739,10 @@ func (resolver *K8sIPResolver) updateIpMapping() {
 					log.Printf("failed to parse instance meta %v, node name %s , node info %v", pod.Name, pod.Spec.NodeName, meta)
 				}
 			} else {
+				resolver.nodeInfoMap.Range(func(key, value interface{}) bool {
+					log.Println("Key:", key, "Value:", value)
+					return true // Returning true continues iteration, false stops it
+				})
 				log.Printf("no node info found for pod %v, node name %s", pod.Name, pod.Spec.NodeName)
 			}
 			podWorkload := Workload{
