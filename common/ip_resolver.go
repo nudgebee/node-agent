@@ -48,6 +48,12 @@ type clusterSnapshot struct {
 	PodDescriptors sync.Map // map[types.UID]Workload
 }
 
+type InstanceMeta struct {
+	Name   string
+	Region string
+	Zone   string
+}
+
 type K8sIPResolver struct {
 	clientset        kubernetes.Interface
 	snapshot         clusterSnapshot
@@ -56,12 +62,15 @@ type K8sIPResolver struct {
 	shouldResolveDns bool
 	dnsResolvedIps   *lrucache.Cache[string, string]
 	podIpsMap        sync.Map
+	nodeInfoMap      sync.Map
 }
 
 type Workload struct {
 	Name      string
 	Namespace string
 	Kind      string
+	Zone      string
+	Region    string
 }
 
 func NewK8sIPResolver(clientset kubernetes.Interface, resolveDns bool) (*K8sIPResolver, error) {
@@ -83,6 +92,7 @@ func NewK8sIPResolver(clientset kubernetes.Interface, resolveDns bool) (*K8sIPRe
 		shouldResolveDns: resolveDns,
 		dnsResolvedIps:   dnsCache,
 		podIpsMap:        sync.Map{},
+		nodeInfoMap:      sync.Map{},
 	}, nil
 }
 
@@ -380,10 +390,21 @@ func (resolver *K8sIPResolver) handlePodWatchEvent(podEvent *watch.Event) {
 		entry := resolver.resolvePodDescriptor(pod)
 		for _, podIp := range pod.Status.PodIPs {
 			resolver.storeWorkloadsIP(podIp.IP, &entry)
+			nodeInfo, err := resolver.nodeInfoMap.Load(pod.Spec.NodeName)
+			region, zone := "", ""
+			if !err {
+				meta, ok := nodeInfo.(InstanceMeta)
+				if ok {
+					region = meta.Region
+					zone = meta.Zone
+				}
+			}
 			podWorkload := Workload{
 				Name:      pod.Name,
 				Namespace: pod.Namespace,
 				Kind:      "pod",
+				Region:    region,
+				Zone:      zone,
 			}
 			resolver.storePodsIP(podIp.IP, &podWorkload)
 		}
@@ -396,11 +417,23 @@ func (resolver *K8sIPResolver) handlePodWatchEvent(podEvent *watch.Event) {
 		entry := resolver.resolvePodDescriptor(pod)
 		for _, podIp := range pod.Status.PodIPs {
 			resolver.storeWorkloadsIP(podIp.IP, &entry)
+			nodeInfo, err := resolver.nodeInfoMap.Load(pod.Spec.NodeName)
+			region, zone := "", ""
+			if !err {
+				meta, ok := nodeInfo.(InstanceMeta)
+				if ok {
+					region = meta.Region
+					zone = meta.Zone
+				}
+			}
 			podWorkload := Workload{
 				Name:      pod.Name,
 				Namespace: pod.Namespace,
 				Kind:      "pod",
+				Region:    region,
+				Zone:      zone,
 			}
+
 			resolver.storePodsIP(podIp.IP, &podWorkload)
 		}
 	case watch.Deleted:
@@ -424,11 +457,16 @@ func (resolver *K8sIPResolver) handleNodeWatchEvent(nodeEvent *watch.Event) {
 				Name:      node.Name,
 				Namespace: "node",
 				Kind:      "node",
+				Zone:      node.Annotations["topology.kubernetes.io/zone"],
+				Region:    node.Annotations["topology.kubernetes.io/region"],
 			})
 		}
+		nodeMetadata := &InstanceMeta{Zone: node.Annotations["topology.kubernetes.io/zone"], Region: node.Annotations["topology.kubernetes.io/region"]}
+		resolver.nodeInfoMap.Store(node.Name, nodeMetadata)
 	case watch.Deleted:
 		if val, ok := nodeEvent.Object.(*v1.Node); ok {
 			resolver.snapshot.Nodes.Delete(val.UID)
+			resolver.nodeInfoMap.Delete(val.Name)
 		}
 	}
 }
@@ -499,6 +537,8 @@ func (resolver *K8sIPResolver) handleServicesWatchEvent(servicesEvent *watch.Eve
 			Name:      service.Name,
 			Namespace: service.Namespace,
 			Kind:      "Service",
+			Zone:      "",
+			Region:    "",
 		}
 
 		// TODO maybe try to match service to workload
