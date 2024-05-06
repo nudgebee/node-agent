@@ -725,10 +725,21 @@ func (resolver *K8sIPResolver) updateIpMapping() {
 		for _, podIp := range pod.Status.PodIPs {
 			// if ip is already in the map, override only if current pod is running
 			resolver.storeWorkloadsIP(podIp.IP, &entry)
+			nodeInfo, err := resolver.nodeInfoMap.Load(pod.Spec.NodeName)
+			region, zone := "", ""
+			if !err {
+				meta, ok := nodeInfo.(InstanceMeta)
+				if ok {
+					region = meta.Region
+					zone = meta.Zone
+				}
+			}
 			podWorkload := Workload{
 				Name:      pod.Name,
 				Namespace: pod.Namespace,
 				Kind:      "pod",
+				Region:    region,
+				Zone:      zone,
 			}
 			resolver.storePodsIP(podIp.IP, &podWorkload)
 		}
