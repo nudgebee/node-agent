@@ -730,20 +730,12 @@ func (resolver *K8sIPResolver) updateIpMapping() {
 			resolver.storeWorkloadsIP(podIp.IP, &entry)
 			nodeInfo, err := resolver.nodeInfoMap.Load(pod.Spec.NodeName)
 			region, zone := "", ""
-			if !err {
+			if err {
 				meta, ok := nodeInfo.(InstanceMeta)
 				if ok {
 					region = meta.Region
 					zone = meta.Zone
-				} else {
-					log.Printf("failed to parse instance meta %v, node name %s , node info %v", pod.Name, pod.Spec.NodeName, meta)
 				}
-			} else {
-				resolver.nodeInfoMap.Range(func(key, value interface{}) bool {
-					log.Println("Key:", key, "Value:", value)
-					return true // Returning true continues iteration, false stops it
-				})
-				log.Printf("no node info found for pod %v, node name %s", pod.Name, pod.Spec.NodeName)
 			}
 			podWorkload := Workload{
 				Name:      pod.Name,
