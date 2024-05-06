@@ -457,11 +457,11 @@ func (resolver *K8sIPResolver) handleNodeWatchEvent(nodeEvent *watch.Event) {
 				Name:      node.Name,
 				Namespace: "node",
 				Kind:      "node",
-				Zone:      node.Annotations["topology.kubernetes.io/zone"],
-				Region:    node.Annotations["topology.kubernetes.io/region"],
+				Zone:      node.ObjectMeta.Annotations["topology.kubernetes.io/zone"],
+				Region:    node.ObjectMeta.Annotations["topology.kubernetes.io/region"],
 			})
 		}
-		nodeMetadata := &InstanceMeta{Zone: node.Annotations["topology.kubernetes.io/zone"], Region: node.Annotations["topology.kubernetes.io/region"]}
+		nodeMetadata := &InstanceMeta{Zone: node.ObjectMeta.Annotations["topology.kubernetes.io/zone"], Region: node.ObjectMeta.Annotations["topology.kubernetes.io/region"]}
 		resolver.nodeInfoMap.Store(node.Name, nodeMetadata)
 	case watch.Deleted:
 		if val, ok := nodeEvent.Object.(*v1.Node); ok {
