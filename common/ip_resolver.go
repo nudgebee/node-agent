@@ -390,9 +390,9 @@ func (resolver *K8sIPResolver) handlePodWatchEvent(podEvent *watch.Event) {
 		entry := resolver.resolvePodDescriptor(pod)
 		for _, podIp := range pod.Status.PodIPs {
 			resolver.storeWorkloadsIP(podIp.IP, &entry)
-			nodeInfo, err := resolver.nodeInfoMap.Load(pod.Spec.NodeName)
+			nodeInfo, ok := resolver.nodeInfoMap.Load(pod.Spec.NodeName)
 			region, zone := "", ""
-			if !err {
+			if ok {
 				meta, ok := nodeInfo.(InstanceMeta)
 				if ok {
 					region = meta.Region
@@ -417,9 +417,9 @@ func (resolver *K8sIPResolver) handlePodWatchEvent(podEvent *watch.Event) {
 		entry := resolver.resolvePodDescriptor(pod)
 		for _, podIp := range pod.Status.PodIPs {
 			resolver.storeWorkloadsIP(podIp.IP, &entry)
-			nodeInfo, err := resolver.nodeInfoMap.Load(pod.Spec.NodeName)
+			nodeInfo, ok := resolver.nodeInfoMap.Load(pod.Spec.NodeName)
 			region, zone := "", ""
-			if !err {
+			if ok {
 				meta, ok := nodeInfo.(InstanceMeta)
 				if ok {
 					region = meta.Region
@@ -728,9 +728,9 @@ func (resolver *K8sIPResolver) updateIpMapping() {
 		for _, podIp := range pod.Status.PodIPs {
 			// if ip is already in the map, override only if current pod is running
 			resolver.storeWorkloadsIP(podIp.IP, &entry)
-			nodeInfo, err := resolver.nodeInfoMap.Load(pod.Spec.NodeName)
+			nodeInfo, ok := resolver.nodeInfoMap.Load(pod.Spec.NodeName)
 			region, zone := "", ""
-			if err {
+			if ok {
 				meta, ok := nodeInfo.(InstanceMeta)
 				if ok {
 					region = meta.Region
