@@ -147,8 +147,7 @@ type Container struct {
 	instanceMetadata *metadata.CloudMetadata
 }
 
-func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, hostConntrack *Conntrack, pid uint32, ip_resolver IPResolver) (*Container, error) {
-	instanceMetadata := metadata.GetInstanceMetadata()
+func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, hostConntrack *Conntrack, pid uint32, ip_resolver IPResolver, instanceMetadata *metadata.CloudMetadata) (*Container, error) {
 	netNs, err := proc.GetNetNs(pid)
 	if err != nil {
 		return nil, err
