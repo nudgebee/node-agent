@@ -15,6 +15,7 @@ import (
 	"github.com/coroot/coroot-node-agent/flags"
 	"github.com/coroot/coroot-node-agent/logs"
 	"github.com/coroot/coroot-node-agent/node"
+	"github.com/coroot/coroot-node-agent/node/metadata"
 	"github.com/coroot/coroot-node-agent/profiling"
 	"github.com/coroot/coroot-node-agent/prom"
 	"github.com/coroot/coroot-node-agent/tracing"
@@ -155,14 +156,14 @@ func main() {
 	registerer := prometheus.WrapRegistererWith(prometheus.Labels{"machine_id": machineId}, registry)
 
 	registerer.MustRegister(info("node_agent_info", version))
-
-	if err := registerer.Register(node.NewCollector(hostname, kv)); err != nil {
+	md := metadata.GetInstanceMetadata()
+	if err := registerer.Register(node.NewCollector(hostname, kv, md)); err != nil {
 		klog.Exitln(err)
 	}
 
 	processInfoCh := profiling.Init(machineId, hostname)
 
-	cr, err := containers.NewRegistry(registerer, kv, processInfoCh, resolver)
+	cr, err := containers.NewRegistry(registerer, kv, processInfoCh, resolver, md)
 	if err != nil {
 		klog.Exitln(err)
 	}

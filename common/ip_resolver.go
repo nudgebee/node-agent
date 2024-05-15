@@ -746,7 +746,6 @@ func (resolver *K8sIPResolver) updateIpMapping() {
 				Region:    region,
 				Zone:      zone,
 			}
-			log.Printf("created pod workload %v", podWorkload)
 			resolver.storePodsIP(podIp.IP, &podWorkload)
 		}
 		return true
