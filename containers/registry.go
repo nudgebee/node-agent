@@ -12,7 +12,6 @@ import (
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer"
 	"github.com/coroot/coroot-node-agent/flags"
-	"github.com/coroot/coroot-node-agent/node/metadata"
 	"github.com/coroot/coroot-node-agent/proc"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vishvananda/netns"
@@ -52,12 +51,11 @@ type Registry struct {
 	containersByCgroupId map[string]*Container
 	containersByPid      map[uint32]*Container
 
-	processInfoCh    chan<- ProcessInfo
-	ip_resolver      IPResolver
-	instanceMetadata *metadata.CloudMetadata
+	processInfoCh chan<- ProcessInfo
+	ip_resolver   IPResolver
 }
 
-func NewRegistry(reg prometheus.Registerer, kernelVersion string, processInfoCh chan<- ProcessInfo, ip_resolver *common.K8sIPResolver, md *metadata.CloudMetadata) (*Registry, error) {
+func NewRegistry(reg prometheus.Registerer, kernelVersion string, processInfoCh chan<- ProcessInfo, ip_resolver *common.K8sIPResolver) (*Registry, error) {
 	ns, err := proc.GetSelfNetNs()
 	if err != nil {
 		return nil, err
@@ -111,9 +109,8 @@ func NewRegistry(reg prometheus.Registerer, kernelVersion string, processInfoCh 
 
 		processInfoCh: processInfoCh,
 
-		tracer:           ebpftracer.NewTracer(kernelVersion, *flags.DisableL7Tracing),
-		ip_resolver:      ip_resolver,
-		instanceMetadata: md,
+		tracer:      ebpftracer.NewTracer(kernelVersion, *flags.DisableL7Tracing),
+		ip_resolver: ip_resolver,
 	}
 
 	go r.handleEvents(r.events)
@@ -309,7 +306,7 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		r.containersByCgroupId[cg.Id] = c
 		return c
 	}
-	c, err := NewContainer(id, cg, md, r.hostConntrack, pid, r.ip_resolver, r.instanceMetadata)
+	c, err := NewContainer(id, cg, md, r.hostConntrack, pid, r.ip_resolver)
 	if err != nil {
 		klog.Warningf("failed to create container pid=%d cg=%s id=%s: %s", pid, cg.Id, id, err)
 		return nil
@@ -348,7 +345,7 @@ func calcId(cg *cgroup.Cgroup, md *ContainerMetadata) ContainerID {
 			name = "sandbox"
 		}
 		if name == "" || name == "POD" { // skip pause containers
-			return ""
+			name = "sandbox"
 		}
 		return ContainerID(fmt.Sprintf("/k8s/%s/%s/%s", namespace, pod, name))
 	}
