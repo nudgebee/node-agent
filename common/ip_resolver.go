@@ -603,17 +603,6 @@ func (resolver *K8sIPResolver) getResolvedClusterSnapshot() error {
 
 // iterate the API for initial coverage of the cluster's state
 func (resolver *K8sIPResolver) getFullClusterSnapshot() error {
-	nodes, err := resolver.clientset.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return errors.New("error getting nodes, aborting snapshot update")
-	}
-	for _, node := range nodes.Items {
-		nodeMetadata := InstanceMeta{Name: node.Name, Zone: node.ObjectMeta.Labels["topology.kubernetes.io/zone"], Region: node.ObjectMeta.Labels["topology.kubernetes.io/region"]}
-		resolver.nodeInfoMap.Store(node.Name, nodeMetadata)
-		resolver.snapshot.Nodes.Store(node.UID, node)
-		log.Printf("parsed node meta %v, got annotations %v", nodeMetadata, node.ObjectMeta.Annotations)
-	}
-
 	pods, err := resolver.clientset.CoreV1().Pods("").List(context.Background(), metav1.ListOptions{})
 	if err != nil {
 		return errors.New("error getting pods, aborting snapshot update")
@@ -622,6 +611,16 @@ func (resolver *K8sIPResolver) getFullClusterSnapshot() error {
 
 	for _, pod := range pods.Items {
 		resolver.snapshot.Pods.Store(pod.UID, pod)
+	}
+
+	nodes, err := resolver.clientset.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return errors.New("error getting nodes, aborting snapshot update")
+	}
+	for _, node := range nodes.Items {
+		nodeMetadata := InstanceMeta{Name: node.Name, Zone: node.ObjectMeta.Labels["topology.kubernetes.io/zone"], Region: node.ObjectMeta.Labels["topology.kubernetes.io/region"]}
+		resolver.nodeInfoMap.Store(node.Name, nodeMetadata)
+		resolver.snapshot.Nodes.Store(node.UID, node)
 	}
 
 	replicasets, err := resolver.clientset.AppsV1().ReplicaSets("").List(context.Background(), metav1.ListOptions{})
