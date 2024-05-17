@@ -8,7 +8,6 @@ import (
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/coroot/coroot-node-agent/flags"
-	"github.com/coroot/coroot-node-agent/node/metadata"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
@@ -108,7 +107,7 @@ func (t *Trace) createSpan(name string, duration time.Duration, error bool, attr
 	span.End(trace.WithTimestamp(end))
 }
 
-func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time.Duration, requestSize uint64, payload string, headers string, response string, host string, instanceMetadata metadata.CloudMetadata, destWorkload common.Workload) {
+func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time.Duration, requestSize uint64, payload string, headers string, response string, host string, srcWorkload common.Workload, destWorkload common.Workload) {
 	if t == nil || method == "" {
 		return
 	}
@@ -124,13 +123,8 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 		attribute.Key("http.headers").String(headers),
 		attribute.Key("http.response").String(response),
 		attribute.Key("http.path").String(path),
-		attribute.Key("source.cloud.region").String(instanceMetadata.Region),
-		attribute.Key("source.cloud.provider").String(string(instanceMetadata.Provider)),
-		attribute.Key("source.cloud.zone").String(instanceMetadata.AvailabilityZone),
-		attribute.Key("source.cloud.zone_id").String(instanceMetadata.AvailabilityZoneId),
-		attribute.Key("source.cloud.instance_id").String(instanceMetadata.InstanceId),
-		attribute.Key("source.cloud.instance_type").String(instanceMetadata.InstanceType),
-		attribute.Key("source.cloud.region").String(instanceMetadata.Region),
+		attribute.Key("source.cloud.region").String(srcWorkload.Region),
+		attribute.Key("source.cloud.zone").String(srcWorkload.Zone),
 		attribute.Key("destination.cloud.region").String(destWorkload.Region),
 		attribute.Key("destination.cloud.zone").String(destWorkload.Zone),
 	)
