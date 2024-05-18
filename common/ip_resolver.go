@@ -63,6 +63,7 @@ type K8sIPResolver struct {
 	dnsResolvedIps   *lrucache.Cache[string, string]
 	podIpsMap        sync.Map
 	nodeInfoMap      sync.Map
+	hostIpsMap       sync.Map
 }
 
 type Workload struct {
@@ -93,6 +94,7 @@ func NewK8sIPResolver(clientset kubernetes.Interface, resolveDns bool) (*K8sIPRe
 		dnsResolvedIps:   dnsCache,
 		podIpsMap:        sync.Map{},
 		nodeInfoMap:      sync.Map{},
+		hostIpsMap:       sync.Map{},
 	}, nil
 }
 
@@ -162,15 +164,16 @@ func (resolver *K8sIPResolver) ResolveIP(ip string) Workload {
 	}
 }
 
-func (resolver *K8sIPResolver) CacheDNS(ip string, dns string) Workload {
-	resolver.dnsResolvedIps.Add(ip, dns)
-	return Workload{
-		Name:      dns,
-		Namespace: "external",
-		Kind:      "external",
-	}
+func (resolver *K8sIPResolver) CacheDNS(ip string, dns string) {
+	resolver.hostIpsMap.Store(ip, dns)
 }
 
+func (resolver *K8sIPResolver) ResolveHost(ip string) string {
+	if host, ok := resolver.hostIpsMap.Load(ip); ok {
+		return host.(string)
+	}
+	return ""
+}
 func (resolver *K8sIPResolver) StartWatching() error {
 	// register watchers
 	podsWatcher, err := resolver.clientset.CoreV1().Pods("").Watch(context.Background(), metav1.ListOptions{})

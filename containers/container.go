@@ -143,7 +143,6 @@ type Container struct {
 
 	done             chan struct{}
 	ip_resolver      IPResolver
-	hostIpsMap       sync.Map
 	instanceMetadata *metadata.CloudMetadata
 }
 
@@ -182,7 +181,6 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, host
 
 		done:             make(chan struct{}),
 		ip_resolver:      ip_resolver,
-		hostIpsMap:       sync.Map{},
 		instanceMetadata: instanceMetadata,
 	}
 
@@ -314,8 +312,9 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 
 		if d.dstWorkload.Kind == "external" {
-			if host, ok := c.hostIpsMap.Load(d.dst); ok {
-				workload_dest = common.Workload{Name: host.(string), Namespace: "external", Kind: "external"}
+			host := c.ip_resolver.ResolveHost(d.dst.IP().String())
+			if host != "" {
+				workload_dest = common.Workload{Name: host, Namespace: "external", Kind: "external"}
 			}
 		}
 		ch <- counter(metrics.NetConnectsSuccessful, float64(count), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
@@ -333,8 +332,9 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 			workload_dest = c.ip_resolver.ResolveIP(d.dst.IP().String())
 		}
 		if d.dstWorkload.Kind == "external" {
-			if host, ok := c.hostIpsMap.Load(d.dst); ok {
-				workload_dest = common.Workload{Name: host.(string), Namespace: "external", Kind: "external"}
+			host := c.ip_resolver.ResolveHost(d.dst.IP().String())
+			if host != "" {
+				workload_dest = common.Workload{Name: host, Namespace: "external", Kind: "external"}
 			}
 		}
 		ch <- counter(metrics.NetRetransmits, float64(count), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind)
@@ -349,8 +349,9 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		workload_dest := c.ip_resolver.ResolveIP(conn.ActualDest.IP().String())
 		actualDestWorkload := c.ip_resolver.ResolveActualIP(conn.ActualDest.IP().String())
 		if workload_dest.Kind == "external" {
-			if host, ok := c.hostIpsMap.Load(conn.ActualDest.IP().String()); ok {
-				workload_dest = common.Workload{Name: host.(string), Namespace: "external", Kind: "external"}
+			host := c.ip_resolver.ResolveHost(conn.ActualDest.IP().String())
+			if host != "" {
+				workload_dest = common.Workload{Name: host, Namespace: "external", Kind: "external"}
 			}
 		}
 		connections[AddrPair{src: addrPair.dst, dst: conn.ActualDest, srcWorkload: workload_src, dstWorkload: workload_dest, actualDestWorkload: actualDestWorkload}]++
@@ -659,7 +660,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		host, error := l7.ParseHostFromHttpRequest(string(r.Payload))
 		if error == nil {
 			conn.dstWorkload.Name = host
-			c.hostIpsMap.Store(conn.ActualDest.IP().String(), host)
+			c.ip_resolver.CacheDNS(conn.ActualDest.IP().String(), host)
 		}
 	}
 	stats := c.l7Stats.get(r.Protocol, conn.Dest, conn.ActualDest, r, conn.srcWorkload, conn.dstWorkload, conn.actualDestWorkload)
