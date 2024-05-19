@@ -12,6 +12,7 @@ import (
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer"
 	"github.com/coroot/coroot-node-agent/flags"
+	"github.com/coroot/coroot-node-agent/node/metadata"
 	"github.com/coroot/coroot-node-agent/proc"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vishvananda/netns"
@@ -34,7 +35,8 @@ type ProcessInfo struct {
 type IPResolver interface {
 	ResolveIP(string) common.Workload
 	ResolveActualIP(string) common.Workload
-	CacheDNS(string, string) common.Workload
+	CacheDNS(string, string)
+	ResolveHost(string) string
 	StartWatching() error
 	StopWatching()
 }
@@ -53,6 +55,7 @@ type Registry struct {
 
 	processInfoCh chan<- ProcessInfo
 	ip_resolver   IPResolver
+	instanceMeta  *metadata.CloudMetadata
 }
 
 func NewRegistry(reg prometheus.Registerer, kernelVersion string, processInfoCh chan<- ProcessInfo, ip_resolver *common.K8sIPResolver) (*Registry, error) {
@@ -109,8 +112,9 @@ func NewRegistry(reg prometheus.Registerer, kernelVersion string, processInfoCh 
 
 		processInfoCh: processInfoCh,
 
-		tracer:      ebpftracer.NewTracer(kernelVersion, *flags.DisableL7Tracing),
-		ip_resolver: ip_resolver,
+		tracer:       ebpftracer.NewTracer(kernelVersion, *flags.DisableL7Tracing),
+		ip_resolver:  ip_resolver,
+		instanceMeta: metadata.GetInstanceMetadata(),
 	}
 
 	go r.handleEvents(r.events)
@@ -207,8 +211,6 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			case ebpftracer.EventTypeListenOpen:
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
 					c.onListenOpen(e.Pid, e.SrcAddr, false)
-				} else {
-					klog.Infoln("TCP listen open from unknown container", e)
 				}
 			case ebpftracer.EventTypeListenClose:
 				if c := r.containersByPid[e.Pid]; c != nil {
@@ -219,14 +221,10 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
 					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.Timestamp, false)
 					c.attachTlsUprobes(r.tracer, e.Pid)
-				} else {
-					klog.Infoln("TCP connection from unknown container", e)
 				}
 			case ebpftracer.EventTypeConnectionError:
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
 					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, 0, true)
-				} else {
-					klog.Infoln("TCP connection error from unknown container", e)
 				}
 			case ebpftracer.EventTypeConnectionClose:
 				srcDst := AddrPair{src: e.SrcAddr, dst: e.DstAddr}
@@ -312,7 +310,7 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		r.containersByCgroupId[cg.Id] = c
 		return c
 	}
-	c, err := NewContainer(id, cg, md, r.hostConntrack, pid, r.ip_resolver)
+	c, err := NewContainer(id, cg, md, r.hostConntrack, pid, r.ip_resolver, r.instanceMeta)
 	if err != nil {
 		klog.Warningf("failed to create container pid=%d cg=%s id=%s: %s", pid, cg.Id, id, err)
 		return nil

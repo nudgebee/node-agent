@@ -17,6 +17,7 @@ import (
 	"github.com/coroot/coroot-node-agent/flags"
 	"github.com/coroot/coroot-node-agent/logs"
 	"github.com/coroot/coroot-node-agent/node"
+	"github.com/coroot/coroot-node-agent/node/metadata"
 	"github.com/coroot/coroot-node-agent/pinger"
 	"github.com/coroot/coroot-node-agent/proc"
 	"github.com/coroot/coroot-node-agent/tracing"
@@ -140,12 +141,13 @@ type Container struct {
 
 	lock sync.RWMutex
 
-	done        chan struct{}
-	ip_resolver IPResolver
-	hostIpsMap  sync.Map
+	done             chan struct{}
+	ip_resolver      IPResolver
+	instanceMetadata *metadata.CloudMetadata
 }
 
-func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, hostConntrack *Conntrack, pid uint32, ip_resolver IPResolver) (*Container, error) {
+func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, hostConntrack *Conntrack, pid uint32, ip_resolver IPResolver, instanceMeta *metadata.CloudMetadata) (*Container, error) {
+	instanceMetadata := instanceMeta
 	netNs, err := proc.GetNetNs(pid)
 	if err != nil {
 		return nil, err
@@ -177,9 +179,9 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, host
 
 		hostConntrack: hostConntrack,
 
-		done:        make(chan struct{}),
-		ip_resolver: ip_resolver,
-		hostIpsMap:  sync.Map{},
+		done:             make(chan struct{}),
+		ip_resolver:      ip_resolver,
+		instanceMetadata: instanceMetadata,
 	}
 
 	for _, n := range md.networks {
@@ -310,8 +312,9 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 
 		if d.dstWorkload.Kind == "external" {
-			if host, ok := c.hostIpsMap.Load(d.dst); ok {
-				workload_dest = common.Workload{Name: host.(string), Namespace: "external", Kind: "external"}
+			host := c.ip_resolver.ResolveHost(d.dst.IP().String())
+			if host != "" {
+				workload_dest = common.Workload{Name: host, Namespace: "external", Kind: "external"}
 			}
 		}
 		ch <- counter(metrics.NetConnectsSuccessful, float64(count), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
@@ -329,8 +332,9 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 			workload_dest = c.ip_resolver.ResolveIP(d.dst.IP().String())
 		}
 		if d.dstWorkload.Kind == "external" {
-			if host, ok := c.hostIpsMap.Load(d.dst); ok {
-				workload_dest = common.Workload{Name: host.(string), Namespace: "external", Kind: "external"}
+			host := c.ip_resolver.ResolveHost(d.dst.IP().String())
+			if host != "" {
+				workload_dest = common.Workload{Name: host, Namespace: "external", Kind: "external"}
 			}
 		}
 		ch <- counter(metrics.NetRetransmits, float64(count), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind)
@@ -345,8 +349,9 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		workload_dest := c.ip_resolver.ResolveIP(conn.ActualDest.IP().String())
 		actualDestWorkload := c.ip_resolver.ResolveActualIP(conn.ActualDest.IP().String())
 		if workload_dest.Kind == "external" {
-			if host, ok := c.hostIpsMap.Load(conn.ActualDest.IP().String()); ok {
-				workload_dest = common.Workload{Name: host.(string), Namespace: "external", Kind: "external"}
+			host := c.ip_resolver.ResolveHost(conn.ActualDest.IP().String())
+			if host != "" {
+				workload_dest = common.Workload{Name: host, Namespace: "external", Kind: "external"}
 			}
 		}
 		connections[AddrPair{src: addrPair.dst, dst: conn.ActualDest, srcWorkload: workload_src, dstWorkload: workload_dest, actualDestWorkload: actualDestWorkload}]++
@@ -551,14 +556,12 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPP
 	}
 	srcWorkload := c.ip_resolver.ResolveIP(src.IP().String())
 	if ignoreControlPlane(srcWorkload.Name) {
-		klog.Warningf("Ignoring src workload %s, %s \n", src.IP().String(), srcWorkload.Name)
 		return
 	}
 	actualDst, err := c.getActualDestination(p, src, dst)
 	dstWorkload := c.ip_resolver.ResolveIP(dst.IP().String())
 
 	if ignoreControlPlane(dstWorkload.Name) {
-		klog.Warningf("Ignoring src workload %s, %s \n", dst.IP().String(), dstWorkload.Name)
 		return
 	}
 	if err != nil {
@@ -657,7 +660,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		host, error := l7.ParseHostFromHttpRequest(string(r.Payload))
 		if error == nil {
 			conn.dstWorkload.Name = host
-			c.hostIpsMap.Store(conn.ActualDest.IP().String(), host)
+			c.ip_resolver.CacheDNS(conn.ActualDest.IP().String(), host)
 		}
 	}
 	stats := c.l7Stats.get(r.Protocol, conn.Dest, conn.ActualDest, r, conn.srcWorkload, conn.dstWorkload, conn.actualDestWorkload)
@@ -693,7 +696,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		if r.Response != nil {
 			response = base64.StdEncoding.EncodeToString(r.Response)
 		}
-		trace.HttpRequest(method, uri, r.Status, r.Duration, r.PayloadSize, payload, headers, response, host)
+		trace.HttpRequest(method, uri, r.Status, r.Duration, r.PayloadSize, payload, headers, response, host, *c.instanceMetadata, conn.actualDestWorkload)
 	case l7.ProtocolHTTP2:
 		if conn.http2Parser == nil {
 			conn.http2Parser = l7.NewHttp2Parser()

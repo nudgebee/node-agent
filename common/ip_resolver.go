@@ -48,6 +48,12 @@ type clusterSnapshot struct {
 	PodDescriptors sync.Map // map[types.UID]Workload
 }
 
+type InstanceMeta struct {
+	Name   string
+	Region string
+	Zone   string
+}
+
 type K8sIPResolver struct {
 	clientset        kubernetes.Interface
 	snapshot         clusterSnapshot
@@ -56,12 +62,16 @@ type K8sIPResolver struct {
 	shouldResolveDns bool
 	dnsResolvedIps   *lrucache.Cache[string, string]
 	podIpsMap        sync.Map
+	nodeInfoMap      sync.Map
+	hostIpsMap       sync.Map
 }
 
 type Workload struct {
 	Name      string
 	Namespace string
 	Kind      string
+	Zone      string
+	Region    string
 }
 
 func NewK8sIPResolver(clientset kubernetes.Interface, resolveDns bool) (*K8sIPResolver, error) {
@@ -83,6 +93,8 @@ func NewK8sIPResolver(clientset kubernetes.Interface, resolveDns bool) (*K8sIPRe
 		shouldResolveDns: resolveDns,
 		dnsResolvedIps:   dnsCache,
 		podIpsMap:        sync.Map{},
+		nodeInfoMap:      sync.Map{},
+		hostIpsMap:       sync.Map{},
 	}, nil
 }
 
@@ -152,15 +164,16 @@ func (resolver *K8sIPResolver) ResolveIP(ip string) Workload {
 	}
 }
 
-func (resolver *K8sIPResolver) CacheDNS(ip string, dns string) Workload {
-	resolver.dnsResolvedIps.Add(ip, dns)
-	return Workload{
-		Name:      dns,
-		Namespace: "external",
-		Kind:      "external",
-	}
+func (resolver *K8sIPResolver) CacheDNS(ip string, dns string) {
+	resolver.hostIpsMap.Store(ip, dns)
 }
 
+func (resolver *K8sIPResolver) ResolveHost(ip string) string {
+	if host, ok := resolver.hostIpsMap.Load(ip); ok {
+		return host.(string)
+	}
+	return ""
+}
 func (resolver *K8sIPResolver) StartWatching() error {
 	// register watchers
 	podsWatcher, err := resolver.clientset.CoreV1().Pods("").Watch(context.Background(), metav1.ListOptions{})
@@ -380,10 +393,23 @@ func (resolver *K8sIPResolver) handlePodWatchEvent(podEvent *watch.Event) {
 		entry := resolver.resolvePodDescriptor(pod)
 		for _, podIp := range pod.Status.PodIPs {
 			resolver.storeWorkloadsIP(podIp.IP, &entry)
+			nodeInfo, ok := resolver.nodeInfoMap.Load(pod.Spec.NodeName)
+			region, zone := "", ""
+			if ok {
+				meta, ok := nodeInfo.(InstanceMeta)
+				if ok {
+					region = meta.Region
+					zone = meta.Zone
+				} else {
+					log.Println("Failed to fetch node info ", ok)
+				}
+			}
 			podWorkload := Workload{
 				Name:      pod.Name,
 				Namespace: pod.Namespace,
 				Kind:      "pod",
+				Region:    region,
+				Zone:      zone,
 			}
 			resolver.storePodsIP(podIp.IP, &podWorkload)
 		}
@@ -396,11 +422,25 @@ func (resolver *K8sIPResolver) handlePodWatchEvent(podEvent *watch.Event) {
 		entry := resolver.resolvePodDescriptor(pod)
 		for _, podIp := range pod.Status.PodIPs {
 			resolver.storeWorkloadsIP(podIp.IP, &entry)
+			nodeInfo, ok := resolver.nodeInfoMap.Load(pod.Spec.NodeName)
+			region, zone := "", ""
+			if ok {
+				meta, ok := nodeInfo.(InstanceMeta)
+				if ok {
+					region = meta.Region
+					zone = meta.Zone
+				}
+			} else {
+				log.Println("Failed to fetch node info ", ok)
+			}
 			podWorkload := Workload{
 				Name:      pod.Name,
 				Namespace: pod.Namespace,
 				Kind:      "pod",
+				Region:    region,
+				Zone:      zone,
 			}
+
 			resolver.storePodsIP(podIp.IP, &podWorkload)
 		}
 	case watch.Deleted:
@@ -424,11 +464,16 @@ func (resolver *K8sIPResolver) handleNodeWatchEvent(nodeEvent *watch.Event) {
 				Name:      node.Name,
 				Namespace: "node",
 				Kind:      "node",
+				Zone:      node.Annotations["topology.kubernetes.io/zone"],
+				Region:    node.Annotations["topology.kubernetes.io/region"],
 			})
 		}
+		nodeMetadata := InstanceMeta{Zone: node.Annotations["topology.kubernetes.io/zone"], Region: node.Annotations["topology.kubernetes.io/region"]}
+		resolver.nodeInfoMap.Store(node.Name, nodeMetadata)
 	case watch.Deleted:
 		if val, ok := nodeEvent.Object.(*v1.Node); ok {
 			resolver.snapshot.Nodes.Delete(val.UID)
+			resolver.nodeInfoMap.Delete(val.Name)
 		}
 	}
 }
@@ -499,6 +544,8 @@ func (resolver *K8sIPResolver) handleServicesWatchEvent(servicesEvent *watch.Eve
 			Name:      service.Name,
 			Namespace: service.Namespace,
 			Kind:      "Service",
+			Zone:      "",
+			Region:    "",
 		}
 
 		// TODO maybe try to match service to workload
@@ -578,6 +625,8 @@ func (resolver *K8sIPResolver) getFullClusterSnapshot() error {
 		return errors.New("error getting nodes, aborting snapshot update")
 	}
 	for _, node := range nodes.Items {
+		nodeMetadata := InstanceMeta{Name: node.Name, Zone: node.ObjectMeta.Labels["topology.kubernetes.io/zone"], Region: node.ObjectMeta.Labels["topology.kubernetes.io/region"]}
+		resolver.nodeInfoMap.Store(node.Name, nodeMetadata)
 		resolver.snapshot.Nodes.Store(node.UID, node)
 	}
 
@@ -685,10 +734,23 @@ func (resolver *K8sIPResolver) updateIpMapping() {
 		for _, podIp := range pod.Status.PodIPs {
 			// if ip is already in the map, override only if current pod is running
 			resolver.storeWorkloadsIP(podIp.IP, &entry)
+			nodeInfo, ok := resolver.nodeInfoMap.Load(pod.Spec.NodeName)
+			region, zone := "", ""
+			if ok {
+				meta, ok := nodeInfo.(InstanceMeta)
+				if ok {
+					region = meta.Region
+					zone = meta.Zone
+				} else {
+					log.Println("Failed to fetch node info ", ok)
+				}
+			}
 			podWorkload := Workload{
 				Name:      pod.Name,
 				Namespace: pod.Namespace,
 				Kind:      "pod",
+				Region:    region,
+				Zone:      zone,
 			}
 			resolver.storePodsIP(podIp.IP, &podWorkload)
 		}
