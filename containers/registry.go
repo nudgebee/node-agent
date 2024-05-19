@@ -12,7 +12,6 @@ import (
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer"
 	"github.com/coroot/coroot-node-agent/flags"
-	"github.com/coroot/coroot-node-agent/node/metadata"
 	"github.com/coroot/coroot-node-agent/proc"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vishvananda/netns"
@@ -55,7 +54,6 @@ type Registry struct {
 
 	processInfoCh chan<- ProcessInfo
 	ip_resolver   IPResolver
-	instanceMeta  *metadata.CloudMetadata
 }
 
 func NewRegistry(reg prometheus.Registerer, kernelVersion string, processInfoCh chan<- ProcessInfo, ip_resolver *common.K8sIPResolver) (*Registry, error) {
@@ -112,9 +110,8 @@ func NewRegistry(reg prometheus.Registerer, kernelVersion string, processInfoCh 
 
 		processInfoCh: processInfoCh,
 
-		tracer:       ebpftracer.NewTracer(kernelVersion, *flags.DisableL7Tracing),
-		ip_resolver:  ip_resolver,
-		instanceMeta: metadata.GetInstanceMetadata(),
+		tracer:      ebpftracer.NewTracer(kernelVersion, *flags.DisableL7Tracing),
+		ip_resolver: ip_resolver,
 	}
 
 	go r.handleEvents(r.events)
@@ -310,7 +307,7 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		r.containersByCgroupId[cg.Id] = c
 		return c
 	}
-	c, err := NewContainer(id, cg, md, r.hostConntrack, pid, r.ip_resolver, r.instanceMeta)
+	c, err := NewContainer(id, cg, md, r.hostConntrack, pid, r.ip_resolver)
 	if err != nil {
 		klog.Warningf("failed to create container pid=%d cg=%s id=%s: %s", pid, cg.Id, id, err)
 		return nil

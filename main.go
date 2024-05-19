@@ -15,6 +15,7 @@ import (
 	"github.com/coroot/coroot-node-agent/flags"
 	"github.com/coroot/coroot-node-agent/logs"
 	"github.com/coroot/coroot-node-agent/node"
+	"github.com/coroot/coroot-node-agent/node/metadata"
 	"github.com/coroot/coroot-node-agent/profiling"
 	"github.com/coroot/coroot-node-agent/prom"
 	"github.com/coroot/coroot-node-agent/tracing"
@@ -148,7 +149,8 @@ func main() {
 	whitelistNodeExternalNetworks()
 
 	machineId := machineID()
-	tracing.Init(machineId, hostname, version)
+	md := metadata.GetInstanceMetadata()
+	tracing.Init(machineId, hostname, version, md)
 	logs.Init(machineId, hostname, version)
 
 	registry := prometheus.NewRegistry()
@@ -156,7 +158,7 @@ func main() {
 
 	registerer.MustRegister(info("node_agent_info", version))
 
-	if err := registerer.Register(node.NewCollector(hostname, kv)); err != nil {
+	if err := registerer.Register(node.NewCollector(hostname, kv, md)); err != nil {
 		klog.Exitln(err)
 	}
 

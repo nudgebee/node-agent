@@ -152,8 +152,7 @@ type Collector struct {
 	instanceMetadata *metadata.CloudMetadata
 }
 
-func NewCollector(hostname, kernelVersion string) *Collector {
-	md := metadata.GetInstanceMetadata()
+func NewCollector(hostname, kernelVersion string, md *metadata.CloudMetadata) *Collector {
 	klog.Infof("instance metadata: %+v", md)
 	return &Collector{
 		hostname:         hostname,
