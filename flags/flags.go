@@ -42,6 +42,7 @@ var (
 	IgnoreControlPlane = kingpin.Flag("ignore-control-plane", "ignore control plane like loki").Default("karpenter,loki,prometheus,grafana,kubelet,etcd,apiserver,victoria").Envar("IGNORE_CONTROL_PLANE").String()
 	SanitizeHeaders    = kingpin.Flag("sanitize-headers", "should sanitize headers").Default("true").Envar("SANITIZE_HEADERS").Bool()
 	SensitiveHeader    = kingpin.Flag("sensitive-headers", "sanitize headers using patterns").Default("Authorization, Cookie, X-Action-Token").Envar("SENSITIVE_HEADERS").String()
+	DisableKubeProbe   = kingpin.Flag("disable-kube-probe", "disable kube probe trace").Default("true").Envar("DISABLE_KUBE_PROBE").Bool()
 )
 
 func GetString(fl *string) string {

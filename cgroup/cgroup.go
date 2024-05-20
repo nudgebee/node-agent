@@ -126,6 +126,9 @@ func containerByCgroup(path string) (ContainerType, string, error) {
 	if len(parts) < 2 {
 		return ContainerTypeStandaloneProcess, "", nil
 	}
+	if *flags.DisableKubeProbe && parts[1] == "kubelet.service" {
+		return ContainerTypeStandaloneProcess, "", nil
+	}
 	prefix := parts[0]
 	if prefix == "user.slice" || prefix == "init.scope" {
 		return ContainerTypeStandaloneProcess, "", nil
