@@ -170,9 +170,11 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	if len(prg) == 0 {
 		return fmt.Errorf("unsupported kernel version: %s", t.kernelVersion)
 	}
+	_, debugFsErr := os.Stat("/sys/kernel/debug/tracing")
+	_, traceFsErr := os.Stat("/sys/kernel/tracing")
 
-	if _, err := os.Stat("/sys/kernel/debug/tracing"); err != nil {
-		return fmt.Errorf("kernel tracing is not available: %w", err)
+	if debugFsErr != nil && traceFsErr != nil {
+		return fmt.Errorf("kernel tracing is not available: debugfs or tracefs must be mounted")
 	}
 
 	collectionSpec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(prg))
@@ -218,7 +220,7 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		program := t.collection.Programs[programSpec.Name]
 		if t.disableL7Tracing {
 			switch programSpec.Name {
-			case "sys_enter_writev", "sys_enter_write", "sys_enter_sendto", "sys_enter_sendmsg":
+			case "sys_enter_writev", "sys_enter_write", "sys_enter_sendto", "sys_enter_sendmsg", "sys_enter_sendmmsg":
 				continue
 			case "sys_enter_read", "sys_enter_readv", "sys_enter_recvfrom", "sys_enter_recvmsg":
 				continue

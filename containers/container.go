@@ -40,14 +40,16 @@ type ContainerNetwork struct {
 }
 
 type ContainerMetadata struct {
-	name        string
-	labels      map[string]string
-	volumes     map[string]string
-	logPath     string
-	image       string
-	logDecoder  logparser.Decoder
-	hostListens map[string][]netaddr.IPPort
-	networks    map[string]ContainerNetwork
+	name               string
+	labels             map[string]string
+	volumes            map[string]string
+	logPath            string
+	image              string
+	logDecoder         logparser.Decoder
+	hostListens        map[string][]netaddr.IPPort
+	networks           map[string]ContainerNetwork
+	env                map[string]string
+	systemdTriggeredBy string
 }
 
 type Delays struct {
@@ -126,7 +128,8 @@ type Container struct {
 	connectionsByPidFd map[PidFd]*ActiveConnection
 	retransmits        map[AddrPair]int64 // dst:actual_dst -> count
 
-	l7Stats L7Stats
+	l7Stats  L7Stats
+	dnsStats *L7Metrics
 
 	oomKills int
 
@@ -170,6 +173,7 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, host
 		connectionsByPidFd: map[PidFd]*ActiveConnection{},
 		retransmits:        map[AddrPair]int64{},
 		l7Stats:            L7Stats{},
+		dnsStats:           &L7Metrics{},
 
 		mounts: map[string]proc.MountInfo{},
 
@@ -237,8 +241,8 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 
-	if c.metadata.image != "" {
-		ch <- gauge(metrics.ContainerInfo, 1, c.metadata.image)
+	if c.metadata.image != "" || c.metadata.systemdTriggeredBy != "" {
+		ch <- gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemdTriggeredBy)
 	}
 
 	ch <- counter(metrics.Restarts, float64(c.restarts))
@@ -374,6 +378,9 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		if appType != "" {
 			appTypes[appType] = struct{}{}
 		}
+		if process.isGolangApp {
+			appTypes["golang"] = struct{}{}
+		}
 		switch {
 		case isJvm(cmdline):
 			jvm, jMetrics := jvmMetrics(pid)
@@ -391,7 +398,12 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	for appType := range appTypes {
 		ch <- gauge(metrics.ApplicationType, 1, appType)
 	}
-
+	if c.dnsStats.Requests != nil {
+		c.dnsStats.Requests.Collect(ch)
+	}
+	if c.dnsStats.Latency != nil {
+		c.dnsStats.Latency.Collect(ch)
+	}
 	c.l7Stats.collect(ch)
 
 	if !*flags.DisablePinger {
@@ -478,6 +490,7 @@ func (c *Container) onFileOpen(pid uint32, fd uint64) {
 }
 
 func (c *Container) onListenOpen(pid uint32, addr netaddr.IPPort, safe bool) {
+	klog.Infof("TCP listen open pid=%d id=%s addr=%s", pid, c.id, addr)
 	if common.PortFilter.ShouldBeSkipped(addr.Port()) {
 		return
 	}
@@ -506,6 +519,7 @@ func (c *Container) onListenOpen(pid uint32, addr netaddr.IPPort, safe bool) {
 			if ips, err = proc.GetNsIps(ns); err != nil {
 				klog.Warningln(err)
 			} else {
+				klog.Infof("got IPs %s for %s", ips, nsId)
 				c.ipsByNs[nsId] = ips
 			}
 		}
@@ -514,6 +528,7 @@ func (c *Container) onListenOpen(pid uint32, addr netaddr.IPPort, safe bool) {
 }
 
 func (c *Container) onListenClose(pid uint32, addr netaddr.IPPort) {
+	klog.Infof("TCP listen close pid=%d id=%s addr=%s", pid, c.id, addr)
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	if _, byAddr := c.listens[addr]; byAddr {
@@ -641,16 +656,55 @@ func (c *Container) onConnectionClose(srcDst AddrPair) bool {
 	return true
 }
 
-func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData) {
+func (c *Container) onDNSRequest(r *l7.RequestData) map[netaddr.IP]string {
+	status := r.Status.DNS()
+	if status == "" {
+		return nil
+	}
+	t, fqdn, ips := l7.ParseDns(r.Payload)
+	if t == "" {
+		return nil
+	}
+	if c.dnsStats.Requests == nil {
+		dnsReq := L7Requests[l7.ProtocolDNS]
+		c.dnsStats.Requests = prometheus.NewCounterVec(
+			prometheus.CounterOpts{Name: dnsReq.Name, Help: dnsReq.Help},
+			[]string{"request_type", "domain", "status"},
+		)
+	}
+	if m, _ := c.dnsStats.Requests.GetMetricWithLabelValues(t, fqdn, status); m != nil {
+		m.Inc()
+	}
+	if r.Duration != 0 {
+		if c.dnsStats.Latency == nil {
+			dnsLatency := L7Latency[l7.ProtocolDNS]
+			c.dnsStats.Latency = prometheus.NewHistogram(prometheus.HistogramOpts{Name: dnsLatency.Name, Help: dnsLatency.Help})
+		}
+		c.dnsStats.Latency.Observe(r.Duration.Seconds())
+	}
+	ip2fqdn := map[netaddr.IP]string{}
+	if fqdn != "" {
+		for _, ip := range ips {
+			ip2fqdn[ip] = fqdn
+		}
+	}
+	return ip2fqdn
+}
+
+func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData) map[netaddr.IP]string {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
+	if r.Protocol == l7.ProtocolDNS {
+		return c.onDNSRequest(r)
+	}
+
 	conn := c.connectionsByPidFd[PidFd{Pid: pid, Fd: fd}]
 	if conn == nil {
-		return
+		return nil
 	}
 	if timestamp != 0 && conn.Timestamp != timestamp {
-		return
+		return nil
 	}
 
 	if conn.dstWorkload.Namespace == "external" && (r.Protocol == l7.ProtocolHTTP || r.Protocol == l7.ProtocolHTTP2) {
@@ -744,6 +798,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	case l7.ProtocolDubbo2:
 		stats.observe(r.Status.String(), "", r.Duration)
 	}
+	return nil
 }
 
 func (c *Container) onRetransmit(srcDst AddrPair) bool {
@@ -917,6 +972,12 @@ func (c *Container) ping() map[netaddr.IP]float64 {
 	}
 	targets := make([]netaddr.IP, 0, len(ips))
 	for ip := range ips {
+		if ip.IsLoopback() {
+			continue
+		}
+		if !ip.Is4() { // pinger doesn't support IPv6 yet
+			continue
+		}
 		targets = append(targets, ip)
 	}
 	rtt, err := pinger.Ping(netNs, selfNetNs, targets, pingTimeout)
@@ -995,7 +1056,7 @@ func (c *Container) gc(now time.Time) {
 	listens := map[netaddr.IPPort]string{}
 	seenNamespaces := map[string]bool{}
 	for _, p := range c.processes {
-		if seenNamespaces[p.NetNsId] {
+		if seenNamespaces[p.NetNsId()] {
 			continue
 		}
 		sockets, err := proc.GetSockets(p.Pid)
@@ -1010,7 +1071,7 @@ func (c *Container) gc(now time.Time) {
 				establishedDst[s.DAddr] = struct{}{}
 			}
 		}
-		seenNamespaces[p.NetNsId] = true
+		seenNamespaces[p.NetNsId()] = true
 	}
 
 	for ns := range c.ipsByNs {
@@ -1022,14 +1083,19 @@ func (c *Container) gc(now time.Time) {
 	c.revalidateListens(now, listens)
 
 	for srcDst, conn := range c.connectionsActive {
+		pidFd := PidFd{Pid: conn.Pid, Fd: conn.Fd}
 		if _, ok := established[srcDst]; !ok {
 			delete(c.connectionsActive, srcDst)
-			delete(c.connectionsByPidFd, PidFd{Pid: conn.Pid, Fd: conn.Fd})
+			if conn == c.connectionsByPidFd[pidFd] {
+				delete(c.connectionsByPidFd, pidFd)
+			}
 			continue
 		}
 		if !conn.Closed.IsZero() && now.Sub(conn.Closed) > gcInterval {
 			delete(c.connectionsActive, srcDst)
-			delete(c.connectionsByPidFd, PidFd{Pid: conn.Pid, Fd: conn.Fd})
+			if conn == c.connectionsByPidFd[pidFd] {
+				delete(c.connectionsByPidFd, pidFd)
+			}
 		}
 	}
 	for dst, at := range c.connectLastAttempt {
@@ -1089,6 +1155,7 @@ func (c *Container) revalidateListens(now time.Time, actualListens map[netaddr.I
 		for pid := range c.processes {
 			fds, err := proc.ReadFds(pid)
 			if err != nil {
+				klog.Warningln(err)
 				continue
 			}
 			for _, fd := range fds {
@@ -1129,7 +1196,9 @@ func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32) {
 		p.openSslUprobesChecked = true
 	}
 	if !p.goTlsUprobesChecked {
-		p.uprobes = append(p.uprobes, tracer.AttachGoTlsUprobes(pid)...)
+		uprobes, isGolangApp := tracer.AttachGoTlsUprobes(pid)
+		p.isGolangApp = isGolangApp
+		p.uprobes = append(p.uprobes, uprobes...)
 		p.goTlsUprobesChecked = true
 	}
 }
