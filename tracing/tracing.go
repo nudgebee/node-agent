@@ -8,7 +8,6 @@ import (
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/coroot/coroot-node-agent/flags"
-	"github.com/coroot/coroot-node-agent/node/metadata"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
@@ -77,7 +76,7 @@ type Trace struct {
 	commonAttrs []attribute.KeyValue
 }
 
-func NewTrace(containerId string, destination netaddr.IPPort, srcWorkload common.Workload, dstWorkload common.Workload, actualDstWorkload common.Workload, instanceMetadata *metadata.CloudMetadata) *Trace {
+func NewTrace(containerId string, destination netaddr.IPPort, srcWorkload common.Workload, dstWorkload common.Workload, actualDstWorkload common.Workload) *Trace {
 	if tracer == nil {
 		return nil
 	}
@@ -93,15 +92,6 @@ func NewTrace(containerId string, destination netaddr.IPPort, srcWorkload common
 		attribute.Key("destination.name").String(actualDstWorkload.Name),
 		attribute.Key("destination.namespace").String(actualDstWorkload.Namespace),
 		attribute.Key("destination.kind").String(actualDstWorkload.Kind),
-		attribute.Key("source.cloud.region").String(instanceMetadata.Region),
-		attribute.Key("source.cloud.provider").String(string(instanceMetadata.Provider)),
-		attribute.Key("source.cloud.zone").String(instanceMetadata.AvailabilityZone),
-		attribute.Key("source.cloud.zone_id").String(instanceMetadata.AvailabilityZoneId),
-		attribute.Key("source.cloud.instance_id").String(instanceMetadata.InstanceId),
-		attribute.Key("source.cloud.instance_type").String(instanceMetadata.InstanceType),
-		attribute.Key("source.cloud.region").String(instanceMetadata.Region),
-		attribute.Key("destination.cloud.region").String(dstWorkload.Region),
-		attribute.Key("destination.cloud.zone").String(dstWorkload.Zone),
 	}}
 }
 
@@ -117,7 +107,7 @@ func (t *Trace) createSpan(name string, duration time.Duration, error bool, attr
 	span.End(trace.WithTimestamp(end))
 }
 
-func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time.Duration, requestSize uint64, payload string, headers string, response string, host string, instanceMeta *metadata.CloudMetadata) {
+func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time.Duration, requestSize uint64, payload string, headers string, response string, host string) {
 	if t == nil || method == "" {
 		return
 	}
