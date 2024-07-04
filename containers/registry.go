@@ -275,7 +275,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 					continue
 				}
 				if c := r.containersByPid[e.Pid]; c != nil {
-					ip2fqdn := c.onL7Request(e.Pid, e.Fd, e.Timestamp, e.L7Request)
+					ip2fqdn := c.onL7Request(e.Pid, e.Fd, e.Timestamp, e.L7Request, r.ip2fqdn)
 					r.ip2fqdnLock.Lock()
 					for ip, fqdn := range ip2fqdn {
 						r.ip2fqdn[ip] = fqdn

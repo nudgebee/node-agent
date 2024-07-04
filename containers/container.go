@@ -691,7 +691,7 @@ func (c *Container) onDNSRequest(r *l7.RequestData) map[netaddr.IP]string {
 	return ip2fqdn
 }
 
-func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData) map[netaddr.IP]string {
+func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData, iqfqdn map[netaddr.IP]string) map[netaddr.IP]string {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -708,10 +708,14 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	}
 
 	if conn.dstWorkload.Namespace == "external" && (r.Protocol == l7.ProtocolHTTP || r.Protocol == l7.ProtocolHTTP2) {
-		host, error := l7.ParseHostFromHttpRequest(string(r.Payload))
-		if error == nil {
+		if host, ok := iqfqdn[conn.Dest.IP()]; ok {
+			log.Printf("Setting external host %s", host)
 			conn.dstWorkload.Name = host
-			c.hostIpsMap.Store(conn.ActualDest.IP().String(), host)
+		} else {
+			host, error := l7.ParseHostFromHttpRequest(string(r.Payload))
+			if error == nil {
+				conn.dstWorkload.Name = host
+			}
 		}
 	}
 	stats := c.l7Stats.get(r.Protocol, conn.Dest, conn.ActualDest, r, conn.srcWorkload, conn.dstWorkload, conn.actualDestWorkload)
@@ -743,6 +747,9 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 			method = req.Method
 			uri = req.URL.Path
 			host = req.Host
+		}
+		if dns, ok := iqfqdn[conn.Dest.IP()]; ok {
+			host = dns
 		}
 		if r.Response != nil {
 			response = base64.StdEncoding.EncodeToString(r.Response)
