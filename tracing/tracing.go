@@ -96,6 +96,20 @@ func NewTrace(containerId string, destination netaddr.IPPort, srcWorkload common
 	if tracer == nil {
 		return nil
 	}
+	region := ""
+	zone := ""
+	node := ""
+	if actualDstWorkload.Zone != "" {
+
+		zone = actualDstWorkload.Zone
+	}
+	if actualDstWorkload.Region != "" {
+		region = actualDstWorkload.Region
+	}
+	if actualDstWorkload.Instance != "" {
+		node = actualDstWorkload.Instance
+	}
+
 	return &Trace{containerId: containerId, destination: destination, commonAttrs: []attribute.KeyValue{
 		semconv.NetPeerName(destination.IP().String()),
 		semconv.NetPeerPort(int(destination.Port())),
@@ -108,6 +122,9 @@ func NewTrace(containerId string, destination netaddr.IPPort, srcWorkload common
 		attribute.Key("destination.name").String(actualDstWorkload.Name),
 		attribute.Key("destination.namespace").String(actualDstWorkload.Namespace),
 		attribute.Key("destination.kind").String(actualDstWorkload.Kind),
+		attribute.Key("destination.cloud.availablity_zone").String(zone),
+		attribute.Key("destination.cloud.region").String(region),
+		attribute.Key("destination.node").String(node),
 	}}
 }
 
