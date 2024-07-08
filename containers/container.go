@@ -705,11 +705,11 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		return nil
 	}
 
-	if conn.dstWorkload.Namespace == "external" && (r.Protocol == l7.ProtocolHTTP || r.Protocol == l7.ProtocolHTTP2) {
+	if conn.dstWorkload.Namespace == "external" {
 		if host, ok := iqfqdn[conn.Dest.IP()]; ok {
 			log.Printf("Setting external host %s", host)
 			conn.dstWorkload.Name = host
-		} else {
+		} else if r.Protocol == l7.ProtocolHTTP || r.Protocol == l7.ProtocolHTTP2 {
 			host, error := l7.ParseHostFromHttpRequest(string(r.Payload))
 			if error == nil {
 				conn.dstWorkload.Name = host
