@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
@@ -147,15 +148,31 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 	if host == "" {
 		host = t.destination.String()
 	}
+	requestPayload := ""
+	if utf8.ValidString(payload) {
+		requestPayload = payload
+	}
+	requestHeaders := ""
+	if utf8.ValidString(headers) {
+		requestHeaders = headers
+	}
+	responsePayload := ""
+	if utf8.ValidString(response) {
+		responsePayload = response
+	}
+	requestPath := ""
+	if utf8.ValidString(path) {
+		requestPath = path
+	}
 	t.createSpan(method, duration, status >= 400,
-		semconv.HTTPURL(fmt.Sprintf("http://%s%s", host, path)),
+		semconv.HTTPURL(fmt.Sprintf("http://%s%s", host, requestPath)),
 		semconv.HTTPMethod(method),
 		semconv.HTTPStatusCode(int(status)),
 		semconv.HTTPRequestContentLength(int(requestSize)),
-		attribute.Key("http.request_payload").String(payload),
-		attribute.Key("http.headers").String(headers),
-		attribute.Key("http.response").String(response),
-		attribute.Key("http.path").String(path),
+		attribute.Key("http.request_payload").String(requestPayload),
+		attribute.Key("http.headers").String(requestHeaders),
+		attribute.Key("http.response").String(responsePayload),
+		attribute.Key("http.path").String(requestPath),
 	)
 }
 
