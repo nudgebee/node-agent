@@ -8,6 +8,7 @@ import (
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/coroot/coroot-node-agent/flags"
+	"github.com/coroot/coroot-node-agent/node/metadata"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
@@ -29,6 +30,7 @@ var (
 )
 
 func Init(machineId, hostname, version string) {
+	md := metadata.GetInstanceMetadata()
 	endpointUrl := *flags.TracesEndpoint
 	if endpointUrl == nil {
 		klog.Infoln("no OpenTelemetry traces collector endpoint configured")
@@ -55,6 +57,17 @@ func Init(machineId, hostname, version string) {
 
 	batcher := sdktrace.WithBatcher(exporter)
 
+	// if md is nil
+	region := ""
+	availabilityZone := ""
+	if md == nil {
+		region = *flags.Region
+		availabilityZone = *flags.AvailabilityZone
+		klog.Infoln("no cloud metadata available, using defaults")
+	} else {
+		region = md.Region
+		availabilityZone = md.AvailabilityZone
+	}
 	tracer = func(containerId string) trace.Tracer {
 		provider := sdktrace.NewTracerProvider(
 			batcher,
@@ -64,6 +77,9 @@ func Init(machineId, hostname, version string) {
 				semconv.HostID(machineId),
 				semconv.ServiceName(common.ContainerIdToOtelServiceName(containerId)),
 				semconv.ContainerID(containerId),
+				semconv.CloudAccountID(md.AccountId),
+				semconv.CloudRegion(region),
+				semconv.CloudAvailabilityZone(availabilityZone),
 			)),
 		)
 		return provider.Tracer("nudgebee-node-agent", trace.WithInstrumentationVersion(version))
