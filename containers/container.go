@@ -566,14 +566,12 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPP
 	}
 	srcWorkload := c.ip_resolver.ResolveIP(src.IP().String())
 	if ignoreControlPlane(srcWorkload.Name) {
-		klog.Warningf("Ignoring src workload %s, %s \n", src.IP().String(), srcWorkload.Name)
 		return
 	}
 	actualDst, err := c.getActualDestination(p, src, dst)
 	dstWorkload := c.ip_resolver.ResolveIP(dst.IP().String())
 
 	if ignoreControlPlane(dstWorkload.Name) {
-		klog.Warningf("Ignoring src workload %s, %s \n", dst.IP().String(), dstWorkload.Name)
 		return
 	}
 	if err != nil {
