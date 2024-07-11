@@ -3,6 +3,7 @@ package containers
 import (
 	"log"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
@@ -70,7 +71,11 @@ func (s L7Stats) get(protocol l7.Protocol, destination, actualDestination netadd
 			labels = append(labels, "method")
 		case l7.ProtocolHTTP:
 			method, path := l7.ParseHttp(r.Payload)
-			constLabels["path"] = path
+			if ValidUtf8(r.Payload) {
+				constLabels["path"] = path
+			} else {
+				log.Printf("Failed to parse path %s", path)
+			}
 			constLabels["method"] = method
 			if dstWorkload.Namespace == "external" {
 				host, err := l7.ParseHostFromHttpRequest(string(r.Payload))
@@ -119,4 +124,8 @@ func (s L7Stats) delete(dst netaddr.IPPort) {
 			}
 		}
 	}
+}
+
+func ValidUtf8(payload []byte) bool {
+	return utf8.Valid(payload)
 }

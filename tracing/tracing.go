@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/coroot/coroot-node-agent/flags"
+	"github.com/coroot/coroot-node-agent/node/metadata"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
@@ -29,6 +31,7 @@ var (
 )
 
 func Init(machineId, hostname, version string) {
+	md := metadata.GetInstanceMetadata()
 	endpointUrl := *flags.TracesEndpoint
 	if endpointUrl == nil {
 		klog.Infoln("no OpenTelemetry traces collector endpoint configured")
@@ -55,6 +58,17 @@ func Init(machineId, hostname, version string) {
 
 	batcher := sdktrace.WithBatcher(exporter)
 
+	// if md is nil
+	region := ""
+	availabilityZone := ""
+	if md == nil {
+		region = *flags.Region
+		availabilityZone = *flags.AvailabilityZone
+		klog.Infoln("no cloud metadata available, using defaults")
+	} else {
+		region = md.Region
+		availabilityZone = md.AvailabilityZone
+	}
 	tracer = func(containerId string) trace.Tracer {
 		provider := sdktrace.NewTracerProvider(
 			batcher,
@@ -64,6 +78,9 @@ func Init(machineId, hostname, version string) {
 				semconv.HostID(machineId),
 				semconv.ServiceName(common.ContainerIdToOtelServiceName(containerId)),
 				semconv.ContainerID(containerId),
+				semconv.CloudAccountID(md.AccountId),
+				semconv.CloudRegion(region),
+				semconv.CloudAvailabilityZone(availabilityZone),
 			)),
 		)
 		return provider.Tracer("nudgebee-node-agent", trace.WithInstrumentationVersion(version))
@@ -80,6 +97,20 @@ func NewTrace(containerId string, destination netaddr.IPPort, srcWorkload common
 	if tracer == nil {
 		return nil
 	}
+	region := ""
+	zone := ""
+	node := ""
+	if actualDstWorkload.Zone != "" {
+
+		zone = actualDstWorkload.Zone
+	}
+	if actualDstWorkload.Region != "" {
+		region = actualDstWorkload.Region
+	}
+	if actualDstWorkload.Instance != "" {
+		node = actualDstWorkload.Instance
+	}
+
 	return &Trace{containerId: containerId, destination: destination, commonAttrs: []attribute.KeyValue{
 		semconv.NetPeerName(destination.IP().String()),
 		semconv.NetPeerPort(int(destination.Port())),
@@ -92,6 +123,9 @@ func NewTrace(containerId string, destination netaddr.IPPort, srcWorkload common
 		attribute.Key("destination.name").String(actualDstWorkload.Name),
 		attribute.Key("destination.namespace").String(actualDstWorkload.Namespace),
 		attribute.Key("destination.kind").String(actualDstWorkload.Kind),
+		attribute.Key("destination.cloud.availablity_zone").String(zone),
+		attribute.Key("destination.cloud.region").String(region),
+		attribute.Key("destination.node").String(node),
 	}}
 }
 
@@ -114,15 +148,31 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 	if host == "" {
 		host = t.destination.String()
 	}
+	requestPayload := ""
+	if utf8.ValidString(payload) {
+		requestPayload = payload
+	}
+	requestHeaders := ""
+	if utf8.ValidString(headers) {
+		requestHeaders = headers
+	}
+	responsePayload := ""
+	if utf8.ValidString(response) {
+		responsePayload = response
+	}
+	requestPath := ""
+	if utf8.ValidString(path) {
+		requestPath = path
+	}
 	t.createSpan(method, duration, status >= 400,
-		semconv.HTTPURL(fmt.Sprintf("http://%s%s", host, path)),
+		semconv.HTTPURL(fmt.Sprintf("http://%s%s", host, requestPath)),
 		semconv.HTTPMethod(method),
 		semconv.HTTPStatusCode(int(status)),
 		semconv.HTTPRequestContentLength(int(requestSize)),
-		attribute.Key("http.request_payload").String(payload),
-		attribute.Key("http.headers").String(headers),
-		attribute.Key("http.response").String(response),
-		attribute.Key("http.path").String(path),
+		attribute.Key("http.request_payload").String(requestPayload),
+		attribute.Key("http.headers").String(requestHeaders),
+		attribute.Key("http.response").String(responsePayload),
+		attribute.Key("http.path").String(requestPath),
 	)
 }
 
