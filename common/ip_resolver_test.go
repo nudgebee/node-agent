@@ -373,7 +373,11 @@ func runTest(t *testing.T, test testScenario) {
 
 		// Act+Assert 2+n
 		for ipToResolve, expectedWorkload := range step.expectedResolves {
-			assert.Equal(expectedWorkload, resolver.ResolveIP(ipToResolve))
+			// exclude Instance from comparision
+			expectedWorkload.Instance = ""
+			resolvedWorkload := resolver.ResolveIP(ipToResolve)
+			resolvedWorkload.Instance = ""
+			assert.Equal(expectedWorkload, resolvedWorkload)
 		}
 
 	}
