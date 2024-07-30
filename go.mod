@@ -11,7 +11,7 @@ require (
 	github.com/containerd/containerd v1.6.26
 	github.com/coreos/go-systemd/v22 v22.5.0
 	github.com/coroot/logparser v1.1.2
-	github.com/docker/docker v25.0.5+incompatible
+	github.com/docker/docker v26.1.4+incompatible
 	github.com/florianl/go-conntrack v0.3.0
 	github.com/go-kit/log v0.2.1
 	github.com/godbus/dbus/v5 v5.0.6
@@ -128,6 +128,7 @@ require (
 	github.com/mdlayher/socket v0.4.1 // indirect
 	github.com/miekg/dns v1.1.59 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
+	github.com/moby/docker-image-spec v1.3.1 // indirect
 	github.com/moby/locker v1.0.1 // indirect
 	github.com/moby/sys/mountinfo v0.6.2 // indirect
 	github.com/moby/sys/signal v0.6.0 // indirect
