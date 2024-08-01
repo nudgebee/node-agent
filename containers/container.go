@@ -161,11 +161,7 @@ type Container struct {
 	hostIpsMap  sync.Map
 }
 
-<<<<<<< HEAD
-func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, hostConntrack *Conntrack, pid uint32, ip_resolver IPResolver) (*Container, error) {
-=======
 func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, hostConntrack *Conntrack, pid uint32, registry *Registry) (*Container, error) {
->>>>>>> upstream/main
 	netNs, err := proc.GetNetNs(pid)
 	if err != nil {
 		return nil, err
@@ -197,15 +193,10 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, host
 
 		hostConntrack: hostConntrack,
 
-<<<<<<< HEAD
 		done:        make(chan struct{}),
-		ip_resolver: ip_resolver,
+		ip_resolver: registry.ip_resolver,
 		hostIpsMap:  sync.Map{},
-=======
-		registry: registry,
-
-		done: make(chan struct{}),
->>>>>>> upstream/main
+		registry:    registry,
 	}
 
 	for _, n := range md.networks {
@@ -328,8 +319,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
-<<<<<<< HEAD
-	for d, count := range c.connectsSuccessful {
+	for d, stats := range c.connectsSuccessful {
 		workload_src := d.srcWorkload
 		workload_dest := d.dstWorkload
 		actualDestWorkload := d.actualDestWorkload
@@ -343,39 +333,17 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 				workload_dest = common.Workload{Name: host.(string), Namespace: "external", Kind: "external"}
 			}
 		}
-		ch <- counter(metrics.NetConnectsSuccessful, float64(count), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
+		ch <- counter(metrics.NetConnectionsSuccessful, float64(stats.Count), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
+		ch <- counter(metrics.NetConnectionsTotalTime, stats.TotalTime.Seconds(), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
+		if stats.Retransmissions > 0 {
+			ch <- counter(metrics.NetRetransmits, float64(stats.Retransmissions), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
+		}
+		ch <- counter(metrics.NetBytesSent, float64(stats.BytesSent), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
+		ch <- counter(metrics.NetBytesReceived, float64(stats.BytesReceived), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
 	}
 	for dst, count := range c.connectsFailed {
 		workload := c.ip_resolver.ResolveIP(dst.IP().String())
-		ch <- counter(metrics.NetConnectsFailed, float64(count), dst.String(), workload.Name, workload.Namespace, workload.Kind, workload.Name, workload.Namespace, workload.Kind)
-	}
-	for d, count := range c.retransmits {
-		workload_src := d.srcWorkload
-		workload_dest := d.dstWorkload
-
-		if d.srcWorkload.Name == "" || len(d.srcWorkload.Name) == 0 {
-			workload_src = c.ip_resolver.ResolveIP(d.src.IP().String())
-			workload_dest = c.ip_resolver.ResolveIP(d.dst.IP().String())
-		}
-		if d.dstWorkload.Kind == "external" {
-			if host, ok := c.hostIpsMap.Load(d.dst); ok {
-				workload_dest = common.Workload{Name: host.(string), Namespace: "external", Kind: "external"}
-			}
-		}
-		ch <- counter(metrics.NetRetransmits, float64(count), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind)
-=======
-	for d, stats := range c.connectsSuccessful {
-		ch <- counter(metrics.NetConnectionsSuccessful, float64(stats.Count), d.src.String(), d.dst.String())
-		ch <- counter(metrics.NetConnectionsTotalTime, stats.TotalTime.Seconds(), d.src.String(), d.dst.String())
-		if stats.Retransmissions > 0 {
-			ch <- counter(metrics.NetRetransmits, float64(stats.Retransmissions), d.src.String(), d.dst.String())
-		}
-		ch <- counter(metrics.NetBytesSent, float64(stats.BytesSent), d.src.String(), d.dst.String())
-		ch <- counter(metrics.NetBytesReceived, float64(stats.BytesReceived), d.src.String(), d.dst.String())
-	}
-	for dst, count := range c.connectsFailed {
-		ch <- counter(metrics.NetConnectionsFailed, float64(count), dst.String())
->>>>>>> upstream/main
+		ch <- counter(metrics.NetConnectionsFailed, float64(count), dst.String(), workload.Name, workload.Namespace, workload.Kind, workload.Name, workload.Namespace, workload.Kind)
 	}
 
 	connections := map[AddrPair]int{}
@@ -450,7 +418,8 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 
 	if !*flags.DisablePinger {
 		for ip, rtt := range c.ping() {
-			ch <- gauge(metrics.NetLatency, rtt, ip.String())
+			destination_workload := c.ip_resolver.ResolveIP(ip.String())
+			ch <- gauge(metrics.NetLatency, rtt, ip.String(), destination_workload.Name, destination_workload.Namespace, destination_workload.Kind)
 		}
 	}
 }
@@ -583,7 +552,6 @@ func (c *Container) onListenClose(pid uint32, addr netaddr.IPPort) {
 	}
 }
 
-<<<<<<< HEAD
 func ignoreControlPlane(name string) bool {
 	keywords := strings.Split(*flags.IgnoreControlPlane, ",")
 	if len(keywords) == 0 {
@@ -597,10 +565,7 @@ func ignoreControlPlane(name string) bool {
 	return false
 }
 
-func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPPort, timestamp uint64, failed bool) {
-=======
 func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPPort, timestamp uint64, failed bool, duration time.Duration) {
->>>>>>> upstream/main
 	if common.PortFilter.ShouldBeSkipped(dst.Port()) {
 		return
 	}
@@ -641,12 +606,9 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPP
 	if failed {
 		c.connectsFailed[dst]++
 	} else {
-<<<<<<< HEAD
 		actualDestWorkload := c.ip_resolver.ResolveActualIP(actualDst.IP().String())
-		c.connectsSuccessful[AddrPair{src: dst, dst: *actualDst, srcWorkload: srcWorkload,
-			dstWorkload: dstWorkload, actualDestWorkload: actualDestWorkload}]++
-=======
-		key := AddrPair{src: dst, dst: *actualDst}
+		key := AddrPair{src: dst, dst: *actualDst, srcWorkload: srcWorkload,
+			dstWorkload: dstWorkload, actualDestWorkload: actualDestWorkload}
 		stats := c.connectsSuccessful[key]
 		if stats == nil {
 			stats = &ConnectionStats{}
@@ -654,7 +616,6 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPP
 		}
 		stats.Count++
 		stats.TotalTime += duration
->>>>>>> upstream/main
 		connection := &ActiveConnection{
 			Dest:               dst,
 			ActualDest:         *actualDst,
@@ -915,19 +876,15 @@ func (c *Container) onRetransmission(srcDst AddrPair) bool {
 	if !ok {
 		return false
 	}
-<<<<<<< HEAD
 	src_workload := c.ip_resolver.ResolveIP(srcDst.dst.IP().String())
 	dst_workload := c.ip_resolver.ResolveIP(conn.ActualDest.IP().String())
-	c.retransmits[AddrPair{src: srcDst.dst, dst: conn.ActualDest, srcWorkload: src_workload, dstWorkload: dst_workload}]++
-=======
-	key := AddrPair{src: srcDst.dst, dst: conn.ActualDest}
+	key := AddrPair{src: srcDst.dst, dst: conn.ActualDest, srcWorkload: src_workload, dstWorkload: dst_workload}
 	stats := c.connectsSuccessful[key]
 	if stats == nil {
 		stats = &ConnectionStats{}
 		c.connectsSuccessful[key] = stats
 	}
 	stats.Retransmissions++
->>>>>>> upstream/main
 	return true
 }
 
