@@ -11,7 +11,7 @@ require (
 	github.com/containerd/containerd v1.6.26
 	github.com/coreos/go-systemd/v22 v22.5.0
 	github.com/coroot/logparser v1.1.2
-	github.com/docker/docker v25.0.5+incompatible
+	github.com/docker/docker v25.0.6+incompatible
 	github.com/florianl/go-conntrack v0.3.0
 	github.com/go-kit/log v0.2.1
 	github.com/godbus/dbus/v5 v5.0.6
