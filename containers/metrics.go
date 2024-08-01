@@ -28,12 +28,15 @@ var metrics = struct {
 	DiskWriteOps   *prometheus.Desc
 	DiskWriteBytes *prometheus.Desc
 
-	NetListenInfo         *prometheus.Desc
-	NetConnectsSuccessful *prometheus.Desc
-	NetConnectsFailed     *prometheus.Desc
-	NetConnectionsActive  *prometheus.Desc
-	NetRetransmits        *prometheus.Desc
-	NetLatency            *prometheus.Desc
+	NetListenInfo            *prometheus.Desc
+	NetConnectionsSuccessful *prometheus.Desc
+	NetConnectionsTotalTime  *prometheus.Desc
+	NetConnectionsFailed     *prometheus.Desc
+	NetConnectionsActive     *prometheus.Desc
+	NetRetransmits           *prometheus.Desc
+	NetLatency               *prometheus.Desc
+	NetBytesSent             *prometheus.Desc
+	NetBytesReceived         *prometheus.Desc
 
 	LogMessages *prometheus.Desc
 
@@ -45,7 +48,10 @@ var metrics = struct {
 	JvmGCTime            *prometheus.Desc
 	JvmSafepointTime     *prometheus.Desc
 	JvmSafepointSyncTime *prometheus.Desc
-	Ip2Fqdn              *prometheus.Desc
+
+	PythonThreadLockWaitTime *prometheus.Desc
+
+	Ip2Fqdn *prometheus.Desc
 }{
 	ContainerInfo: metric("container_info", "Meta information about the container", "image", "systemd_triggered_by"),
 
@@ -70,12 +76,15 @@ var metrics = struct {
 	DiskWriteOps:   metric("container_resources_disk_writes_total", "Total number of writes completed successfully by the container", "mount_point", "device", "volume"),
 	DiskWriteBytes: metric("container_resources_disk_written_bytes_total", "Total number of bytes written to the disk by the container", "mount_point", "device", "volume"),
 
-	NetListenInfo:         metric("container_net_tcp_listen_info", "Listen address of the container", "listen_addr", "proxy"),
-	NetConnectsSuccessful: metric("container_net_tcp_successful_connects_total", "Total number of successful TCP connects", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
-	NetConnectsFailed:     metric("container_net_tcp_failed_connects_total", "Total number of failed TCP connects", "destination", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
-	NetConnectionsActive:  metric("container_net_tcp_active_connections", "Number of active outbound connections used by the container", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
-	NetRetransmits:        metric("container_net_tcp_retransmits_total", "Total number of retransmitted TCP segments", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
-	NetLatency:            metric("container_net_latency_seconds", "Round-trip time between the container and a remote IP", "destination_ip"),
+	NetListenInfo:            metric("container_net_tcp_listen_info", "Listen address of the container", "listen_addr", "proxy"),
+	NetConnectionsSuccessful: metric("container_net_tcp_successful_connects_total", "Total number of successful TCP connects", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
+	NetConnectionsTotalTime:  metric("container_net_tcp_connection_time_seconds_total", "Time spent on TCP connections", "destination", "actual_destination"),
+	NetConnectionsFailed:     metric("container_net_tcp_failed_connects_total", "Total number of failed TCP connects", "destination", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
+	NetConnectionsActive:     metric("container_net_tcp_active_connections", "Number of active outbound connections used by the container", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
+	NetRetransmits:           metric("container_net_tcp_retransmits_total", "Total number of retransmitted TCP segments", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
+	NetLatency:               metric("container_net_latency_seconds", "Round-trip time between the container and a remote IP", "destination_ip"),
+	NetBytesSent:             metric("container_net_tcp_bytes_sent_total", "Total number of bytes sent to the peer", "destination", "actual_destination"),
+	NetBytesReceived:         metric("container_net_tcp_bytes_received_total", "Total number of bytes received from the peer", "destination", "actual_destination"),
 
 	LogMessages: metric("container_log_messages_total", "Number of messages grouped by the automatically extracted repeated pattern", "source", "level", "pattern_hash", "sample"),
 
@@ -87,7 +96,10 @@ var metrics = struct {
 	JvmGCTime:            metric("container_jvm_gc_time_seconds", "Time spent in the given JVM garbage collector in seconds", "jvm", "gc"),
 	JvmSafepointTime:     metric("container_jvm_safepoint_time_seconds", "Time the application has been stopped for safepoint operations in seconds", "jvm"),
 	JvmSafepointSyncTime: metric("container_jvm_safepoint_sync_time_seconds", "Time spent getting to safepoints in seconds", "jvm"),
-	Ip2Fqdn:              metric("ip_to_fqdn", "Mapping IP addresses to FQDNs based on DNS requests initiated by containers", "ip", "fqdn"),
+
+	Ip2Fqdn: metric("ip_to_fqdn", "Mapping IP addresses to FQDNs based on DNS requests initiated by containers", "ip", "fqdn"),
+
+	PythonThreadLockWaitTime: metric("container_python_thread_lock_wait_time_seconds", "Time spent waiting acquiring GIL in seconds"),
 }
 
 var (
