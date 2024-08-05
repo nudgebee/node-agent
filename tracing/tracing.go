@@ -61,13 +61,16 @@ func Init(machineId, hostname, version string) {
 	// if md is nil
 	region := ""
 	availabilityZone := ""
+	accountId := ""
 	if md == nil {
 		region = *flags.Region
 		availabilityZone = *flags.AvailabilityZone
+		accountId = *flags.AccountId
 		klog.Infoln("no cloud metadata available, using defaults")
 	} else {
 		region = md.Region
 		availabilityZone = md.AvailabilityZone
+		accountId = md.AccountId
 	}
 	tracer = func(containerId string) trace.Tracer {
 		provider := sdktrace.NewTracerProvider(
@@ -78,7 +81,7 @@ func Init(machineId, hostname, version string) {
 				semconv.HostID(machineId),
 				semconv.ServiceName(common.ContainerIdToOtelServiceName(containerId)),
 				semconv.ContainerID(containerId),
-				semconv.CloudAccountID(md.AccountId),
+				semconv.CloudAccountID(accountId),
 				semconv.CloudRegion(region),
 				semconv.CloudAvailabilityZone(availabilityZone),
 			)),
