@@ -167,7 +167,7 @@ func main() {
 
 	registerer.MustRegister(info("node_agent_info", version))
 
-	if err := registerer.Register(node.NewCollector(hostname, kv)); err != nil {
+	if err := registerer.Register(node.NewCollector(hostname, kv, md)); err != nil {
 		klog.Exitln(err)
 	}
 

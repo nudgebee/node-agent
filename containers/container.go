@@ -158,7 +158,6 @@ type Container struct {
 
 	done        chan struct{}
 	ip_resolver IPResolver
-	hostIpsMap  sync.Map
 }
 
 func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, hostConntrack *Conntrack, pid uint32, registry *Registry) (*Container, error) {
@@ -329,8 +328,9 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 
 		if d.dstWorkload.Kind == "external" {
-			if host, ok := c.hostIpsMap.Load(d.dst); ok {
-				workload_dest = common.Workload{Name: host.(string), Namespace: "external", Kind: "external"}
+			host := c.ip_resolver.ResolveHost(d.dst.IP().String())
+			if host != "" {
+				workload_dest = common.Workload{Name: host, Namespace: "external", Kind: "external"}
 			}
 		}
 		ch <- counter(metrics.NetConnectionsSuccessful, float64(stats.Count), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
@@ -355,8 +355,9 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		workload_dest := c.ip_resolver.ResolveIP(conn.ActualDest.IP().String())
 		actualDestWorkload := c.ip_resolver.ResolveActualIP(conn.ActualDest.IP().String())
 		if workload_dest.Kind == "external" {
-			if host, ok := c.hostIpsMap.Load(conn.ActualDest.IP().String()); ok {
-				workload_dest = common.Workload{Name: host.(string), Namespace: "external", Kind: "external"}
+			host := c.ip_resolver.ResolveHost(conn.ActualDest.IP().String())
+			if host != "" {
+				workload_dest = common.Workload{Name: host, Namespace: "external", Kind: "external"}
 			}
 		}
 		connections[AddrPair{src: addrPair.dst, dst: conn.ActualDest, srcWorkload: workload_src, dstWorkload: workload_dest, actualDestWorkload: actualDestWorkload}]++
@@ -815,7 +816,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		if r.Response != nil {
 			response = base64.StdEncoding.EncodeToString(r.Response)
 		}
-		trace.HttpRequest(method, uri, r.Status, r.Duration, r.PayloadSize, payload, headers, response, host)
+		trace.HttpRequest(method, uri, r.Status, r.Duration, r.PayloadSize, payload, headers, response, host, conn.actualDestWorkload)
 	case l7.ProtocolHTTP2:
 		if conn.http2Parser == nil {
 			conn.http2Parser = l7.NewHttp2Parser()

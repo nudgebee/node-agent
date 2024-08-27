@@ -27,12 +27,14 @@ const (
 )
 
 var (
-	tracer func(containerId string) trace.Tracer
+	tracer           func(containerId string) trace.Tracer
+	instanceMetadata *metadata.CloudMetadata
 )
 
 func Init(machineId, hostname, version string) {
 	md := metadata.GetInstanceMetadata()
 	endpointUrl := *flags.TracesEndpoint
+	instanceMetadata = md
 	if endpointUrl == nil {
 		klog.Infoln("no OpenTelemetry traces collector endpoint configured")
 		return
@@ -144,7 +146,7 @@ func (t *Trace) createSpan(name string, duration time.Duration, error bool, attr
 	span.End(trace.WithTimestamp(end))
 }
 
-func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time.Duration, requestSize uint64, payload string, headers string, response string, host string) {
+func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time.Duration, requestSize uint64, payload string, headers string, response string, host string, destWorkload common.Workload) {
 	if t == nil || method == "" {
 		return
 	}

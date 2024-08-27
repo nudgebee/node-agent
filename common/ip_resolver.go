@@ -48,6 +48,12 @@ type clusterSnapshot struct {
 	PodDescriptors sync.Map // map[types.UID]Workload
 }
 
+type InstanceMeta struct {
+	Name   string
+	Region string
+	Zone   string
+}
+
 type K8sIPResolver struct {
 	clientset        kubernetes.Interface
 	snapshot         clusterSnapshot
@@ -179,6 +185,12 @@ func (resolver *K8sIPResolver) CacheDNS(ip string, dns string) Workload {
 	}
 }
 
+func (resolver *K8sIPResolver) ResolveHost(ip string) string {
+	if host, ok := resolver.hostIpsMap.Load(ip); ok {
+		return host.(string)
+	}
+	return ""
+}
 func (resolver *K8sIPResolver) StartWatching() error {
 	// register watchers
 	podsWatcher, err := resolver.clientset.CoreV1().Pods("").Watch(context.Background(), metav1.ListOptions{})
@@ -416,6 +428,17 @@ func (resolver *K8sIPResolver) handlePodWatchEvent(podEvent *watch.Event) {
 		}
 		for _, podIp := range pod.Status.PodIPs {
 			resolver.storeWorkloadsIP(podIp.IP, &entry)
+			nodeInfo, ok := resolver.nodeInfoMap.Load(pod.Spec.NodeName)
+			region, zone := "", ""
+			if ok {
+				meta, ok := nodeInfo.(InstanceMeta)
+				if ok {
+					region = meta.Region
+					zone = meta.Zone
+				} else {
+					log.Println("Failed to fetch node info ", ok)
+				}
+			}
 			podWorkload := Workload{
 				Name:      pod.Name,
 				Namespace: pod.Namespace,
@@ -449,6 +472,17 @@ func (resolver *K8sIPResolver) handlePodWatchEvent(podEvent *watch.Event) {
 		}
 		for _, podIp := range pod.Status.PodIPs {
 			resolver.storeWorkloadsIP(podIp.IP, &entry)
+			nodeInfo, ok := resolver.nodeInfoMap.Load(pod.Spec.NodeName)
+			region, zone := "", ""
+			if ok {
+				meta, ok := nodeInfo.(InstanceMeta)
+				if ok {
+					region = meta.Region
+					zone = meta.Zone
+				}
+			} else {
+				log.Println("Failed to fetch node info ", ok)
+			}
 			podWorkload := Workload{
 				Name:      pod.Name,
 				Namespace: pod.Namespace,
@@ -457,6 +491,7 @@ func (resolver *K8sIPResolver) handlePodWatchEvent(podEvent *watch.Event) {
 				Zone:      zone,
 				Instance:  pod.Spec.NodeName,
 			}
+
 			resolver.storePodsIP(podIp.IP, &podWorkload)
 		}
 	case watch.Deleted:
@@ -494,6 +529,8 @@ func (resolver *K8sIPResolver) handleNodeWatchEvent(nodeEvent *watch.Event) {
 				Instance:  node.Name,
 			})
 		}
+		nodeMetadata := InstanceMeta{Zone: node.Annotations["topology.kubernetes.io/zone"], Region: node.Annotations["topology.kubernetes.io/region"]}
+		resolver.nodeInfoMap.Store(node.Name, nodeMetadata)
 	case watch.Deleted:
 		if val, ok := nodeEvent.Object.(*v1.Node); ok {
 			resolver.snapshot.Nodes.Delete(val.UID)
