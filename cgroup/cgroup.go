@@ -105,7 +105,10 @@ func NewFromProcessCgroupFile(filePath string) (*Cgroup, error) {
 			cg.subsystems[cgType] = path.Join(baseCgroupPath, parts[2])
 		}
 	}
-	if p := cg.subsystems["cpu"]; p != "" {
+	if p := cg.subsystems["name=systemd"]; p != "" {
+		cg.Id = p
+		cg.Version = V1
+	} else if p = cg.subsystems["cpu"]; p != "" {
 		cg.Id = p
 		cg.Version = V1
 	} else {
@@ -121,6 +124,9 @@ func NewFromProcessCgroupFile(filePath string) (*Cgroup, error) {
 func containerByCgroup(path string) (ContainerType, string, error) {
 	parts := strings.Split(strings.TrimLeft(path, "/"), "/")
 	if len(parts) < 2 {
+		return ContainerTypeStandaloneProcess, "", nil
+	}
+	if *flags.DisableKubeProbe && parts[1] == "kubelet.service" {
 		return ContainerTypeStandaloneProcess, "", nil
 	}
 	prefix := parts[0]

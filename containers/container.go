@@ -40,14 +40,16 @@ type ContainerNetwork struct {
 }
 
 type ContainerMetadata struct {
-	name        string
-	labels      map[string]string
-	volumes     map[string]string
-	logPath     string
-	image       string
-	logDecoder  logparser.Decoder
-	hostListens map[string][]netaddr.IPPort
-	networks    map[string]ContainerNetwork
+	name               string
+	labels             map[string]string
+	volumes            map[string]string
+	logPath            string
+	image              string
+	logDecoder         logparser.Decoder
+	hostListens        map[string][]netaddr.IPPort
+	networks           map[string]ContainerNetwork
+	env                map[string]string
+	systemdTriggeredBy string
 }
 
 type Delays struct {
@@ -86,6 +88,9 @@ type ActiveConnection struct {
 	Timestamp          uint64
 	Closed             time.Time
 
+	BytesSent     uint64
+	BytesReceived uint64
+
 	http2Parser    *l7.Http2Parser
 	postgresParser *l7.PostgresParser
 	mysqlParser    *l7.MysqlParser
@@ -99,6 +104,14 @@ type ListenDetails struct {
 type PidFd struct {
 	Pid uint32
 	Fd  uint64
+}
+
+type ConnectionStats struct {
+	Count           uint64
+	TotalTime       time.Duration
+	Retransmissions uint64
+	BytesSent       uint64
+	BytesReceived   uint64
 }
 
 type Container struct {
@@ -119,16 +132,17 @@ type Container struct {
 	listens map[netaddr.IPPort]map[uint32]*ListenDetails
 	ipsByNs map[string][]netaddr.IP
 
-	connectsSuccessful map[AddrPair]int64           // dst:actual_dst -> count
-	connectsFailed     map[netaddr.IPPort]int64     // dst -> count
-	connectLastAttempt map[netaddr.IPPort]time.Time // dst -> time
+	connectsSuccessful map[AddrPair]*ConnectionStats // dst:actual_dst -> count
+	connectsFailed     map[netaddr.IPPort]int64      // dst -> count
+	connectLastAttempt map[netaddr.IPPort]time.Time  // dst -> time
 	connectionsActive  map[AddrPair]*ActiveConnection
 	connectionsByPidFd map[PidFd]*ActiveConnection
-	retransmits        map[AddrPair]int64 // dst:actual_dst -> count
 
-	l7Stats L7Stats
+	l7Stats  L7Stats
+	dnsStats *L7Metrics
 
-	oomKills int
+	oomKills                 int
+	pythonThreadLockWaitTime time.Duration
 
 	mounts map[string]proc.MountInfo
 
@@ -138,13 +152,15 @@ type Container struct {
 	nsConntrack   *Conntrack
 	lbConntracks  []*Conntrack
 
+	registry *Registry
+
 	lock sync.RWMutex
 
 	done        chan struct{}
 	ip_resolver IPResolver
 }
 
-func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, hostConntrack *Conntrack, pid uint32, ip_resolver IPResolver) (*Container, error) {
+func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, hostConntrack *Conntrack, pid uint32, registry *Registry) (*Container, error) {
 	netNs, err := proc.GetNetNs(pid)
 	if err != nil {
 		return nil, err
@@ -162,13 +178,13 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, host
 		listens: map[netaddr.IPPort]map[uint32]*ListenDetails{},
 		ipsByNs: map[string][]netaddr.IP{},
 
-		connectsSuccessful: map[AddrPair]int64{},
+		connectsSuccessful: map[AddrPair]*ConnectionStats{},
 		connectsFailed:     map[netaddr.IPPort]int64{},
 		connectLastAttempt: map[netaddr.IPPort]time.Time{},
 		connectionsActive:  map[AddrPair]*ActiveConnection{},
 		connectionsByPidFd: map[PidFd]*ActiveConnection{},
-		retransmits:        map[AddrPair]int64{},
 		l7Stats:            L7Stats{},
+		dnsStats:           &L7Metrics{},
 
 		mounts: map[string]proc.MountInfo{},
 
@@ -177,7 +193,9 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, host
 		hostConntrack: hostConntrack,
 
 		done:        make(chan struct{}),
-		ip_resolver: ip_resolver,
+		ip_resolver: registry.ip_resolver,
+		hostIpsMap:  sync.Map{},
+		registry:    registry,
 	}
 
 	for _, n := range md.networks {
@@ -232,11 +250,13 @@ func (c *Container) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *Container) Collect(ch chan<- prometheus.Metric) {
+	c.registry.updateTrafficStatsIfNecessary()
+
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 
-	if c.metadata.image != "" {
-		ch <- gauge(metrics.ContainerInfo, 1, c.metadata.image)
+	if c.metadata.image != "" || c.metadata.systemdTriggeredBy != "" {
+		ch <- gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemdTriggeredBy)
 	}
 
 	ch <- counter(metrics.Restarts, float64(c.restarts))
@@ -298,7 +318,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
-	for d, count := range c.connectsSuccessful {
+	for d, stats := range c.connectsSuccessful {
 		workload_src := d.srcWorkload
 		workload_dest := d.dstWorkload
 		actualDestWorkload := d.actualDestWorkload
@@ -313,27 +333,17 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 				workload_dest = common.Workload{Name: host, Namespace: "external", Kind: "external"}
 			}
 		}
-		ch <- counter(metrics.NetConnectsSuccessful, float64(count), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
+		ch <- counter(metrics.NetConnectionsSuccessful, float64(stats.Count), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
+		ch <- counter(metrics.NetConnectionsTotalTime, stats.TotalTime.Seconds(), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
+		if stats.Retransmissions > 0 {
+			ch <- counter(metrics.NetRetransmits, float64(stats.Retransmissions), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
+		}
+		ch <- counter(metrics.NetBytesSent, float64(stats.BytesSent), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
+		ch <- counter(metrics.NetBytesReceived, float64(stats.BytesReceived), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
 	}
 	for dst, count := range c.connectsFailed {
 		workload := c.ip_resolver.ResolveIP(dst.IP().String())
-		ch <- counter(metrics.NetConnectsFailed, float64(count), dst.String(), workload.Name, workload.Namespace, workload.Kind, workload.Name, workload.Namespace, workload.Kind)
-	}
-	for d, count := range c.retransmits {
-		workload_src := d.srcWorkload
-		workload_dest := d.dstWorkload
-
-		if d.srcWorkload.Name == "" || len(d.srcWorkload.Name) == 0 {
-			workload_src = c.ip_resolver.ResolveIP(d.src.IP().String())
-			workload_dest = c.ip_resolver.ResolveIP(d.dst.IP().String())
-		}
-		if d.dstWorkload.Kind == "external" {
-			host := c.ip_resolver.ResolveHost(d.dst.IP().String())
-			if host != "" {
-				workload_dest = common.Workload{Name: host, Namespace: "external", Kind: "external"}
-			}
-		}
-		ch <- counter(metrics.NetRetransmits, float64(count), d.src.String(), d.dst.String(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind)
+		ch <- counter(metrics.NetConnectionsFailed, float64(count), dst.String(), workload.Name, workload.Namespace, workload.Kind, workload.Name, workload.Namespace, workload.Kind)
 	}
 
 	connections := map[AddrPair]int{}
@@ -375,6 +385,9 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		if appType != "" {
 			appTypes[appType] = struct{}{}
 		}
+		if process.isGolangApp {
+			appTypes["golang"] = struct{}{}
+		}
 		switch {
 		case isJvm(cmdline):
 			jvm, jMetrics := jvmMetrics(pid)
@@ -392,12 +405,22 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	for appType := range appTypes {
 		ch <- gauge(metrics.ApplicationType, 1, appType)
 	}
+	if c.pythonThreadLockWaitTime > 0 {
+		ch <- counter(metrics.PythonThreadLockWaitTime, c.pythonThreadLockWaitTime.Seconds())
+	}
 
+	if c.dnsStats.Requests != nil {
+		c.dnsStats.Requests.Collect(ch)
+	}
+	if c.dnsStats.Latency != nil {
+		c.dnsStats.Latency.Collect(ch)
+	}
 	c.l7Stats.collect(ch)
 
 	if !*flags.DisablePinger {
 		for ip, rtt := range c.ping() {
-			ch <- gauge(metrics.NetLatency, rtt, ip.String())
+			destination_workload := c.ip_resolver.ResolveIP(ip.String())
+			ch <- gauge(metrics.NetLatency, rtt, ip.String(), destination_workload.Name, destination_workload.Namespace, destination_workload.Kind)
 		}
 	}
 }
@@ -410,7 +433,8 @@ func (c *Container) onProcessStart(pid uint32) *Process {
 		return nil
 	}
 	c.zombieAt = time.Time{}
-	p := NewProcess(pid, stats)
+	p := NewProcess(pid, stats, c.registry.tracer)
+
 	if p == nil {
 		return nil
 	}
@@ -479,6 +503,7 @@ func (c *Container) onFileOpen(pid uint32, fd uint64) {
 }
 
 func (c *Container) onListenOpen(pid uint32, addr netaddr.IPPort, safe bool) {
+	klog.Infof("TCP listen open pid=%d id=%s addr=%s", pid, c.id, addr)
 	if common.PortFilter.ShouldBeSkipped(addr.Port()) {
 		return
 	}
@@ -507,6 +532,7 @@ func (c *Container) onListenOpen(pid uint32, addr netaddr.IPPort, safe bool) {
 			if ips, err = proc.GetNsIps(ns); err != nil {
 				klog.Warningln(err)
 			} else {
+				klog.Infof("got IPs %s for %s", ips, nsId)
 				c.ipsByNs[nsId] = ips
 			}
 		}
@@ -515,6 +541,7 @@ func (c *Container) onListenOpen(pid uint32, addr netaddr.IPPort, safe bool) {
 }
 
 func (c *Container) onListenClose(pid uint32, addr netaddr.IPPort) {
+	klog.Infof("TCP listen close pid=%d id=%s addr=%s", pid, c.id, addr)
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	if _, byAddr := c.listens[addr]; byAddr {
@@ -539,7 +566,7 @@ func ignoreControlPlane(name string) bool {
 	return false
 }
 
-func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPPort, timestamp uint64, failed bool) {
+func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPPort, timestamp uint64, failed bool, duration time.Duration) {
 	if common.PortFilter.ShouldBeSkipped(dst.Port()) {
 		return
 	}
@@ -581,8 +608,15 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst netaddr.IPP
 		c.connectsFailed[dst]++
 	} else {
 		actualDestWorkload := c.ip_resolver.ResolveActualIP(actualDst.IP().String())
-		c.connectsSuccessful[AddrPair{src: dst, dst: *actualDst, srcWorkload: srcWorkload,
-			dstWorkload: dstWorkload, actualDestWorkload: actualDestWorkload}]++
+		key := AddrPair{src: dst, dst: *actualDst, srcWorkload: srcWorkload,
+			dstWorkload: dstWorkload, actualDestWorkload: actualDestWorkload}
+		stats := c.connectsSuccessful[key]
+		if stats == nil {
+			stats = &ConnectionStats{}
+			c.connectsSuccessful[key] = stats
+		}
+		stats.Count++
+		stats.TotalTime += duration
 		connection := &ActiveConnection{
 			Dest:               dst,
 			ActualDest:         *actualDst,
@@ -629,34 +663,121 @@ func (c *Container) getActualDestination(p *Process, src, dst netaddr.IPPort) (*
 	return nil, nil
 }
 
-func (c *Container) onConnectionClose(srcDst AddrPair) bool {
+func (c *Container) onConnectionClose(e ebpftracer.Event) bool {
+	srcDst := AddrPair{src: e.SrcAddr, dst: e.DstAddr}
 	c.lock.Lock()
-	defer c.lock.Unlock()
-	conn := c.connectionsActive[srcDst]
-	if conn == nil {
-		return false
+	conn, ok := c.connectionsActive[srcDst]
+	c.lock.Unlock()
+	if conn != nil {
+		if conn.Closed.IsZero() {
+			if e.Pid == 0 && e.Fd == 0 {
+				stats, err := c.registry.tracer.GetAndDeleteTCPConnection(conn.Pid, conn.Fd)
+				if err != nil {
+					klog.Warningln(c.id, conn.Pid, conn.Fd, conn.ActualDest, err)
+				} else {
+					c.lock.Lock()
+					c.updateConnectionTrafficStats(conn, stats.BytesSent, stats.BytesReceived)
+					c.lock.Unlock()
+				}
+			} else if e.TrafficStats != nil {
+				c.lock.Lock()
+				c.updateConnectionTrafficStats(conn, e.TrafficStats.BytesSent, e.TrafficStats.BytesReceived)
+				c.lock.Unlock()
+			}
+			conn.Closed = time.Now()
+		}
 	}
-	conn.Closed = time.Now()
-	return true
+	return ok
 }
 
-func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData) {
+func (c *Container) updateTrafficStats(u *TrafficStatsUpdate) {
+	if u == nil {
+		return
+	}
 	c.lock.Lock()
 	defer c.lock.Unlock()
+	c.updateConnectionTrafficStats(c.connectionsByPidFd[PidFd{Pid: u.Pid, Fd: u.FD}], u.BytesSent, u.BytesReceived)
+}
+
+func (c *Container) updateConnectionTrafficStats(ac *ActiveConnection, sent, received uint64) {
+	if ac == nil {
+		return
+	}
+	key := AddrPair{src: ac.Dest, dst: ac.ActualDest}
+	stats := c.connectsSuccessful[key]
+	if stats == nil {
+		stats = &ConnectionStats{}
+		c.connectsSuccessful[key] = stats
+	}
+	if sent > ac.BytesSent {
+		stats.BytesSent += sent - ac.BytesSent
+	}
+	if received > ac.BytesReceived {
+		stats.BytesReceived += received - ac.BytesReceived
+	}
+	ac.BytesSent = sent
+	ac.BytesReceived = received
+}
+
+func (c *Container) onDNSRequest(r *l7.RequestData) map[netaddr.IP]string {
+	status := r.Status.DNS()
+	if status == "" {
+		return nil
+	}
+	t, fqdn, ips := l7.ParseDns(r.Payload)
+	if t == "" {
+		return nil
+	}
+	if c.dnsStats.Requests == nil {
+		dnsReq := L7Requests[l7.ProtocolDNS]
+		c.dnsStats.Requests = prometheus.NewCounterVec(
+			prometheus.CounterOpts{Name: dnsReq.Name, Help: dnsReq.Help},
+			[]string{"request_type", "domain", "status"},
+		)
+	}
+	if m, _ := c.dnsStats.Requests.GetMetricWithLabelValues(t, fqdn, status); m != nil {
+		m.Inc()
+	}
+	if r.Duration != 0 {
+		if c.dnsStats.Latency == nil {
+			dnsLatency := L7Latency[l7.ProtocolDNS]
+			c.dnsStats.Latency = prometheus.NewHistogram(prometheus.HistogramOpts{Name: dnsLatency.Name, Help: dnsLatency.Help})
+		}
+		c.dnsStats.Latency.Observe(r.Duration.Seconds())
+	}
+	ip2fqdn := map[netaddr.IP]string{}
+	if fqdn != "" {
+		for _, ip := range ips {
+			ip2fqdn[ip] = fqdn
+		}
+	}
+	return ip2fqdn
+}
+
+func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData, iqfqdn map[netaddr.IP]string) map[netaddr.IP]string {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	if r.Protocol == l7.ProtocolDNS {
+		return c.onDNSRequest(r)
+	}
 
 	conn := c.connectionsByPidFd[PidFd{Pid: pid, Fd: fd}]
 	if conn == nil {
-		return
+		return nil
 	}
 	if timestamp != 0 && conn.Timestamp != timestamp {
-		return
+		return nil
 	}
 
-	if conn.dstWorkload.Namespace == "external" && (r.Protocol == l7.ProtocolHTTP || r.Protocol == l7.ProtocolHTTP2) {
-		host, error := l7.ParseHostFromHttpRequest(string(r.Payload))
-		if error == nil {
+	if conn.dstWorkload.Namespace == "external" {
+		if host, ok := iqfqdn[conn.Dest.IP()]; ok {
 			conn.dstWorkload.Name = host
-			c.ip_resolver.CacheDNS(conn.ActualDest.IP().String(), host)
+		} else if r.Protocol == l7.ProtocolHTTP || r.Protocol == l7.ProtocolHTTP2 {
+			host, error := l7.ParseHostFromHttpRequest(string(r.Payload))
+			if error == nil {
+				conn.dstWorkload.Name = host
+			}
 		}
 	}
 	stats := c.l7Stats.get(r.Protocol, conn.Dest, conn.ActualDest, r, conn.srcWorkload, conn.dstWorkload, conn.actualDestWorkload)
@@ -688,6 +809,9 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 			method = req.Method
 			uri = req.URL.Path
 			host = req.Host
+		}
+		if dns, ok := iqfqdn[conn.Dest.IP()]; ok {
+			host = dns
 		}
 		if r.Response != nil {
 			response = base64.StdEncoding.EncodeToString(r.Response)
@@ -743,9 +867,10 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	case l7.ProtocolDubbo2:
 		stats.observe(r.Status.String(), "", r.Duration)
 	}
+	return nil
 }
 
-func (c *Container) onRetransmit(srcDst AddrPair) bool {
+func (c *Container) onRetransmission(srcDst AddrPair) bool {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	conn, ok := c.connectionsActive[srcDst]
@@ -754,7 +879,13 @@ func (c *Container) onRetransmit(srcDst AddrPair) bool {
 	}
 	src_workload := c.ip_resolver.ResolveIP(srcDst.dst.IP().String())
 	dst_workload := c.ip_resolver.ResolveIP(conn.ActualDest.IP().String())
-	c.retransmits[AddrPair{src: srcDst.dst, dst: conn.ActualDest, srcWorkload: src_workload, dstWorkload: dst_workload}]++
+	key := AddrPair{src: srcDst.dst, dst: conn.ActualDest, srcWorkload: src_workload, dstWorkload: dst_workload}
+	stats := c.connectsSuccessful[key]
+	if stats == nil {
+		stats = &ConnectionStats{}
+		c.connectsSuccessful[key] = stats
+	}
+	stats.Retransmissions++
 	return true
 }
 
@@ -916,6 +1047,12 @@ func (c *Container) ping() map[netaddr.IP]float64 {
 	}
 	targets := make([]netaddr.IP, 0, len(ips))
 	for ip := range ips {
+		if ip.IsLoopback() {
+			continue
+		}
+		if !ip.Is4() { // pinger doesn't support IPv6 yet
+			continue
+		}
 		targets = append(targets, ip)
 	}
 	rtt, err := pinger.Ping(netNs, selfNetNs, targets, pingTimeout)
@@ -994,7 +1131,7 @@ func (c *Container) gc(now time.Time) {
 	listens := map[netaddr.IPPort]string{}
 	seenNamespaces := map[string]bool{}
 	for _, p := range c.processes {
-		if seenNamespaces[p.NetNsId] {
+		if seenNamespaces[p.NetNsId()] {
 			continue
 		}
 		sockets, err := proc.GetSockets(p.Pid)
@@ -1009,7 +1146,7 @@ func (c *Container) gc(now time.Time) {
 				establishedDst[s.DAddr] = struct{}{}
 			}
 		}
-		seenNamespaces[p.NetNsId] = true
+		seenNamespaces[p.NetNsId()] = true
 	}
 
 	for ns := range c.ipsByNs {
@@ -1021,14 +1158,19 @@ func (c *Container) gc(now time.Time) {
 	c.revalidateListens(now, listens)
 
 	for srcDst, conn := range c.connectionsActive {
+		pidFd := PidFd{Pid: conn.Pid, Fd: conn.Fd}
 		if _, ok := established[srcDst]; !ok {
 			delete(c.connectionsActive, srcDst)
-			delete(c.connectionsByPidFd, PidFd{Pid: conn.Pid, Fd: conn.Fd})
+			if conn == c.connectionsByPidFd[pidFd] {
+				delete(c.connectionsByPidFd, pidFd)
+			}
 			continue
 		}
 		if !conn.Closed.IsZero() && now.Sub(conn.Closed) > gcInterval {
 			delete(c.connectionsActive, srcDst)
-			delete(c.connectionsByPidFd, PidFd{Pid: conn.Pid, Fd: conn.Fd})
+			if conn == c.connectionsByPidFd[pidFd] {
+				delete(c.connectionsByPidFd, pidFd)
+			}
 		}
 	}
 	for dst, at := range c.connectLastAttempt {
@@ -1039,11 +1181,6 @@ func (c *Container) gc(now time.Time) {
 			for d := range c.connectsSuccessful {
 				if d.src == dst {
 					delete(c.connectsSuccessful, d)
-				}
-			}
-			for d := range c.retransmits {
-				if d.src == dst {
-					delete(c.retransmits, d)
 				}
 			}
 			c.l7Stats.delete(dst)
@@ -1088,6 +1225,7 @@ func (c *Container) revalidateListens(now time.Time, actualListens map[netaddr.I
 		for pid := range c.processes {
 			fds, err := proc.ReadFds(pid)
 			if err != nil {
+				klog.Warningln(err)
 				continue
 			}
 			for _, fd := range fds {
@@ -1128,7 +1266,9 @@ func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32) {
 		p.openSslUprobesChecked = true
 	}
 	if !p.goTlsUprobesChecked {
-		p.uprobes = append(p.uprobes, tracer.AttachGoTlsUprobes(pid)...)
+		uprobes, isGolangApp := tracer.AttachGoTlsUprobes(pid)
+		p.isGolangApp = isGolangApp
+		p.uprobes = append(p.uprobes, uprobes...)
 		p.goTlsUprobesChecked = true
 	}
 }

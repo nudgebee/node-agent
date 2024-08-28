@@ -32,7 +32,7 @@ jobs:
         uses: docker/build-push-action@v3
         with:
           context: .
-          file: 'Dockerfile'
+          file: 'Dockerfile.alpine'
           push: true
           tags: |
             740395098545.dkr.ecr.us-east-1.amazonaws.com/nudgebee-node-agent:${{ env.tag }}

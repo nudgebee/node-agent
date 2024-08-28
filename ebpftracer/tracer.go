@@ -29,39 +29,48 @@ type EventType uint32
 type EventReason uint32
 
 const (
-	EventTypeProcessStart    EventType = 1
-	EventTypeProcessExit     EventType = 2
-	EventTypeConnectionOpen  EventType = 3
-	EventTypeConnectionClose EventType = 4
-	EventTypeConnectionError EventType = 5
-	EventTypeListenOpen      EventType = 6
-	EventTypeListenClose     EventType = 7
-	EventTypeFileOpen        EventType = 8
-	EventTypeTCPRetransmit   EventType = 9
-	EventTypeL7Request       EventType = 10
+	EventTypeProcessStart     EventType = 1
+	EventTypeProcessExit      EventType = 2
+	EventTypeConnectionOpen   EventType = 3
+	EventTypeConnectionClose  EventType = 4
+	EventTypeConnectionError  EventType = 5
+	EventTypeListenOpen       EventType = 6
+	EventTypeListenClose      EventType = 7
+	EventTypeFileOpen         EventType = 8
+	EventTypeTCPRetransmit    EventType = 9
+	EventTypeL7Request        EventType = 10
+	EventTypePythonThreadLock EventType = 11
 
 	EventReasonNone    EventReason = 0
 	EventReasonOOMKill EventReason = 1
 )
 
+type TrafficStats struct {
+	BytesSent     uint64
+	BytesReceived uint64
+}
+
 type Event struct {
-	Type      EventType
-	Reason    EventReason
-	Pid       uint32
-	SrcAddr   netaddr.IPPort
-	DstAddr   netaddr.IPPort
-	Fd        uint64
-	Timestamp uint64
-	L7Request *l7.RequestData
+	Type         EventType
+	Reason       EventReason
+	Pid          uint32
+	SrcAddr      netaddr.IPPort
+	DstAddr      netaddr.IPPort
+	Fd           uint64
+	Timestamp    uint64
+	Duration     time.Duration
+	L7Request    *l7.RequestData
+	TrafficStats *TrafficStats
 }
 
 type perfMapType uint8
 
 const (
-	perfMapTypeProcEvents perfMapType = 1
-	perfMapTypeTCPEvents  perfMapType = 2
-	perfMapTypeFileEvents perfMapType = 3
-	perfMapTypeL7Events   perfMapType = 4
+	perfMapTypeProcEvents         perfMapType = 1
+	perfMapTypeTCPEvents          perfMapType = 2
+	perfMapTypeFileEvents         perfMapType = 3
+	perfMapTypeL7Events           perfMapType = 4
+	perfMapTypePythonThreadEvents perfMapType = 5
 )
 
 type Tracer struct {
@@ -131,6 +140,8 @@ func (t *Tracer) init(ch chan<- Event) error {
 		}
 	}
 
+	ebpfConnectionsMap := t.collection.Maps["active_connections"]
+	timestamp := uint64(time.Now().UnixNano())
 	for _, s := range sockets {
 		typ := EventTypeConnectionOpen
 		if s.Listen {
@@ -139,14 +150,44 @@ func (t *Tracer) init(ch chan<- Event) error {
 			continue
 		}
 		ch <- Event{
-			Type:    typ,
-			Pid:     s.pid,
-			Fd:      s.fd,
-			SrcAddr: s.SAddr,
-			DstAddr: s.DAddr,
+			Type:      typ,
+			Pid:       s.pid,
+			Timestamp: timestamp,
+			Fd:        s.fd,
+			SrcAddr:   s.SAddr,
+			DstAddr:   s.DAddr,
+		}
+		if typ == EventTypeConnectionOpen {
+			id := ConnectionId{FD: s.fd, PID: s.pid}
+			conn := Connection{Timestamp: timestamp}
+			if err := ebpfConnectionsMap.Update(id, conn, ebpf.UpdateNoExist); err != nil {
+				klog.Warningln(err)
+			}
 		}
 	}
 	return nil
+}
+
+func (t *Tracer) GetAndDeleteTCPConnection(pid uint32, fd uint64) (*Connection, error) {
+	id := ConnectionId{FD: fd, PID: pid}
+	conn := &Connection{}
+	return conn, t.collection.Maps["active_connections"].LookupAndDelete(id, conn)
+}
+
+func (t *Tracer) ActiveConnectionsIterator() *ebpf.MapIterator {
+	return t.collection.Maps["active_connections"].Iterate()
+}
+
+type ConnectionId struct {
+	FD  uint64
+	PID uint32
+	_   uint32
+}
+
+type Connection struct {
+	Timestamp     uint64
+	BytesSent     uint64
+	BytesReceived uint64
 }
 
 type perfMap struct {
@@ -170,9 +211,11 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	if len(prg) == 0 {
 		return fmt.Errorf("unsupported kernel version: %s", t.kernelVersion)
 	}
+	_, debugFsErr := os.Stat("/sys/kernel/debug/tracing")
+	_, traceFsErr := os.Stat("/sys/kernel/tracing")
 
-	if _, err := os.Stat("/sys/kernel/debug/tracing"); err != nil {
-		return fmt.Errorf("kernel tracing is not available: %w", err)
+	if debugFsErr != nil && traceFsErr != nil {
+		return fmt.Errorf("kernel tracing is not available: debugfs or tracefs must be mounted")
 	}
 
 	collectionSpec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(prg))
@@ -198,6 +241,7 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		{name: "tcp_connect_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 8},
 		{name: "tcp_retransmit_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 4},
 		{name: "file_events", typ: perfMapTypeFileEvents, perCPUBufferSizePages: 4},
+		{name: "python_thread_events", typ: perfMapTypePythonThreadEvents, perCPUBufferSizePages: 4},
 	}
 
 	if !t.disableL7Tracing {
@@ -218,7 +262,7 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		program := t.collection.Programs[programSpec.Name]
 		if t.disableL7Tracing {
 			switch programSpec.Name {
-			case "sys_enter_writev", "sys_enter_write", "sys_enter_sendto", "sys_enter_sendmsg":
+			case "sys_enter_writev", "sys_enter_write", "sys_enter_sendto", "sys_enter_sendmsg", "sys_enter_sendmmsg":
 				continue
 			case "sys_enter_read", "sys_enter_readv", "sys_enter_recvfrom", "sys_enter_recvmsg":
 				continue
@@ -291,14 +335,17 @@ type procEvent struct {
 }
 
 type tcpEvent struct {
-	Fd        uint64
-	Timestamp uint64
-	Type      EventType
-	Pid       uint32
-	SPort     uint16
-	DPort     uint16
-	SAddr     [16]byte
-	DAddr     [16]byte
+	Fd            uint64
+	Timestamp     uint64
+	Duration      uint64
+	Type          EventType
+	Pid           uint32
+	BytesSent     uint64
+	BytesReceived uint64
+	SPort         uint16
+	DPort         uint16
+	SAddr         [16]byte
+	DAddr         [16]byte
 }
 
 type fileEvent struct {
@@ -319,6 +366,12 @@ type l7Event struct {
 	StatementId         uint32
 	PayloadSize         uint64
 	ResponseSize        uint64
+}
+
+type pythonThreadEvent struct {
+	Type     EventType
+	Pid      uint32
+	Duration uint64
 }
 
 func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapType) {
@@ -398,6 +451,24 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 				DstAddr:   ipPort(v.DAddr, v.DPort),
 				Fd:        v.Fd,
 				Timestamp: v.Timestamp,
+				Duration:  time.Duration(v.Duration),
+			}
+			if v.Type == EventTypeConnectionClose {
+				event.TrafficStats = &TrafficStats{
+					BytesSent:     v.BytesSent,
+					BytesReceived: v.BytesReceived,
+				}
+			}
+		case perfMapTypePythonThreadEvents:
+			v := &pythonThreadEvent{}
+			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
+				klog.Warningln("failed to read msg:", err)
+				continue
+			}
+			event = Event{
+				Type:     v.Type,
+				Pid:      v.Pid,
+				Duration: time.Duration(v.Duration),
 			}
 		default:
 			continue
