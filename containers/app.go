@@ -13,6 +13,9 @@ var (
 
 func guessApplicationType(cmdline []byte) string {
 	parts := bytes.Split(cmdline, []byte{0})
+	if len(parts) == 0 || len(parts[0]) == 0 {
+		return ""
+	}
 	cmd := bytes.TrimSuffix(bytes.Fields(parts[0])[0], []byte{':'})
 	switch {
 	case bytes.HasSuffix(cmd, []byte("memcached")):
@@ -28,6 +31,8 @@ func guessApplicationType(cmdline []byte) string {
 	case bytes.HasSuffix(cmd, []byte("mongos")):
 		return "mongos"
 	case bytes.HasSuffix(cmd, []byte("mysqld")):
+		return "mysql"
+	case bytes.HasSuffix(cmd, []byte("mariadbd")):
 		return "mysql"
 	case bytes.Contains(cmdline, []byte("org.apache.zookeeper.server.quorum.QuorumPeerMain")):
 		return "zookeeper"
