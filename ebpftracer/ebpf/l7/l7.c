@@ -311,7 +311,7 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
         if (prev_req && prev_req->protocol == PROTOCOL_KAFKA) {
             req->ns = prev_req->ns;
         }
-    } else if (looks_like_http2_frame(payload, size, METHOD_HTTP2_CLIENT_FRAMES)) {
+    } else if (is_http2_frame(payload, size)) {
         struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
         if (!e) {
             return 0;
@@ -320,7 +320,15 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
         e->method = METHOD_HTTP2_CLIENT_FRAMES;
         e->duration = bpf_ktime_get_ns();
         e->payload_size = size;
-        COPY_PAYLOAD(e->payload, size, payload);
+        bpf_probe_read(e->payload, MAX_PAYLOAD_SIZE, payload);
+        e->response_size = 0;
+        e->status = STATUS_UNKNOWN;
+        if(size > MAX_PAYLOAD_SIZE){
+            // will not be able to copy all of it
+            e->payload_size = MAX_PAYLOAD_SIZE;
+        }else{
+            e->payload_size = size;
+        }
         send_event(ctx, e, cid, conn);
         return 0;
     } else if (is_dubbo2_request(payload, size)) {
@@ -422,7 +430,6 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     e->statement_id = 0;
     e->payload_size = 0;
     e->response_size = ret;
-    COPY_PAYLOAD(e->response, ret, payload);
     if (is_rabbitmq_consume(payload, ret)) {
         e->protocol = PROTOCOL_RABBITMQ;
         e->method = METHOD_CONSUME;
@@ -457,7 +464,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
                 return 0;
             }
             response = 1;
-        } else if (looks_like_http2_frame(payload, ret, METHOD_HTTP2_SERVER_FRAMES)) {
+        } else if (is_http2_frame(payload, ret)) {
             e->protocol = PROTOCOL_HTTP2;
             e->method = METHOD_HTTP2_SERVER_FRAMES;
             e->duration = bpf_ktime_get_ns();
@@ -476,6 +483,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     bpf_map_delete_elem(&active_l7_requests, &k);
     if (e->protocol == PROTOCOL_HTTP) {
         response = is_http_response(payload, &e->status);
+        COPY_PAYLOAD(e->response, ret, payload);
     } else if (e->protocol == PROTOCOL_POSTGRES) {
         response = is_postgres_response(payload, ret, &e->status);
         if (req->request_type == POSTGRES_FRAME_PARSE) {
