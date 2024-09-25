@@ -662,23 +662,13 @@ func (c *Container) getActualDestination(p *Process, src, dst netaddr.IPPort) (*
 	return nil, nil
 }
 
-func (c *Container) onConnectionClose(e ebpftracer.Event) bool {
-	srcDst := AddrPair{src: e.SrcAddr, dst: e.DstAddr}
+func (c *Container) onConnectionClose(e ebpftracer.Event) {
 	c.lock.Lock()
-	conn, ok := c.connectionsActive[srcDst]
+	conn := c.connectionsByPidFd[PidFd{Pid: e.Pid, Fd: e.Fd}]
 	c.lock.Unlock()
 	if conn != nil {
 		if conn.Closed.IsZero() {
-			if e.Pid == 0 && e.Fd == 0 {
-				stats, err := c.registry.tracer.GetAndDeleteTCPConnection(conn.Pid, conn.Fd)
-				if err != nil {
-					klog.Warningln(c.id, conn.Pid, conn.Fd, conn.ActualDest, err)
-				} else {
-					c.lock.Lock()
-					c.updateConnectionTrafficStats(conn, stats.BytesSent, stats.BytesReceived)
-					c.lock.Unlock()
-				}
-			} else if e.TrafficStats != nil {
+			if e.TrafficStats != nil {
 				c.lock.Lock()
 				c.updateConnectionTrafficStats(conn, e.TrafficStats.BytesSent, e.TrafficStats.BytesReceived)
 				c.lock.Unlock()
@@ -686,7 +676,6 @@ func (c *Container) onConnectionClose(e ebpftracer.Event) bool {
 			conn.Closed = time.Now()
 		}
 	}
-	return ok
 }
 
 func (c *Container) updateTrafficStats(u *TrafficStatsUpdate) {
