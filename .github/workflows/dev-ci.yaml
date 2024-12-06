@@ -3,12 +3,12 @@ on:
   workflow_dispatch:
   push:
     branches: [ "main" ]
-
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
-    env:
-      GOPRIVATE: github.com/nudgebee/logparser
+    permissions:
+      contents: read
+      packages: read
     steps:
       - name: Checkout
         uses: actions/checkout@main
@@ -36,5 +36,7 @@ jobs:
           context: .
           file: 'Dockerfile.alpine'
           push: true
+          build-args: |
+            GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
           tags: |
             280501305789.dkr.ecr.us-east-1.amazonaws.com/nudgebee-node-agent:${{ env.tag }}
