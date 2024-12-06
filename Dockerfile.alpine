@@ -1,4 +1,5 @@
 FROM --platform=linux/amd64 golang:1.22-alpine as build-stage
+ARG SSH_PRIVATE_KEY
 
 # Set destination for COPY
 WORKDIR /app
@@ -19,8 +20,22 @@ RUN cd /tmp && git clone https://github.com/systemd/systemd
 RUN apk add elogind-dev
 
 # Download Go modules
+ENV GOPRIVATE=github.com/nudgebee
+
+# Set global Git config to avoid manual intervention
+RUN git config --global url.ssh://git@github.com/.insteadOf https://github.com/
+
+RUN mkdir -p /root/.ssh && \
+    chmod 0700 /root/.ssh && \
+    ssh-keyscan github.com > /root/.ssh/known_hosts
+
 COPY go.mod go.sum ./
-RUN go mod download
+
+RUN echo "$SSH_PRIVATE_KEY" > /root/.ssh/id_rsa && \
+    chmod 600 /root/.ssh/id_rsa && \
+    go mod download && \
+    rm -rf /root/.ssh/
+
 COPY ./ ./
 ARG VERSION=unknown
 RUN CGO_ENABLED=1 go build -mod=readonly -ldflags "-X main.version=$VERSION" -o coroot-node-agent .
