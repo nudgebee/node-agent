@@ -20,7 +20,7 @@ import (
 	"github.com/coroot/coroot-node-agent/pinger"
 	"github.com/coroot/coroot-node-agent/proc"
 	"github.com/coroot/coroot-node-agent/tracing"
-	"github.com/coroot/logparser"
+	"github.com/nudgebee/logparser"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vishvananda/netns"
 	"inet.af/netaddr"
@@ -368,6 +368,9 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 			if c.Level == logparser.LevelCritical || c.Level == logparser.LevelError {
 				ch <- counter(metrics.LogMessages, float64(c.Messages), source, c.Level.String(), c.Hash, c.Sample)
 			}
+		}
+		for _, c := range p.parser.GetSensitiveCounters() {
+			ch <- counter(metrics.SensitiveLogMessages, float64(c.Messages), source, c.Pattern, c.Sample)
 		}
 	}
 

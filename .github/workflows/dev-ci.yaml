@@ -7,6 +7,8 @@ on:
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
+    env:
+      GOPRIVATE: github.com/nudgebee/logparser
     steps:
       - name: Checkout
         uses: actions/checkout@main
