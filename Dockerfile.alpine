@@ -1,7 +1,4 @@
 FROM --platform=linux/amd64 golang:1.22-alpine as build-stage
-ARG GITHUB_TOKEN
-
-RUN echo "DEBUG: Token starts with: ${GITHUB_TOKEN:0:5}"
 # Set destination for COPY
 WORKDIR /app
 RUN apk add --no-cache --update go gcc g++ bash git
@@ -10,7 +7,7 @@ RUN echo "unicode=\"YES\"" >> /etc/rc.conf && \
         autoconf file libc-dev make pkgconf python3 py3-pip ninja \
         util-linux pciutils usbutils coreutils binutils findutils grep \
         build-base abuild binutils binutils-doc gcc-doc gperf libcap libcap-dev \
-        valgrind-dev libmount && pip3 install meson --break-system-packages
+        valgrind-dev libmount && pip3 install meson --break-system-packages 
 
 RUN cd /tmp && git clone https://github.com/systemd/systemd
 
@@ -20,19 +17,9 @@ RUN cd /tmp && git clone https://github.com/systemd/systemd
 
 RUN apk add elogind-dev
 
-# Download Go modules
-ENV GOPRIVATE=github.com/nudgebee
-
-# Set up git to use the GitHub token for private repos
-RUN mkdir -p /root && \
-    echo "machine github.com login x-access-token password ${GITHUB_TOKEN}" > /root/.netrc && \
-    chmod 600 /root/.netrc
-
-# Set global Git config to avoid manual intervention
-RUN git config --global url."https://github.com/".insteadOf "git@github.com:"
-
 COPY go.mod go.sum ./
-RUN go mod download
+
+RUN  go mod download 
 
 COPY ./ ./
 ARG VERSION=unknown
