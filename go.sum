@@ -843,6 +843,8 @@ github.com/nudgebee/logparser v0.0.0-20241210114706-d657df16b2f0 h1:x24xYWQASKdK
 github.com/nudgebee/logparser v0.0.0-20241210114706-d657df16b2f0/go.mod h1:ddmUa8en2sToRL+bBvFkuS1AHvA6Msn56v3BpLMbKoc=
 github.com/nudgebee/logparser v0.0.0-20241210123812-8fe0178d3689 h1:LBk0wG+RohMGu6Ea1fRkzgK4Kfo+iaA0cp7M9ZYC/V8=
 github.com/nudgebee/logparser v0.0.0-20241210123812-8fe0178d3689/go.mod h1:ddmUa8en2sToRL+bBvFkuS1AHvA6Msn56v3BpLMbKoc=
+github.com/nudgebee/logparser v0.0.0-20241210125612-324af8411ed3 h1:Md9rIDABi+8wB26mUw0rn+kRcygvOz3iFm7dpgklJf8=
+github.com/nudgebee/logparser v0.0.0-20241210125612-324af8411ed3/go.mod h1:ddmUa8en2sToRL+bBvFkuS1AHvA6Msn56v3BpLMbKoc=
 github.com/nxadm/tail v1.4.4/go.mod h1:kenIhsEOeOJmVchQTgglprH7qJGnHDVpk1VPCcaMI8A=
 github.com/oklog/ulid v1.3.1 h1:EGfNDEx6MqHz8B3uNV6QAib1UR2Lm97sHi3ocA6ESJ4=
 github.com/oklog/ulid v1.3.1/go.mod h1:CirwcVhetQ6Lv90oh/F+FBtV6XMibvdAFo93nm5qn4U=
