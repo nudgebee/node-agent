@@ -19,7 +19,7 @@ require (
 	github.com/hashicorp/golang-lru/v2 v2.0.5
 	github.com/jpillora/backoff v1.0.0
 	github.com/mdlayher/taskstats v0.0.0-20230712191918-387b3d561d14
-	github.com/nudgebee/logparser v0.0.0-20241210103204-01cbfd2652bb
+	github.com/nudgebee/logparser v0.0.0-20241210123812-8fe0178d3689
 	github.com/opencontainers/runtime-spec v1.0.3-0.20210326190908-1c3f411f0417
 	github.com/prometheus/client_golang v1.18.0
 	github.com/prometheus/common v0.46.0
@@ -43,6 +43,7 @@ require (
 	golang.org/x/time v0.5.0
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
 	gopkg.in/yaml.v2 v2.4.0
+	gotest.tools v2.2.0+incompatible
 	inet.af/netaddr v0.0.0-20230525184311-b8eac61e914a
 	k8s.io/api v0.28.6
 	k8s.io/apimachinery v0.28.6

@@ -839,8 +839,10 @@ github.com/mwitkow/go-conntrack v0.0.0-20190716064945-2f068394615f/go.mod h1:qRW
 github.com/mxk/go-flowrate v0.0.0-20140419014527-cca7078d478f/go.mod h1:ZdcZmHo+o7JKHSa8/e818NopupXU1YMK5fe1lsApnBw=
 github.com/ncw/swift v1.0.47/go.mod h1:23YIA4yWVnGwv2dQlN4bB7egfYX6YLn0Yo/S6zZO/ZM=
 github.com/niemeyer/pretty v0.0.0-20200227124842-a10e7caefd8e/go.mod h1:zD1mROLANZcx1PVRCS0qkT7pwLkGfwJo4zjcN/Tysno=
-github.com/nudgebee/logparser v0.0.0-20241210103204-01cbfd2652bb h1:UFqBRIcFOHGJ/gj2AyRDectghFMIC5EAWGMB5WPcr80=
-github.com/nudgebee/logparser v0.0.0-20241210103204-01cbfd2652bb/go.mod h1:ddmUa8en2sToRL+bBvFkuS1AHvA6Msn56v3BpLMbKoc=
+github.com/nudgebee/logparser v0.0.0-20241210114706-d657df16b2f0 h1:x24xYWQASKdKYO1gZ1xN8H4qi7diVJt8YpksDxlo4Io=
+github.com/nudgebee/logparser v0.0.0-20241210114706-d657df16b2f0/go.mod h1:ddmUa8en2sToRL+bBvFkuS1AHvA6Msn56v3BpLMbKoc=
+github.com/nudgebee/logparser v0.0.0-20241210123812-8fe0178d3689 h1:LBk0wG+RohMGu6Ea1fRkzgK4Kfo+iaA0cp7M9ZYC/V8=
+github.com/nudgebee/logparser v0.0.0-20241210123812-8fe0178d3689/go.mod h1:ddmUa8en2sToRL+bBvFkuS1AHvA6Msn56v3BpLMbKoc=
 github.com/nxadm/tail v1.4.4/go.mod h1:kenIhsEOeOJmVchQTgglprH7qJGnHDVpk1VPCcaMI8A=
 github.com/oklog/ulid v1.3.1 h1:EGfNDEx6MqHz8B3uNV6QAib1UR2Lm97sHi3ocA6ESJ4=
 github.com/oklog/ulid v1.3.1/go.mod h1:CirwcVhetQ6Lv90oh/F+FBtV6XMibvdAFo93nm5qn4U=
