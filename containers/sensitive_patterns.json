@@ -1,0 +1,7 @@
+[
+    {
+        "name": "AWS",
+        "pattern": "\\b((?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16})\\b"
+    }
+    
+]
