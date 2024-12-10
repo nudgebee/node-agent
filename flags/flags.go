@@ -37,13 +37,14 @@ var (
 	LogsEndpoint      = kingpin.Flag("logs-endpoint", "The URL of the endpoint to send logs to").Envar("LOGS_ENDPOINT").URL()
 	ProfilesEndpoint  = kingpin.Flag("profiles-endpoint", "The URL of the endpoint to send profiles to").Envar("PROFILES_ENDPOINT").URL()
 
-	ScrapeInterval     = kingpin.Flag("scrape-interval", "How often to gather metrics from the agent").Default("15s").Envar("SCRAPE_INTERVAL").Duration()
-	WalDir             = kingpin.Flag("wal-dir", "Path to where the agent stores data (e.g. the metrics Write-Ahead Log)").Default("/tmp/coroot-node-agent").Envar("WAL_DIR").String()
-	ResolveDns         = kingpin.Flag("resolve-dns", "should resolve DNS").Default("false").Envar("RESOLVE_DNS").Bool()
-	IgnoreControlPlane = kingpin.Flag("ignore-control-plane", "ignore control plane like loki").Default("karpenter,loki,prometheus,grafana,kubelet,etcd,apiserver,victoria,nudgebee-agent,kube-system").Envar("IGNORE_CONTROL_PLANE").String()
-	SanitizeHeaders    = kingpin.Flag("sanitize-headers", "should sanitize headers").Default("true").Envar("SANITIZE_HEADERS").Bool()
-	SensitiveHeader    = kingpin.Flag("sensitive-headers", "sanitize headers using patterns").Default("Authorization, Cookie, X-Action-Token").Envar("SENSITIVE_HEADERS").String()
-	DisableKubeProbe   = kingpin.Flag("disable-kube-probe", "disable kube probe trace").Default("true").Envar("DISABLE_KUBE_PROBE").Bool()
+	ScrapeInterval             = kingpin.Flag("scrape-interval", "How often to gather metrics from the agent").Default("15s").Envar("SCRAPE_INTERVAL").Duration()
+	WalDir                     = kingpin.Flag("wal-dir", "Path to where the agent stores data (e.g. the metrics Write-Ahead Log)").Default("/tmp/coroot-node-agent").Envar("WAL_DIR").String()
+	ResolveDns                 = kingpin.Flag("resolve-dns", "should resolve DNS").Default("false").Envar("RESOLVE_DNS").Bool()
+	IgnoreControlPlane         = kingpin.Flag("ignore-control-plane", "ignore control plane like loki").Default("karpenter,loki,prometheus,grafana,kubelet,etcd,apiserver,victoria,nudgebee-agent,kube-system").Envar("IGNORE_CONTROL_PLANE").String()
+	SanitizeHeaders            = kingpin.Flag("sanitize-headers", "should sanitize headers").Default("true").Envar("SANITIZE_HEADERS").Bool()
+	SensitiveHeader            = kingpin.Flag("sensitive-headers", "sanitize headers using patterns").Default("Authorization, Cookie, X-Action-Token").Envar("SENSITIVE_HEADERS").String()
+	DisableKubeProbe           = kingpin.Flag("disable-kube-probe", "disable kube probe trace").Default("true").Envar("DISABLE_KUBE_PROBE").Bool()
+	DisableSensitiveLogParsing = kingpin.Flag("disable-sensitive-log-parsing", "disable sensitive log parsing").Default("false").Envar("DISABLE_SENSITIVE_LOG_PARSING").Bool()
 )
 
 func GetString(fl *string) string {
