@@ -10,7 +10,6 @@ require (
 	github.com/containerd/cgroups v1.0.4
 	github.com/containerd/containerd v1.6.26
 	github.com/coreos/go-systemd/v22 v22.5.0
-	github.com/coroot/logparser v1.1.5
 	github.com/docker/docker v25.0.6+incompatible
 	github.com/florianl/go-conntrack v0.3.0
 	github.com/go-kit/log v0.2.1
@@ -20,6 +19,7 @@ require (
 	github.com/hashicorp/golang-lru/v2 v2.0.5
 	github.com/jpillora/backoff v1.0.0
 	github.com/mdlayher/taskstats v0.0.0-20230712191918-387b3d561d14
+	github.com/nudgebee/logparser v0.0.0-20241210131312-b84406d6088f
 	github.com/opencontainers/runtime-spec v1.0.3-0.20210326190908-1c3f411f0417
 	github.com/prometheus/client_golang v1.18.0
 	github.com/prometheus/common v0.46.0
@@ -43,6 +43,7 @@ require (
 	golang.org/x/time v0.5.0
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
 	gopkg.in/yaml.v2 v2.4.0
+	gotest.tools v2.2.0+incompatible
 	inet.af/netaddr v0.0.0-20230525184311-b8eac61e914a
 	k8s.io/api v0.28.6
 	k8s.io/apimachinery v0.28.6

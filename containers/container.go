@@ -20,7 +20,7 @@ import (
 	"github.com/coroot/coroot-node-agent/pinger"
 	"github.com/coroot/coroot-node-agent/proc"
 	"github.com/coroot/coroot-node-agent/tracing"
-	"github.com/coroot/logparser"
+	"github.com/nudgebee/logparser"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vishvananda/netns"
 	"inet.af/netaddr"
@@ -368,6 +368,10 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 			if c.Level == logparser.LevelCritical || c.Level == logparser.LevelError {
 				ch <- counter(metrics.LogMessages, float64(c.Messages), source, c.Level.String(), c.Hash, c.Sample)
 			}
+		}
+		for _, c := range p.parser.GetSensitiveCounters() {
+			log.Printf("sensitive log message: %s", c.Pattern)
+			ch <- counter(metrics.SensitiveLogMessages, float64(c.Messages), source, c.Pattern, c.Sample)
 		}
 	}
 
@@ -1057,13 +1061,14 @@ func (c *Container) runLogParser(logPath string) {
 			return
 		}
 		ch := make(chan logparser.LogEntry)
-		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId))
+		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), *flags.DisableSensitiveLogParsing)
 		reader, err := logs.NewTailReader(proc.HostPath(logPath), ch)
 		if err != nil {
 			klog.Warningln(err)
 			parser.Stop()
 			return
 		}
+		klog.InfoS("started logparser for container", c.id, "log", logPath)
 		klog.InfoS("started varlog logparser", "cg", c.cgroup.Id, "log", logPath)
 		c.logParsers[logPath] = &LogParser{parser: parser, stop: reader.Stop}
 		return
@@ -1076,10 +1081,11 @@ func (c *Container) runLogParser(logPath string) {
 			klog.Warningln(err)
 			return
 		}
-		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId))
+		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), *flags.DisableSensitiveLogParsing)
 		stop := func() {
 			JournaldUnsubscribe(c.cgroup)
 		}
+		klog.InfoS("started logparser for container", c.id)
 		klog.InfoS("started journald logparser", "cg", c.cgroup.Id)
 		c.logParsers["journald"] = &LogParser{parser: parser, stop: stop}
 
@@ -1092,13 +1098,14 @@ func (c *Container) runLogParser(logPath string) {
 			delete(c.logParsers, "stdout/stderr")
 		}
 		ch := make(chan logparser.LogEntry)
-		parser := logparser.NewParser(ch, c.metadata.logDecoder, logs.OtelLogEmitter(containerId))
+		parser := logparser.NewParser(ch, c.metadata.logDecoder, logs.OtelLogEmitter(containerId), *flags.DisableSensitiveLogParsing)
 		reader, err := logs.NewTailReader(proc.HostPath(c.metadata.logPath), ch)
 		if err != nil {
 			klog.Warningln(err)
 			parser.Stop()
 			return
 		}
+		klog.InfoS("started logparser for container", c.id, "log", c.metadata.logPath)
 		klog.InfoS("started container logparser", "cg", c.cgroup.Id)
 		c.logParsers["stdout/stderr"] = &LogParser{parser: parser, stop: reader.Stop}
 	}

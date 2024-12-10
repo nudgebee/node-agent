@@ -10,8 +10,8 @@ import (
 
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/proc"
-	"github.com/coroot/logparser"
 	"github.com/docker/docker/client"
+	"github.com/nudgebee/logparser"
 	"github.com/vishvananda/netns"
 	"inet.af/netaddr"
 )

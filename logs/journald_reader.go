@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/coreos/go-systemd/v22/sdjournal"
-	"github.com/coroot/logparser"
+	"github.com/nudgebee/logparser"
 	"k8s.io/klog/v2"
 )
 
