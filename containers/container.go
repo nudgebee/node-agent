@@ -370,8 +370,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 			}
 		}
 		for _, c := range p.parser.GetSensitiveCounters() {
-			log.Printf("sensitive log message: %s", c.Pattern)
-			ch <- counter(metrics.SensitiveLogMessages, float64(c.Messages), source, c.Pattern, c.Sample)
+			ch <- counter(metrics.SensitiveLogMessages, float64(c.Messages), source, c.Pattern, c.Sample, c.Regex, c.Name)
 		}
 	}
 
