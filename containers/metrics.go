@@ -88,7 +88,7 @@ var metrics = struct {
 	NetBytesReceived:         metric("container_net_tcp_bytes_received_total", "Total number of bytes received from the peer", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
 
 	LogMessages:          metric("container_log_messages_total", "Number of messages grouped by the automatically extracted repeated pattern", "source", "level", "pattern_hash", "sample"),
-	SensitiveLogMessages: metric("container_sensitive_log_messages_total", "Number of messages that contain sensitive information", "source", "pattern", "sample", "regex", "name"),
+	SensitiveLogMessages: metric("container_sensitive_log_messages_total", "Number of messages that contain sensitive information", "source", "pattern", "sample", "regex", "name", "pattern_hash"),
 
 	ApplicationType: metric("container_application_type", "Type of the application running in the container (e.g. memcached, postgres, mysql)", "application_type"),
 
