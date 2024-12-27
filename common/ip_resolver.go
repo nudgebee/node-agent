@@ -9,36 +9,31 @@ import (
 	"sync"
 	"time"
 
-	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/klog/v2"
 
 	lrucache "github.com/hashicorp/golang-lru/v2"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	"k8s.io/api/batch/v1beta1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-const MAX_RESOLVED_DNS = 10000
-const MAX_PODS = 20000
-
-var reregisterWatchSleepDuration = 1 * time.Second
-
-var (
-	watchEventsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "nudgbee_watcher_events_count",
-	}, []string{"object_type"})
-	watchResetsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "nudgebee_watcher_resets_count",
-	}, []string{"object_type"})
-)
+const MAX_RESOLVED_DNS = 10000 // arbitrary limit
+const MAX_PODS_LIMIT = 30000   // arbitrary limit
 
 type clusterSnapshot struct {
 	Pods           sync.Map // map[types.UID]v1.Pod
 	Nodes          sync.Map // map[types.UID]v1.Node
+	ReplicaSets    sync.Map // map[types.UID]appsv1.ReplicaSet
+	DaemonSets     sync.Map // map[types.UID]appsv1.DaemonSet
+	StatefulSets   sync.Map // map[types.UID]appsv1.StatefulSet
+	Jobs           sync.Map // map[types.UID]batchv1.Job
+	Services       sync.Map // map[types.UID]v1.Service
+	Deployments    sync.Map // map[types.UID]appsv1.Deployment
+	CronJobs       sync.Map // map[types.UID]batchv1.CronJob or batchv1beta.CronJob
 	PodDescriptors sync.Map // map[types.UID]Workload
 }
 
@@ -46,7 +41,7 @@ type K8sIPResolver struct {
 	clientset        kubernetes.Interface
 	snapshot         clusterSnapshot
 	ipsMap           sync.Map
-	stopSignal       chan bool
+	stopSignal       chan struct{}
 	shouldResolveDns bool
 	dnsResolvedIps   *lrucache.Cache[string, string]
 	podIpsMap        *lrucache.Cache[string, Workload]
@@ -79,7 +74,8 @@ func NewK8sIPResolver(clientset kubernetes.Interface, resolveDns bool) (*K8sIPRe
 	} else {
 		dnsCache = nil
 	}
-	podsCache, err := lrucache.New[string, Workload](MAX_RESOLVED_DNS)
+	var podCache *lrucache.Cache[string, Workload]
+	podCache, err := lrucache.New[string, Workload](MAX_PODS_LIMIT)
 	if err != nil {
 		return nil, err
 	}
@@ -88,10 +84,10 @@ func NewK8sIPResolver(clientset kubernetes.Interface, resolveDns bool) (*K8sIPRe
 		clientset:        clientset,
 		snapshot:         clusterSnapshot{},
 		ipsMap:           sync.Map{},
-		stopSignal:       make(chan bool),
+		stopSignal:       make(chan struct{}),
 		shouldResolveDns: resolveDns,
 		dnsResolvedIps:   dnsCache,
-		podIpsMap:        podsCache,
+		podIpsMap:        podCache,
 		instanceMetaMap:  sync.Map{},
 	}, nil
 }
@@ -173,119 +169,155 @@ func (resolver *K8sIPResolver) CacheDNS(ip string, dns string) Workload {
 }
 
 func (resolver *K8sIPResolver) StartWatching() error {
-	// register watchers
-	podsWatcher, err := resolver.clientset.CoreV1().Pods("").Watch(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("error watching pods changes - %v", err)
-	}
-
-	nodesWatcher, err := resolver.clientset.CoreV1().Nodes().Watch(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("error watching nodes changes - %v", err)
-	}
-
-	replicasetsWatcher, err := resolver.clientset.AppsV1().ReplicaSets("").Watch(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("error watching replicasets changes - %v", err)
-	}
-
-	daemonsetsWatcher, err := resolver.clientset.AppsV1().DaemonSets("").Watch(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("error watching daemonsets changes - %v", err)
-	}
-
-	statefulsetsWatcher, err := resolver.clientset.AppsV1().StatefulSets("").Watch(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("error watching statefulsets changes - %v", err)
-	}
-
-	jobsWatcher, err := resolver.clientset.BatchV1().Jobs("").Watch(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("error watching jobs changes - %v", err)
-	}
-
-	servicesWatcher, err := resolver.clientset.CoreV1().Services("").Watch(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("error watching services changes - %v", err)
-	}
-
-	deploymentsWatcher, err := resolver.clientset.AppsV1().Deployments("").Watch(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("error watching deployments changes - %v", err)
-	}
-
-	cronJobsWatcher, err := resolver.startCronjobWatcher()
-	if err != nil {
-		klog.Errorf("failed to init watcher %v", err)
-		return fmt.Errorf("error watching cronjobs changes - %v", err)
-	}
-	log.Printf("registered IP watcher")
-	// invoke a watching function
-	go func() {
-		for {
-			select {
-			case <-resolver.stopSignal:
-				podsWatcher.Stop()
-				nodesWatcher.Stop()
-				replicasetsWatcher.Stop()
-				daemonsetsWatcher.Stop()
-				statefulsetsWatcher.Stop()
-				jobsWatcher.Stop()
-				servicesWatcher.Stop()
-				deploymentsWatcher.Stop()
-				cronJobsWatcher.Stop()
-				return
-			case podEvent, ok := <-podsWatcher.ResultChan():
-				{
-
-					if !ok {
-						watchResetsCounter.WithLabelValues("pod").Inc()
-						podsWatcher, err = resolver.clientset.CoreV1().Pods("").Watch(context.Background(), metav1.ListOptions{})
-						if err != nil {
-							time.Sleep(reregisterWatchSleepDuration)
-						}
-						continue
-					}
-					watchEventsCounter.WithLabelValues("pod").Inc()
-					resolver.handlePodWatchEvent(&podEvent)
-				}
-			case nodeEvent, ok := <-nodesWatcher.ResultChan():
-				{
-					if !ok {
-						watchResetsCounter.WithLabelValues("node").Inc()
-						nodesWatcher, err = resolver.clientset.CoreV1().Nodes().Watch(context.Background(), metav1.ListOptions{})
-						if err != nil {
-							time.Sleep(reregisterWatchSleepDuration)
-						}
-						continue
-					}
-					watchEventsCounter.WithLabelValues("node").Inc()
-					resolver.handleNodeWatchEvent(&nodeEvent)
-				}
-			}
-		}
-	}()
-
-	// get initial state
-	err = resolver.getResolvedClusterSnapshot()
-	if err != nil {
-		resolver.StopWatching()
-		return fmt.Errorf("error retrieving cluster's initial state: %v", err)
-	}
-
-	return nil
-}
-
-func (resolver *K8sIPResolver) StartWatchingV2(ip string, entry *Workload) {
-
 	factory := informers.NewSharedInformerFactory(resolver.clientset, time.Minute*10)
 	// Define individual informers
 	podInformer := factory.Core().V1().Pods().Informer()
 	nodeInformer := factory.Core().V1().Nodes().Informer()
+	replicaSetInformer := factory.Apps().V1().ReplicaSets().Informer()
+	daemonSetInformer := factory.Apps().V1().DaemonSets().Informer()
+	statefulSetInformer := factory.Apps().V1().StatefulSets().Informer()
+	jobInformer := factory.Batch().V1().Jobs().Informer()
+	serviceInformer := factory.Core().V1().Services().Informer()
+	deploymentInformer := factory.Apps().V1().Deployments().Informer()
 
 	resolver.addPodHandlers(podInformer)
 	resolver.addNodeHandlers(nodeInformer)
+	resolver.addReplicaSetHandlers(replicaSetInformer)
+	resolver.addDaemonSetHandlers(daemonSetInformer)
+	resolver.addStatefulSetHandlers(statefulSetInformer)
+	resolver.addJobHandlers(jobInformer)
+	resolver.addServiceHandlers(serviceInformer)
+	resolver.addDeploymentHandlers(deploymentInformer)
+
+	// get initial state
+	err := resolver.getResolvedClusterSnapshot()
+	if err != nil {
+		return fmt.Errorf("error retrieving cluster's initial state: %v", err)
+	}
+	factory.Start(resolver.stopSignal) // runs in background
+	return nil
 }
+
+func (resolve *K8sIPResolver) addReplicaSetHandlers(replicaSetInformer cache.SharedIndexInformer) {
+	replicaSetInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			replicaSet := obj.(*appsv1.ReplicaSet)
+			log.Printf("ReplicaSet added: %s/%s", replicaSet.Namespace, replicaSet.Name)
+			resolve.snapshot.ReplicaSets.Store(replicaSet.UID, *replicaSet)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			replicaSet := newObj.(*appsv1.ReplicaSet)
+			log.Printf("ReplicaSet updated: %s/%s", replicaSet.Namespace, replicaSet.Name)
+			resolve.snapshot.ReplicaSets.Store(replicaSet.UID, *replicaSet)
+		},
+		DeleteFunc: func(obj interface{}) {
+			replicaSet := obj.(*appsv1.ReplicaSet)
+			log.Printf("ReplicaSet deleted: %s/%s", replicaSet.Namespace, replicaSet.Name)
+			resolve.snapshot.ReplicaSets.Delete(replicaSet.UID)
+		},
+	})
+}
+
+func (resolve *K8sIPResolver) addDaemonSetHandlers(daemonSetInformer cache.SharedIndexInformer) {
+	daemonSetInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			daemonSet := obj.(*appsv1.DaemonSet)
+			log.Printf("DaemonSet added: %s/%s", daemonSet.Namespace, daemonSet.Name)
+			resolve.snapshot.DaemonSets.Store(daemonSet.UID, *daemonSet)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			daemonSet := newObj.(*appsv1.DaemonSet)
+			log.Printf("DaemonSet updated: %s/%s", daemonSet.Namespace, daemonSet.Name)
+			resolve.snapshot.DaemonSets.Store(daemonSet.UID, *daemonSet)
+		},
+		DeleteFunc: func(obj interface{}) {
+			daemonSet := obj.(*appsv1.DaemonSet)
+			log.Printf("DaemonSet deleted: %s/%s", daemonSet.Namespace, daemonSet.Name)
+			resolve.snapshot.DaemonSets.Delete(daemonSet.UID)
+		},
+	})
+}
+
+func (resolve *K8sIPResolver) addStatefulSetHandlers(statefulSetInformer cache.SharedIndexInformer) {
+	statefulSetInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			statefulSet := obj.(*appsv1.StatefulSet)
+			log.Printf("StatefulSet added: %s/%s", statefulSet.Namespace, statefulSet.Name)
+			resolve.snapshot.StatefulSets.Store(statefulSet.UID, *statefulSet)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			statefulSet := newObj.(*appsv1.StatefulSet)
+			log.Printf("StatefulSet updated: %s/%s", statefulSet.Namespace, statefulSet.Name)
+			resolve.snapshot.StatefulSets.Store(statefulSet.UID, *statefulSet)
+		},
+		DeleteFunc: func(obj interface{}) {
+			statefulSet := obj.(*appsv1.StatefulSet)
+			log.Printf("StatefulSet deleted: %s/%s", statefulSet.Namespace, statefulSet.Name)
+			resolve.snapshot.StatefulSets.Delete(statefulSet.UID)
+		},
+	})
+}
+
+func (resolve *K8sIPResolver) addJobHandlers(jobInformer cache.SharedIndexInformer) {
+	jobInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			job := obj.(*batchv1.Job)
+			log.Printf("Job added: %s/%s", job.Namespace, job.Name)
+			resolve.snapshot.Jobs.Store(job.UID, *job)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			job := newObj.(*batchv1.Job)
+			log.Printf("Job updated: %s/%s", job.Namespace, job.Name)
+			resolve.snapshot.Jobs.Store(job.UID, *job)
+		},
+		DeleteFunc: func(obj interface{}) {
+			job := obj.(*batchv1.Job)
+			log.Printf("Job deleted: %s/%s", job.Namespace, job.Name)
+			resolve.snapshot.Jobs.Delete(job.UID)
+		},
+	})
+}
+
+func (resolve *K8sIPResolver) addServiceHandlers(serviceInformer cache.SharedIndexInformer) {
+	serviceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			service := obj.(*v1.Service)
+			log.Printf("Service added: %s/%s", service.Namespace, service.Name)
+			resolve.snapshot.Services.Store(service.UID, *service)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			service := newObj.(*v1.Service)
+			log.Printf("Service updated: %s/%s", service.Namespace, service.Name)
+			resolve.snapshot.Services.Store(service.UID, *service)
+		},
+		DeleteFunc: func(obj interface{}) {
+			service := obj.(*v1.Service)
+			log.Printf("Service deleted: %s/%s", service.Namespace, service.Name)
+			resolve.snapshot.Services.Delete(service.UID)
+		},
+	})
+}
+
+func (resolve *K8sIPResolver) addDeploymentHandlers(deploymentInformer cache.SharedIndexInformer) {
+	deploymentInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			deployment := obj.(*appsv1.Deployment)
+			log.Printf("Deployment added: %s/%s", deployment.Namespace, deployment.Name)
+			resolve.snapshot.Deployments.Store(deployment.UID, *deployment)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			deployment := newObj.(*appsv1.Deployment)
+			log.Printf("Deployment updated: %s/%s", deployment.Namespace, deployment.Name)
+			resolve.snapshot.Deployments.Store(deployment.UID, *deployment)
+		},
+		DeleteFunc: func(obj interface{}) {
+			deployment := obj.(*appsv1.Deployment)
+			log.Printf("Deployment deleted: %s/%s", deployment.Namespace, deployment.Name)
+			resolve.snapshot.Deployments.Delete(deployment.UID)
+		},
+	})
+}
+
 func (resolver *K8sIPResolver) addPodHandlers(podInformer cache.SharedIndexInformer) {
 	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
@@ -308,59 +340,6 @@ func (resolver *K8sIPResolver) addPodHandlers(podInformer cache.SharedIndexInfor
 			}
 		},
 	})
-}
-
-func (resolver *K8sIPResolver) addNodeHandlers(nodeInformer cache.SharedIndexInformer) {
-	nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			node := obj.(*v1.Node)
-			shouldReturn := resolver.handleNodeEvent(node)
-			if shouldReturn {
-				return
-			}
-		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			node := newObj.(*v1.Node)
-			shouldReturn := resolver.handleNodeEvent(node)
-			if shouldReturn {
-				return
-			}
-		},
-		DeleteFunc: func(obj interface{}) {
-			node := obj.(*v1.Node)
-			resolver.snapshot.Nodes.Delete(node.UID)
-			resolver.instanceMetaMap.Delete(node.Name)
-		},
-	})
-}
-
-func (resolver *K8sIPResolver) startCronjobWatcher() (watch.Interface, error) {
-	cronJobsWatcher, err := resolver.clientset.BatchV1().CronJobs("").Watch(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return resolver.clientset.BatchV1beta1().CronJobs("").Watch(context.Background(), metav1.ListOptions{})
-	}
-
-	return cronJobsWatcher, nil
-}
-
-func (resolver *K8sIPResolver) StopWatching() {
-	resolver.stopSignal <- true
-}
-
-func (resolver *K8sIPResolver) handlePodWatchEvent(podEvent *watch.Event) {
-	switch podEvent.Type {
-	case watch.Added, watch.Modified:
-		pod, ok := podEvent.Object.(*v1.Pod)
-		if !ok {
-			return
-		}
-		resolver.handlePodAdd(pod)
-	case watch.Deleted:
-		if val, ok := podEvent.Object.(*v1.Pod); ok {
-			resolver.snapshot.Pods.Delete(val.UID)
-			resolver.snapshot.PodDescriptors.Delete(val.UID)
-		}
-	}
 }
 
 func (resolver *K8sIPResolver) handlePodAdd(pod *v1.Pod) bool {
@@ -393,24 +372,28 @@ func (resolver *K8sIPResolver) handlePodAdd(pod *v1.Pod) bool {
 	return false
 }
 
-func (resolver *K8sIPResolver) handleNodeWatchEvent(nodeEvent *watch.Event) {
-	switch nodeEvent.Type {
-	case watch.Added, watch.Modified:
-		// extract region and zone from attributes
-		node, ok := nodeEvent.Object.(*v1.Node)
-		if !ok {
-			return
-		}
-		shouldReturn := resolver.handleNodeEvent(node)
-		if shouldReturn {
-			return
-		}
-	case watch.Deleted:
-		if val, ok := nodeEvent.Object.(*v1.Node); ok {
-			resolver.snapshot.Nodes.Delete(val.UID)
-			resolver.instanceMetaMap.Delete(val.Name)
-		}
-	}
+func (resolver *K8sIPResolver) addNodeHandlers(nodeInformer cache.SharedIndexInformer) {
+	nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			node := obj.(*v1.Node)
+			shouldReturn := resolver.handleNodeEvent(node)
+			if shouldReturn {
+				return
+			}
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			node := newObj.(*v1.Node)
+			shouldReturn := resolver.handleNodeEvent(node)
+			if shouldReturn {
+				return
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			node := obj.(*v1.Node)
+			resolver.snapshot.Nodes.Delete(node.UID)
+			resolver.instanceMetaMap.Delete(node.Name)
+		},
+	})
 }
 
 func (resolver *K8sIPResolver) handleNodeEvent(node *v1.Node) bool {
@@ -474,12 +457,104 @@ func (resolver *K8sIPResolver) getFullClusterSnapshot() error {
 		resolver.instanceMetaMap.Store(node.Name, meta)
 		resolver.snapshot.Nodes.Store(node.UID, node)
 	}
+
+	replicasets, err := resolver.clientset.AppsV1().ReplicaSets("").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return errors.New("error getting replicasets, aborting snapshot update")
+	}
+	for _, rs := range replicasets.Items {
+		resolver.snapshot.ReplicaSets.Store(rs.ObjectMeta.UID, rs)
+	}
+
+	daemonsets, err := resolver.clientset.AppsV1().DaemonSets("").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return errors.New("error getting daemonsets, aborting snapshot update")
+	}
+	for _, ds := range daemonsets.Items {
+		resolver.snapshot.DaemonSets.Store(ds.ObjectMeta.UID, ds)
+	}
+
+	statefulsets, err := resolver.clientset.AppsV1().StatefulSets("").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return errors.New("error getting statefulsets, aborting snapshot update")
+	}
+	for _, ss := range statefulsets.Items {
+		resolver.snapshot.StatefulSets.Store(ss.ObjectMeta.UID, ss)
+	}
+
+	jobs, err := resolver.clientset.BatchV1().Jobs("").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return errors.New("error getting jobs, aborting snapshot update")
+	}
+	for _, job := range jobs.Items {
+		resolver.snapshot.Jobs.Store(job.ObjectMeta.UID, job)
+	}
+
+	services, err := resolver.clientset.CoreV1().Services("").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return errors.New("error getting services, aborting snapshot update")
+	}
+	for _, service := range services.Items {
+		resolver.snapshot.Services.Store(service.UID, service)
+	}
+
+	deployments, err := resolver.clientset.AppsV1().Deployments("").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return errors.New("error getting deployments, aborting snapshot update")
+	}
+	for _, deployment := range deployments.Items {
+		resolver.snapshot.Deployments.Store(deployment.UID, deployment)
+	}
+
+	cronJobs, err := resolver.clientset.BatchV1().CronJobs("").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		cronJobs, err := resolver.clientset.BatchV1beta1().CronJobs("").List(context.Background(), metav1.ListOptions{})
+		if err != nil {
+			return errors.New("error getting cronjobs, aborting snapshot update")
+		}
+		for _, cronJob := range cronJobs.Items {
+			resolver.snapshot.CronJobs.Store(cronJob.UID, cronJob)
+		}
+	}
+	for _, cronJob := range cronJobs.Items {
+		resolver.snapshot.CronJobs.Store(cronJob.UID, cronJob)
+	}
+
 	return nil
 }
 
 // add mapping from ip to resolved host to an existing map,
 // based on the given cluster snapshot
 func (resolver *K8sIPResolver) updateIpMapping() {
+	// because IP collisions may occur and lead to overwrites in the map, the order is important
+	// we go from less "favorable" to more "favorable" -
+	// services -> running pods -> nodes
+
+	resolver.snapshot.Services.Range(func(key any, val any) bool {
+		service, ok := val.(v1.Service)
+		if !ok {
+			log.Printf("Type confusion in services map")
+			return true // continue
+		}
+		// services has (potentially multiple) ClusterIP
+		workload := Workload{
+			Name:      service.Name,
+			Namespace: service.Namespace,
+			Kind:      "Service",
+			Zone:      "",
+			Region:    "",
+			Instance:  "",
+		}
+
+		// TODO maybe try to match service to workload
+		for _, clusterIp := range service.Spec.ClusterIPs {
+			if clusterIp != "None" {
+				resolver.storeWorkloadsIP(clusterIp, &workload)
+			}
+		}
+		return true
+	})
+
 	resolver.snapshot.Nodes.Range(func(key any, value any) bool {
 		node, ok := value.(v1.Node)
 		if !ok {
@@ -565,6 +640,79 @@ func (resolver *K8sIPResolver) storePodsIP(ip string, newWorkload *Workload) {
 	resolver.podIpsMap.Add(ip, *newWorkload)
 }
 
+// an ugly function to go up one level in hierarchy. maybe there's a better way to do it
+// the snapshot is maintained to avoid using an API request for each resolving
+func (resolver *K8sIPResolver) getControllerOfOwner(originalOwner *metav1.OwnerReference) (*metav1.OwnerReference, error) {
+	switch originalOwner.Kind {
+	case "ReplicaSet":
+		replicaSetVal, ok := resolver.snapshot.ReplicaSets.Load(originalOwner.UID)
+		if !ok {
+			return nil, errors.New("Missing replicaset for UID " + string(originalOwner.UID))
+		}
+		replicaSet, ok := replicaSetVal.(appsv1.ReplicaSet)
+		if !ok {
+			return nil, errors.New("type confusion in replicasets map")
+		}
+		return metav1.GetControllerOf(&replicaSet), nil
+	case "DaemonSet":
+		daemonSetVal, ok := resolver.snapshot.DaemonSets.Load(originalOwner.UID)
+		if !ok {
+			return nil, errors.New("Missing daemonset for UID " + string(originalOwner.UID))
+		}
+		daemonSet, ok := daemonSetVal.(appsv1.DaemonSet)
+		if !ok {
+			return nil, errors.New("type confusion in daemonsets map")
+		}
+		return metav1.GetControllerOf(&daemonSet), nil
+	case "StatefulSet":
+		statefulSetVal, ok := resolver.snapshot.StatefulSets.Load(originalOwner.UID)
+		if !ok {
+			return nil, errors.New("Missing statefulset for UID " + string(originalOwner.UID))
+		}
+		statefulSet, ok := statefulSetVal.(appsv1.StatefulSet)
+		if !ok {
+			return nil, errors.New("type confusion in statefulsets map")
+		}
+		return metav1.GetControllerOf(&statefulSet), nil
+	case "Job":
+		jobVal, ok := resolver.snapshot.Jobs.Load(originalOwner.UID)
+		if !ok {
+			return nil, errors.New("Missing job for UID " + string(originalOwner.UID))
+		}
+		job, ok := jobVal.(batchv1.Job)
+		if !ok {
+			return nil, errors.New("type confusion in jobs map")
+		}
+		return metav1.GetControllerOf(&job), nil
+	case "Deployment":
+		deploymentVal, ok := resolver.snapshot.Deployments.Load(originalOwner.UID)
+		if !ok {
+			return nil, errors.New("Missing deployment for UID " + string(originalOwner.UID))
+		}
+		deployment, ok := deploymentVal.(appsv1.Deployment)
+		if !ok {
+			return nil, errors.New("type confusion in deployments map")
+		}
+		return metav1.GetControllerOf(&deployment), nil
+	case "CronJob":
+		cronJobVal, ok := resolver.snapshot.CronJobs.Load(originalOwner.UID)
+		if !ok {
+			return nil, errors.New("Missing cronjob for UID " + string(originalOwner.UID))
+		}
+		cronJob, ok := cronJobVal.(batchv1.CronJob)
+		if !ok {
+			cronJob, ok := cronJobVal.(v1beta1.CronJob)
+			if !ok {
+				return nil, errors.New("type confusion in cronjobs map")
+			}
+			return metav1.GetControllerOf(&cronJob), nil
+		}
+
+		return metav1.GetControllerOf(&cronJob), nil
+	}
+	return nil, errors.New("Unsupported kind for lookup - " + originalOwner.Kind)
+}
+
 func (resolver *K8sIPResolver) resolvePodDescriptor(pod *v1.Pod) Workload {
 	existing, ok := resolver.snapshot.PodDescriptors.Load(pod.UID)
 	if ok {
@@ -577,6 +725,17 @@ func (resolver *K8sIPResolver) resolvePodDescriptor(pod *v1.Pod) Workload {
 	name := pod.Name
 	namespace := pod.Namespace
 	kind := "pod"
+	owner := metav1.GetControllerOf(pod)
+	// climbing up the owners' hierarchy. if an error occurs, we take the data we got and save
+	// the error to know we shouldn't save this resolution to the descriptors map and retry later.
+	for owner != nil {
+		name = owner.Name
+		kind = owner.Kind
+		owner, err = resolver.getControllerOfOwner(owner)
+		if err != nil {
+			log.Printf("Warning: couldn't retrieve owner of %v - %v. This might happen when starting up", name, err)
+		}
+	}
 	instanceMeta, ok := resolver.instanceMetaMap.Load(pod.Spec.NodeName)
 	region := ""
 	zone := ""

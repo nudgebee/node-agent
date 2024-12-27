@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"encoding/base64"
 
@@ -792,7 +793,13 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 				headers = base64.StdEncoding.EncodeToString([]byte(headersStr))
 			}
 			method = req.Method
-			uri = req.URL.Path
+			if utf8.ValidString(req.URL.Path) {
+				uri = req.URL.Path
+			} else {
+				// remove non-utf8 characters
+				klog.Warningf("Non-utf8 characters in uri %q", req.URL.Path)
+				uri = string([]rune(req.URL.Path))
+			}
 			host = req.Host
 		}
 		if dns, ok := iqfqdn[conn.Dest.IP()]; ok {
