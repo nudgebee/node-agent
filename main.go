@@ -6,8 +6,10 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"os/signal"
 	"runtime"
 	"strings"
+	"syscall"
 
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/containers"
@@ -137,12 +139,24 @@ func main() {
 	}
 	err = resolver.StartWatching()
 	if err != nil {
-		log.Fatalf("Error watching cluster's state: %v", err)
+		klog.Errorf("Error starting resolver: %v", err)
 	}
+	go func() {
+		sigChannel := make(chan os.Signal, 1)
+		defer close(sigChannel)
+
+		signal.Notify(sigChannel, os.Interrupt, syscall.SIGTERM)
+		<-sigChannel
+
+		klog.Infoln("Received signal, shutting down")
+		resolver.StopWatching()
+		os.Exit(0) // Ensure graceful termination
+	}()
 	hostname, kv, err := uname()
 	if err != nil {
 		klog.Exitln("failed to get uname:", err)
 	}
+
 	klog.Infoln("hostname:", hostname)
 	klog.Infoln("kernel version:", kv)
 

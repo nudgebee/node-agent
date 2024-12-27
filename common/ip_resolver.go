@@ -168,6 +168,10 @@ func (resolver *K8sIPResolver) CacheDNS(ip string, dns string) Workload {
 	}
 }
 
+func (resolver *K8sIPResolver) StopWatching() {
+	close(resolver.stopSignal)
+}
+
 func (resolver *K8sIPResolver) StartWatching() error {
 	factory := informers.NewSharedInformerFactory(resolver.clientset, time.Minute*10)
 	// Define individual informers
