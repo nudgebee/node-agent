@@ -79,9 +79,6 @@ func Init(machineId, hostname, version string) {
 		semconv.CloudRegion(region),
 		semconv.CloudAvailabilityZone(availabilityZone)}
 
-	region := ""
-	availabilityZone := ""
-	accountId := ""
 	if md == nil {
 		region = *flags.Region
 		availabilityZone = *flags.AvailabilityZone
@@ -118,7 +115,19 @@ func GetContainerTracer(containerId string) *Tracer {
 	return &Tracer{otel: provider.Tracer("nudgebee-node-agent", trace.WithInstrumentationVersion(agentVersion))}
 }
 
-func (t *Tracer) NewTrace(destination common.HostPort, srcWorkload *Workload, dstWorkload *Workload, actualDstWorkload *Workload) *Trace {
+func (t *Tracer) NewTrace(destination common.HostPort, srcWorkload *common.Workload, dstWorkload *common.Workload, actualDstWorkload *common.Workload) *Trace {
+	region := ""
+	zone := ""
+	node := ""
+	if actualDstWorkload.Zone != "" {
+		zone = actualDstWorkload.Zone
+	}
+	if actualDstWorkload.Region != "" {
+		region = actualDstWorkload.Region
+	}
+	if actualDstWorkload.Instance != "" {
+		node = actualDstWorkload.Instance
+	}
 	return &Trace{tracer: t, destination: destination, commonAttrs: []attribute.KeyValue{
 		semconv.NetPeerName(destination.Host()),
 		semconv.NetPeerPort(int(destination.Port())),
