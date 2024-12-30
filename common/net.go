@@ -242,3 +242,11 @@ func NormalizeFQDN(fqdn string, requestType string) string {
 	}
 	return fqdn
 }
+
+func (dk DestinationKey) GetDestinationWorkload() Workload {
+	return dk.destinationWorkload
+}
+
+func (dk DestinationKey) GetActualDestinationWorkload() Workload {
+	return dk.actualDestinationWorkload
+}

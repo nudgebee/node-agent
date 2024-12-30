@@ -73,22 +73,22 @@ func (p *LogParser) Stop() {
 }
 
 type ConnectionKey struct {
-	src netaddr.IPPort
-	dst netaddr.IPPort
+	src                netaddr.IPPort
+	dst                netaddr.IPPort
 	srcWorkload        common.Workload
 	dstWorkload        common.Workload
 	actualDestWorkload common.Workload
 }
 
 type ActiveConnection struct {
-	DestinationKey common.DestinationKey
+	DestinationKey     common.DestinationKey
 	srcWorkload        common.Workload
 	dstWorkload        common.Workload
 	actualDestWorkload common.Workload
-	Pid            uint32
-	Fd             uint64
-	Timestamp      uint64
-	Closed         time.Time
+	Pid                uint32
+	Fd                 uint64
+	Timestamp          uint64
+	Closed             time.Time
 
 	BytesSent     uint64
 	BytesReceived uint64
@@ -326,7 +326,9 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		connections[conn.DestinationKey]++
 	}
 	for d, count := range connections {
-		ch <- gauge(metrics.NetConnectionsActive, float64(count), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), d.)
+		actualDestWorkload := d.GetActualDestinationWorkload()
+		destWorkload := d.GetDestinationWorkload()
+		ch <- gauge(metrics.NetConnectionsActive, float64(count), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), destWorkload.Name, destWorkload.Namespace, destWorkload.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
 	}
 
 	for source, p := range c.logParsers {
@@ -599,10 +601,10 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 		stats.Count++
 		stats.TotalTime += duration
 		connection := &ActiveConnection{
-			DestinationKey: key,
-			Pid:            pid,
-			Fd:             fd,
-			Timestamp:      timestamp,
+			DestinationKey:     key,
+			Pid:                pid,
+			Fd:                 fd,
+			Timestamp:          timestamp,
 			srcWorkload:        srcWorkload,
 			dstWorkload:        dstWorkload,
 			actualDestWorkload: actualDestWorkload,
@@ -1055,7 +1057,7 @@ func (c *Container) runLogParser(logPath string) {
 			klog.Warningln(err)
 			return
 		}
-		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId),multilineCollectorTimeout, *flags.DisableSensitiveLogParsing)
+		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.DisableSensitiveLogParsing)
 		stop := func() {
 			JournaldUnsubscribe(c.cgroup)
 		}
