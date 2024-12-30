@@ -62,6 +62,27 @@ func TestNewFromProcessCgroupFile(t *testing.T) {
 	assert.Equal(t, "/system.slice/springboot.service", cg.ContainerId)
 	assert.Equal(t, ContainerTypeSystemdService, cg.ContainerType)
 
+	cg, err = NewFromProcessCgroupFile(path.Join("fixtures/proc/700/cgroup"))
+	assert.Nil(t, err)
+	assert.Equal(t, V2, cg.Version)
+	assert.Equal(t, "/podruntime/runtime", cg.Id)
+	assert.Equal(t, "/talos/runtime", cg.ContainerId)
+	assert.Equal(t, ContainerTypeTalosRuntime, cg.ContainerType)
+
+	cg, err = NewFromProcessCgroupFile(path.Join("fixtures/proc/800/cgroup"))
+	assert.Nil(t, err)
+	assert.Equal(t, V2, cg.Version)
+	assert.Equal(t, "/system.slice/docker-cf87ba651579c9231db817909e7865e5747bd7abcac0c57ce23cf4abbaee046b.scope", cg.Id)
+	assert.Equal(t, "cf87ba651579c9231db817909e7865e5747bd7abcac0c57ce23cf4abbaee046b", cg.ContainerId)
+	assert.Equal(t, ContainerTypeDocker, cg.ContainerType)
+
+	cg, err = NewFromProcessCgroupFile(path.Join("fixtures/proc/900/cgroup"))
+	assert.Nil(t, err)
+	assert.Equal(t, V1, cg.Version)
+	assert.Equal(t, "/system.slice/python-app.service", cg.Id)
+	assert.Equal(t, "/system.slice/python-app.service", cg.ContainerId)
+	assert.Equal(t, ContainerTypeSystemdService, cg.ContainerType)
+
 	baseCgroupPath = "/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-podc83d0428_58af_41eb_8dba_b9e6eddffe7b.slice/docker-0e612005fd07e7f47e2cd07df99a2b4e909446814d71d0b5e4efc7159dd51252.scope"
 	defer func() {
 		baseCgroupPath = ""
@@ -90,6 +111,11 @@ func TestContainerByCgroup(t *testing.T) {
 	typ, id, err = containerByCgroup("/kubepods/poda38c12e8-255a-11e9-8cd9-0007cb0b2cc8/32c562ed81a2622b37b80cb216859820ba51bd694f60ee4cf10d07a4011266f8")
 	as.Equal(typ, ContainerTypeDocker)
 	as.Equal("32c562ed81a2622b37b80cb216859820ba51bd694f60ee4cf10d07a4011266f8", id)
+	as.Nil(err)
+
+	typ, id, err = containerByCgroup("/docker/63425c4a8b4291744a79dd9011fddc7a1f8ffda61f65d72196aa01d00cae2e2d")
+	as.Equal(typ, ContainerTypeDocker)
+	as.Equal("63425c4a8b4291744a79dd9011fddc7a1f8ffda61f65d72196aa01d00cae2e2d", id)
 	as.Nil(err)
 
 	typ, id, err = containerByCgroup("/docker/63425c4a8b4291744a79dd9011fddc7a1f8ffda61f65d72196aa01d00cae2e2d")
@@ -135,5 +161,20 @@ func TestContainerByCgroup(t *testing.T) {
 	typ, id, err = containerByCgroup("/system.slice/containerd.service/kubepods-burstable-pod4ed02c0b_0df8_4d14_a30e_fd589ee4143a.slice:cri-containerd:d4a9f9195eaf7e4a729f24151101e1de61f1398677e7b82acfb936dff0b4ce55")
 	as.Equal(typ, ContainerTypeContainerd)
 	as.Equal("d4a9f9195eaf7e4a729f24151101e1de61f1398677e7b82acfb936dff0b4ce55", id)
+	as.Nil(err)
+
+	typ, id, err = containerByCgroup("/podruntime/kubelet")
+	as.Equal(typ, ContainerTypeTalosRuntime)
+	as.Equal("/talos/kubelet", id)
+	as.Nil(err)
+
+	typ, id, err = containerByCgroup("/system/dashboard")
+	as.Equal(typ, ContainerTypeTalosRuntime)
+	as.Equal("/talos/dashboard", id)
+	as.Nil(err)
+
+	typ, id, err = containerByCgroup("/init")
+	as.Equal(typ, ContainerTypeTalosRuntime)
+	as.Equal("/talos/init", id)
 	as.Nil(err)
 }

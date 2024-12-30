@@ -8,7 +8,6 @@ import (
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/prometheus/client_golang/prometheus"
-	"inet.af/netaddr"
 	"k8s.io/klog/v2"
 )
 
@@ -37,24 +36,23 @@ func (m *L7Metrics) observe(status, method string, duration time.Duration) {
 	}
 }
 
-type L7Stats map[l7.Protocol]map[AddrPair]*L7Metrics // protocol -> dst:actual_dst -> metrics
+type L7Stats map[l7.Protocol]map[common.DestinationKey]*L7Metrics // protocol -> dst:actual_dst -> metrics
 
-func (s L7Stats) get(protocol l7.Protocol, destination, actualDestination netaddr.IPPort, r *l7.RequestData, srcWorkload common.Workload, dstWorkload common.Workload, actualDstWorkload common.Workload) *L7Metrics {
+func (s L7Stats) get(protocol l7.Protocol, key common.DestinationKey, r *l7.RequestData, srcWorkload common.Workload, dstWorkload common.Workload, actualDstWorkload common.Workload) *L7Metrics {
 	if protocol == l7.ProtocolHTTP2 {
 		protocol = l7.ProtocolHTTP
 	}
 	protoStats := s[protocol]
 	if protoStats == nil {
-		protoStats = map[AddrPair]*L7Metrics{}
+		protoStats = map[common.DestinationKey]*L7Metrics{}
 		s[protocol] = protoStats
 	}
-	dest := AddrPair{src: destination, dst: actualDestination, srcWorkload: srcWorkload, dstWorkload: dstWorkload, actualDestWorkload: actualDstWorkload}
-	m := protoStats[dest]
+	m := protoStats[key]
 	if m == nil {
 		m = &L7Metrics{}
-		protoStats[dest] = m
-		constLabels := map[string]string{"destination": destination.String(),
-			"actual_destination":                    actualDestination.String(),
+		protoStats[key] = m
+		constLabels := map[string]string{"destination": key.DestinationLabelValue(),
+			"actual_destination":                    key.ActualDestinationLabelValue(),
 			"destination_workload_kind":             dstWorkload.Kind,
 			"destination_workload_name":             dstWorkload.Name,
 			"destination_workload_namespace":        dstWorkload.Namespace,
@@ -116,10 +114,10 @@ func (s L7Stats) collect(ch chan<- prometheus.Metric) {
 	}
 }
 
-func (s L7Stats) delete(dst netaddr.IPPort) {
+func (s L7Stats) delete(dst common.HostPort) {
 	for _, protoStats := range s {
 		for d := range protoStats {
-			if d.src == dst {
+			if d.Destination() == dst {
 				delete(protoStats, d)
 			}
 		}

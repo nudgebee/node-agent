@@ -8,19 +8,21 @@ import (
 type Protocol uint8
 
 const (
-	ProtocolHTTP      Protocol = 1
-	ProtocolPostgres  Protocol = 2
-	ProtocolRedis     Protocol = 3
-	ProtocolMemcached Protocol = 4
-	ProtocolMysql     Protocol = 5
-	ProtocolMongo     Protocol = 6
-	ProtocolKafka     Protocol = 7
-	ProtocolCassandra Protocol = 8
-	ProtocolRabbitmq  Protocol = 9
-	ProtocolNats      Protocol = 10
-	ProtocolHTTP2     Protocol = 11
-	ProtocolDubbo2    Protocol = 12
-	ProtocolDNS       Protocol = 13
+	ProtocolHTTP       Protocol = 1
+	ProtocolPostgres   Protocol = 2
+	ProtocolRedis      Protocol = 3
+	ProtocolMemcached  Protocol = 4
+	ProtocolMysql      Protocol = 5
+	ProtocolMongo      Protocol = 6
+	ProtocolKafka      Protocol = 7
+	ProtocolCassandra  Protocol = 8
+	ProtocolRabbitmq   Protocol = 9
+	ProtocolNats       Protocol = 10
+	ProtocolHTTP2      Protocol = 11
+	ProtocolDubbo2     Protocol = 12
+	ProtocolDNS        Protocol = 13
+	ProtocolClickhouse Protocol = 14
+	ProtocolZookeeper  Protocol = 15
 )
 
 func (p Protocol) String() string {
@@ -51,6 +53,10 @@ func (p Protocol) String() string {
 		return "Dubbo2"
 	case ProtocolDNS:
 		return "DNS"
+	case ProtocolClickhouse:
+		return "ClickHouse"
+	case ProtocolZookeeper:
+		return "Zookeeper"
 	}
 	return "UNKNOWN:" + strconv.Itoa(int(p))
 }
@@ -108,7 +114,19 @@ func (s Status) String() string {
 }
 
 func (s Status) Http() string {
-	return strconv.Itoa(int(s))
+	switch {
+	case s >= 100 && s < 200:
+		return "1xx"
+	case s >= 200 && s < 300:
+		return "2xx"
+	case s >= 300 && s < 400:
+		return "3xx"
+	case s >= 400 && s < 500:
+		return "4xx"
+	case s >= 500 && s < 600:
+		return "5xx"
+	}
+	return "unknown"
 }
 
 func (s Status) DNS() string {
@@ -127,6 +145,16 @@ func (s Status) DNS() string {
 		return "refused"
 	}
 	return ""
+}
+
+func (s Status) Zookeeper() string {
+	if s <= -1 && s >= -9 {
+		return "failed"
+	}
+	if s == -123 { //ZK_ERR_RECONFIG_DISABLED
+		return "failed"
+	}
+	return "ok"
 }
 
 func (s Status) Error() bool {

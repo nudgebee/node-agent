@@ -2,6 +2,8 @@ package cgroup
 
 import (
 	"path"
+
+	"github.com/coroot/coroot-node-agent/common"
 )
 
 const maxMemory = 1 << 62
@@ -12,19 +14,24 @@ type MemoryStat struct {
 	Limit uint64
 }
 
-func (cg *Cgroup) MemoryStat() (*MemoryStat, error) {
+func (cg *Cgroup) MemoryStat() *MemoryStat {
 	if cg.Version == V1 {
-		return cg.memoryStatV1()
+		st, _ := cg.memoryStatV1()
+		return st
 	}
-	return cg.memoryStatV2()
+	st, _ := cg.memoryStatV2()
+	return st
 }
 
 func (cg *Cgroup) memoryStatV1() (*MemoryStat, error) {
+	if cg.subsystems["memory"] == "/" {
+		return nil, nil
+	}
 	vars, err := readVariablesFromFile(path.Join(cgRoot, "memory", cg.subsystems["memory"], "memory.stat"))
 	if err != nil {
 		return nil, err
 	}
-	limit, err := readUintFromFile(path.Join(cgRoot, "memory", cg.subsystems["memory"], "memory.limit_in_bytes"))
+	limit, err := common.ReadUintFromFile(path.Join(cgRoot, "memory", cg.subsystems["memory"], "memory.limit_in_bytes"))
 	if err != nil {
 		return nil, err
 	}
@@ -51,7 +58,7 @@ func (cg *Cgroup) memoryStatV2() (*MemoryStat, error) {
 	if err != nil {
 		return nil, err
 	}
-	limit, _ := readUintFromFile(path.Join(cgRoot, cg.subsystems[""], "memory.max"))
+	limit, _ := common.ReadUintFromFile(path.Join(cgRoot, cg.subsystems[""], "memory.max"))
 	return &MemoryStat{
 		RSS:   vars["anon"] + vars["file_mapped"],
 		Cache: vars["file"],

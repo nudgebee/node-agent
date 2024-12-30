@@ -2,6 +2,7 @@ package tracing
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"time"
 	"unicode/utf8"
@@ -18,7 +19,6 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.18.0"
 	"go.opentelemetry.io/otel/trace"
-	"inet.af/netaddr"
 	"k8s.io/klog/v2"
 )
 
@@ -27,7 +27,10 @@ const (
 )
 
 var (
-	tracer func(containerId string) trace.Tracer
+	batcher             sdktrace.TracerProviderOption
+	commonResourceAttrs []attribute.KeyValue
+	agentVersion        string
+	initialized         bool
 )
 
 func Init(machineId, hostname, version string) {
@@ -46,6 +49,7 @@ func Init(machineId, hostname, version string) {
 		otlptracehttp.WithEndpoint(endpointUrl.Host),
 		otlptracehttp.WithURLPath(path),
 		otlptracehttp.WithHeaders(common.AuthHeaders()),
+		otlptracehttp.WithTLSClientConfig(&tls.Config{InsecureSkipVerify: *flags.InsecureSkipVerify}),
 	}
 	if endpointUrl.Scheme != "https" {
 		opts = append(opts, otlptracehttp.WithInsecure())
@@ -56,9 +60,7 @@ func Init(machineId, hostname, version string) {
 		klog.Exitln(err)
 	}
 
-	batcher := sdktrace.WithBatcher(exporter)
-
-	// if md is nil
+	batcher = sdktrace.WithBatcher(exporter)
 	region := ""
 	availabilityZone := ""
 	accountId := ""
@@ -72,34 +74,48 @@ func Init(machineId, hostname, version string) {
 		availabilityZone = md.AvailabilityZone
 		accountId = md.AccountId
 	}
-	tracer = func(containerId string) trace.Tracer {
-		provider := sdktrace.NewTracerProvider(
-			batcher,
-			sdktrace.WithResource(resource.NewWithAttributes(
-				semconv.SchemaURL,
-				semconv.HostName(hostname),
-				semconv.HostID(machineId),
+	commonResourceAttrs = []attribute.KeyValue{semconv.HostName(hostname), semconv.HostID(machineId),
+		semconv.CloudAccountID(accountId),
+		semconv.CloudRegion(region),
+		semconv.CloudAvailabilityZone(availabilityZone)}
+
+	if md == nil {
+		region = *flags.Region
+		availabilityZone = *flags.AvailabilityZone
+		accountId = *flags.AccountId
+		klog.Infoln("no cloud metadata available, using defaults")
+	} else {
+		region = md.Region
+		availabilityZone = md.AvailabilityZone
+		accountId = md.AccountId
+	}
+	agentVersion = version
+	initialized = true
+}
+
+type Tracer struct {
+	otel trace.Tracer
+}
+
+func GetContainerTracer(containerId string) *Tracer {
+	if !initialized {
+		return &Tracer{otel: nil}
+	}
+	provider := sdktrace.NewTracerProvider(
+		batcher,
+		sdktrace.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			append(
+				commonResourceAttrs,
 				semconv.ServiceName(common.ContainerIdToOtelServiceName(containerId)),
 				semconv.ContainerID(containerId),
-				semconv.CloudAccountID(accountId),
-				semconv.CloudRegion(region),
-				semconv.CloudAvailabilityZone(availabilityZone),
-			)),
-		)
-		return provider.Tracer("nudgebee-node-agent", trace.WithInstrumentationVersion(version))
-	}
+			)...,
+		)),
+	)
+	return &Tracer{otel: provider.Tracer("nudgebee-node-agent", trace.WithInstrumentationVersion(agentVersion))}
 }
 
-type Trace struct {
-	containerId string
-	destination netaddr.IPPort
-	commonAttrs []attribute.KeyValue
-}
-
-func NewTrace(containerId string, destination netaddr.IPPort, srcWorkload common.Workload, dstWorkload common.Workload, actualDstWorkload common.Workload) *Trace {
-	if tracer == nil {
-		return nil
-	}
+func (t *Tracer) NewTrace(destination common.HostPort, srcWorkload common.Workload, dstWorkload common.Workload, actualDstWorkload common.Workload) *Trace {
 	region := ""
 	zone := ""
 	node := ""
@@ -112,9 +128,8 @@ func NewTrace(containerId string, destination netaddr.IPPort, srcWorkload common
 	if actualDstWorkload.Instance != "" {
 		node = actualDstWorkload.Instance
 	}
-
-	return &Trace{containerId: containerId, destination: destination, commonAttrs: []attribute.KeyValue{
-		semconv.NetPeerName(destination.IP().String()),
+	return &Trace{tracer: t, destination: destination, commonAttrs: []attribute.KeyValue{
+		semconv.NetPeerName(destination.Host()),
 		semconv.NetPeerPort(int(destination.Port())),
 		attribute.Key("destination.workload_name").String(dstWorkload.Name),
 		attribute.Key("destination.workload_namespace").String(dstWorkload.Namespace),
@@ -131,10 +146,19 @@ func NewTrace(containerId string, destination netaddr.IPPort, srcWorkload common
 	}}
 }
 
+type Trace struct {
+	tracer      *Tracer
+	destination common.HostPort
+	commonAttrs []attribute.KeyValue
+}
+
 func (t *Trace) createSpan(name string, duration time.Duration, error bool, attrs ...attribute.KeyValue) {
+	if t.tracer.otel == nil {
+		return
+	}
 	end := time.Now()
 	start := end.Add(-duration)
-	_, span := tracer(t.containerId).Start(nil, name, trace.WithTimestamp(start), trace.WithSpanKind(trace.SpanKindClient))
+	_, span := t.tracer.otel.Start(nil, name, trace.WithTimestamp(start), trace.WithSpanKind(trace.SpanKindClient))
 	span.SetAttributes(attrs...)
 	span.SetAttributes(t.commonAttrs...)
 	if error {
@@ -267,5 +291,34 @@ func (t *Trace) RedisQuery(cmd, args string, error bool, duration time.Duration)
 		semconv.DBSystemRedis,
 		semconv.DBOperation(cmd),
 		semconv.DBStatement(statement),
+	)
+}
+
+func (t *Trace) ClickhouseQuery(query string, error bool, duration time.Duration) {
+	if t == nil {
+		return
+	}
+	t.createSpan("query", duration, error,
+		semconv.DBSystemClickhouse,
+		semconv.DBStatement(query),
+	)
+}
+
+func (t *Trace) ZookeeperRequest(op string, args string, status l7.Status, duration time.Duration) {
+	if t == nil {
+		return
+	}
+	if op == "" {
+		return
+	}
+	statement := op
+	if args != "" {
+		statement += " " + args
+	}
+	t.createSpan(op, duration, status.Zookeeper() != "ok",
+		semconv.DBSystemKey.String("zookeeper"),
+		semconv.DBOperation(op),
+		semconv.DBStatementKey.String(statement),
+		attribute.Key("zookeeper.status_code").Int(int(status)),
 	)
 }
