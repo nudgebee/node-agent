@@ -9,13 +9,11 @@ import (
 	"sync"
 	"time"
 
-	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/klog/v2"
+	"k8s.io/client-go/tools/cache"
 
 	lrucache "github.com/hashicorp/golang-lru/v2"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	"k8s.io/api/batch/v1beta1"
@@ -24,16 +22,7 @@ import (
 )
 
 const MAX_RESOLVED_DNS = 10000 // arbitrary limit
-var reregisterWatchSleepDuration = 1 * time.Second
-
-var (
-	watchEventsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "nudgbee_watcher_events_count",
-	}, []string{"object_type"})
-	watchResetsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "nudgebee_watcher_resets_count",
-	}, []string{"object_type"})
-)
+const MAX_PODS_LIMIT = 30000   // arbitrary limit
 
 type clusterSnapshot struct {
 	Pods           sync.Map // map[types.UID]v1.Pod
@@ -52,10 +41,10 @@ type K8sIPResolver struct {
 	clientset        kubernetes.Interface
 	snapshot         clusterSnapshot
 	ipsMap           sync.Map
-	stopSignal       chan bool
+	stopSignal       chan struct{}
 	shouldResolveDns bool
 	dnsResolvedIps   *lrucache.Cache[string, string]
-	podIpsMap        sync.Map
+	podIpsMap        *lrucache.Cache[string, Workload]
 	instanceMetaMap  sync.Map
 }
 
@@ -85,24 +74,27 @@ func NewK8sIPResolver(clientset kubernetes.Interface, resolveDns bool) (*K8sIPRe
 	} else {
 		dnsCache = nil
 	}
+	var podCache *lrucache.Cache[string, Workload]
+	podCache, err := lrucache.New[string, Workload](MAX_PODS_LIMIT)
+	if err != nil {
+		return nil, err
+	}
+
 	return &K8sIPResolver{
 		clientset:        clientset,
 		snapshot:         clusterSnapshot{},
 		ipsMap:           sync.Map{},
-		stopSignal:       make(chan bool),
+		stopSignal:       make(chan struct{}),
 		shouldResolveDns: resolveDns,
 		dnsResolvedIps:   dnsCache,
-		podIpsMap:        sync.Map{},
+		podIpsMap:        podCache,
 		instanceMetaMap:  sync.Map{},
 	}, nil
 }
 
 func (resolver *K8sIPResolver) ResolveActualIP(ip string) Workload {
-	if val, ok := resolver.podIpsMap.Load(ip); ok {
-		entry, ok := val.(Workload)
-		if ok {
-			return entry
-		}
+	if val, ok := resolver.podIpsMap.Get(ip); ok {
+		return val
 	}
 	host := ip
 
@@ -137,11 +129,8 @@ func (resolver *K8sIPResolver) ResolveIP(ip string) Workload {
 		log.Printf("type confusion in ipsMap")
 	}
 
-	if val, ok := resolver.podIpsMap.Load(ip); ok {
-		entry, ok := val.(Workload)
-		if ok {
-			return entry
-		}
+	if val, ok := resolver.podIpsMap.Get(ip); ok {
+		return val
 	}
 	host := ip
 
@@ -179,447 +168,259 @@ func (resolver *K8sIPResolver) CacheDNS(ip string, dns string) Workload {
 	}
 }
 
+func (resolver *K8sIPResolver) StopWatching() {
+	close(resolver.stopSignal)
+}
+
 func (resolver *K8sIPResolver) StartWatching() error {
-	// register watchers
-	podsWatcher, err := resolver.clientset.CoreV1().Pods("").Watch(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("error watching pods changes - %v", err)
-	}
+	factory := informers.NewSharedInformerFactory(resolver.clientset, time.Minute*10)
+	// Define individual informers
+	podInformer := factory.Core().V1().Pods().Informer()
+	nodeInformer := factory.Core().V1().Nodes().Informer()
+	replicaSetInformer := factory.Apps().V1().ReplicaSets().Informer()
+	daemonSetInformer := factory.Apps().V1().DaemonSets().Informer()
+	statefulSetInformer := factory.Apps().V1().StatefulSets().Informer()
+	jobInformer := factory.Batch().V1().Jobs().Informer()
+	serviceInformer := factory.Core().V1().Services().Informer()
+	deploymentInformer := factory.Apps().V1().Deployments().Informer()
 
-	nodesWatcher, err := resolver.clientset.CoreV1().Nodes().Watch(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("error watching nodes changes - %v", err)
-	}
-
-	replicasetsWatcher, err := resolver.clientset.AppsV1().ReplicaSets("").Watch(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("error watching replicasets changes - %v", err)
-	}
-
-	daemonsetsWatcher, err := resolver.clientset.AppsV1().DaemonSets("").Watch(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("error watching daemonsets changes - %v", err)
-	}
-
-	statefulsetsWatcher, err := resolver.clientset.AppsV1().StatefulSets("").Watch(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("error watching statefulsets changes - %v", err)
-	}
-
-	jobsWatcher, err := resolver.clientset.BatchV1().Jobs("").Watch(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("error watching jobs changes - %v", err)
-	}
-
-	servicesWatcher, err := resolver.clientset.CoreV1().Services("").Watch(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("error watching services changes - %v", err)
-	}
-
-	deploymentsWatcher, err := resolver.clientset.AppsV1().Deployments("").Watch(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("error watching deployments changes - %v", err)
-	}
-
-	cronJobsWatcher, err := resolver.startCronjobWatcher()
-	if err != nil {
-		klog.Errorf("failed to init watcher %v", err)
-		return fmt.Errorf("error watching cronjobs changes - %v", err)
-	}
-	log.Printf("registered IP watcher")
-	// invoke a watching function
-	go func() {
-		for {
-			select {
-			case <-resolver.stopSignal:
-				podsWatcher.Stop()
-				nodesWatcher.Stop()
-				replicasetsWatcher.Stop()
-				daemonsetsWatcher.Stop()
-				statefulsetsWatcher.Stop()
-				jobsWatcher.Stop()
-				servicesWatcher.Stop()
-				deploymentsWatcher.Stop()
-				cronJobsWatcher.Stop()
-				return
-			case podEvent, ok := <-podsWatcher.ResultChan():
-				{
-
-					if !ok {
-						watchResetsCounter.WithLabelValues("pod").Inc()
-						podsWatcher, err = resolver.clientset.CoreV1().Pods("").Watch(context.Background(), metav1.ListOptions{})
-						if err != nil {
-							time.Sleep(reregisterWatchSleepDuration)
-						}
-						continue
-					}
-					watchEventsCounter.WithLabelValues("pod").Inc()
-					resolver.handlePodWatchEvent(&podEvent)
-				}
-			case nodeEvent, ok := <-nodesWatcher.ResultChan():
-				{
-					if !ok {
-						watchResetsCounter.WithLabelValues("node").Inc()
-						nodesWatcher, err = resolver.clientset.CoreV1().Nodes().Watch(context.Background(), metav1.ListOptions{})
-						if err != nil {
-							time.Sleep(reregisterWatchSleepDuration)
-						}
-						continue
-					}
-					watchEventsCounter.WithLabelValues("node").Inc()
-					resolver.handleNodeWatchEvent(&nodeEvent)
-				}
-			case replicasetsEvent, ok := <-replicasetsWatcher.ResultChan():
-				{
-					if !ok {
-						watchResetsCounter.WithLabelValues("replicaset").Inc()
-						replicasetsWatcher, err = resolver.clientset.AppsV1().ReplicaSets("").Watch(context.Background(), metav1.ListOptions{})
-						if err != nil {
-							time.Sleep(reregisterWatchSleepDuration)
-						}
-						continue
-					}
-					watchEventsCounter.WithLabelValues("replicaset").Inc()
-					resolver.handleReplicaSetWatchEvent(&replicasetsEvent)
-				}
-			case daemonsetsEvent, ok := <-daemonsetsWatcher.ResultChan():
-				{
-					if !ok {
-						watchResetsCounter.WithLabelValues("daemonset").Inc()
-						daemonsetsWatcher, err = resolver.clientset.AppsV1().DaemonSets("").Watch(context.Background(), metav1.ListOptions{})
-						if err != nil {
-							time.Sleep(reregisterWatchSleepDuration)
-						}
-						continue
-					}
-					watchEventsCounter.WithLabelValues("daemonset").Inc()
-					resolver.handleDaemonSetWatchEvent(&daemonsetsEvent)
-				}
-			case statefulsetsEvent, ok := <-statefulsetsWatcher.ResultChan():
-				{
-					if !ok {
-						watchResetsCounter.WithLabelValues("statefulset").Inc()
-						statefulsetsWatcher, err = resolver.clientset.AppsV1().StatefulSets("").Watch(context.Background(), metav1.ListOptions{})
-						if err != nil {
-							time.Sleep(reregisterWatchSleepDuration)
-						}
-						continue
-					}
-					watchEventsCounter.WithLabelValues("statefulset").Inc()
-					resolver.handleStatefulSetWatchEvent(&statefulsetsEvent)
-				}
-			case jobsEvent, ok := <-jobsWatcher.ResultChan():
-				{
-					if !ok {
-						watchResetsCounter.WithLabelValues("job").Inc()
-						jobsWatcher, err = resolver.clientset.BatchV1().Jobs("").Watch(context.Background(), metav1.ListOptions{})
-						if err != nil {
-							time.Sleep(reregisterWatchSleepDuration)
-						}
-						continue
-					}
-					watchEventsCounter.WithLabelValues("job").Inc()
-					resolver.handleJobsWatchEvent(&jobsEvent)
-				}
-			case servicesEvent, ok := <-servicesWatcher.ResultChan():
-				{
-					if !ok {
-						watchResetsCounter.WithLabelValues("service").Inc()
-						servicesWatcher, err = resolver.clientset.CoreV1().Services("").Watch(context.Background(), metav1.ListOptions{})
-						if err != nil {
-							time.Sleep(reregisterWatchSleepDuration)
-						}
-						continue
-					}
-					watchEventsCounter.WithLabelValues("service").Inc()
-					resolver.handleServicesWatchEvent(&servicesEvent)
-				}
-			case deploymentsEvent, ok := <-deploymentsWatcher.ResultChan():
-				{
-					if !ok {
-						watchResetsCounter.WithLabelValues("deployment").Inc()
-						deploymentsWatcher, err = resolver.clientset.AppsV1().Deployments("").Watch(context.Background(), metav1.ListOptions{})
-						if err != nil {
-							time.Sleep(reregisterWatchSleepDuration)
-						}
-						continue
-					}
-					watchEventsCounter.WithLabelValues("deployment").Inc()
-					resolver.handleDeploymentsWatchEvent(&deploymentsEvent)
-				}
-			case cronjobsEvent, ok := <-cronJobsWatcher.ResultChan():
-				{
-					if !ok {
-						watchResetsCounter.WithLabelValues("cronjob").Inc()
-						cronJobsWatcher, err = resolver.startCronjobWatcher()
-						if err != nil {
-							time.Sleep(reregisterWatchSleepDuration)
-						}
-						continue
-					}
-					watchEventsCounter.WithLabelValues("cronjob").Inc()
-					resolver.handleCronJobsWatchEvent(&cronjobsEvent)
-				}
-			}
-		}
-	}()
+	resolver.addPodHandlers(podInformer)
+	resolver.addNodeHandlers(nodeInformer)
+	resolver.addReplicaSetHandlers(replicaSetInformer)
+	resolver.addDaemonSetHandlers(daemonSetInformer)
+	resolver.addStatefulSetHandlers(statefulSetInformer)
+	resolver.addJobHandlers(jobInformer)
+	resolver.addServiceHandlers(serviceInformer)
+	resolver.addDeploymentHandlers(deploymentInformer)
 
 	// get initial state
-	err = resolver.getResolvedClusterSnapshot()
+	err := resolver.getResolvedClusterSnapshot()
 	if err != nil {
-		resolver.StopWatching()
 		return fmt.Errorf("error retrieving cluster's initial state: %v", err)
 	}
-
+	factory.Start(resolver.stopSignal) // runs in background
 	return nil
 }
 
-func (resolver *K8sIPResolver) startCronjobWatcher() (watch.Interface, error) {
-	cronJobsWatcher, err := resolver.clientset.BatchV1().CronJobs("").Watch(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return resolver.clientset.BatchV1beta1().CronJobs("").Watch(context.Background(), metav1.ListOptions{})
-	}
-
-	return cronJobsWatcher, nil
+func (resolve *K8sIPResolver) addReplicaSetHandlers(replicaSetInformer cache.SharedIndexInformer) {
+	replicaSetInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			replicaSet := obj.(*appsv1.ReplicaSet)
+			log.Printf("ReplicaSet added: %s/%s", replicaSet.Namespace, replicaSet.Name)
+			resolve.snapshot.ReplicaSets.Store(replicaSet.UID, *replicaSet)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			replicaSet := newObj.(*appsv1.ReplicaSet)
+			log.Printf("ReplicaSet updated: %s/%s", replicaSet.Namespace, replicaSet.Name)
+			resolve.snapshot.ReplicaSets.Store(replicaSet.UID, *replicaSet)
+		},
+		DeleteFunc: func(obj interface{}) {
+			replicaSet := obj.(*appsv1.ReplicaSet)
+			log.Printf("ReplicaSet deleted: %s/%s", replicaSet.Namespace, replicaSet.Name)
+			resolve.snapshot.ReplicaSets.Delete(replicaSet.UID)
+		},
+	})
 }
 
-func (resolver *K8sIPResolver) StopWatching() {
-	resolver.stopSignal <- true
+func (resolve *K8sIPResolver) addDaemonSetHandlers(daemonSetInformer cache.SharedIndexInformer) {
+	daemonSetInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			daemonSet := obj.(*appsv1.DaemonSet)
+			log.Printf("DaemonSet added: %s/%s", daemonSet.Namespace, daemonSet.Name)
+			resolve.snapshot.DaemonSets.Store(daemonSet.UID, *daemonSet)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			daemonSet := newObj.(*appsv1.DaemonSet)
+			log.Printf("DaemonSet updated: %s/%s", daemonSet.Namespace, daemonSet.Name)
+			resolve.snapshot.DaemonSets.Store(daemonSet.UID, *daemonSet)
+		},
+		DeleteFunc: func(obj interface{}) {
+			daemonSet := obj.(*appsv1.DaemonSet)
+			log.Printf("DaemonSet deleted: %s/%s", daemonSet.Namespace, daemonSet.Name)
+			resolve.snapshot.DaemonSets.Delete(daemonSet.UID)
+		},
+	})
 }
 
-func (resolver *K8sIPResolver) handlePodWatchEvent(podEvent *watch.Event) {
-	switch podEvent.Type {
-	case watch.Added:
-		pod, ok := podEvent.Object.(*v1.Pod)
-		if !ok {
-			return
-		}
-		resolver.snapshot.Pods.Store(pod.UID, *pod)
-		entry := resolver.resolvePodDescriptor(pod)
-		instanceMeta, ok := resolver.instanceMetaMap.Load(pod.Spec.NodeName)
-		region := ""
-		zone := ""
+func (resolve *K8sIPResolver) addStatefulSetHandlers(statefulSetInformer cache.SharedIndexInformer) {
+	statefulSetInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			statefulSet := obj.(*appsv1.StatefulSet)
+			log.Printf("StatefulSet added: %s/%s", statefulSet.Namespace, statefulSet.Name)
+			resolve.snapshot.StatefulSets.Store(statefulSet.UID, *statefulSet)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			statefulSet := newObj.(*appsv1.StatefulSet)
+			log.Printf("StatefulSet updated: %s/%s", statefulSet.Namespace, statefulSet.Name)
+			resolve.snapshot.StatefulSets.Store(statefulSet.UID, *statefulSet)
+		},
+		DeleteFunc: func(obj interface{}) {
+			statefulSet := obj.(*appsv1.StatefulSet)
+			log.Printf("StatefulSet deleted: %s/%s", statefulSet.Namespace, statefulSet.Name)
+			resolve.snapshot.StatefulSets.Delete(statefulSet.UID)
+		},
+	})
+}
+
+func (resolve *K8sIPResolver) addJobHandlers(jobInformer cache.SharedIndexInformer) {
+	jobInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			job := obj.(*batchv1.Job)
+			log.Printf("Job added: %s/%s", job.Namespace, job.Name)
+			resolve.snapshot.Jobs.Store(job.UID, *job)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			job := newObj.(*batchv1.Job)
+			log.Printf("Job updated: %s/%s", job.Namespace, job.Name)
+			resolve.snapshot.Jobs.Store(job.UID, *job)
+		},
+		DeleteFunc: func(obj interface{}) {
+			job := obj.(*batchv1.Job)
+			log.Printf("Job deleted: %s/%s", job.Namespace, job.Name)
+			resolve.snapshot.Jobs.Delete(job.UID)
+		},
+	})
+}
+
+func (resolve *K8sIPResolver) addServiceHandlers(serviceInformer cache.SharedIndexInformer) {
+	serviceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			service := obj.(*v1.Service)
+			log.Printf("Service added: %s/%s", service.Namespace, service.Name)
+			resolve.snapshot.Services.Store(service.UID, *service)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			service := newObj.(*v1.Service)
+			log.Printf("Service updated: %s/%s", service.Namespace, service.Name)
+			resolve.snapshot.Services.Store(service.UID, *service)
+		},
+		DeleteFunc: func(obj interface{}) {
+			service := obj.(*v1.Service)
+			log.Printf("Service deleted: %s/%s", service.Namespace, service.Name)
+			resolve.snapshot.Services.Delete(service.UID)
+		},
+	})
+}
+
+func (resolve *K8sIPResolver) addDeploymentHandlers(deploymentInformer cache.SharedIndexInformer) {
+	deploymentInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			deployment := obj.(*appsv1.Deployment)
+			log.Printf("Deployment added: %s/%s", deployment.Namespace, deployment.Name)
+			resolve.snapshot.Deployments.Store(deployment.UID, *deployment)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			deployment := newObj.(*appsv1.Deployment)
+			log.Printf("Deployment updated: %s/%s", deployment.Namespace, deployment.Name)
+			resolve.snapshot.Deployments.Store(deployment.UID, *deployment)
+		},
+		DeleteFunc: func(obj interface{}) {
+			deployment := obj.(*appsv1.Deployment)
+			log.Printf("Deployment deleted: %s/%s", deployment.Namespace, deployment.Name)
+			resolve.snapshot.Deployments.Delete(deployment.UID)
+		},
+	})
+}
+
+func (resolver *K8sIPResolver) addPodHandlers(podInformer cache.SharedIndexInformer) {
+	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			pod := obj.(*v1.Pod)
+			log.Printf("Pod added: %s/%s", pod.Namespace, pod.Name)
+			resolver.handlePodAdd(pod)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			newPod := newObj.(*v1.Pod)
+			log.Printf("Pod updated: %s/%s", newPod.Namespace, newPod.Name)
+			resolver.handlePodAdd(newPod)
+		},
+		DeleteFunc: func(obj interface{}) {
+			pod := obj.(*v1.Pod)
+			log.Printf("Pod deleted: %s/%s", pod.Namespace, pod.Name)
+			resolver.snapshot.Pods.Delete(pod.UID)
+			resolver.snapshot.PodDescriptors.Delete(pod.UID)
+			for _, podIp := range pod.Status.PodIPs {
+				resolver.podIpsMap.Remove(podIp.IP)
+			}
+		},
+	})
+}
+
+func (resolver *K8sIPResolver) handlePodAdd(pod *v1.Pod) bool {
+	resolver.snapshot.Pods.Store(pod.UID, *pod)
+	entry := resolver.resolvePodDescriptor(pod)
+	instanceMeta, ok := resolver.instanceMetaMap.Load(pod.Spec.NodeName)
+	region := ""
+	zone := ""
+	if ok {
+		instanceMeta, ok := instanceMeta.(InstanceMeta)
 		if ok {
-			instanceMeta, ok := instanceMeta.(InstanceMeta)
-			if ok {
-				region = instanceMeta.Region
-				zone = instanceMeta.Zone
-			} else {
-				log.Printf("Type confusion in instance meta for node %s", pod.Spec.NodeName)
-			}
+			region = instanceMeta.Region
+			zone = instanceMeta.Zone
 		} else {
-			log.Printf("Missing instance meta for node %s", pod.Spec.NodeName)
-			resolver.instanceMetaMap.Range(func(key, value interface{}) bool {
-				log.Printf("key: %s, value: %v", key, value)
-				return true
-			})
+			log.Printf("Type confusion in instance meta for node %s", pod.Spec.NodeName)
 		}
-		for _, podIp := range pod.Status.PodIPs {
-			resolver.storeWorkloadsIP(podIp.IP, &entry)
-			podWorkload := Workload{
-				Name:      pod.Name,
-				Namespace: pod.Namespace,
-				Kind:      "pod",
-				Region:    region,
-				Zone:      zone,
-				Instance:  pod.Spec.NodeName,
+	}
+	for _, podIp := range pod.Status.PodIPs {
+		resolver.storeWorkloadsIP(podIp.IP, &entry)
+		podWorkload := Workload{
+			Name:      pod.Name,
+			Namespace: pod.Namespace,
+			Kind:      "pod",
+			Region:    region,
+			Zone:      zone,
+			Instance:  pod.Spec.NodeName,
+		}
+		resolver.storePodsIP(podIp.IP, &podWorkload)
+	}
+	return false
+}
+
+func (resolver *K8sIPResolver) addNodeHandlers(nodeInformer cache.SharedIndexInformer) {
+	nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			node := obj.(*v1.Node)
+			shouldReturn := resolver.handleNodeEvent(node)
+			if shouldReturn {
+				return
 			}
-			resolver.storePodsIP(podIp.IP, &podWorkload)
-		}
-	case watch.Modified:
-		pod, ok := podEvent.Object.(*v1.Pod)
-		if !ok {
-			return
-		}
-		resolver.snapshot.Pods.Store(pod.UID, *pod)
-		entry := resolver.resolvePodDescriptor(pod)
-		instanceMeta, ok := resolver.instanceMetaMap.Load(pod.Spec.NodeName)
-		region := ""
-		zone := ""
-		if ok {
-			instanceMeta, ok := instanceMeta.(InstanceMeta)
-			if ok {
-				region = instanceMeta.Region
-				zone = instanceMeta.Zone
-			} else {
-				log.Printf("Type confusion in instance meta for node %s", pod.Spec.NodeName)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			node := newObj.(*v1.Node)
+			shouldReturn := resolver.handleNodeEvent(node)
+			if shouldReturn {
+				return
 			}
-		} else {
-			log.Printf("Missing instance meta for node %s", pod.Spec.NodeName)
-		}
-		for _, podIp := range pod.Status.PodIPs {
-			resolver.storeWorkloadsIP(podIp.IP, &entry)
-			podWorkload := Workload{
-				Name:      pod.Name,
-				Namespace: pod.Namespace,
-				Kind:      "pod",
-				Region:    region,
-				Zone:      zone,
-				Instance:  pod.Spec.NodeName,
-			}
-			resolver.storePodsIP(podIp.IP, &podWorkload)
-		}
-	case watch.Deleted:
-		if val, ok := podEvent.Object.(*v1.Pod); ok {
-			resolver.snapshot.Pods.Delete(val.UID)
-			resolver.snapshot.PodDescriptors.Delete(val.UID)
-		}
-	}
+		},
+		DeleteFunc: func(obj interface{}) {
+			node := obj.(*v1.Node)
+			resolver.snapshot.Nodes.Delete(node.UID)
+			resolver.instanceMetaMap.Delete(node.Name)
+		},
+	})
 }
 
-func (resolver *K8sIPResolver) handleNodeWatchEvent(nodeEvent *watch.Event) {
-	switch nodeEvent.Type {
-	case watch.Added, watch.Modified:
-		node, ok := nodeEvent.Object.(*v1.Node)
-		if !ok {
-			return
-		}
-		resolver.snapshot.Nodes.Store(node.UID, *node)
-		// extract region and zone from attributes
-		region := node.Labels["topology.kubernetes.io/region"]
-		zone := node.Labels["topology.kubernetes.io/zone"]
-		meta := InstanceMeta{
-			Region:   region,
-			Zone:     zone,
-			Instance: node.Name,
-		}
-		resolver.instanceMetaMap.Store(node.Name, meta)
-		for _, nodeAddress := range node.Status.Addresses {
-			resolver.storeWorkloadsIP(nodeAddress.Address, &Workload{
-				Name:      node.Name,
-				Namespace: "node",
-				Kind:      "node",
-				Region:    region,
-				Zone:      zone,
-				Instance:  node.Name,
-			})
-		}
-	case watch.Deleted:
-		if val, ok := nodeEvent.Object.(*v1.Node); ok {
-			resolver.snapshot.Nodes.Delete(val.UID)
-			resolver.instanceMetaMap.Delete(val.Name)
-		}
+func (resolver *K8sIPResolver) handleNodeEvent(node *v1.Node) bool {
+	resolver.snapshot.Nodes.Store(node.UID, *node)
+	region := node.Labels["topology.kubernetes.io/region"]
+	zone := node.Labels["topology.kubernetes.io/zone"]
+	meta := InstanceMeta{
+		Region:   region,
+		Zone:     zone,
+		Instance: node.Name,
 	}
-}
-
-func (resolver *K8sIPResolver) handleReplicaSetWatchEvent(replicasetsEvent *watch.Event) {
-	switch replicasetsEvent.Type {
-	case watch.Added:
-		if val, ok := replicasetsEvent.Object.(*appsv1.ReplicaSet); ok {
-			resolver.snapshot.ReplicaSets.Store(val.UID, *val)
-		}
-	case watch.Deleted:
-		if val, ok := replicasetsEvent.Object.(*appsv1.ReplicaSet); ok {
-			resolver.snapshot.ReplicaSets.Delete(val.UID)
-		}
+	resolver.instanceMetaMap.Store(node.Name, meta)
+	for _, nodeAddress := range node.Status.Addresses {
+		resolver.storeWorkloadsIP(nodeAddress.Address, &Workload{
+			Name:      node.Name,
+			Namespace: "node",
+			Kind:      "node",
+			Region:    region,
+			Zone:      zone,
+			Instance:  node.Name,
+		})
 	}
-}
-
-func (resolver *K8sIPResolver) handleDaemonSetWatchEvent(daemonsetsEvent *watch.Event) {
-	switch daemonsetsEvent.Type {
-	case watch.Added:
-		if val, ok := daemonsetsEvent.Object.(*appsv1.DaemonSet); ok {
-			resolver.snapshot.DaemonSets.Store(val.UID, *val)
-		}
-	case watch.Deleted:
-		if val, ok := daemonsetsEvent.Object.(*appsv1.DaemonSet); ok {
-			resolver.snapshot.DaemonSets.Delete(val.UID)
-		}
-	}
-}
-
-func (resolver *K8sIPResolver) handleStatefulSetWatchEvent(statefulsetsEvent *watch.Event) {
-	switch statefulsetsEvent.Type {
-	case watch.Added:
-		if val, ok := statefulsetsEvent.Object.(*appsv1.StatefulSet); ok {
-			resolver.snapshot.StatefulSets.Store(val.UID, *val)
-		}
-	case watch.Deleted:
-		if val, ok := statefulsetsEvent.Object.(*appsv1.StatefulSet); ok {
-			resolver.snapshot.StatefulSets.Delete(val.UID)
-		}
-	}
-}
-
-func (resolver *K8sIPResolver) handleJobsWatchEvent(jobsEvent *watch.Event) {
-	switch jobsEvent.Type {
-	case watch.Added:
-		if val, ok := jobsEvent.Object.(*batchv1.Job); ok {
-			resolver.snapshot.Jobs.Store(val.UID, *val)
-		}
-	case watch.Deleted:
-		if val, ok := jobsEvent.Object.(*batchv1.Job); ok {
-			resolver.snapshot.Jobs.Delete(val.UID)
-		}
-	}
-}
-
-func (resolver *K8sIPResolver) handleServicesWatchEvent(servicesEvent *watch.Event) {
-	switch servicesEvent.Type {
-	case watch.Added, watch.Modified:
-		service, ok := servicesEvent.Object.(*v1.Service)
-		if !ok {
-			return
-		}
-		resolver.snapshot.Services.Store(service.UID, *service)
-
-		// services has (potentially multiple) ClusterIP
-		workload := Workload{
-			Name:      service.Name,
-			Namespace: service.Namespace,
-			Kind:      "Service",
-			Zone:      "",
-			Region:    "",
-			Instance:  "",
-		}
-
-		// TODO maybe try to match service to workload
-		for _, clusterIp := range service.Spec.ClusterIPs {
-			if clusterIp != "None" {
-				_, ok := resolver.ipsMap.Load(clusterIp)
-				if !ok {
-					resolver.storeWorkloadsIP(clusterIp, &workload)
-				}
-			}
-		}
-	case watch.Deleted:
-		if val, ok := servicesEvent.Object.(*v1.Service); ok {
-			resolver.snapshot.Services.Delete(val.UID)
-		}
-	}
-}
-
-func (resolver *K8sIPResolver) handleDeploymentsWatchEvent(deploymentsEvent *watch.Event) {
-	switch deploymentsEvent.Type {
-	case watch.Added:
-		if val, ok := deploymentsEvent.Object.(*appsv1.Deployment); ok {
-			resolver.snapshot.Deployments.Store(val.UID, *val)
-		}
-	case watch.Deleted:
-		if val, ok := deploymentsEvent.Object.(*appsv1.Deployment); ok {
-			resolver.snapshot.Deployments.Delete(val.UID)
-		}
-	}
-}
-
-func (resolver *K8sIPResolver) handleCronJobsWatchEvent(cronjobsEvent *watch.Event) {
-	switch cronjobsEvent.Type {
-	case watch.Added:
-		if val, ok := cronjobsEvent.Object.(*batchv1.CronJob); ok {
-			resolver.snapshot.CronJobs.Store(val.UID, *val)
-		}
-		if val, ok := cronjobsEvent.Object.(*v1beta1.CronJob); ok {
-			resolver.snapshot.CronJobs.Store(val.UID, *val)
-		}
-
-	case watch.Deleted:
-		if val, ok := cronjobsEvent.Object.(*batchv1.CronJob); ok {
-			resolver.snapshot.CronJobs.Delete(val.UID)
-		}
-		if val, ok := cronjobsEvent.Object.(*v1beta1.CronJob); ok {
-			resolver.snapshot.CronJobs.Delete(val.UID)
-		}
-	}
+	return false
 }
 
 func (resolver *K8sIPResolver) getResolvedClusterSnapshot() error {
@@ -840,7 +641,7 @@ func (resolver *K8sIPResolver) storeWorkloadsIP(ip string, newWorkload *Workload
 }
 
 func (resolver *K8sIPResolver) storePodsIP(ip string, newWorkload *Workload) {
-	resolver.podIpsMap.Store(ip, *newWorkload)
+	resolver.podIpsMap.Add(ip, *newWorkload)
 }
 
 // an ugly function to go up one level in hierarchy. maybe there's a better way to do it

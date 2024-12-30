@@ -104,7 +104,6 @@ func NewTrace(containerId string, destination netaddr.IPPort, srcWorkload common
 	zone := ""
 	node := ""
 	if actualDstWorkload.Zone != "" {
-
 		zone = actualDstWorkload.Zone
 	}
 	if actualDstWorkload.Region != "" {
@@ -167,8 +166,13 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 	if utf8.ValidString(path) {
 		requestPath = path
 	}
+	requestHost := ""
+	if utf8.ValidString(host) {
+		requestHost = host
+	}
+
 	t.createSpan(method, duration, status >= 400,
-		semconv.HTTPURL(fmt.Sprintf("http://%s%s", host, requestPath)),
+		semconv.HTTPURL(fmt.Sprintf("http://%s%s", requestHost, requestPath)),
 		semconv.HTTPMethod(method),
 		semconv.HTTPStatusCode(int(status)),
 		semconv.HTTPRequestContentLength(int(requestSize)),
@@ -192,11 +196,16 @@ func (t *Trace) Http2Request(method, path, scheme string, status l7.Status, dura
 	if scheme == "" {
 		scheme = "unknown"
 	}
+	requestPayload := ""
+	if utf8.ValidString(payload) {
+		requestPayload = payload
+	}
+
 	t.createSpan(method, duration, status > 400,
 		semconv.HTTPURL(fmt.Sprintf("%s://%s%s", scheme, t.destination.String(), path)),
 		semconv.HTTPMethod(method),
 		semconv.HTTPStatusCode(int(status)),
-		attribute.Key("http.request_payload").String(payload),
+		attribute.Key("http.request_payload").String(requestPayload),
 	)
 }
 

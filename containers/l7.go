@@ -82,7 +82,7 @@ func (s L7Stats) get(protocol l7.Protocol, destination, actualDestination netadd
 				if host != "" {
 					constLabels["destination_workload_name"] = host
 				} else {
-					log.Printf("Failed to parse host %s , %q", host, err)
+					log.Printf("Failed to parse host %s , %v", string(r.Payload), err)
 				}
 			}
 			hOpts := L7Latency[protocol]
