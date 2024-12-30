@@ -794,6 +794,8 @@ github.com/ncw/swift v1.0.47/go.mod h1:23YIA4yWVnGwv2dQlN4bB7egfYX6YLn0Yo/S6zZO/
 github.com/niemeyer/pretty v0.0.0-20200227124842-a10e7caefd8e/go.mod h1:zD1mROLANZcx1PVRCS0qkT7pwLkGfwJo4zjcN/Tysno=
 github.com/nudgebee/logparser v0.0.0-20241217070538-1fe7ca1e772b h1:5EeDl1YFDFBEPkjXy6f8WKXZIcWFsB75dr0lxTp8Rqc=
 github.com/nudgebee/logparser v0.0.0-20241217070538-1fe7ca1e772b/go.mod h1:ddmUa8en2sToRL+bBvFkuS1AHvA6Msn56v3BpLMbKoc=
+github.com/nudgebee/logparser v0.0.0-20241220065527-a5a0c2491668 h1:aF+gUNuXvDbNv4WLroxwIcLmdHeil0N1xCTWa0ilg6I=
+github.com/nudgebee/logparser v0.0.0-20241220065527-a5a0c2491668/go.mod h1:ddmUa8en2sToRL+bBvFkuS1AHvA6Msn56v3BpLMbKoc=
 github.com/nxadm/tail v1.4.4/go.mod h1:kenIhsEOeOJmVchQTgglprH7qJGnHDVpk1VPCcaMI8A=
 github.com/oklog/ulid v1.3.1 h1:EGfNDEx6MqHz8B3uNV6QAib1UR2Lm97sHi3ocA6ESJ4=
 github.com/oklog/ulid v1.3.1/go.mod h1:CirwcVhetQ6Lv90oh/F+FBtV6XMibvdAFo93nm5qn4U=

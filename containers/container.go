@@ -1,6 +1,7 @@
 package containers
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -34,6 +35,7 @@ var (
 	gcInterval                = 10 * time.Minute
 	pingTimeout               = 300 * time.Millisecond
 	multilineCollectorTimeout = time.Second
+	payloadThreshold          = 1024 * 1024
 )
 
 type ContainerID string
@@ -158,6 +160,7 @@ type Container struct {
 
 	done        chan struct{}
 	ip_resolver IPResolver
+	srcWorkload common.Workload
 }
 
 func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid uint32, registry *Registry) (*Container, error) {
@@ -166,6 +169,17 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		return nil, err
 	}
 	defer netNs.Close()
+	// /k8s/%s/%s/%s split
+	// /k8s/ -> namespace
+	// %s -> pod name
+
+	split := strings.Split(string(id), "/")
+	if len(split) != 3 {
+		return nil, fmt.Errorf("invalid container id %s", id)
+	}
+	namespace := split[1]
+	podName := split[2]
+
 	c := &Container{
 		id:       id,
 		cgroup:   cg,
@@ -195,6 +209,7 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		done:        make(chan struct{}),
 		ip_resolver: registry.ip_resolver,
 		registry:    registry,
+		srcWorkload: common.Workload{Name: podName, Namespace: namespace, Kind: "Pod"},
 	}
 	c.runLogParser("")
 
@@ -302,9 +317,9 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	for d, stats := range c.connectionStats {
-		workload_src := d.srcWorkload
-		workload_dest := d.dstWorkload
-		actualDestWorkload := d.actualDestWorkload
+		workload_src := c.srcWorkload
+		workload_dest := d.GetDestinationWorkload()
+		actualDestWorkload := d.GetActualDestinationWorkload()
 		ch <- counter(metrics.NetConnectionsSuccessful, float64(stats.Count), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
 		ch <- counter(metrics.NetConnectionsTotalTime, stats.TotalTime.Seconds(), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
 		if stats.Retransmissions > 0 {
@@ -328,7 +343,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	for d, count := range connections {
 		actualDestWorkload := d.GetActualDestinationWorkload()
 		destWorkload := d.GetDestinationWorkload()
-		ch <- gauge(metrics.NetConnectionsActive, float64(count), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), destWorkload.Name, destWorkload.Namespace, destWorkload.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
+		ch <- gauge(metrics.NetConnectionsActive, float64(count), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), c.srcWorkload.Name, c.srcWorkload.Namespace, c.srcWorkload.Kind, destWorkload.Name, destWorkload.Namespace, destWorkload.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
 	}
 
 	for source, p := range c.logParsers {
@@ -563,9 +578,6 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 	if dst.IP().IsLoopback() && !p.isHostNs() {
 		return
 	}
-	if ignoreControlPlane(dstWorkload.Name) {
-		return
-	}
 	if actualDst.Port() == 0 {
 		if a := lookupCiliumConntrackTable(src, dst); a != nil {
 			actualDst = *a
@@ -578,9 +590,11 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 	if ignoreControlPlane(srcWorkload.Name) {
 		return
 	}
-	actualDst, err := c.getActualDestination(p, src, dst)
 	dstWorkload := c.ip_resolver.ResolveIP(dst.IP().String())
-
+	if ignoreControlPlane(dstWorkload.Name) {
+		return
+	}
+	actualDstWorkload := c.ip_resolver.ResolveIP(actualDst.IP().String())
 	if actualDst.IP().IsLoopback() && !p.isHostNs() {
 		return
 	}
@@ -607,7 +621,7 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 			Timestamp:          timestamp,
 			srcWorkload:        srcWorkload,
 			dstWorkload:        dstWorkload,
-			actualDestWorkload: actualDestWorkload,
+			actualDestWorkload: actualDstWorkload,
 		}
 		c.activeConnections[ConnectionKey{src: src, dst: dst}] = connection
 		k := PidFd{Pid: pid, Fd: fd}
@@ -726,9 +740,9 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	if timestamp != 0 && conn.Timestamp != timestamp {
 		return nil
 	}
-	stats := c.l7Stats.get(r.Protocol, conn.DestinationKey)
+	stats := c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, conn.DestinationKey.GetDestinationWorkload(), conn.DestinationKey.GetActualDestinationWorkload())
 
-	trace := c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown(), conn.srcWorkload, conn.dstWorkload, conn.actualDestWorkload)
+	trace := c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown(), conn.srcWorkload, conn.DestinationKey.GetDestinationWorkload(), conn.DestinationKey.GetActualDestinationWorkload())
 	switch r.Protocol {
 	case l7.ProtocolHTTP:
 		stats.observe(r.Status.Http(), "", r.Duration)
@@ -762,9 +776,6 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 				uri = string([]rune(req.URL.Path))
 			}
 			host = req.Host
-		}
-		if dns, ok := iqfqdn[conn.Dest.IP()]; ok {
-			host = dns
 		}
 		if r.Response != nil {
 			response = base64.StdEncoding.EncodeToString(r.Response)

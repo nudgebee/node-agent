@@ -115,7 +115,7 @@ func GetContainerTracer(containerId string) *Tracer {
 	return &Tracer{otel: provider.Tracer("nudgebee-node-agent", trace.WithInstrumentationVersion(agentVersion))}
 }
 
-func (t *Tracer) NewTrace(destination common.HostPort, srcWorkload *common.Workload, dstWorkload *common.Workload, actualDstWorkload *common.Workload) *Trace {
+func (t *Tracer) NewTrace(destination common.HostPort, srcWorkload common.Workload, dstWorkload common.Workload, actualDstWorkload common.Workload) *Trace {
 	region := ""
 	zone := ""
 	node := ""

@@ -201,7 +201,7 @@ var (
 	awsS3FQDN = regexp.MustCompile(`.+s3.*.amazonaws.com`)
 )
 
-func NewDestinationKey(dst, actualDst netaddr.IPPort, fqdn string, dstWorkload *Workload, actualDestWorkload *Workload) DestinationKey {
+func NewDestinationKey(dst, actualDst netaddr.IPPort, fqdn string, dstWorkload Workload, actualDestWorkload Workload) DestinationKey {
 	if awsS3FQDN.MatchString(fqdn) {
 		return DestinationKey{
 			destination: HostPortWithEmptyIP(fqdn, dst.Port()),
@@ -210,8 +210,8 @@ func NewDestinationKey(dst, actualDst netaddr.IPPort, fqdn string, dstWorkload *
 	return DestinationKey{
 		destination:               HostPortFromIPPort(dst),
 		actualDestination:         HostPortFromIPPort(actualDst),
-		destinationWorkload:       *dstWorkload,
-		actualDestinationWorkload: *actualDestWorkload,
+		destinationWorkload:       dstWorkload,
+		actualDestinationWorkload: actualDestWorkload,
 	}
 }
 
