@@ -206,17 +206,14 @@ func (resolve *K8sIPResolver) addReplicaSetHandlers(replicaSetInformer cache.Sha
 	replicaSetInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			replicaSet := obj.(*appsv1.ReplicaSet)
-			log.Printf("ReplicaSet added: %s/%s", replicaSet.Namespace, replicaSet.Name)
 			resolve.snapshot.ReplicaSets.Store(replicaSet.UID, *replicaSet)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			replicaSet := newObj.(*appsv1.ReplicaSet)
-			log.Printf("ReplicaSet updated: %s/%s", replicaSet.Namespace, replicaSet.Name)
 			resolve.snapshot.ReplicaSets.Store(replicaSet.UID, *replicaSet)
 		},
 		DeleteFunc: func(obj interface{}) {
 			replicaSet := obj.(*appsv1.ReplicaSet)
-			log.Printf("ReplicaSet deleted: %s/%s", replicaSet.Namespace, replicaSet.Name)
 			resolve.snapshot.ReplicaSets.Delete(replicaSet.UID)
 		},
 	})
@@ -226,17 +223,14 @@ func (resolve *K8sIPResolver) addDaemonSetHandlers(daemonSetInformer cache.Share
 	daemonSetInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			daemonSet := obj.(*appsv1.DaemonSet)
-			log.Printf("DaemonSet added: %s/%s", daemonSet.Namespace, daemonSet.Name)
 			resolve.snapshot.DaemonSets.Store(daemonSet.UID, *daemonSet)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			daemonSet := newObj.(*appsv1.DaemonSet)
-			log.Printf("DaemonSet updated: %s/%s", daemonSet.Namespace, daemonSet.Name)
 			resolve.snapshot.DaemonSets.Store(daemonSet.UID, *daemonSet)
 		},
 		DeleteFunc: func(obj interface{}) {
 			daemonSet := obj.(*appsv1.DaemonSet)
-			log.Printf("DaemonSet deleted: %s/%s", daemonSet.Namespace, daemonSet.Name)
 			resolve.snapshot.DaemonSets.Delete(daemonSet.UID)
 		},
 	})
@@ -246,17 +240,14 @@ func (resolve *K8sIPResolver) addStatefulSetHandlers(statefulSetInformer cache.S
 	statefulSetInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			statefulSet := obj.(*appsv1.StatefulSet)
-			log.Printf("StatefulSet added: %s/%s", statefulSet.Namespace, statefulSet.Name)
 			resolve.snapshot.StatefulSets.Store(statefulSet.UID, *statefulSet)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			statefulSet := newObj.(*appsv1.StatefulSet)
-			log.Printf("StatefulSet updated: %s/%s", statefulSet.Namespace, statefulSet.Name)
 			resolve.snapshot.StatefulSets.Store(statefulSet.UID, *statefulSet)
 		},
 		DeleteFunc: func(obj interface{}) {
 			statefulSet := obj.(*appsv1.StatefulSet)
-			log.Printf("StatefulSet deleted: %s/%s", statefulSet.Namespace, statefulSet.Name)
 			resolve.snapshot.StatefulSets.Delete(statefulSet.UID)
 		},
 	})
@@ -266,17 +257,14 @@ func (resolve *K8sIPResolver) addJobHandlers(jobInformer cache.SharedIndexInform
 	jobInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			job := obj.(*batchv1.Job)
-			log.Printf("Job added: %s/%s", job.Namespace, job.Name)
 			resolve.snapshot.Jobs.Store(job.UID, *job)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			job := newObj.(*batchv1.Job)
-			log.Printf("Job updated: %s/%s", job.Namespace, job.Name)
 			resolve.snapshot.Jobs.Store(job.UID, *job)
 		},
 		DeleteFunc: func(obj interface{}) {
 			job := obj.(*batchv1.Job)
-			log.Printf("Job deleted: %s/%s", job.Namespace, job.Name)
 			resolve.snapshot.Jobs.Delete(job.UID)
 		},
 	})
@@ -286,17 +274,14 @@ func (resolve *K8sIPResolver) addServiceHandlers(serviceInformer cache.SharedInd
 	serviceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			service := obj.(*v1.Service)
-			log.Printf("Service added: %s/%s", service.Namespace, service.Name)
 			resolve.snapshot.Services.Store(service.UID, *service)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			service := newObj.(*v1.Service)
-			log.Printf("Service updated: %s/%s", service.Namespace, service.Name)
 			resolve.snapshot.Services.Store(service.UID, *service)
 		},
 		DeleteFunc: func(obj interface{}) {
 			service := obj.(*v1.Service)
-			log.Printf("Service deleted: %s/%s", service.Namespace, service.Name)
 			resolve.snapshot.Services.Delete(service.UID)
 		},
 	})
@@ -306,17 +291,14 @@ func (resolve *K8sIPResolver) addDeploymentHandlers(deploymentInformer cache.Sha
 	deploymentInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			deployment := obj.(*appsv1.Deployment)
-			log.Printf("Deployment added: %s/%s", deployment.Namespace, deployment.Name)
 			resolve.snapshot.Deployments.Store(deployment.UID, *deployment)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			deployment := newObj.(*appsv1.Deployment)
-			log.Printf("Deployment updated: %s/%s", deployment.Namespace, deployment.Name)
 			resolve.snapshot.Deployments.Store(deployment.UID, *deployment)
 		},
 		DeleteFunc: func(obj interface{}) {
 			deployment := obj.(*appsv1.Deployment)
-			log.Printf("Deployment deleted: %s/%s", deployment.Namespace, deployment.Name)
 			resolve.snapshot.Deployments.Delete(deployment.UID)
 		},
 	})
@@ -326,17 +308,14 @@ func (resolver *K8sIPResolver) addPodHandlers(podInformer cache.SharedIndexInfor
 	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			pod := obj.(*v1.Pod)
-			log.Printf("Pod added: %s/%s", pod.Namespace, pod.Name)
 			resolver.handlePodAdd(pod)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			newPod := newObj.(*v1.Pod)
-			log.Printf("Pod updated: %s/%s", newPod.Namespace, newPod.Name)
 			resolver.handlePodAdd(newPod)
 		},
 		DeleteFunc: func(obj interface{}) {
 			pod := obj.(*v1.Pod)
-			log.Printf("Pod deleted: %s/%s", pod.Namespace, pod.Name)
 			resolver.snapshot.Pods.Delete(pod.UID)
 			resolver.snapshot.PodDescriptors.Delete(pod.UID)
 			for _, podIp := range pod.Status.PodIPs {
