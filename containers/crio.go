@@ -13,7 +13,7 @@ import (
 
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/proc"
-	"github.com/coroot/logparser"
+	"github.com/nudgebee/logparser"
 	"k8s.io/klog/v2"
 )
 

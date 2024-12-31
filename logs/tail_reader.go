@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coroot/logparser"
+	"github.com/nudgebee/logparser"
 	"k8s.io/klog/v2"
 )
 

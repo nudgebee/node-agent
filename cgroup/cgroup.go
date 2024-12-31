@@ -23,6 +23,7 @@ var (
 	containerdIdRegexp  = regexp.MustCompile(`cri-containerd[-:]([a-z0-9]{64})`)
 	lxcIdRegexp         = regexp.MustCompile(`/lxc/([^/]+)`)
 	systemSliceIdRegexp = regexp.MustCompile(`(/(system|runtime)\.slice/([^/]+))`)
+	talosIdRegexp       = regexp.MustCompile(`/(system|podruntime)/([^/]+)`)
 )
 
 type Version uint8
@@ -43,6 +44,7 @@ const (
 	ContainerTypeLxc
 	ContainerTypeSystemdService
 	ContainerTypeSandbox
+	ContainerTypeTalosRuntime
 )
 
 func (t ContainerType) String() string {
@@ -105,15 +107,13 @@ func NewFromProcessCgroupFile(filePath string) (*Cgroup, error) {
 			cg.subsystems[cgType] = path.Join(baseCgroupPath, parts[2])
 		}
 	}
-	if p := cg.subsystems["name=systemd"]; p != "" {
-		cg.Id = p
-		cg.Version = V1
-	} else if p = cg.subsystems["cpu"]; p != "" {
-		cg.Id = p
-		cg.Version = V1
-	} else {
-		cg.Id = cg.subsystems[""]
+	if cg.Id = cg.subsystems[""]; cg.Id != "" {
 		cg.Version = V2
+	} else if cg.Id = cg.subsystems["cpu"]; cg.Id != "" {
+		cg.Version = V1
+	}
+	if (cg.Id == "" || cg.Id == "/") && cg.subsystems["name=systemd"] != "/" {
+		cg.Id = cg.subsystems["name=systemd"]
 	}
 	if cg.ContainerType, cg.ContainerId, err = containerByCgroup(cg.Id); err != nil {
 		return nil, err
@@ -121,8 +121,11 @@ func NewFromProcessCgroupFile(filePath string) (*Cgroup, error) {
 	return cg, nil
 }
 
-func containerByCgroup(path string) (ContainerType, string, error) {
-	parts := strings.Split(strings.TrimLeft(path, "/"), "/")
+func containerByCgroup(cgroupPath string) (ContainerType, string, error) {
+	parts := strings.Split(strings.TrimLeft(cgroupPath, "/"), "/")
+	if cgroupPath == "/init" {
+		return ContainerTypeTalosRuntime, "/talos/init", nil
+	}
 	if len(parts) < 2 {
 		return ContainerTypeStandaloneProcess, "", nil
 	}
@@ -134,43 +137,50 @@ func containerByCgroup(path string) (ContainerType, string, error) {
 		return ContainerTypeStandaloneProcess, "", nil
 	}
 	if prefix == "docker" || (prefix == "system.slice" && strings.HasPrefix(parts[1], "docker-")) {
-		matches := dockerIdRegexp.FindStringSubmatch(path)
+		matches := dockerIdRegexp.FindStringSubmatch(cgroupPath)
 		if matches == nil {
-			return ContainerTypeUnknown, "", fmt.Errorf("invalid docker cgroup %s", path)
+			return ContainerTypeUnknown, "", fmt.Errorf("invalid docker cgroup %s", cgroupPath)
 		}
 		return ContainerTypeDocker, matches[1], nil
 	}
-	if strings.Contains(path, "kubepods") {
-		crioMatches := crioIdRegexp.FindStringSubmatch(path)
+	if strings.Contains(cgroupPath, "kubepods") {
+		crioMatches := crioIdRegexp.FindStringSubmatch(cgroupPath)
 		if crioMatches != nil {
 			return ContainerTypeCrio, crioMatches[1], nil
 		}
-		if strings.Contains(path, "crio-conmon-") {
+		if strings.Contains(cgroupPath, "crio-conmon-") {
 			return ContainerTypeUnknown, "", nil
 		}
-		containerdMatches := containerdIdRegexp.FindStringSubmatch(path)
+		containerdMatches := containerdIdRegexp.FindStringSubmatch(cgroupPath)
 		if containerdMatches != nil {
 			return ContainerTypeContainerd, containerdMatches[1], nil
 		}
-		matches := dockerIdRegexp.FindStringSubmatch(path)
+		matches := dockerIdRegexp.FindStringSubmatch(cgroupPath)
 		if matches == nil {
 			return ContainerTypeSandbox, "", nil
 		}
 		return ContainerTypeDocker, matches[1], nil
 	}
 	if prefix == "lxc" {
-		matches := lxcIdRegexp.FindStringSubmatch(path)
+		matches := lxcIdRegexp.FindStringSubmatch(cgroupPath)
 		if matches == nil {
-			return ContainerTypeUnknown, "", fmt.Errorf("invalid lxc cgroup %s", path)
+			return ContainerTypeUnknown, "", fmt.Errorf("invalid lxc cgroup %s", cgroupPath)
 		}
 		return ContainerTypeLxc, matches[1], nil
 	}
-	if prefix == "system.slice" || prefix == "runtime.slice" {
-		matches := systemSliceIdRegexp.FindStringSubmatch(path)
+	if prefix == "system" || prefix == "podruntime" {
+		matches := talosIdRegexp.FindStringSubmatch(cgroupPath)
 		if matches == nil {
-			return ContainerTypeUnknown, "", fmt.Errorf("invalid systemd cgroup %s", path)
+			return ContainerTypeUnknown, "", fmt.Errorf("invalid talos runtime cgroup %s", cgroupPath)
+		}
+		return ContainerTypeTalosRuntime, path.Join("/talos/", matches[2]), nil
+	}
+	if prefix == "system.slice" || prefix == "runtime.slice" {
+		matches := systemSliceIdRegexp.FindStringSubmatch(cgroupPath)
+		if matches == nil {
+			return ContainerTypeUnknown, "", fmt.Errorf("invalid systemd cgroup %s", cgroupPath)
 		}
 		return ContainerTypeSystemdService, strings.Replace(matches[1], "\\x2d", "-", -1), nil
 	}
-	return ContainerTypeUnknown, "", fmt.Errorf("unknown container: %s", path)
+	return ContainerTypeUnknown, "", fmt.Errorf("unknown container: %s", cgroupPath)
 }

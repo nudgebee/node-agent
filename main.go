@@ -6,8 +6,10 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"os/signal"
 	"runtime"
 	"strings"
+	"syscall"
 
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/containers"
@@ -20,7 +22,6 @@ import (
 	"github.com/coroot/coroot-node-agent/tracing"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"golang.org/x/mod/semver"
 	"golang.org/x/sys/unix"
 	"golang.org/x/time/rate"
 	"k8s.io/client-go/kubernetes"
@@ -32,8 +33,6 @@ import (
 var (
 	version = "unknown"
 )
-
-const minSupportedKernelVersion = "4.16"
 
 func uname() (string, string, error) {
 	runtime.LockOSThread()
@@ -137,21 +136,33 @@ func main() {
 	}
 	err = resolver.StartWatching()
 	if err != nil {
-		log.Fatalf("Error watching cluster's state: %v", err)
+		klog.Errorf("Error starting resolver: %v", err)
 	}
+	go func() {
+		sigChannel := make(chan os.Signal, 1)
+		defer close(sigChannel)
+
+		signal.Notify(sigChannel, os.Interrupt, syscall.SIGTERM)
+		<-sigChannel
+
+		klog.Infoln("Received signal, shutting down")
+		resolver.StopWatching()
+		os.Exit(0) // Ensure graceful termination
+	}()
 	hostname, kv, err := uname()
 	if err != nil {
 		klog.Exitln("failed to get uname:", err)
 	}
+
 	klog.Infoln("hostname:", hostname)
 	klog.Infoln("kernel version:", kv)
 
-	ver := common.KernelMajorMinor(kv)
-	if ver == "" {
-		klog.Exitln("invalid kernel version:", kv)
+	if err = common.SetKernelVersion(kv); err != nil {
+		klog.Exitln(err)
 	}
-	if semver.Compare("v"+ver, "v"+minSupportedKernelVersion) == -1 {
-		klog.Exitf("the minimum Linux kernel version required is %s or later", minSupportedKernelVersion)
+
+	if !common.GetKernelVersion().GreaterOrEqual(common.NewVersion(4, 16, 0)) {
+		klog.Exitln("the minimum Linux kernel version required is 4.16 or later")
 	}
 
 	whitelistNodeExternalNetworks()
@@ -173,7 +184,7 @@ func main() {
 
 	processInfoCh := profiling.Init(machineId, hostname)
 
-	cr, err := containers.NewRegistry(registerer, kv, processInfoCh, resolver)
+	cr, err := containers.NewRegistry(registerer, processInfoCh, resolver)
 	if err != nil {
 		klog.Exitln(err)
 	}
