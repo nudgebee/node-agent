@@ -6,7 +6,7 @@ import (
 	"github.com/coroot/coroot-node-agent/cgroup"
 	"github.com/coroot/coroot-node-agent/logs"
 	"github.com/coroot/coroot-node-agent/proc"
-	"github.com/coroot/logparser"
+	"github.com/nudgebee/logparser"
 )
 
 var (

@@ -1,5 +1,5 @@
-#define IPPROTO_TCP 6
 #define MAX_CONNECTIONS 1000000
+#define MAX_PAYLOAD_SIZE 1024 * 5 // must be power of 2
 
 struct tcp_event {
     __u64 fd;
@@ -11,8 +11,10 @@ struct tcp_event {
     __u64 bytes_received;
     __u16 sport;
     __u16 dport;
+    __u16 aport;
     __u8 saddr[16];
     __u8 daddr[16];
+    __u8 aaddr[16];
 };
 
 struct {
@@ -29,6 +31,9 @@ struct {
 
 struct trace_event_raw_inet_sock_set_state__stub {
     __u64 unused;
+#if defined(__CTX_EXTRA_PADDING)
+    __u64 unused2;
+#endif
     void *skaddr;
     int oldstate;
     int newstate;
@@ -78,6 +83,29 @@ struct {
     __uint(max_entries, MAX_CONNECTIONS);
 } active_connections SEC(".maps");
 
+struct l7_request_key {
+    __u64 fd;
+    __u32 pid;
+    __u16 is_tls;
+    __s16 stream_id;
+};
+
+struct l7_request {
+    __u64 ns;
+    __u8 protocol;
+    __u8 partial;
+    __u8 request_type;
+    __s32 request_id;
+    __u64 payload_size;
+    char payload[MAX_PAYLOAD_SIZE];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(key_size, sizeof(struct l7_request_key));
+    __uint(value_size, sizeof(struct l7_request));
+    __uint(max_entries, 32768);
+} active_l7_requests SEC(".maps");
 
 SEC("tracepoint/sock/inet_sock_set_state")
 int inet_sock_set_state(void *ctx)
@@ -132,6 +160,7 @@ int inet_sock_set_state(void *ctx)
             timestamp = conn->timestamp;
             type = EVENT_TYPE_CONNECTION_OPEN;
         } else if (args.newstate == BPF_TCP_CLOSE) {
+            bpf_map_delete_elem(&connection_id_by_socket, &args.skaddr);
             bpf_map_delete_elem(&active_connections, cid);
             type = EVENT_TYPE_CONNECTION_ERROR;
         }
@@ -140,19 +169,7 @@ int inet_sock_set_state(void *ctx)
         fd = cid->fd;
     }
     if (args.oldstate == BPF_TCP_ESTABLISHED && (args.newstate == BPF_TCP_FIN_WAIT1 || args.newstate == BPF_TCP_CLOSE_WAIT)) {
-        struct connection_id *cid = bpf_map_lookup_elem(&connection_id_by_socket, &args.skaddr);
-        if (cid) {
-            pid = cid->pid;
-            fd = cid->fd;
-            struct connection *conn = bpf_map_lookup_elem(&active_connections, cid);
-            if (conn) {
-                e.bytes_sent = conn->bytes_sent;
-                e.bytes_received = conn->bytes_received;
-                bpf_map_delete_elem(&active_connections, cid);
-            }
-            bpf_map_delete_elem(&connection_id_by_socket, &args.skaddr);
-        }
-        type = EVENT_TYPE_CONNECTION_CLOSE;
+        bpf_map_delete_elem(&connection_id_by_socket, &args.skaddr);
     }
     if (args.oldstate == BPF_TCP_CLOSE && args.newstate == BPF_TCP_LISTEN) {
         type = EVENT_TYPE_LISTEN_OPEN;
@@ -176,14 +193,22 @@ int inet_sock_set_state(void *ctx)
     __builtin_memcpy(&e.saddr, &args.saddr_v6, sizeof(e.saddr));
     __builtin_memcpy(&e.daddr, &args.daddr_v6, sizeof(e.saddr));
 
-    bpf_perf_event_output(ctx, map, BPF_F_CURRENT_CPU, &e, sizeof(e));
+    struct ipPort src = {};
+    __builtin_memcpy(&src.ip, &args.saddr_v6, sizeof(args.saddr_v6));
+    src.port = args.sport;
 
+    struct ipPort *actualDst = bpf_map_lookup_elem(&actual_destinations, &src);
+    if (actualDst) {
+        e.aport = actualDst->port;
+        __builtin_memcpy(&e.aaddr, &actualDst->ip, sizeof(e.aaddr));
+    }
+    bpf_perf_event_output(ctx, map, BPF_F_CURRENT_CPU, &e, sizeof(e));
     return 0;
 }
 
 struct trace_event_raw_args_with_fd__stub {
     __u64 unused;
-    long int id;
+    __u64 unused2;
     __u64 fd;
 };
 
@@ -214,6 +239,18 @@ int sys_exit_connect(struct trace_event_raw_sys_exit__stub* ctx) {
         conn.timestamp = bpf_ktime_get_ns();
         bpf_map_update_elem(&active_connections, &cid, &conn, BPF_ANY);
     }
+
+    struct l7_request_key k = {
+        .fd = cid.fd,
+        .pid = cid.pid,
+        .is_tls = 0,
+        .stream_id = -1,
+    };
+    bpf_map_delete_elem(&active_l7_requests, &k);
+
+    k.is_tls = 1;
+    bpf_map_delete_elem(&active_l7_requests, &k);
+
     bpf_map_delete_elem(&fd_by_pid_tgid, &id);
     return 0;
 }
@@ -225,24 +262,20 @@ int sys_enter_close(void *ctx) {
         return 0;
     }
     __u64 id = bpf_get_current_pid_tgid();
-    bpf_map_update_elem(&fd_by_pid_tgid, &id, &args.fd, BPF_ANY);
-    return 0;
-}
-
-SEC("tracepoint/syscalls/sys_exit_close")
-int sys_exit_close(struct trace_event_raw_sys_exit__stub* ctx) {
-    __u64 id = bpf_get_current_pid_tgid();
-    __u64 *fdp = bpf_map_lookup_elem(&fd_by_pid_tgid, &id);
-    if (!fdp) {
-        return 0;
-    }
     struct connection_id cid = {};
     cid.pid = id >> 32;
-    cid.fd = *fdp;
-    bpf_map_delete_elem(&active_connections, &cid);
-    bpf_map_delete_elem(&fd_by_pid_tgid, &id);
+    cid.fd = args.fd;
+    struct connection *conn = bpf_map_lookup_elem(&active_connections, &cid);
+    if (conn) {
+        struct tcp_event e = {};
+        e.type = EVENT_TYPE_CONNECTION_CLOSE;
+        e.pid = cid.pid;
+        e.fd = cid.fd;
+        e.bytes_sent = conn->bytes_sent;
+        e.bytes_received = conn->bytes_received;
+        e.timestamp = conn->timestamp;
+        bpf_perf_event_output(ctx, &tcp_connect_events, BPF_F_CURRENT_CPU, &e, sizeof(e));
+        bpf_map_delete_elem(&active_connections, &cid);
+    }
     return 0;
 }
-
-
-

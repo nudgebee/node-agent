@@ -1,7 +1,7 @@
 package cgroup
 
 import (
-	"io/ioutil"
+	"os"
 	"strconv"
 	"strings"
 
@@ -9,7 +9,7 @@ import (
 )
 
 func readVariablesFromFile(filePath string) (map[string]uint64, error) {
-	data, err := ioutil.ReadFile(filePath)
+	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, err
 	}
@@ -26,20 +26,4 @@ func readVariablesFromFile(filePath string) (map[string]uint64, error) {
 		}
 	}
 	return res, nil
-}
-
-func readIntFromFile(filePath string) (int64, error) {
-	data, err := ioutil.ReadFile(filePath)
-	if err != nil {
-		return 0, err
-	}
-	return strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
-}
-
-func readUintFromFile(filePath string) (uint64, error) {
-	data, err := ioutil.ReadFile(filePath)
-	if err != nil {
-		return 0, err
-	}
-	return strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
 }

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coroot/logparser"
+	"github.com/nudgebee/logparser"
 	"github.com/stretchr/testify/assert"
 )
 

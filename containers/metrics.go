@@ -38,7 +38,8 @@ var metrics = struct {
 	NetBytesSent             *prometheus.Desc
 	NetBytesReceived         *prometheus.Desc
 
-	LogMessages *prometheus.Desc
+	LogMessages          *prometheus.Desc
+	SensitiveLogMessages *prometheus.Desc
 
 	ApplicationType *prometheus.Desc
 
@@ -86,7 +87,8 @@ var metrics = struct {
 	NetBytesSent:             metric("container_net_tcp_bytes_sent_total", "Total number of bytes sent to the peer", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
 	NetBytesReceived:         metric("container_net_tcp_bytes_received_total", "Total number of bytes received from the peer", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
 
-	LogMessages: metric("container_log_messages_total", "Number of messages grouped by the automatically extracted repeated pattern", "source", "level", "pattern_hash", "sample"),
+	LogMessages:          metric("container_log_messages_total", "Number of messages grouped by the automatically extracted repeated pattern", "source", "level", "pattern_hash", "sample"),
+	SensitiveLogMessages: metric("container_sensitive_log_messages_total", "Number of messages that contain sensitive information", "source", "pattern", "sample", "regex", "name", "pattern_hash"),
 
 	ApplicationType: metric("container_application_type", "Type of the application running in the container (e.g. memcached, postgres, mysql)", "application_type"),
 
@@ -104,30 +106,34 @@ var metrics = struct {
 
 var (
 	L7Requests = map[l7.Protocol]prometheus.CounterOpts{
-		l7.ProtocolHTTP:      {Name: "container_http_requests_total", Help: "Total number of outbound HTTP requests"},
-		l7.ProtocolPostgres:  {Name: "container_postgres_queries_total", Help: "Total number of outbound Postgres queries"},
-		l7.ProtocolRedis:     {Name: "container_redis_queries_total", Help: "Total number of outbound Redis queries"},
-		l7.ProtocolMemcached: {Name: "container_memcached_queries_total", Help: "Total number of outbound Memcached queries"},
-		l7.ProtocolMysql:     {Name: "container_mysql_queries_total", Help: "Total number of outbound Mysql queries"},
-		l7.ProtocolMongo:     {Name: "container_mongo_queries_total", Help: "Total number of outbound Mongo queries"},
-		l7.ProtocolKafka:     {Name: "container_kafka_requests_total", Help: "Total number of outbound Kafka requests"},
-		l7.ProtocolCassandra: {Name: "container_cassandra_queries_total", Help: "Total number of outbound Cassandra requests"},
-		l7.ProtocolRabbitmq:  {Name: "container_rabbitmq_messages_total", Help: "Total number of Rabbitmq messages produced or consumed by the container"},
-		l7.ProtocolNats:      {Name: "container_nats_messages_total", Help: "Total number of NATS messages produced or consumed by the container"},
-		l7.ProtocolDubbo2:    {Name: "container_dubbo_requests_total", Help: "Total number of outbound DUBBO requests"},
-		l7.ProtocolDNS:       {Name: "container_dns_requests_total", Help: "Total number of outbound DNS requests"},
+		l7.ProtocolHTTP:       {Name: "container_http_requests_total", Help: "Total number of outbound HTTP requests"},
+		l7.ProtocolPostgres:   {Name: "container_postgres_queries_total", Help: "Total number of outbound Postgres queries"},
+		l7.ProtocolRedis:      {Name: "container_redis_queries_total", Help: "Total number of outbound Redis queries"},
+		l7.ProtocolMemcached:  {Name: "container_memcached_queries_total", Help: "Total number of outbound Memcached queries"},
+		l7.ProtocolMysql:      {Name: "container_mysql_queries_total", Help: "Total number of outbound Mysql queries"},
+		l7.ProtocolMongo:      {Name: "container_mongo_queries_total", Help: "Total number of outbound Mongo queries"},
+		l7.ProtocolKafka:      {Name: "container_kafka_requests_total", Help: "Total number of outbound Kafka requests"},
+		l7.ProtocolCassandra:  {Name: "container_cassandra_queries_total", Help: "Total number of outbound Cassandra requests"},
+		l7.ProtocolRabbitmq:   {Name: "container_rabbitmq_messages_total", Help: "Total number of Rabbitmq messages produced or consumed by the container"},
+		l7.ProtocolNats:       {Name: "container_nats_messages_total", Help: "Total number of NATS messages produced or consumed by the container"},
+		l7.ProtocolDubbo2:     {Name: "container_dubbo_requests_total", Help: "Total number of outbound DUBBO requests"},
+		l7.ProtocolDNS:        {Name: "container_dns_requests_total", Help: "Total number of outbound DNS requests"},
+		l7.ProtocolClickhouse: {Name: "container_clickhouse_queries_total", Help: "Total number of outbound ClickHouse queries"},
+		l7.ProtocolZookeeper:  {Name: "container_zookeeper_requests_total", Help: "Total number of outbound Zookeeper requests"},
 	}
 	L7Latency = map[l7.Protocol]prometheus.HistogramOpts{
-		l7.ProtocolHTTP:      {Name: "container_http_requests_duration_seconds_total", Help: "Histogram of the response time for each outbound HTTP request"},
-		l7.ProtocolPostgres:  {Name: "container_postgres_queries_duration_seconds_total", Help: "Histogram of the execution time for each outbound Postgres query"},
-		l7.ProtocolRedis:     {Name: "container_redis_queries_duration_seconds_total", Help: "Histogram of the execution time for each outbound Redis query"},
-		l7.ProtocolMemcached: {Name: "container_memcached_queries_duration_seconds_total", Help: "Histogram of the execution time for each outbound Memcached query"},
-		l7.ProtocolMysql:     {Name: "container_mysql_queries_duration_seconds_total", Help: "Histogram of the execution time for each outbound Mysql query"},
-		l7.ProtocolMongo:     {Name: "container_mongo_queries_duration_seconds_total", Help: "Histogram of the execution time for each outbound Mongo query"},
-		l7.ProtocolKafka:     {Name: "container_kafka_requests_duration_seconds_total", Help: "Histogram of the execution time for each outbound Kafka request"},
-		l7.ProtocolCassandra: {Name: "container_cassandra_queries_duration_seconds_total", Help: "Histogram of the execution time for each outbound Cassandra request"},
-		l7.ProtocolDubbo2:    {Name: "container_dubbo_requests_duration_seconds_total", Help: "Histogram of the response time for each outbound DUBBO request"},
-		l7.ProtocolDNS:       {Name: "container_dns_requests_duration_seconds_total", Help: "Histogram of the response time for each outbound DNS request"},
+		l7.ProtocolHTTP:       {Name: "container_http_requests_duration_seconds_total", Help: "Histogram of the response time for each outbound HTTP request"},
+		l7.ProtocolPostgres:   {Name: "container_postgres_queries_duration_seconds_total", Help: "Histogram of the execution time for each outbound Postgres query"},
+		l7.ProtocolRedis:      {Name: "container_redis_queries_duration_seconds_total", Help: "Histogram of the execution time for each outbound Redis query"},
+		l7.ProtocolMemcached:  {Name: "container_memcached_queries_duration_seconds_total", Help: "Histogram of the execution time for each outbound Memcached query"},
+		l7.ProtocolMysql:      {Name: "container_mysql_queries_duration_seconds_total", Help: "Histogram of the execution time for each outbound Mysql query"},
+		l7.ProtocolMongo:      {Name: "container_mongo_queries_duration_seconds_total", Help: "Histogram of the execution time for each outbound Mongo query"},
+		l7.ProtocolKafka:      {Name: "container_kafka_requests_duration_seconds_total", Help: "Histogram of the execution time for each outbound Kafka request"},
+		l7.ProtocolCassandra:  {Name: "container_cassandra_queries_duration_seconds_total", Help: "Histogram of the execution time for each outbound Cassandra request"},
+		l7.ProtocolDubbo2:     {Name: "container_dubbo_requests_duration_seconds_total", Help: "Histogram of the response time for each outbound DUBBO request"},
+		l7.ProtocolDNS:        {Name: "container_dns_requests_duration_seconds_total", Help: "Histogram of the response time for each outbound DNS request"},
+		l7.ProtocolClickhouse: {Name: "container_clickhouse_queries_duration_seconds_total", Help: "Histogram of the execution time for each outbound ClickHouse query"},
+		l7.ProtocolZookeeper:  {Name: "container_zookeeper_requests_duration_seconds_total", Help: "Histogram of the execution time for each outbound Zookeeper request"},
 	}
 )
 

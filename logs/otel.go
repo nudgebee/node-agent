@@ -2,6 +2,7 @@ package logs
 
 import (
 	"context"
+	"crypto/tls"
 	"time"
 
 	otel "github.com/agoda-com/opentelemetry-logs-go"
@@ -11,7 +12,7 @@ import (
 	sdk "github.com/agoda-com/opentelemetry-logs-go/sdk/logs"
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/flags"
-	"github.com/coroot/logparser"
+	"github.com/nudgebee/logparser"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.18.0"
@@ -36,6 +37,7 @@ func Init(machineId, hostname, version string) {
 		otlplogshttp.WithEndpoint(endpointUrl.Host),
 		otlplogshttp.WithURLPath(path),
 		otlplogshttp.WithHeaders(common.AuthHeaders()),
+		otlplogshttp.WithTLSClientConfig(&tls.Config{InsecureSkipVerify: *flags.InsecureSkipVerify}),
 	}
 	if endpointUrl.Scheme != "https" {
 		opts = append(opts, otlplogshttp.WithInsecure())
