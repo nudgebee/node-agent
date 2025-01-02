@@ -174,7 +174,7 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 	// %s -> pod name
 
 	split := strings.Split(string(id), "/")
-	if len(split) != 3 {
+	if len(split) > 3 {
 		return nil, fmt.Errorf("invalid container id %s", id)
 	}
 	namespace := split[1]
