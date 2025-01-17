@@ -754,9 +754,6 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 			log.Printf("Failed to parse payload %s, %q", err, string(r.Payload))
 			method, uri = l7.ParseHttp(r.Payload)
 			host, _ = l7.ParseHostFromHttpRequest(string(r.Payload))
-			if req.Header != nil {
-				headers = req.Header
-			}
 		} else {
 			if req != nil && req.Body != nil {
 				body, _ := io.ReadAll(req.Body)
@@ -772,6 +769,9 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 				uri = string([]rune(req.URL.Path))
 			}
 			host = req.Host
+			if req.Header != nil {
+				headers = req.Header
+			}
 		}
 		if r.Response != nil {
 			response = base64.StdEncoding.EncodeToString(r.Response)
