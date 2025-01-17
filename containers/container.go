@@ -3,6 +3,7 @@ package containers
 import (
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -747,11 +748,13 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		uri := ""
 		response := ""
 		host := ""
+		headers := http.Header{}
 		req, err := l7.ParseHTTPRequest(r.Payload)
 		if err != nil {
 			log.Printf("Failed to parse payload %s, %q", err, string(r.Payload))
 			method, uri = l7.ParseHttp(r.Payload)
 			host, _ = l7.ParseHostFromHttpRequest(string(r.Payload))
+			headers = req.Header
 		} else {
 			if req != nil && req.Body != nil {
 				body, _ := io.ReadAll(req.Body)
@@ -771,7 +774,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		if r.Response != nil {
 			response = base64.StdEncoding.EncodeToString(r.Response)
 		}
-		trace.HttpRequest(method, uri, r.Status, r.Duration, r.PayloadSize, payload, req.Header, response, host)
+		trace.HttpRequest(method, uri, r.Status, r.Duration, r.PayloadSize, payload, headers, response, host)
 	case l7.ProtocolHTTP2:
 		if conn.http2Parser == nil {
 			conn.http2Parser = l7.NewHttp2Parser()
