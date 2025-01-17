@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -161,7 +162,7 @@ func (t *Trace) createSpan(name string, duration time.Duration, error bool, trac
 	start := end.Add(-duration)
 	ctx := context.Background()
 	if traceId != "" {
-		// Convert traceId to a TraceID and create a SpanContext
+		traceId = ParseTraceIdHeaders(traceId)
 		traceID, err := trace.TraceIDFromHex(traceId)
 		if err != nil {
 			context.Background()
@@ -179,6 +180,19 @@ func (t *Trace) createSpan(name string, duration time.Duration, error bool, trac
 		span.SetStatus(codes.Error, "")
 	}
 	span.End(trace.WithTimestamp(end))
+}
+
+func ParseTraceIdHeaders(traceId string) string {
+	if traceId == "" {
+		return ""
+	}
+	// if its a traceparent header, extract the traceId
+	parts := strings.Split(traceId, "-")
+	if len(parts) == 4 {
+		traceId = parts[1]
+	}
+
+	return traceId
 }
 
 func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time.Duration, requestSize uint64, payload string, headers http.Header, response string, host string) {
