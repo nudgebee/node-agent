@@ -223,8 +223,16 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 	traceId := ""
 	if headers != nil {
 		requestHeaders = l7.ConvertHeadersToBase64String(headers)
-		if id := headers.Get(*flags.TraceIdHeaders); id != "" {
-			traceId = id
+		traceIdHeaders := strings.Split(*flags.TraceIdHeaders, ",")
+		for _, header := range traceIdHeaders {
+			if id := headers.Get(header); id != "" {
+				// check for lowercase header
+				traceId = id
+				break
+			} else if id := headers.Get(strings.ToLower(header)); id != "" {
+				traceId = id
+				break
+			}
 		}
 	}
 
