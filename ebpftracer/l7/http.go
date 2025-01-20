@@ -2,6 +2,7 @@ package l7
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -129,7 +130,7 @@ func ParseHostFromHttpRequest(input string) (string, error) {
 	return host, nil
 }
 
-func ConvertHeadersToString(headers http.Header) string {
+func ConvertHeadersToBase64String(headers http.Header) string {
 	headerMap := make(map[string][]string)
 	for key, values := range headers {
 		headerMap[key] = values
@@ -138,7 +139,8 @@ func ConvertHeadersToString(headers http.Header) string {
 	if err != nil {
 		return ""
 	}
-	return string(jsonString)
+	header64 := base64.StdEncoding.EncodeToString([]byte(jsonString))
+	return string(header64)
 }
 
 func SanitizeString(value string) string {
