@@ -148,5 +148,5 @@ func SanitizeString(value string) string {
 
 		return value
 	}
-	return strings.Repeat("*", len(value))
+	return strings.Repeat("*", 5)
 }
