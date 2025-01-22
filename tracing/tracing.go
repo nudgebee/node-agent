@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"net/http"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -152,13 +154,26 @@ type Trace struct {
 	commonAttrs []attribute.KeyValue
 }
 
-func (t *Trace) createSpan(name string, duration time.Duration, error bool, attrs ...attribute.KeyValue) {
+func (t *Trace) createSpan(name string, duration time.Duration, error bool, traceId string, attrs ...attribute.KeyValue) {
 	if t.tracer.otel == nil {
 		return
 	}
 	end := time.Now()
 	start := end.Add(-duration)
-	_, span := t.tracer.otel.Start(nil, name, trace.WithTimestamp(start), trace.WithSpanKind(trace.SpanKindClient))
+	ctx := context.Background()
+	if traceId != "" {
+		traceId = ParseTraceIdHeaders(traceId)
+		traceID, err := trace.TraceIDFromHex(traceId)
+		if err != nil {
+			context.Background()
+		}
+		spanContext := trace.NewSpanContext(trace.SpanContextConfig{
+			TraceID: traceID,
+		})
+		ctx = trace.ContextWithRemoteSpanContext(ctx, spanContext)
+	}
+
+	_, span := t.tracer.otel.Start(ctx, name, trace.WithTimestamp(start), trace.WithSpanKind(trace.SpanKindClient))
 	span.SetAttributes(attrs...)
 	span.SetAttributes(t.commonAttrs...)
 	if error {
@@ -167,7 +182,20 @@ func (t *Trace) createSpan(name string, duration time.Duration, error bool, attr
 	span.End(trace.WithTimestamp(end))
 }
 
-func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time.Duration, requestSize uint64, payload string, headers string, response string, host string) {
+func ParseTraceIdHeaders(traceId string) string {
+	if traceId == "" {
+		return ""
+	}
+	// if its a traceparent header, extract the traceId
+	parts := strings.Split(traceId, "-")
+	if len(parts) == 4 {
+		traceId = parts[1]
+	}
+
+	return traceId
+}
+
+func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time.Duration, requestSize uint64, payload string, headers http.Header, response string, host string) {
 	if t == nil || method == "" {
 		return
 	}
@@ -179,9 +207,6 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 		requestPayload = payload
 	}
 	requestHeaders := ""
-	if utf8.ValidString(headers) {
-		requestHeaders = headers
-	}
 	responsePayload := ""
 	if utf8.ValidString(response) {
 		responsePayload = response
@@ -195,7 +220,24 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 		requestHost = host
 	}
 
+	traceId := ""
+	if headers != nil {
+		requestHeaders = l7.ConvertHeadersToBase64String(headers)
+		traceIdHeaders := strings.Split(*flags.TraceIdHeaders, ",")
+		for _, header := range traceIdHeaders {
+			if id := headers.Get(header); id != "" {
+				// check for lowercase header
+				traceId = id
+				break
+			} else if id := headers.Get(strings.ToLower(header)); id != "" {
+				traceId = id
+				break
+			}
+		}
+	}
+
 	t.createSpan(method, duration, status >= 400,
+		traceId,
 		semconv.HTTPURL(fmt.Sprintf("http://%s%s", requestHost, requestPath)),
 		semconv.HTTPMethod(method),
 		semconv.HTTPStatusCode(int(status)),
@@ -225,7 +267,7 @@ func (t *Trace) Http2Request(method, path, scheme string, status l7.Status, dura
 		requestPayload = payload
 	}
 
-	t.createSpan(method, duration, status > 400,
+	t.createSpan(method, duration, status > 400, "",
 		semconv.HTTPURL(fmt.Sprintf("%s://%s%s", scheme, t.destination.String(), path)),
 		semconv.HTTPMethod(method),
 		semconv.HTTPStatusCode(int(status)),
@@ -237,7 +279,7 @@ func (t *Trace) PostgresQuery(query string, error bool, duration time.Duration) 
 	if t == nil || query == "" {
 		return
 	}
-	t.createSpan("query", duration, error,
+	t.createSpan("query", duration, error, "",
 		semconv.DBSystemPostgreSQL,
 		semconv.DBStatement(query),
 	)
@@ -247,7 +289,7 @@ func (t *Trace) MysqlQuery(query string, error bool, duration time.Duration) {
 	if t == nil || query == "" {
 		return
 	}
-	t.createSpan("query", duration, error,
+	t.createSpan("query", duration, error, "",
 		semconv.DBSystemMySQL,
 		semconv.DBStatement(query),
 	)
@@ -257,7 +299,7 @@ func (t *Trace) MongoQuery(query string, error bool, duration time.Duration) {
 	if t == nil || query == "" {
 		return
 	}
-	t.createSpan("query", duration, error,
+	t.createSpan("query", duration, error, "",
 		semconv.DBSystemMongoDB,
 		semconv.DBStatement(query),
 	)
@@ -276,7 +318,7 @@ func (t *Trace) MemcachedQuery(cmd string, items []string, error bool, duration 
 	} else if len(items) > 1 {
 		attrs = append(attrs, MemcacheDBItemKeyName.StringSlice(items))
 	}
-	t.createSpan(cmd, duration, error, attrs...)
+	t.createSpan(cmd, duration, error, "", attrs...)
 }
 
 func (t *Trace) RedisQuery(cmd, args string, error bool, duration time.Duration) {
@@ -287,7 +329,7 @@ func (t *Trace) RedisQuery(cmd, args string, error bool, duration time.Duration)
 	if args != "" {
 		statement += " " + args
 	}
-	t.createSpan(cmd, duration, error,
+	t.createSpan(cmd, duration, error, "",
 		semconv.DBSystemRedis,
 		semconv.DBOperation(cmd),
 		semconv.DBStatement(statement),
@@ -298,7 +340,7 @@ func (t *Trace) ClickhouseQuery(query string, error bool, duration time.Duration
 	if t == nil {
 		return
 	}
-	t.createSpan("query", duration, error,
+	t.createSpan("query", duration, error, "",
 		semconv.DBSystemClickhouse,
 		semconv.DBStatement(query),
 	)
@@ -315,7 +357,7 @@ func (t *Trace) ZookeeperRequest(op string, args string, status l7.Status, durat
 	if args != "" {
 		statement += " " + args
 	}
-	t.createSpan(op, duration, status.Zookeeper() != "ok",
+	t.createSpan(op, duration, status.Zookeeper() != "ok", "",
 		semconv.DBSystemKey.String("zookeeper"),
 		semconv.DBOperation(op),
 		semconv.DBStatementKey.String(statement),
