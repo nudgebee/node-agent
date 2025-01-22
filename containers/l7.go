@@ -69,7 +69,7 @@ func (s L7Stats) get(protocol l7.Protocol, key common.DestinationKey, r *l7.Requ
 			labels = append(labels, "method")
 		case l7.ProtocolHTTP:
 			method, path := l7.ParseHttp(r.Payload)
-			if ValidUtf8(r.Payload) {
+			if ValidUtf8([]byte(path)) {
 				constLabels["path"] = path
 			} else {
 				log.Printf("Failed to parse path %s", path)

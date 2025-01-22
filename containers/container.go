@@ -3,6 +3,7 @@ package containers
 import (
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -743,11 +744,11 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	case l7.ProtocolHTTP:
 		stats.observe(r.Status.Http(), "", r.Duration)
 		payload := ""
-		headers := ""
 		method := ""
 		uri := ""
 		response := ""
 		host := ""
+		headers := http.Header{}
 		req, err := l7.ParseHTTPRequest(r.Payload)
 		if err != nil {
 			log.Printf("Failed to parse payload %s, %q", err, string(r.Payload))
@@ -759,10 +760,6 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 				base64String := base64.StdEncoding.EncodeToString(body)
 				payload = string(base64String)
 			}
-			if req != nil && req.Header != nil {
-				headersStr := l7.ConvertHeadersToString(req.Header)
-				headers = base64.StdEncoding.EncodeToString([]byte(headersStr))
-			}
 			method = req.Method
 			if utf8.ValidString(req.URL.Path) {
 				uri = req.URL.Path
@@ -772,6 +769,9 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 				uri = string([]rune(req.URL.Path))
 			}
 			host = req.Host
+			if req.Header != nil {
+				headers = req.Header
+			}
 		}
 		if r.Response != nil {
 			response = base64.StdEncoding.EncodeToString(r.Response)
