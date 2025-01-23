@@ -114,19 +114,7 @@ func (s Status) String() string {
 }
 
 func (s Status) Http() string {
-	switch {
-	case s >= 100 && s < 200:
-		return "1xx"
-	case s >= 200 && s < 300:
-		return "2xx"
-	case s >= 300 && s < 400:
-		return "3xx"
-	case s >= 400 && s < 500:
-		return "4xx"
-	case s >= 500 && s < 600:
-		return "5xx"
-	}
-	return "unknown"
+	return strconv.Itoa(int(s))
 }
 
 func (s Status) DNS() string {
