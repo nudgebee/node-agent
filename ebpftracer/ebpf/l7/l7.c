@@ -398,8 +398,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     e->method = METHOD_UNKNOWN;
     e->statement_id = 0;
     e->payload_size = 0;
-    e->response_size = ret;
-    COPY_PAYLOAD(e->response, ret, payload);
+    e->response_size = 0;
     if (is_rabbitmq_consume(payload, ret)) {
         e->protocol = PROTOCOL_RABBITMQ;
         e->method = METHOD_CONSUME;
@@ -451,6 +450,8 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     e->payload_size = req->payload_size;
     COPY_PAYLOAD(e->payload, req->payload_size, req->payload);
     if (e->protocol == PROTOCOL_HTTP) {
+        e->response_size = ret;
+        COPY_PAYLOAD(e->response, ret, payload);
         response = is_http_response(payload, &e->status);
     } else if (e->protocol == PROTOCOL_POSTGRES) {
         response = is_postgres_response(payload, ret, &e->status);
