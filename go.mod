@@ -38,7 +38,7 @@ require (
 	go.opentelemetry.io/otel/trace v1.24.0
 	golang.org/x/arch v0.4.0
 	golang.org/x/exp v0.0.0-20240119083558-1b970713d09a
-	golang.org/x/net v0.26.0
+	golang.org/x/net v0.33.0
 	golang.org/x/sys v0.28.0
 	golang.org/x/time v0.5.0
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
