@@ -388,11 +388,32 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 			v := &l7Event{}
 			data := rec.RawSample
 			reader := bytes.NewBuffer(data)
+
+			// Ensure binary.Read does not fail before proceeding
 			if err := binary.Read(reader, binary.LittleEndian, v); err != nil {
 				klog.Warningln("failed to read msg:", err)
 				continue
 			}
+
 			payload := reader.Bytes()
+			expectedSize := int(v.PayloadSize) + int(v.ResponseSize)
+
+			// If the actual payload is smaller than expected, we log a warning and adjust
+			if len(payload) < expectedSize {
+				klog.Warningf("Payload too small (got %d bytes, expected %d), adjusting sizes", len(payload), expectedSize)
+			}
+
+			// Compute safe slicing limits
+			payloadEnd := min(int(v.PayloadSize), len(payload))
+			responseEnd := min(payloadEnd+int(v.ResponseSize), len(payload))
+
+			// Always copy to prevent garbage data from reused buffers
+			payloadData := make([]byte, payloadEnd)
+			copy(payloadData, payload[:payloadEnd])
+
+			responseData := make([]byte, responseEnd-payloadEnd)
+			copy(responseData, payload[payloadEnd:responseEnd])
+
 			req := &l7.RequestData{
 				Protocol:     l7.Protocol(v.Protocol),
 				Status:       l7.Status(v.Status),
@@ -401,23 +422,17 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 				StatementId:  v.StatementId,
 				PayloadSize:  v.PayloadSize,
 				ResponseSize: v.ResponseSize,
+				Payload:      payloadData,
+				Response:     responseData,
 			}
-			switch {
-			case v.PayloadSize == 0:
-			case v.PayloadSize > MaxPayloadSize && v.ResponseSize > MaxPayloadSize:
-				req.Payload = payload[:MaxPayloadSize]
-				req.Response = payload[MaxPayloadSize:]
-			case v.PayloadSize > MaxPayloadSize:
-				req.Payload = payload[:MaxPayloadSize]
-				req.Response = payload[MaxPayloadSize : MaxPayloadSize+v.ResponseSize]
-			case v.ResponseSize > MaxPayloadSize:
-				req.Payload = payload[:v.PayloadSize]
-				req.Response = payload[MaxPayloadSize:]
-			default:
-				req.Payload = payload[:v.PayloadSize]
-				req.Response = payload[MaxPayloadSize : MaxPayloadSize+v.ResponseSize]
+
+			event = Event{
+				Type:      EventTypeL7Request,
+				Pid:       v.Pid,
+				Fd:        v.Fd,
+				Timestamp: v.ConnectionTimestamp,
+				L7Request: req,
 			}
-			event = Event{Type: EventTypeL7Request, Pid: v.Pid, Fd: v.Fd, Timestamp: v.ConnectionTimestamp, L7Request: req}
 		case perfMapTypeFileEvents:
 			v := &fileEvent{}
 			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {

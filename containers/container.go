@@ -737,6 +737,18 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	if timestamp != 0 && conn.Timestamp != timestamp {
 		return nil
 	}
+	if conn.dstWorkload.Namespace == "external" && (r.Protocol == l7.ProtocolHTTP || r.Protocol == l7.ProtocolHTTP2) {
+		if host, ok := iqfqdn[conn.DestinationKey.ActualDestination().IP()]; ok {
+			log.Printf("Setting external host %s", host)
+			conn.dstWorkload.Name = host
+		} else {
+			host, error := l7.ParseHostFromHttpRequest(string(r.Payload))
+			if error == nil {
+				conn.dstWorkload.Name = host
+			}
+		}
+	}
+
 	stats := c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, conn.DestinationKey.GetDestinationWorkload(), conn.DestinationKey.GetActualDestinationWorkload())
 
 	trace := c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown(), conn.srcWorkload, conn.DestinationKey.GetDestinationWorkload(), conn.DestinationKey.GetActualDestinationWorkload())
@@ -747,13 +759,12 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		method := ""
 		uri := ""
 		response := ""
-		host := ""
+		host := conn.dstWorkload.Name
 		headers := http.Header{}
 		req, err := l7.ParseHTTPRequest(r.Payload)
 		if err != nil {
 			log.Printf("Failed to parse payload %s, %q", err, string(r.Payload))
 			method, uri = l7.ParseHttp(r.Payload)
-			host, _ = l7.ParseHostFromHttpRequest(string(r.Payload))
 		} else {
 			if req != nil && req.Body != nil {
 				body, _ := io.ReadAll(req.Body)
@@ -768,7 +779,6 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 				klog.Warningf("Non-utf8 characters in uri %q", req.URL.Path)
 				uri = string([]rune(req.URL.Path))
 			}
-			host = req.Host
 			if req.Header != nil {
 				headers = req.Header
 			}
