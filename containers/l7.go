@@ -75,14 +75,6 @@ func (s L7Stats) get(protocol l7.Protocol, key common.DestinationKey, r *l7.Requ
 				log.Printf("Failed to parse path %s", path)
 			}
 			constLabels["method"] = method
-			if dstWorkload.Namespace == "external" {
-				host, err := l7.ParseHostFromHttpRequest(string(r.Payload))
-				if host != "" {
-					constLabels["destination_workload_name"] = host
-				} else {
-					log.Printf("Failed to parse host %s , %v", string(r.Payload), err)
-				}
-			}
 			hOpts := L7Latency[protocol]
 			m.Latency = prometheus.NewHistogram(
 				prometheus.HistogramOpts{Name: hOpts.Name, Help: hOpts.Help, ConstLabels: constLabels},
