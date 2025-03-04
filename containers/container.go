@@ -749,32 +749,23 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		}
 	}
 
-	headers := http.Header{}
+	// Parse HTTP request once if needed
+	var req *http.Request
+	var err error
+	var headers http.Header = http.Header{}
 	if r.Protocol == l7.ProtocolHTTP {
-		req, err := l7.ParseHTTPRequest(r.Payload)
+		req, err = l7.ParseHTTPRequest(r.Payload)
 		if err == nil && req != nil && req.Header != nil {
 			headers = req.Header
 		}
 	}
 
+	trace := c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown(), conn.srcWorkload, conn.DestinationKey.GetDestinationWorkload(), conn.DestinationKey.GetActualDestinationWorkload())
 	traceId := ""
 	if headers != nil {
-		traceIdHeaders := strings.Split(*flags.TraceIdHeaders, ",")
-		for _, header := range traceIdHeaders {
-			if id := headers.Get(header); id != "" {
-				// check for lowercase header
-				traceId = id
-				break
-			} else if id := headers.Get(strings.ToLower(header)); id != "" {
-				traceId = id
-				break
-			}
-		}
+		traceId = trace.ExtractTraceId(headers)
 	}
-
 	stats := c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, conn.DestinationKey.GetDestinationWorkload(), conn.DestinationKey.GetActualDestinationWorkload(), traceId)
-
-	trace := c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown(), conn.srcWorkload, conn.DestinationKey.GetDestinationWorkload(), conn.DestinationKey.GetActualDestinationWorkload())
 	switch r.Protocol {
 	case l7.ProtocolHTTP:
 		stats.observe(r.Status.Http(), "", r.Duration)
@@ -783,7 +774,6 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		uri := ""
 		response := ""
 		host := conn.dstWorkload.Name
-		req, err := l7.ParseHTTPRequest(r.Payload)
 		if err != nil {
 			log.Printf("Failed to parse payload %s, %q", err, string(r.Payload))
 			method, uri = l7.ParseHttp(r.Payload)
