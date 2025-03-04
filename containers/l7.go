@@ -38,7 +38,7 @@ func (m *L7Metrics) observe(status, method string, duration time.Duration) {
 
 type L7Stats map[l7.Protocol]map[common.DestinationKey]*L7Metrics // protocol -> dst:actual_dst -> metrics
 
-func (s L7Stats) get(protocol l7.Protocol, key common.DestinationKey, r *l7.RequestData, srcWorkload common.Workload, dstWorkload common.Workload, actualDstWorkload common.Workload) *L7Metrics {
+func (s L7Stats) get(protocol l7.Protocol, key common.DestinationKey, r *l7.RequestData, srcWorkload common.Workload, dstWorkload common.Workload, actualDstWorkload common.Workload, traceId string) *L7Metrics {
 	if protocol == l7.ProtocolHTTP2 {
 		protocol = l7.ProtocolHTTP
 	}
@@ -62,6 +62,9 @@ func (s L7Stats) get(protocol l7.Protocol, key common.DestinationKey, r *l7.Requ
 			"actual_destination_workload_kind":      actualDstWorkload.Kind,
 			"actual_destination_workload_name":      actualDstWorkload.Name,
 			"actual_destination_workload_namespace": actualDstWorkload.Namespace,
+		}
+		if traceId != "" {
+			constLabels["trace_id"] = traceId
 		}
 		labels := []string{"status"}
 		switch protocol {

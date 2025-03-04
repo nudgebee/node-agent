@@ -749,7 +749,30 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		}
 	}
 
-	stats := c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, conn.DestinationKey.GetDestinationWorkload(), conn.DestinationKey.GetActualDestinationWorkload())
+	headers := http.Header{}
+	if r.Protocol == l7.ProtocolHTTP {
+		req, err := l7.ParseHTTPRequest(r.Payload)
+		if err == nil && req != nil && req.Header != nil {
+			headers = req.Header
+		}
+	}
+
+	traceId := ""
+	if headers != nil {
+		traceIdHeaders := strings.Split(*flags.TraceIdHeaders, ",")
+		for _, header := range traceIdHeaders {
+			if id := headers.Get(header); id != "" {
+				// check for lowercase header
+				traceId = id
+				break
+			} else if id := headers.Get(strings.ToLower(header)); id != "" {
+				traceId = id
+				break
+			}
+		}
+	}
+
+	stats := c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, conn.DestinationKey.GetDestinationWorkload(), conn.DestinationKey.GetActualDestinationWorkload(), traceId)
 
 	trace := c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown(), conn.srcWorkload, conn.DestinationKey.GetDestinationWorkload(), conn.DestinationKey.GetActualDestinationWorkload())
 	switch r.Protocol {
@@ -760,7 +783,6 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		uri := ""
 		response := ""
 		host := conn.dstWorkload.Name
-		headers := http.Header{}
 		req, err := l7.ParseHTTPRequest(r.Payload)
 		if err != nil {
 			log.Printf("Failed to parse payload %s, %q", err, string(r.Payload))
@@ -778,9 +800,6 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 				// remove non-utf8 characters
 				klog.Warningf("Non-utf8 characters in uri %q", req.URL.Path)
 				uri = string([]rune(req.URL.Path))
-			}
-			if req.Header != nil {
-				headers = req.Header
 			}
 		}
 		if r.Response != nil {
