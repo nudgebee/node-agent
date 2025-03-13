@@ -1,6 +1,9 @@
 module github.com/coroot/coroot-node-agent
 
-go 1.23
+go 1.23.0
+
+toolchain go1.23.6
+
 require (
 	cloud.google.com/go/compute/metadata v0.3.0
 	github.com/ClickHouse/ch-go v0.62.0
@@ -42,6 +45,7 @@ require (
 	golang.org/x/time v0.5.0
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
 	gopkg.in/yaml.v2 v2.4.0
+	gotest.tools v2.2.0+incompatible
 	inet.af/netaddr v0.0.0-20230525184311-b8eac61e914a
 	k8s.io/api v0.29.2
 	k8s.io/apimachinery v0.29.2
