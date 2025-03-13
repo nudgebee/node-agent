@@ -79,6 +79,12 @@ func NewTailReader(fileName string, ch chan<- logparser.LogEntry) (*TailReader, 
 }
 
 func (r *TailReader) Stop() {
+	// handle panic
+	defer func() {
+		if r := recover(); r != nil {
+			klog.Errorln("recovered from panic", r)
+		}
+	}()
 	klog.Infoln("stopping tail reader for", r.fileName)
 	r.stop()
 	<-r.stopped
