@@ -44,6 +44,7 @@ type IPResolver interface {
 	CacheDNS(string, string) common.Workload
 	StartWatching() error
 	StopWatching()
+	ResolvePodOwner(string, string) common.Workload
 }
 
 type Registry struct {

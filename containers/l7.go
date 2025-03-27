@@ -56,7 +56,7 @@ func (s L7Stats) get(protocol l7.Protocol, key common.DestinationKey, r *l7.Requ
 			"destination_workload_kind":             dstWorkload.Kind,
 			"destination_workload_name":             dstWorkload.Name,
 			"destination_workload_namespace":        dstWorkload.Namespace,
-			"src_kind":                              srcWorkload.Kind,
+			"src_workload_kind":                     srcWorkload.Kind,
 			"src_workload_name":                     srcWorkload.Name,
 			"src_workload_namespace":                srcWorkload.Namespace,
 			"actual_destination_workload_kind":      actualDstWorkload.Kind,

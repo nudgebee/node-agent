@@ -174,9 +174,10 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 	// %s -> pod name
 
 	split := strings.Split(string(id), "/")
-	namespace := split[1]
-	podName := split[2]
-
+	namespace := split[2]
+	podName := split[3]
+	src_workload := registry.ip_resolver.ResolvePodOwner(podName, namespace)
+	klog.Infof("Pod %s/%s is owned by %s/%s/%s", namespace, podName, src_workload.Name, src_workload.Namespace, src_workload.Kind)
 	c := &Container{
 		id:       id,
 		cgroup:   cg,
@@ -206,7 +207,7 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		done:        make(chan struct{}),
 		ip_resolver: registry.ip_resolver,
 		registry:    registry,
-		srcWorkload: common.Workload{Name: podName, Namespace: namespace, Kind: "Pod"},
+		srcWorkload: src_workload,
 	}
 	c.runLogParser("")
 

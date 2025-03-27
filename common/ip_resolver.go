@@ -636,7 +636,8 @@ func (resolver *K8sIPResolver) getControllerOfOwner(originalOwner *metav1.OwnerR
 		if !ok {
 			return nil, errors.New("type confusion in replicasets map")
 		}
-		return metav1.GetControllerOf(&replicaSet), nil
+		owner := metav1.GetControllerOf(&replicaSet)
+		return owner, nil
 	case "DaemonSet":
 		daemonSetVal, ok := resolver.snapshot.DaemonSets.Load(originalOwner.UID)
 		if !ok {
@@ -749,4 +750,19 @@ func (resolver *K8sIPResolver) resolvePodDescriptor(pod *v1.Pod) Workload {
 		resolver.snapshot.PodDescriptors.Store(pod.UID, result)
 	}
 	return result
+}
+
+func (resolver *K8sIPResolver) ResolvePodOwner(podName string, podNamespace string) Workload {
+	pods, err := resolver.clientset.CoreV1().Pods(podNamespace).Get(context.Background(), podName, metav1.GetOptions{})
+	if err != nil {
+		return Workload{
+			Name:      podName,
+			Namespace: podNamespace,
+			Kind:      "Pod",
+			Region:    "",
+			Zone:      "",
+			Instance:  "",
+		}
+	}
+	return resolver.resolvePodDescriptor(pods)
 }
