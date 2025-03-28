@@ -174,9 +174,10 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 	// %s -> pod name
 
 	split := strings.Split(string(id), "/")
-	namespace := split[1]
-	podName := split[2]
-
+	namespace := split[2]
+	podName := split[3]
+	src_workload := registry.ip_resolver.ResolvePodOwner(podName, namespace)
+	klog.Infof("Pod %s/%s is owned by %s/%s/%s", namespace, podName, src_workload.Name, src_workload.Namespace, src_workload.Kind)
 	c := &Container{
 		id:       id,
 		cgroup:   cg,
@@ -206,7 +207,7 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		done:        make(chan struct{}),
 		ip_resolver: registry.ip_resolver,
 		registry:    registry,
-		srcWorkload: common.Workload{Name: podName, Namespace: namespace, Kind: "Pod"},
+		srcWorkload: src_workload,
 	}
 	c.runLogParser("")
 
@@ -737,9 +738,35 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	if timestamp != 0 && conn.Timestamp != timestamp {
 		return nil
 	}
-	stats := c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, conn.DestinationKey.GetDestinationWorkload(), conn.DestinationKey.GetActualDestinationWorkload())
+	if conn.dstWorkload.Namespace == "external" && (r.Protocol == l7.ProtocolHTTP || r.Protocol == l7.ProtocolHTTP2) {
+		if host, ok := iqfqdn[conn.DestinationKey.ActualDestination().IP()]; ok {
+			log.Printf("Setting external host %s", host)
+			conn.dstWorkload.Name = host
+		} else {
+			host, error := l7.ParseHostFromHttpRequest(string(r.Payload))
+			if error == nil {
+				conn.dstWorkload.Name = host
+			}
+		}
+	}
+
+	// Parse HTTP request once if needed
+	var req *http.Request
+	var err error
+	var headers http.Header = http.Header{}
+	if r.Protocol == l7.ProtocolHTTP {
+		req, err = l7.ParseHTTPRequest(r.Payload)
+		if err == nil && req != nil && req.Header != nil {
+			headers = req.Header
+		}
+	}
 
 	trace := c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown(), conn.srcWorkload, conn.DestinationKey.GetDestinationWorkload(), conn.DestinationKey.GetActualDestinationWorkload())
+	traceId := ""
+	if headers != nil {
+		traceId = trace.ExtractTraceId(headers)
+	}
+	stats := c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, conn.DestinationKey.GetDestinationWorkload(), conn.DestinationKey.GetActualDestinationWorkload(), traceId)
 	switch r.Protocol {
 	case l7.ProtocolHTTP:
 		stats.observe(r.Status.Http(), "", r.Duration)
@@ -747,13 +774,10 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		method := ""
 		uri := ""
 		response := ""
-		host := ""
-		headers := http.Header{}
-		req, err := l7.ParseHTTPRequest(r.Payload)
+		host := conn.dstWorkload.Name
 		if err != nil {
 			log.Printf("Failed to parse payload %s, %q", err, string(r.Payload))
 			method, uri = l7.ParseHttp(r.Payload)
-			host, _ = l7.ParseHostFromHttpRequest(string(r.Payload))
 		} else {
 			if req != nil && req.Body != nil {
 				body, _ := io.ReadAll(req.Body)
@@ -767,10 +791,6 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 				// remove non-utf8 characters
 				klog.Warningf("Non-utf8 characters in uri %q", req.URL.Path)
 				uri = string([]rune(req.URL.Path))
-			}
-			host = req.Host
-			if req.Header != nil {
-				headers = req.Header
 			}
 		}
 		if r.Response != nil {

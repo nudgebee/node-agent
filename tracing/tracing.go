@@ -195,6 +195,22 @@ func ParseTraceIdHeaders(traceId string) string {
 	return traceId
 }
 
+func (t *Trace) ExtractTraceId(headers http.Header) string {
+	if headers == nil {
+		return ""
+	}
+
+	traceIdHeaders := strings.Split(*flags.TraceIdHeaders, ",")
+	for _, header := range traceIdHeaders {
+		if id := headers.Get(header); id != "" {
+			return id
+		} else if id := headers.Get(strings.ToLower(header)); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
 func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time.Duration, requestSize uint64, payload string, headers http.Header, response string, host string) {
 	if t == nil || method == "" {
 		return
@@ -220,22 +236,11 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 		requestHost = host
 	}
 
-	traceId := ""
 	if headers != nil {
 		requestHeaders = l7.ConvertHeadersToBase64String(headers)
-		traceIdHeaders := strings.Split(*flags.TraceIdHeaders, ",")
-		for _, header := range traceIdHeaders {
-			if id := headers.Get(header); id != "" {
-				// check for lowercase header
-				traceId = id
-				break
-			} else if id := headers.Get(strings.ToLower(header)); id != "" {
-				traceId = id
-				break
-			}
-		}
 	}
 
+	traceId := t.ExtractTraceId(headers)
 	t.createSpan(method, duration, status >= 400,
 		traceId,
 		semconv.HTTPURL(fmt.Sprintf("http://%s%s", requestHost, requestPath)),
