@@ -29,6 +29,7 @@ jobs:
         
       - name: Build and Push Agent Image
         uses: docker/build-push-action@v3
+        platforms: linux/amd64,linux/arm64
         with:
           context: .
           file: 'Dockerfile.alpine'
