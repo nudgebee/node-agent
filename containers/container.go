@@ -1,6 +1,7 @@
 package containers
 
 import (
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -169,11 +170,11 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		return nil, err
 	}
 	defer netNs.Close()
-	// /k8s/%s/%s/%s split
-	// /k8s/ -> namespace
-	// %s -> pod name
-
 	split := strings.Split(string(id), "/")
+	if len(split) < 4 {
+		klog.Errorf("unexpected container id %s", id)
+		return nil, errors.New("unexpected container id")
+	}
 	namespace := split[2]
 	podName := split[3]
 	src_workload := registry.ip_resolver.ResolvePodOwner(podName, namespace)
