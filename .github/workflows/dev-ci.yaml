@@ -40,4 +40,4 @@ jobs:
           file: 'Dockerfile.alpine'
           push: true
           tags: |
-            280501305789.dkr.ecr.us-east-1.amazonaws.com/nudgebee-node-agent:${{ env.tag }}
+            864186153326.dkr.ecr.us-east-1.amazonaws.com/nudgebee-node-agent:${{ env.tag }}
