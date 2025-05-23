@@ -1,10 +1,14 @@
 package cgroup
 
 import (
+	"os"
+	"path"
 	"runtime"
+	"strings"
 
 	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
+	"k8s.io/klog/v2"
 )
 
 func Init() error {
@@ -18,25 +22,32 @@ func Init() error {
 		return err
 	}
 	defer hostNs.Close()
-	if selfNs.Equal(hostNs) {
-		return nil
-	}
+	if !selfNs.Equal(hostNs) {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		if err := unix.Setns(int(hostNs), unix.CLONE_NEWCGROUP); err != nil {
+			return err
+		}
+		cg, err := NewFromProcessCgroupFile("/proc/self/cgroup")
+		if err != nil {
+			return err
+		}
+		baseCgroupPath = cg.Id
 
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	if err := unix.Setns(int(hostNs), unix.CLONE_NEWCGROUP); err != nil {
-		return err
+		if err := unix.Setns(int(selfNs), unix.CLONE_NEWCGROUP); err != nil {
+			return err
+		}
 	}
-
-	cg, err := NewFromProcessCgroupFile("/proc/self/cgroup")
-	if err != nil {
-		return err
+	if _, err := os.Stat(path.Join(cgRoot, "unified")); err == nil {
+		if data, err := os.ReadFile("/proc/self/mounts"); err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				if strings.Contains(line, "cgroup/unified") {
+					cg2Root = path.Join(cgRoot, "unified")
+					break
+				}
+			}
+		}
 	}
-	baseCgroupPath = cg.Id
-
-	if err := unix.Setns(int(selfNs), unix.CLONE_NEWCGROUP); err != nil {
-		return err
-	}
-
+	klog.Infoln("cgroup v2 root is", cg2Root)
 	return nil
 }
