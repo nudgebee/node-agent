@@ -21,7 +21,10 @@ import (
 	"k8s.io/klog/v2"
 )
 
-const MinTrafficStatsUpdateInterval = 5 * time.Second
+const (
+	MinTrafficStatsUpdateInterval = 5 * time.Second
+	IgnoredContainersCacheTTL     = 15 * time.Second
+)
 
 var (
 	selfNetNs                = netns.None()
@@ -53,11 +56,12 @@ type Registry struct {
 	tracer *ebpftracer.Tracer
 	events chan ebpftracer.Event
 
-	containersById       map[ContainerID]*Container
-	containersByCgroupId map[string]*Container
-	containersByPid      map[uint32]*Container
-	ip2fqdn              map[netaddr.IP]string
-	ip2fqdnLock          sync.RWMutex
+	containersById         map[ContainerID]*Container
+	containersByCgroupId   map[string]*Container
+	containersByPid        map[uint32]*Container
+	containersByPidIgnored map[uint32]*time.Time
+	ip2fqdn                map[netaddr.IP]*common.Domain
+	ip2fqdnLock            sync.RWMutex
 
 	processInfoCh chan<- ProcessInfo
 	ip_resolver   IPResolver
@@ -89,29 +93,30 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, ip
 	if err != nil {
 		return nil, err
 	}
-	if err := cgroup.Init(); err != nil {
+	if err = cgroup.Init(); err != nil {
 		return nil, err
 	}
-	if err := DockerdInit(); err != nil {
+	if err = DockerdInit(); err != nil {
 		klog.Warningln(err)
 	}
-	if err := ContainerdInit(); err != nil {
+	if err = ContainerdInit(); err != nil {
 		klog.Warningln(err)
 	}
-	if err := CrioInit(); err != nil {
+	if err = CrioInit(); err != nil {
 		klog.Warningln(err)
 	}
-	if err := JournaldInit(); err != nil {
+	if err = JournaldInit(); err != nil {
 		klog.Warningln(err)
 	}
 
 	r := &Registry{
-		reg:                  reg,
-		events:               make(chan ebpftracer.Event, 10000),
-		containersById:       map[ContainerID]*Container{},
-		containersByCgroupId: map[string]*Container{},
-		containersByPid:      map[uint32]*Container{},
-		ip2fqdn:              map[netaddr.IP]string{},
+		reg:                    reg,
+		events:                 make(chan ebpftracer.Event, 10000),
+		containersById:         map[ContainerID]*Container{},
+		containersByCgroupId:   map[string]*Container{},
+		containersByPid:        map[uint32]*Container{},
+		containersByPidIgnored: map[uint32]*time.Time{},
+		ip2fqdn:                map[netaddr.IP]*common.Domain{},
 
 		processInfoCh:        processInfoCh,
 		ip_resolver:          ip_resolver,
@@ -137,8 +142,10 @@ func (r *Registry) Describe(ch chan<- *prometheus.Desc) {
 func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 	r.ip2fqdnLock.RLock()
 	defer r.ip2fqdnLock.RUnlock()
-	for ip, fqdn := range r.ip2fqdn {
-		ch <- gauge(metrics.Ip2Fqdn, 1, ip.String(), fqdn)
+	for ip, domain := range r.ip2fqdn {
+		if domain.SpecifyIP {
+			ch <- gauge(metrics.Ip2Fqdn, 1, ip.String(), domain.FQDN)
+		}
 	}
 }
 
@@ -167,6 +174,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 					c.onProcessExit(pid, false)
 				}
 			}
+			r.containersByPidIgnored = map[uint32]*time.Time{}
 			activeIPs := map[netaddr.IP]struct{}{}
 			for id, c := range r.containersById {
 				for dst := range c.lastConnectionAttempts {
@@ -186,7 +194,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 						delete(r.containersByPid, pid)
 					}
 				}
-				if ok := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(id)}, r.reg).Unregister(c); !ok {
+				if ok := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(c.id), "app_id": c.appId}, r.reg).Unregister(c); !ok {
 					klog.Warningln("failed to unregister container:", id)
 				}
 				delete(r.containersById, id)
@@ -277,8 +285,8 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				if c := r.containersByPid[e.Pid]; c != nil {
 					ip2fqdn := c.onL7Request(e.Pid, e.Fd, e.Timestamp, e.L7Request, r.ip2fqdn)
 					r.ip2fqdnLock.Lock()
-					for ip, fqdn := range ip2fqdn {
-						r.ip2fqdn[ip] = fqdn
+					for ip, domain := range ip2fqdn {
+						r.ip2fqdn[ip] = domain
 					}
 					r.ip2fqdnLock.Unlock()
 				}
@@ -292,10 +300,16 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 }
 
 func (r *Registry) getOrCreateContainer(pid uint32) *Container {
-	if c, seen := r.containersByPid[pid]; c != nil {
+	if c := r.containersByPid[pid]; c != nil {
 		return c
-	} else if seen { // ignored
-		return nil
+	} else {
+		if t := r.containersByPidIgnored[pid]; t != nil {
+			if time.Since(*t) < IgnoredContainersCacheTTL {
+				return nil
+			} else {
+				delete(r.containersByPidIgnored, pid)
+			}
+		}
 	}
 	cg, err := proc.ReadCgroup(pid)
 	if err != nil {
@@ -330,10 +344,18 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 			klog.InfoS("ignoring without persisting", "cg", cg.Id, "pid", pid)
 		} else {
 			klog.InfoS("ignoring", "cg", cg.Id, "pid", pid)
-			r.containersByPid[pid] = nil
+			t := time.Now()
+			r.containersByPidIgnored[pid] = &t
 		}
 		return nil
 	}
+	if common.ContainerFilter.ShouldBeSkipped(string(id)) {
+		klog.InfoS("skipping due to user-defined settings", "id", id, "pid", pid)
+		t := time.Now()
+		r.containersByPidIgnored[pid] = &t
+		return nil
+	}
+
 	if c := r.containersById[id]; c != nil {
 		klog.Warningln("id conflict:", id)
 		if cg.CreatedAt().After(c.cgroup.CreatedAt()) {
@@ -350,8 +372,8 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		klog.Warningf("failed to create container pid=%d cg=%s id=%s: %s", pid, cg.Id, id, err)
 		return nil
 	}
-
-	if err := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(id)}, r.reg).Register(c); err != nil {
+	klog.InfoS("detected a new container", "pid", pid, "cg", cg.Id, "id", id, "app", c.appId)
+	if err := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(id), "app_id": c.appId}, r.reg).Register(c); err != nil {
 		klog.Warningln("failed to register container:", err)
 		return nil
 	}
@@ -386,7 +408,7 @@ func (r *Registry) updateTrafficStatsIfNecessary() {
 	r.trafficStatsLastUpdated = time.Now()
 }
 
-func (r *Registry) getFQDN(ip netaddr.IP) string {
+func (r *Registry) getDomain(ip netaddr.IP) *common.Domain {
 	r.ip2fqdnLock.RLock()
 	defer r.ip2fqdnLock.RUnlock()
 	return r.ip2fqdn[ip]

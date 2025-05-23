@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"fmt"
 	"net"
-	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/coroot/coroot-node-agent/flags"
+	"github.com/gobwas/glob"
 	"inet.af/netaddr"
 	"k8s.io/klog/v2"
 )
@@ -18,6 +18,8 @@ var (
 		whitelist: map[string]netaddr.IPPrefix{},
 	}
 	PortFilter *portFilter
+
+	HttpFilter *httpFilter
 )
 
 func init() {
@@ -28,7 +30,7 @@ func init() {
 		}
 		p, err := netaddr.ParseIPPrefix(prefix)
 		if err != nil {
-			klog.Fatalf("invalid network %s: %s", prefix, err)
+			klog.Exitf("invalid network %s: %s", prefix, err)
 		}
 		ConnectionFilter.WhitelistPrefix(p)
 	}
@@ -36,23 +38,27 @@ func init() {
 		klog.Infoln("ephemeral-port-range:", *r)
 		parts := strings.Split(*r, "-")
 		if len(parts) != 2 {
-			klog.Fatalf("invalid port range: %s", *r)
+			klog.Exitf("invalid port range: %s", *r)
 		}
 		from, err := strconv.ParseUint(parts[0], 10, 16)
 		if err != nil {
-			klog.Fatalf("invalid port range: %s", *r)
+			klog.Exitf("invalid port range: %s", *r)
 		}
 		to, err := strconv.ParseUint(parts[1], 10, 16)
 		if err != nil {
-			klog.Fatalf("invalid port range: %s", *r)
+			klog.Exitf("invalid port range: %s", *r)
 		}
 		if from > to {
-			klog.Fatalf("invalid port range: %s", *r)
+			klog.Exitf("invalid port range: %s", *r)
 		}
 		PortFilter = &portFilter{
 			from: uint16(from),
 			to:   uint16(to),
 		}
+	}
+	var err error
+	if HttpFilter, err = newHttpFilter(*flags.ExcludeHTTPMetricsByPath); err != nil {
+		klog.Exitf("invalid HTTP filter: %s", err)
 	}
 }
 
@@ -65,6 +71,10 @@ func IsIpPrivate(ip netaddr.IP) bool {
 		return parts[0] == 100 && parts[1]&0xc0 == 64 // 100.64.0.0/10
 	}
 	return false
+}
+
+func IsIpExternal(ip netaddr.IP) bool {
+	return !ip.IsLoopback() && !IsIpPrivate(ip)
 }
 
 type connectionFilter struct {
@@ -197,14 +207,36 @@ func (dk DestinationKey) String() string {
 	return fmt.Sprintf("%s (%s)", dk.Destination(), dk.actualDestination.String())
 }
 
-var (
-	awsS3FQDN = regexp.MustCompile(`.+s3.*.amazonaws.com`)
-)
+type Domain struct {
+	FQDN      string
+	SpecifyIP bool
+}
 
-func NewDestinationKey(dst, actualDst netaddr.IPPort, fqdn string, dstWorkload Workload, actualDestWorkload Workload) DestinationKey {
-	if awsS3FQDN.MatchString(fqdn) {
+func (d *Domain) String() string {
+	return fmt.Sprintf("Domain(%s,%t)", d.FQDN, d.SpecifyIP)
+}
+
+func NewDomain(fqdn string, ips []netaddr.IP) *Domain {
+	d := &Domain{FQDN: fqdn, SpecifyIP: true}
+	if len(ips) > 1 {
+		containsPrivateIPs := false
+		for _, ip := range ips {
+			if !IsIpExternal(ip) {
+				containsPrivateIPs = true
+				break
+			}
+		}
+		if !containsPrivateIPs {
+			d.SpecifyIP = false
+		}
+	}
+	return d
+}
+
+func NewDestinationKey(dst, actualDst netaddr.IPPort, domain *Domain, dstWorkload Workload, actualDestWorkload Workload) DestinationKey {
+	if IsIpExternal(actualDst.IP()) && domain != nil && !domain.SpecifyIP {
 		return DestinationKey{
-			destination: HostPortWithEmptyIP(fqdn, dst.Port()),
+			destination: HostPortWithEmptyIP(domain.FQDN, dst.Port()),
 		}
 	}
 	return DestinationKey{
@@ -249,4 +281,33 @@ func (dk DestinationKey) GetDestinationWorkload() Workload {
 
 func (dk DestinationKey) GetActualDestinationWorkload() Workload {
 	return dk.actualDestinationWorkload
+}
+
+type httpFilter struct {
+	globs []glob.Glob
+}
+
+func newHttpFilter(patterns []string) (*httpFilter, error) {
+	f := &httpFilter{}
+	if len(patterns) == 0 {
+		return f, nil
+	}
+	klog.Infof("HTTP paths to exclude: %v", patterns)
+	for _, p := range patterns {
+		g, err := glob.Compile(p)
+		if err != nil {
+			return nil, err
+		}
+		f.globs = append(f.globs, g)
+	}
+	return f, nil
+}
+
+func (f *httpFilter) ShouldBeSkipped(path string) bool {
+	for _, g := range f.globs {
+		if g.Match(path) {
+			return true
+		}
+	}
+	return false
 }
