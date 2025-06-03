@@ -44,16 +44,56 @@ func ParseHTTPRequest(data []byte) (*http.Request, error) {
 		uri = append(uri, []byte("...")...)
 	}
 
-	httpVersion, rest, _ := bytes.Cut(rest, []byte{'\n'})
-	remaining := bytes.Split(rest, []byte{'\r', '\n', '\r', '\n'})
-	headers := remaining[0]
-	var body []byte
-	if len(remaining) > 1 {
-		body = remaining[1]
-	}
+	httpVersion, rest, ok := bytes.Cut(rest, []byte{'\n'})
 	if !ok {
-		return nil, errors.New("invalid headers")
+		// Handle the case where there's no newline after httpVersion,
+		// meaning there are no headers or body.
+		rest = []byte{} // Ensure rest is empty
 	}
+
+	var headers []byte
+	var body []byte
+	headerLinesBytes := [][]byte{}
+	bodyStartIndex := -1
+
+	// Iterate through 'rest' line by line to find the empty line separating headers and body
+	tempRest := rest
+	for i := 0; ; i++ {
+		line, after, found := bytes.Cut(tempRest, []byte{'\n'})
+		if !found {
+			// No more newlines, the rest is part of the last header line or body
+			if bodyStartIndex != -1 { // If we are already capturing body
+				body = append(body, tempRest...)
+			} else { // Still in headers
+				headerLinesBytes = append(headerLinesBytes, tempRest)
+			}
+			break
+		}
+
+		// Check if the line is empty (carriage return followed by newline, or just newline)
+		trimmedLine := bytes.TrimSpace(line)
+		if len(trimmedLine) == 0 {
+			bodyStartIndex = i + 1 // Mark the start of the body
+			body = after           // The rest is body
+			break
+		}
+
+		if bodyStartIndex == -1 { // Still processing headers
+			headerLinesBytes = append(headerLinesBytes, line)
+		}
+		tempRest = after
+	}
+
+	if len(headerLinesBytes) > 0 {
+		headers = bytes.Join(headerLinesBytes, []byte{'\n'})
+	} else {
+		headers = []byte{}
+	}
+
+	// The original code had `if !ok` check for headers which is not directly applicable here
+	// as we are manually parsing. We'll rely on subsequent parsing steps to validate.
+	// For instance, url.ParseRequestURI will fail if uri is bad.
+
 	parsedURL, err := url.ParseRequestURI(string(uri))
 
 	if err != nil {
@@ -68,6 +108,9 @@ func ParseHTTPRequest(data []byte) (*http.Request, error) {
 	}
 	var header = http.Header{}
 	var host = ""
+	// We already have headerLinesBytes, but it contains the full lines including \r if present.
+	// For header parsing, we need to split by \n and then process each line.
+	// The 'headers' variable now contains all header lines joined by '\n'.
 	headerLines := bytes.Split(headers, []byte("\n"))
 	sensitiveHeaders := make(map[string]bool)
 	sensitiveKeysList := strings.Split(*flags.SensitiveHeader, ",")

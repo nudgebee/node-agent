@@ -1,5 +1,5 @@
 #define MAX_CONNECTIONS 1000000
-#define MAX_PAYLOAD_SIZE 1024 * 5 // must be power of 2
+#define MAX_PAYLOAD_SIZE 1024 * 16 // Increased from 5KB to 16KB
 
 struct tcp_event {
     __u64 fd;
@@ -95,6 +95,7 @@ struct l7_request {
     __u8 protocol;
     __u8 partial;
     __u8 request_type;
+    __u8 request_potentially_truncated; // New field
     __s32 request_id;
     __u64 payload_size;
     char payload[MAX_PAYLOAD_SIZE];

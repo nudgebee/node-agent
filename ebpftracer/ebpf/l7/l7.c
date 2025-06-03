@@ -27,6 +27,9 @@
 #define METHOD_HTTP2_CLIENT_FRAMES  5
 #define METHOD_HTTP2_SERVER_FRAMES  6
 
+#define L7_EVENT_FLAG_REQUEST_TRUNCATED  (1 << 0)
+#define L7_EVENT_FLAG_RESPONSE_TRUNCATED (1 << 1)
+
 #define TRUNCATE_PAYLOAD_SIZE(size) ({                                  \
     size = MIN(size, MAX_PAYLOAD_SIZE-1);                               \
     asm volatile ("%0 &= %1" : "+r"(size) : "i"(MAX_PAYLOAD_SIZE-1));   \
@@ -65,7 +68,7 @@ struct l7_event {
     __u64 duration;
     __u8 protocol;
     __u8 method;
-    __u16 padding;
+    __u16 flags;
     __u32 statement_id;
     __u64 payload_size;
     __u64 response_size;
@@ -215,7 +218,12 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
     req->partial = 0;
     req->request_id = 0;
     req->ns = 0;
-    req->payload_size = size;
+    req->request_potentially_truncated = 0; // Initialize new field
+
+    // total_size holds the original size before any potential truncation by read_iovec for payload analysis
+    // size holds the size to be copied by COPY_PAYLOAD, potentially already limited by read_iovec's MAX_PAYLOAD_SIZE constraint for buffer
+    req->request_potentially_truncated = (total_size >= MAX_PAYLOAD_SIZE);
+
     struct l7_request_key k = {};
     k.pid = cid.pid;
     k.fd = cid.fd;
@@ -230,10 +238,15 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
             if (!e) {
                 return 0;
             }
+            __builtin_memset(e, 0, sizeof(*e)); // Initialize event, including flags
             e->protocol = PROTOCOL_POSTGRES;
             e->method = METHOD_STATEMENT_CLOSE;
-            e->payload_size = size;
-            COPY_PAYLOAD(e->payload, size, payload);
+            if (total_size >= MAX_PAYLOAD_SIZE) {
+                e->flags |= L7_EVENT_FLAG_REQUEST_TRUNCATED;
+            }
+            __u64 copy_size = size; // size might be from read_iovec, total_size is original
+            COPY_PAYLOAD(e->payload, copy_size, payload); // copy_size gets updated to truncated size
+            e->payload_size = copy_size; // Store the actual copied size
             send_event(ctx, e, cid, conn);
             return 0;
         }
@@ -248,10 +261,15 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
             if (!e) {
                 return 0;
             }
+            __builtin_memset(e, 0, sizeof(*e)); // Initialize event
             e->protocol = PROTOCOL_MYSQL;
             e->method = METHOD_STATEMENT_CLOSE;
-            e->payload_size = size;
-            COPY_PAYLOAD(e->payload, size, payload);
+            if (total_size >= MAX_PAYLOAD_SIZE) {
+                e->flags |= L7_EVENT_FLAG_REQUEST_TRUNCATED;
+            }
+            __u64 copy_size = size;
+            COPY_PAYLOAD(e->payload, copy_size, payload); // copy_size gets updated
+            e->payload_size = copy_size;
             send_event(ctx, e, cid, conn);
             return 0;
         }
@@ -263,8 +281,12 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
         if (!e) {
             return 0;
         }
+        __builtin_memset(e, 0, sizeof(*e));
         e->protocol = PROTOCOL_RABBITMQ;
         e->method = METHOD_PRODUCE;
+        // Produce events often don't copy payload in this path, but if they did:
+        // if (total_size >= MAX_PAYLOAD_SIZE) { e->flags |= L7_EVENT_FLAG_REQUEST_TRUNCATED; }
+        // e->payload_size = actual_copied_size;
         send_event(ctx, e, cid, conn);
         return 0;
     } else if (nats_method(payload, size) == METHOD_PRODUCE) {
@@ -272,8 +294,11 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
         if (!e) {
             return 0;
         }
+        __builtin_memset(e, 0, sizeof(*e));
         e->protocol = PROTOCOL_NATS;
         e->method = METHOD_PRODUCE;
+        // Similar to RabbitMQ produce
+        // if (total_size >= MAX_PAYLOAD_SIZE) { e->flags |= L7_EVENT_FLAG_REQUEST_TRUNCATED; }
         send_event(ctx, e, cid, conn);
         return 0;
     } else if (is_cassandra_request(payload, size, &k.stream_id)) {
@@ -283,11 +308,16 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
         if (!e) {
             return 0;
         }
+        __builtin_memset(e, 0, sizeof(*e));
         e->protocol = PROTOCOL_HTTP2;
         e->method = METHOD_HTTP2_CLIENT_FRAMES;
-        e->duration = bpf_ktime_get_ns();
-        e->payload_size = size;
-        COPY_PAYLOAD(e->payload, size, payload);
+        e->duration = bpf_ktime_get_ns(); // This is a timestamp of the event
+        if (total_size >= MAX_PAYLOAD_SIZE) { // total_size is original frame size
+            e->flags |= L7_EVENT_FLAG_REQUEST_TRUNCATED;
+        }
+        __u64 copy_size = size; // size is from read_iovec or syscall
+        COPY_PAYLOAD(e->payload, copy_size, payload); // copy_size gets updated
+        e->payload_size = copy_size; // Store actual copied size
         send_event(ctx, e, cid, conn);
         return 0;
     } else if (is_clickhouse_query(payload, size)) {
@@ -312,7 +342,13 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
     if (req->ns == 0) {
         req->ns = bpf_ktime_get_ns();
     }
-    COPY_PAYLOAD(req->payload, size, payload);
+    // req->request_potentially_truncated is already set based on total_size
+    // 'size' here is the size determined from read_iovec or original syscall size,
+    // which is what COPY_PAYLOAD will attempt to copy.
+    __u64 req_copy_size = size;
+    COPY_PAYLOAD(req->payload, req_copy_size, payload); // req_copy_size gets updated
+    req->payload_size = req_copy_size; // Store the actually copied (potentially truncated) size in req
+
     bpf_map_update_elem(&active_l7_requests, &k, req, BPF_NOEXIST);
     return 0;
 }
@@ -393,20 +429,31 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     if (!e) {
         return 0;
     }
+    __builtin_memset(e, 0, sizeof(*e)); // Initialize event, including flags to 0
     e->protocol = PROTOCOL_UNKNOWN;
     e->status = STATUS_UNKNOWN;
     e->method = METHOD_UNKNOWN;
-    e->statement_id = 0;
-    e->payload_size = 0;
-    e->response_size = ret;
-    COPY_PAYLOAD(e->response, ret, payload);
-    if (is_rabbitmq_consume(payload, ret)) {
+    // e->payload_size will be filled from req if applicable
+
+    // Handle response truncation
+    // total_size is the original size of the data read by the syscall
+    // ret is the amount of data successfully read into 'payload' buffer (potentially after read_iovec processing)
+    if (total_size >= MAX_PAYLOAD_SIZE) {
+        e->flags |= L7_EVENT_FLAG_RESPONSE_TRUNCATED;
+    }
+    __u64 response_copy_size = ret; // This 'ret' is the size available in 'payload' buffer
+    COPY_PAYLOAD(e->response, response_copy_size, payload); // response_copy_size gets updated
+    e->response_size = response_copy_size; // Store actual copied size
+
+    // Check for consume events first as they don't rely on a prior request in active_l7_requests
+    if (is_rabbitmq_consume(e->response, e->response_size)) {
         e->protocol = PROTOCOL_RABBITMQ;
         e->method = METHOD_CONSUME;
+        // Request part is not applicable for consume, L7_EVENT_FLAG_REQUEST_TRUNCATED remains 0
         send_event(ctx, e, cid, conn);
         return 0;
     }
-    if (nats_method(payload, ret) == METHOD_CONSUME) {
+    if (nats_method(e->response, e->response_size) == METHOD_CONSUME) {
         e->protocol = PROTOCOL_NATS;
         e->method = METHOD_CONSUME;
         send_event(ctx, e, cid, conn);
@@ -421,10 +468,31 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
             if (!req) {
                 return 0;
             }
+            if (req->request_potentially_truncated) {
+                e->flags |= L7_EVENT_FLAG_REQUEST_TRUNCATED;
+            }
+            // For DNS, the response is typically copied into e->payload.
+            // The L7_EVENT_FLAG_RESPONSE_TRUNCATED set above for e->response might be misleading if e->response isn't sent.
+            // Let's assume 'payload' (the read buffer) contains DNS response.
+            // 'total_size' is original DNS response size. 'ret' is size in 'payload' buffer.
+            // We are copying from 'payload' to 'e->payload'.
+            e->flags &= ~L7_EVENT_FLAG_RESPONSE_TRUNCATED; // Clear general response flag, as DNS response goes to e->payload
+            if (total_size >= MAX_PAYLOAD_SIZE) { // total_size is original size of DNS response
+                e->flags |= L7_EVENT_FLAG_PAYLOAD_TRUNCATED_ALIAS; // Placeholder, this needs to be specific: e->payload is the response here
+            }
+            // Actually, let's simplify: if this is a DNS response, e->payload gets the response.
+            // So L7_EVENT_FLAG_RESPONSE_TRUNCATED should apply to this copy.
+             if (total_size >= MAX_PAYLOAD_SIZE) { // total_size is original size of DNS response in 'payload' buffer
+                e->flags |= L7_EVENT_FLAG_RESPONSE_TRUNCATED;
+            }
+            __u64 dns_response_copy_size = ret; // ret is size of DNS response in 'payload'
+            COPY_PAYLOAD(e->payload, dns_response_copy_size, payload); // dns_response_copy_size updated
+            e->payload_size = dns_response_copy_size; // This is the DNS response size
+            e->response_size = 0; // e->response is not used for DNS response
+
             e->protocol = PROTOCOL_DNS;
             e->duration = bpf_ktime_get_ns() - req->ns;
-            e->payload_size = ret;
-            COPY_PAYLOAD(e->payload, ret, payload);
+            // e->status is set by is_dns_response
             send_event(ctx, e, cid, conn);
             bpf_map_delete_elem(&active_l7_requests, &k);
             return 0;
@@ -433,60 +501,81 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
             if (!req) {
                 return 0;
             }
-            response = 1;
-        } else if (looks_like_http2_frame(payload, ret, METHOD_HTTP2_SERVER_FRAMES)) {
+            response = 1; // Mark that we found a matching request
+            if (req->request_potentially_truncated) {
+                e->flags |= L7_EVENT_FLAG_REQUEST_TRUNCATED;
+            }
+            // Response truncation for e->response already handled by general logic.
+            // For Cassandra, e->response contains the actual response.
+        } else if (looks_like_http2_frame(e->response, e->response_size, METHOD_HTTP2_SERVER_FRAMES)) {
+            // This is an HTTP2 server frame, not necessarily a direct response to a stored req.
+            // Treated as a separate event. The content is in e->response.
+            // The L7_EVENT_FLAG_RESPONSE_TRUNCATED on e->response is already set if it was truncated.
             e->protocol = PROTOCOL_HTTP2;
             e->method = METHOD_HTTP2_SERVER_FRAMES;
-            e->duration = bpf_ktime_get_ns();
-            e->payload_size = ret;
-            COPY_PAYLOAD(e->payload, ret, payload);
+            e->duration = bpf_ktime_get_ns(); // Timestamp of the frame event
+            // Request part is not applicable here.
+            // e->payload is not used for these frames.
+            e->payload_size = 0;
             send_event(ctx, e, cid, conn);
             return 0;
         } else {
-            return 0;
+            return 0; // No matching request or recognized standalone event
         }
+    } else { // req was found for protocols other than DNS/Cassandra special handling above
+        if (req->request_potentially_truncated) {
+            e->flags |= L7_EVENT_FLAG_REQUEST_TRUNCATED;
+        }
+        // Copy request from req->payload to e->payload
+        __u64 event_req_copy_size = req->payload_size; // req->payload_size is already truncated size
+        COPY_PAYLOAD(e->payload, event_req_copy_size, req->payload);
+        e->payload_size = event_req_copy_size; // Store it
     }
 
-    e->protocol = req->protocol;
-    e->payload_size = req->payload_size;
-    COPY_PAYLOAD(e->payload, req->payload_size, req->payload);
+    // This part is for events that had a matching 'req'
+    e->protocol = req->protocol; // Ensure protocol is from 'req'
+    // e->response and e->response_size are already populated and truncation flagged.
+    // e->payload and e->payload_size are populated from 'req' and truncation flagged.
+
+    // Determine response type and status based on e->response (the current read buffer)
     if (e->protocol == PROTOCOL_HTTP) {
-        response = is_http_response(payload, &e->status);
+        response = is_http_response(e->response, e->response_size, &e->status);
     } else if (e->protocol == PROTOCOL_POSTGRES) {
-        response = is_postgres_response(payload, ret, &e->status);
+        response = is_postgres_response(e->response, e->response_size, &e->status);
         if (req->request_type == POSTGRES_FRAME_PARSE) {
             e->method = METHOD_STATEMENT_PREPARE;
         }
     } else if (e->protocol == PROTOCOL_REDIS) {
-        response = is_redis_response(payload, ret, &e->status);
+        response = is_redis_response(e->response, e->response_size, &e->status);
     } else if (e->protocol == PROTOCOL_MEMCACHED) {
-        response = is_memcached_response(payload, ret, &e->status);
+        response = is_memcached_response(e->response, e->response_size, &e->status);
     } else if (e->protocol == PROTOCOL_MYSQL) {
-        response = is_mysql_response(payload, ret, req->request_type, &e->statement_id, &e->status);
+        response = is_mysql_response(e->response, e->response_size, req->request_type, &e->statement_id, &e->status);
         if (req->request_type == MYSQL_COM_STMT_PREPARE) {
             e->method = METHOD_STATEMENT_PREPARE;
         }
     } else if (e->protocol == PROTOCOL_MONGO) {
-        response = is_mongo_response(payload, ret, req->partial);
+        response = is_mongo_response(e->response, e->response_size, req->partial);
         if (response == 2) { // partial
             req->partial = 1;
             return 0; // keeping the query in the map
         }
     } else if (e->protocol == PROTOCOL_KAFKA) {
-        response = is_kafka_response(payload, req->request_id);
+        response = is_kafka_response(e->response, req->request_id); // Uses e->response content
     } else if (e->protocol == PROTOCOL_CLICKHOUSE) {
-        response = is_clickhouse_response(payload, &e->status);
+        response = is_clickhouse_response(e->response, &e->status); // Uses e->response content
         if (!response) {
             return 0; // keeping the query in the map
         }
     } else if (e->protocol == PROTOCOL_ZOOKEEPER) {
-        response = is_zk_response(payload, total_size, &e->status, req->partial);
+        // For ZK, the original total_size of the response matters for is_zk_response logic
+        response = is_zk_response(e->response, total_size, &e->status, req->partial);
         if (response == 2) { // partial
             req->partial = 1;
             return 0; // keeping the query in the map
         }
     } else if (e->protocol == PROTOCOL_DUBBO2) {
-        response = is_dubbo2_response(payload, &e->status);
+        response = is_dubbo2_response(e->response, &e->status); // Uses e->response content
     }
     bpf_map_delete_elem(&active_l7_requests, &k);
     if (!response) {

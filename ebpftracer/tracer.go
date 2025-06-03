@@ -45,6 +45,10 @@ const (
 	EventTypeL7Request        EventType = 10
 	EventTypePythonThreadLock EventType = 11
 
+	// L7 event flags (mirrored from eBPF C code)
+	L7EventFlagRequestTruncated  = (1 << 0)
+	L7EventFlagResponseTruncated = (1 << 1)
+
 	EventReasonNone    EventReason = 0
 	EventReasonOOMKill EventReason = 1
 )
@@ -352,7 +356,7 @@ type l7Event struct {
 	Duration            uint64
 	Protocol            uint8
 	Method              uint8
-	Padding             uint16
+	Flags               uint16
 	StatementId         uint32
 	PayloadSize         uint64
 	ResponseSize        uint64
@@ -377,80 +381,53 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 			}
 			continue
 		}
-		if rec.LostSamples > 0 {
-			klog.Errorln(name, "lost samples:", rec.LostSamples)
-			continue
-		}
+		// Moved LostSamples check into processL7Record for L7, keeping here for others.
+		// For L7, processL7Record will return an error or an empty event if LostSamples > 0.
 		var event Event
+		var sendEvent bool = true // Flag to control sending the event
 
 		switch typ {
 		case perfMapTypeL7Events:
-			v := &l7Event{}
-			data := rec.RawSample
-			reader := bytes.NewBuffer(data)
-
-			// Ensure binary.Read does not fail before proceeding
-			if err := binary.Read(reader, binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read msg:", err)
-				continue
+			var l7ProcessingErr error
+			event, l7ProcessingErr = processL7Record(rec.RawSample, rec.LostSamples)
+			if l7ProcessingErr != nil {
+				klog.Warningln("failed to process L7 record:", name, l7ProcessingErr)
+				sendEvent = false // Do not send event if processing failed
 			}
-
-			payload := reader.Bytes()
-			expectedSize := int(v.PayloadSize) + int(v.ResponseSize)
-
-			// If the actual payload is smaller than expected, we log a warning and adjust
-			if len(payload) < expectedSize {
-				klog.Warningf("Payload too small (got %d bytes, expected %d), adjusting sizes", len(payload), expectedSize)
-			}
-
-			// Compute safe slicing limits
-			payloadEnd := min(int(v.PayloadSize), len(payload))
-			responseEnd := min(payloadEnd+int(v.ResponseSize), len(payload))
-
-			// Always copy to prevent garbage data from reused buffers
-			payloadData := make([]byte, payloadEnd)
-			copy(payloadData, payload[:payloadEnd])
-
-			responseData := make([]byte, responseEnd-payloadEnd)
-			copy(responseData, payload[payloadEnd:responseEnd])
-
-			req := &l7.RequestData{
-				Protocol:     l7.Protocol(v.Protocol),
-				Status:       l7.Status(v.Status),
-				Duration:     time.Duration(v.Duration),
-				Method:       l7.Method(v.Method),
-				StatementId:  v.StatementId,
-				PayloadSize:  v.PayloadSize,
-				ResponseSize: v.ResponseSize,
-				Payload:      payloadData,
-				Response:     responseData,
-			}
-
-			event = Event{
-				Type:      EventTypeL7Request,
-				Pid:       v.Pid,
-				Fd:        v.Fd,
-				Timestamp: v.ConnectionTimestamp,
-				L7Request: req,
+			if event.Type == 0 && l7ProcessingErr == nil { // processL7Record might return empty event for lost samples
+				sendEvent = false
 			}
 		case perfMapTypeFileEvents:
+			if rec.LostSamples > 0 {
+				klog.Errorln(name, "lost samples:", rec.LostSamples)
+				continue
+			}
 			v := &fileEvent{}
 			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read msg:", err)
+				klog.Warningln("failed to read msg:", name, err)
 				continue
 			}
 			event = Event{Type: v.Type, Pid: v.Pid, Fd: v.Fd, Mnt: v.Mnt, Log: v.Log > 0}
 		case perfMapTypeProcEvents:
+			if rec.LostSamples > 0 {
+				klog.Errorln(name, "lost samples:", rec.LostSamples)
+				continue
+			}
 			v := &procEvent{}
 			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read msg:", err)
+				klog.Warningln("failed to read msg:", name, err)
 				continue
 			}
 			event = Event{Type: v.Type, Reason: EventReason(v.Reason), Pid: v.Pid}
 		case perfMapTypeTCPEvents:
+			if rec.LostSamples > 0 {
+				klog.Errorln(name, "lost samples:", rec.LostSamples)
+				continue
+			}
 			v := &tcpEvent{}
 			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read msg:", err)
+				klog.Warningln("failed to read msg:", name, err)
+				klog.Warningln("failed to read msg:", name, err)
 				continue
 			}
 			event = Event{
@@ -481,11 +458,78 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 				Duration: time.Duration(v.Duration),
 			}
 		default:
-			continue
+			sendEvent = false // Don't send if type is unknown
+			klog.Warningln("unknown event type in reader:", name, typ)
 		}
 
-		ch <- event
+		if sendEvent {
+			ch <- event
+		}
 	}
+}
+
+func processL7Record(rawSample []byte, lostSamples uint64) (Event, error) {
+	if lostSamples > 0 {
+		klog.Errorln("l7_events lost samples:", lostSamples)
+		return Event{}, nil // Return empty event, no error, to skip sending
+	}
+
+	v := &l7Event{}
+	reader := bytes.NewBuffer(rawSample)
+
+	if err := binary.Read(reader, binary.LittleEndian, v); err != nil {
+		return Event{}, fmt.Errorf("failed to read l7Event: %w", err)
+	}
+
+	payloadBytes := reader.Bytes() // Remaining bytes are payload + response
+	expectedSize := int(v.PayloadSize) + int(v.ResponseSize)
+
+	if len(payloadBytes) < expectedSize {
+		klog.Warningf("L7 Payload too small (got %d bytes, expected %d for PID %d, FD %d, Proto %s), adjusting sizes", len(payloadBytes), expectedSize, v.Pid, v.Fd, l7.Protocol(v.Protocol))
+		// Adjustments will happen naturally with min below, this log is important.
+	}
+
+	payloadEnd := min(int(v.PayloadSize), len(payloadBytes))
+	responseEnd := min(payloadEnd+int(v.ResponseSize), len(payloadBytes))
+
+	payloadData := make([]byte, payloadEnd)
+	copy(payloadData, payloadBytes[:payloadEnd])
+
+	responseData := make([]byte, responseEnd-payloadEnd)
+	copy(responseData, payloadBytes[payloadEnd:responseEnd])
+
+	RequestTruncated := (v.Flags & L7EventFlagRequestTruncated) != 0
+	ResponseTruncated := (v.Flags & L7EventFlagResponseTruncated) != 0
+
+	if RequestTruncated {
+		klog.Warningf("L7 Request payload potentially truncated for PID %d, FD %d, Proto %s", v.Pid, v.Fd, l7.Protocol(v.Protocol))
+	}
+	if ResponseTruncated {
+		klog.Warningf("L7 Response payload potentially truncated for PID %d, FD %d, Proto %s", v.Pid, v.Fd, l7.Protocol(v.Protocol))
+	}
+
+	reqData := &l7.RequestData{
+		Protocol:          l7.Protocol(v.Protocol),
+		Status:            l7.Status(v.Status),
+		Duration:          time.Duration(v.Duration),
+		Method:            l7.Method(v.Method),
+		StatementId:       v.StatementId,
+		PayloadSize:       v.PayloadSize, // Original intended sizes
+		ResponseSize:      v.ResponseSize,
+		Payload:           payloadData,  // Actual copied data
+		Response:          responseData, // Actual copied data
+		RequestTruncated:  RequestTruncated,
+		ResponseTruncated: ResponseTruncated,
+	}
+
+	event := Event{
+		Type:      EventTypeL7Request,
+		Pid:       v.Pid,
+		Fd:        v.Fd,
+		Timestamp: v.ConnectionTimestamp,
+		L7Request: reqData,
+	}
+	return event, nil
 }
 
 func ipPort(ip [16]byte, port uint16) netaddr.IPPort {

@@ -159,4 +159,6 @@ type RequestData struct {
 	PayloadSize  uint64
 	ResponseSize uint64
 	Response     []byte
+	RequestTruncated  bool
+	ResponseTruncated bool
 }
