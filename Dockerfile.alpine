@@ -1,32 +1,34 @@
-FROM golang:1.23-alpine as build-stage
-# Set destination for COPY
+# Build stage
+FROM golang:1.23.8-alpine AS builder
+
+# Install build tools
+RUN apk add --no-cache build-base
+
+# Set up workspace
 WORKDIR /app
-RUN apk add --no-cache --update go gcc g++ bash git
-RUN echo "unicode=\"YES\"" >> /etc/rc.conf && \
-    apk add --no-cache --virtual .build_deps \
-        autoconf file libc-dev make pkgconf python3 py3-pip ninja \
-        util-linux pciutils usbutils coreutils binutils findutils grep \
-        build-base abuild binutils binutils-doc gcc-doc gperf libcap libcap-dev \
-        valgrind-dev libmount && pip3 install meson --break-system-packages 
 
-RUN cd /tmp && git clone https://github.com/systemd/systemd
+# Copy go mod files and download dependencies
+COPY go.mod .
+COPY go.sum .
+RUN go mod download
 
-# RUN cd /tmp/systemd && \
-#     meson build && \
-#     ninja build
+# Copy the rest of the code
+COPY . .
 
-RUN apk add elogind-dev
-
-COPY go.mod go.sum ./
-
-RUN  go mod download 
-
-COPY ./ ./
+# Build statically linked binary
 ARG VERSION=unknown
-RUN CGO_ENABLED=1 go build -mod=readonly -ldflags "-X main.version=$VERSION" -o coroot-node-agent .
+RUN CGO_ENABLED=1 go build -mod=readonly -ldflags "-extldflags='-Wl,-z,lazy' -X 'github.com/coroot/coroot-node-agent/flags.Version=${VERSION}'" -o coroot-node-agent .
 
-FROM alpine:3.19 AS release-stage
+# Runtime stage
+FROM alpine:3.22 AS release-stage
+
 WORKDIR /app
-COPY --from=build-stage /app/coroot-node-agent /usr/bin/coroot-node-agent
+
+# Copy the statically linked binary
+COPY --from=builder /app/coroot-node-agent /usr/bin/coroot-node-agent
+
+# Ensure it’s executable
 RUN chmod +x /usr/bin/coroot-node-agent
-CMD ["coroot-node-agent"]
+
+# Run it
+CMD ["/usr/bin/coroot-node-agent"]
