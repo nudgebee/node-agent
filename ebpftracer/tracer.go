@@ -355,7 +355,6 @@ type l7Event struct {
 	Padding             uint16
 	StatementId         uint32
 	PayloadSize         uint64
-	ResponseSize        uint64
 }
 
 type pythonThreadEvent struct {
@@ -395,35 +394,18 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 				continue
 			}
 
-			payload := reader.Bytes()
-			expectedSize := int(v.PayloadSize) + int(v.ResponseSize)
-
-			// If the actual payload is smaller than expected, we log a warning and adjust
-			if len(payload) < expectedSize {
-				klog.Warningf("Payload too small (got %d bytes, expected %d), adjusting sizes", len(payload), expectedSize)
-			}
-
-			// Compute safe slicing limits
-			payloadEnd := min(int(v.PayloadSize), len(payload))
-			responseEnd := min(payloadEnd+int(v.ResponseSize), len(payload))
-
-			// Always copy to prevent garbage data from reused buffers
-			payloadData := make([]byte, payloadEnd)
-			copy(payloadData, payload[:payloadEnd])
-
-			responseData := make([]byte, responseEnd-payloadEnd)
-			copy(responseData, payload[payloadEnd:responseEnd])
+			payloadData := reader.Bytes()
+			responseData := make([]byte, 0)
 
 			req := &l7.RequestData{
-				Protocol:     l7.Protocol(v.Protocol),
-				Status:       l7.Status(v.Status),
-				Duration:     time.Duration(v.Duration),
-				Method:       l7.Method(v.Method),
-				StatementId:  v.StatementId,
-				PayloadSize:  v.PayloadSize,
-				ResponseSize: v.ResponseSize,
-				Payload:      payloadData,
-				Response:     responseData,
+				Protocol:    l7.Protocol(v.Protocol),
+				Status:      l7.Status(v.Status),
+				Duration:    time.Duration(v.Duration),
+				Method:      l7.Method(v.Method),
+				StatementId: v.StatementId,
+				PayloadSize: v.PayloadSize,
+				Payload:     payloadData,
+				Response:    responseData,
 			}
 
 			event = Event{
