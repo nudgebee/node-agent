@@ -14,6 +14,7 @@ import (
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/containers"
 	"github.com/coroot/coroot-node-agent/flags"
+	"github.com/coroot/coroot-node-agent/gpu"
 	"github.com/coroot/coroot-node-agent/logs"
 	"github.com/coroot/coroot-node-agent/node"
 	"github.com/coroot/coroot-node-agent/proc"
@@ -184,21 +185,25 @@ func main() {
 	if err := registerer.Register(nodeCollector); err != nil {
 		klog.Exitln(err)
 	}
+
+	gpuCollector, err := gpu.NewCollector()
+	if err != nil {
+		klog.Warningln("failed to initialize GPU collector:", err)
+	}
+	if err := registerer.Register(gpuCollector); err != nil {
+		klog.Exitln(err)
+	}
 	registerer.MustRegister(info("node_agent_info", version))
 
 	if md := nodeCollector.Metadata(); md != nil {
 		region := md.Region
 		az := md.AvailabilityZone
 		if region != "" && az != "" {
-			registerer = prometheus.WrapRegistererWith(
-				prometheus.Labels{"az": md.AvailabilityZone, "region": md.Region},
-				registerer,
-			)
+			registerer = prometheus.WrapRegistererWith(prometheus.Labels{"az": az, "region": region}, registerer)
 		}
 	}
 	processInfoCh := profiling.Init(machineId, hostname)
-
-	cr, err := containers.NewRegistry(registerer, processInfoCh, resolver)
+	cr, err := containers.NewRegistry(registerer, processInfoCh, resolver, gpuCollector.ProcessUsageSampleCh)
 	if err != nil {
 		klog.Exitln(err)
 	}
@@ -207,7 +212,7 @@ func main() {
 	profiling.Start()
 	defer profiling.Stop()
 
-	if err := prom.StartAgent(machineId); err != nil {
+	if err := prom.StartAgent(registry, machineId); err != nil {
 		klog.Exitln(err)
 	}
 
