@@ -8,22 +8,35 @@ import (
 var (
 	phpCmd    = regexp.MustCompile(`.*php\d*\.?\d*$`)
 	pythonCmd = regexp.MustCompile(`.*python\d*\.?\d*$`)
+	rubyCmd   = regexp.MustCompile(`.*ruby\d*\.?\d*$`)
 	nodejsCmd = regexp.MustCompile(`.*node(js)?\d*\.?\d*$`)
 )
 
-func guessApplicationType(cmdline []byte) string {
+func guessApplicationTypeByCmdline(cmdline []byte) string {
 	parts := bytes.Split(cmdline, []byte{0})
 	if len(parts) == 0 || len(parts[0]) == 0 {
 		return ""
 	}
 	cmd := bytes.TrimSuffix(bytes.Fields(parts[0])[0], []byte{':'})
 	switch {
+	case bytes.HasSuffix(cmd, []byte("coroot")):
+		return "coroot-community-edition"
+	case bytes.HasSuffix(cmd, []byte("coroot-ee")):
+		return "coroot-enterprise-edition"
+	case bytes.HasSuffix(cmd, []byte("coroot-node-agent")):
+		return "coroot-node-agent"
+	case bytes.HasSuffix(cmd, []byte("coroot-cluster-agent")):
+		return "coroot-cluster-agent"
+	case bytes.HasSuffix(cmd, []byte("coroot-operator")):
+		return "coroot-operator"
 	case bytes.HasSuffix(cmd, []byte("memcached")):
 		return "memcached"
 	case bytes.HasSuffix(cmd, []byte("envoy")):
 		return "envoy"
 	case bytes.Contains(cmdline, []byte("org.elasticsearch.bootstrap")):
 		return "elasticsearch"
+	case bytes.Contains(cmdline, []byte("org.opensearch.bootstrap")):
+		return "opensearch"
 	case bytes.Contains(cmdline, []byte("kafka.Kafka")) || bytes.Contains(cmdline, []byte("io.confluent.support.metrics.SupportedKafka")):
 		return "kafka"
 	case bytes.HasSuffix(cmd, []byte("mongod")):
@@ -107,12 +120,37 @@ func guessApplicationType(cmdline []byte) string {
 		return "nats"
 	case bytes.HasSuffix(cmd, []byte("java")):
 		return "java"
+	case bytes.HasSuffix(cmd, []byte("ollama")):
+		return "ollama"
+	case bytes.Contains(cmd, []byte("victoria-metrics")) ||
+		bytes.Contains(cmd, []byte("vmstorage")) ||
+		bytes.Contains(cmd, []byte("vminsert")) ||
+		bytes.Contains(cmd, []byte("vmselect")):
+		return "victoria-metrics"
+	case bytes.Contains(cmd, []byte("victoria-logs")):
+		return "victoria-logs"
 	case phpCmd.Match(cmd):
 		return "php"
 	case pythonCmd.Match(cmd):
 		return "python"
 	case nodejsCmd.Match(cmd):
 		return "nodejs"
+	case rubyCmd.Match(cmd):
+		return "ruby"
+	}
+	return ""
+}
+
+func guessApplicationTypeByExe(exe string) string {
+	switch {
+	case phpCmd.MatchString(exe):
+		return "php"
+	case pythonCmd.MatchString(exe):
+		return "python"
+	case nodejsCmd.MatchString(exe):
+		return "nodejs"
+	case rubyCmd.MatchString(exe):
+		return "ruby"
 	}
 	return ""
 }

@@ -37,6 +37,7 @@ var (
 	pingTimeout               = 300 * time.Millisecond
 	multilineCollectorTimeout = time.Second
 	payloadThreshold          = 1024 * 1024
+	gpuStatsWindow            = 15 * time.Second
 )
 
 type ContainerID string
@@ -121,6 +122,7 @@ type ConnectionStats struct {
 
 type Container struct {
 	id       ContainerID
+	appId    string
 	cgroup   *cgroup.Cgroup
 	metadata *ContainerMetadata
 
@@ -144,6 +146,8 @@ type Container struct {
 
 	l7Stats  L7Stats
 	dnsStats *L7Metrics
+
+	gpuStats map[string]*GpuUsage
 
 	oomKills                 int
 	pythonThreadLockWaitTime time.Duration
@@ -179,8 +183,15 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 	podName := split[3]
 	src_workload := registry.ip_resolver.ResolvePodOwner(podName, namespace)
 	klog.Infof("Pod %s/%s is owned by %s/%s/%s", namespace, podName, src_workload.Name, src_workload.Namespace, src_workload.Kind)
+
+	cid := string(id)
+	appId := common.ContainerIdToOtelServiceName(cid)
+	if appId == cid {
+		appId = ""
+	}
 	c := &Container{
 		id:       id,
+		appId:    appId,
 		cgroup:   cg,
 		metadata: md,
 
@@ -197,6 +208,8 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		connectionsByPidFd:       map[PidFd]*ActiveConnection{},
 		l7Stats:                  L7Stats{},
 		dnsStats:                 &L7Metrics{},
+
+		gpuStats: map[string]*GpuUsage{},
 
 		mounts:     map[string]proc.MountInfo{},
 		seenMounts: map[uint64]struct{}{},
@@ -324,8 +337,8 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		if stats.Retransmissions > 0 {
 			ch <- counter(metrics.NetRetransmits, float64(stats.Retransmissions), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
 		}
-		ch <- counter(metrics.NetBytesSent, float64(stats.BytesSent), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
-		ch <- counter(metrics.NetBytesReceived, float64(stats.BytesReceived), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
+		ch <- counter(metrics.NetBytesSent, float64(stats.BytesSent), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, actualDestWorkload.Region, actualDestWorkload.Zone)
+		ch <- counter(metrics.NetBytesReceived, float64(stats.BytesReceived), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, actualDestWorkload.Region, actualDestWorkload.Zone)
 	}
 	for dst, count := range c.failedConnectionAttempts {
 		workload := c.ip_resolver.ResolveIP(dst.IP().String())
@@ -348,7 +361,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	for source, p := range c.logParsers {
 		for _, c := range p.parser.GetCounters() {
 			if c.Level == logparser.LevelCritical || c.Level == logparser.LevelError {
-				ch <- counter(metrics.LogMessages, float64(c.Messages), source, c.Level.String(), c.Hash, c.Sample)
+				ch <- counter(metrics.LogMessages, float64(c.Messages), source, c.Level.String(), c.Hash, common.TruncateUtf8(c.Sample, *flags.MaxLabelLength))
 			}
 		}
 		for _, c := range p.parser.GetSensitiveCounters() {
@@ -370,15 +383,20 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		if len(cmdline) == 0 {
 			continue
 		}
-		appType := guessApplicationType(cmdline)
-		if appType != "" {
+		if appType := guessApplicationTypeByCmdline(cmdline); appType != "" {
 			appTypes[appType] = struct{}{}
+		} else {
+			if exe, err := os.Readlink(proc.Path(pid, "exe")); err == nil {
+				if appType = guessApplicationTypeByExe(exe); appType != "" {
+					appTypes[appType] = struct{}{}
+				}
+			}
 		}
 		if process.isGolangApp {
 			appTypes["golang"] = struct{}{}
 		}
 		switch {
-		case isJvm(cmdline):
+		case proc.IsJvm(cmdline):
 			jvm, jMetrics := jvmMetrics(pid)
 			if len(jMetrics) > 0 && !seenJvms[jvm] {
 				seenJvms[jvm] = true
@@ -394,7 +412,27 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 				process.dotNetMonitor.Collect(ch)
 			}
 		}
+
+		for _, usage := range c.gpuStats {
+			usage.Reset()
+		}
+		if usage := process.getGPUUsage(); usage != nil {
+			for uuid, u := range usage {
+				tu := c.gpuStats[uuid]
+				if tu == nil {
+					tu = &GpuUsage{}
+					c.gpuStats[uuid] = tu
+				}
+				tu.GPU += u.GPU
+				tu.Memory += u.Memory
+			}
+		}
 	}
+	for uuid, usage := range c.gpuStats {
+		ch <- gauge(metrics.GpuUsagePercent, usage.GPU, uuid)
+		ch <- gauge(metrics.GpuMemoryUsagePercent, usage.Memory, uuid)
+	}
+
 	for appType := range appTypes {
 		ch <- gauge(metrics.ApplicationType, 1, appType)
 	}
@@ -600,7 +638,7 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 	if common.ConnectionFilter.ShouldBeSkipped(dst.IP(), actualDst.IP()) {
 		return
 	}
-	key := common.NewDestinationKey(dst, actualDst, c.registry.getFQDN(dst.IP()), dstWorkload, actualDstWorkload)
+	key := common.NewDestinationKey(dst, actualDst, c.registry.getDomain(dst.IP()), dstWorkload, actualDstWorkload)
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	if failed {
@@ -680,7 +718,7 @@ func (c *Container) updateConnectionTrafficStats(ac *ActiveConnection, sent, rec
 	ac.BytesReceived = received
 }
 
-func (c *Container) onDNSRequest(r *l7.RequestData) map[netaddr.IP]string {
+func (c *Container) onDNSRequest(r *l7.RequestData) map[netaddr.IP]*common.Domain {
 	status := r.Status.DNS()
 	if status == "" {
 		return nil
@@ -715,16 +753,17 @@ func (c *Container) onDNSRequest(r *l7.RequestData) map[netaddr.IP]string {
 		}
 		c.dnsStats.Latency.Observe(r.Duration.Seconds())
 	}
-	ip2fqdn := map[netaddr.IP]string{}
+	ip2fqdn := map[netaddr.IP]*common.Domain{}
 	if fqdn != "" {
+		d := common.NewDomain(fqdn, ips)
 		for _, ip := range ips {
-			ip2fqdn[ip] = fqdn
+			ip2fqdn[ip] = d
 		}
 	}
 	return ip2fqdn
 }
 
-func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData, iqfqdn map[netaddr.IP]string) map[netaddr.IP]string {
+func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData, iqfqdn map[netaddr.IP]*common.Domain) map[netaddr.IP]*common.Domain {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -742,7 +781,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	if conn.dstWorkload.Namespace == "external" && (r.Protocol == l7.ProtocolHTTP || r.Protocol == l7.ProtocolHTTP2) {
 		if host, ok := iqfqdn[conn.DestinationKey.ActualDestination().IP()]; ok {
 			log.Printf("Setting external host %s", host)
-			conn.dstWorkload.Name = host
+			conn.dstWorkload.Name = host.FQDN
 		} else {
 			host, error := l7.ParseHostFromHttpRequest(string(r.Payload))
 			if error == nil {

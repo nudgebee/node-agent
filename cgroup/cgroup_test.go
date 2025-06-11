@@ -11,7 +11,6 @@ func TestNewFromProcessCgroupFile(t *testing.T) {
 	cg, err := NewFromProcessCgroupFile(path.Join("fixtures/proc/100/cgroup"))
 	assert.Nil(t, err)
 	assert.Equal(t, "/system.slice/docker.service", cg.Id)
-	assert.Equal(t, V1, cg.Version)
 	assert.Equal(t, "/system.slice/docker.service", cg.ContainerId)
 	assert.Equal(t, ContainerTypeSystemdService, cg.ContainerType)
 
@@ -20,15 +19,9 @@ func TestNewFromProcessCgroupFile(t *testing.T) {
 			"blkio":        "/system.slice/docker.service",
 			"cpu":          "/system.slice/docker.service",
 			"cpuacct":      "/system.slice/docker.service",
-			"cpuset":       "/",
 			"devices":      "/system.slice/docker.service",
-			"freezer":      "/",
-			"hugetlb":      "/",
 			"memory":       "/system.slice/docker.service",
 			"name=systemd": "/system.slice/docker.service",
-			"net_cls":      "/",
-			"net_prio":     "/",
-			"perf_event":   "/",
 			"pids":         "/system.slice/docker.service",
 		},
 		cg.subsystems,
@@ -36,52 +29,51 @@ func TestNewFromProcessCgroupFile(t *testing.T) {
 
 	cg, err = NewFromProcessCgroupFile(path.Join("fixtures/proc/200/cgroup"))
 	assert.Nil(t, err)
-	assert.Equal(t, V1, cg.Version)
 	assert.Equal(t, "/docker/b43d92bf1e5c6f78bb9b7bc6f40721280299855ba692092716e3a1b6c0b86f3f", cg.Id)
 	assert.Equal(t, "b43d92bf1e5c6f78bb9b7bc6f40721280299855ba692092716e3a1b6c0b86f3f", cg.ContainerId)
 	assert.Equal(t, ContainerTypeDocker, cg.ContainerType)
 
 	cg, err = NewFromProcessCgroupFile(path.Join("fixtures/proc/300/cgroup"))
 	assert.Nil(t, err)
-	assert.Equal(t, V1, cg.Version)
 	assert.Equal(t, "/kubepods/burstable/pod6a4ce4a0-ba47-11ea-b2a7-0cc47ac5979e/17db96a24ae1e9dd57143e62b1cb0d2d35e693c65c774c7470e87b0572e07c1a", cg.Id)
 	assert.Equal(t, "17db96a24ae1e9dd57143e62b1cb0d2d35e693c65c774c7470e87b0572e07c1a", cg.ContainerId)
 	assert.Equal(t, ContainerTypeDocker, cg.ContainerType)
 
 	cg, err = NewFromProcessCgroupFile(path.Join("fixtures/proc/400/cgroup"))
 	assert.Nil(t, err)
-	assert.Equal(t, V2, cg.Version)
 	assert.Equal(t, "/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod8712f785_1a3e_41ec_a00b_e2dcc77431cb.slice/docker-73051af271105c07e1f493b34856a77e665e3b0b4fc72f76c807dfbffeb881bd.scope", cg.Id)
 	assert.Equal(t, "73051af271105c07e1f493b34856a77e665e3b0b4fc72f76c807dfbffeb881bd", cg.ContainerId)
 	assert.Equal(t, ContainerTypeDocker, cg.ContainerType)
 
 	cg, err = NewFromProcessCgroupFile(path.Join("fixtures/proc/600/cgroup"))
 	assert.Nil(t, err)
-	assert.Equal(t, V1, cg.Version)
 	assert.Equal(t, "/system.slice/springboot.service", cg.Id)
 	assert.Equal(t, "/system.slice/springboot.service", cg.ContainerId)
 	assert.Equal(t, ContainerTypeSystemdService, cg.ContainerType)
 
 	cg, err = NewFromProcessCgroupFile(path.Join("fixtures/proc/700/cgroup"))
 	assert.Nil(t, err)
-	assert.Equal(t, V2, cg.Version)
 	assert.Equal(t, "/podruntime/runtime", cg.Id)
 	assert.Equal(t, "/talos/runtime", cg.ContainerId)
 	assert.Equal(t, ContainerTypeTalosRuntime, cg.ContainerType)
 
 	cg, err = NewFromProcessCgroupFile(path.Join("fixtures/proc/800/cgroup"))
 	assert.Nil(t, err)
-	assert.Equal(t, V2, cg.Version)
 	assert.Equal(t, "/system.slice/docker-cf87ba651579c9231db817909e7865e5747bd7abcac0c57ce23cf4abbaee046b.scope", cg.Id)
 	assert.Equal(t, "cf87ba651579c9231db817909e7865e5747bd7abcac0c57ce23cf4abbaee046b", cg.ContainerId)
 	assert.Equal(t, ContainerTypeDocker, cg.ContainerType)
 
 	cg, err = NewFromProcessCgroupFile(path.Join("fixtures/proc/900/cgroup"))
 	assert.Nil(t, err)
-	assert.Equal(t, V1, cg.Version)
 	assert.Equal(t, "/system.slice/python-app.service", cg.Id)
 	assert.Equal(t, "/system.slice/python-app.service", cg.ContainerId)
 	assert.Equal(t, ContainerTypeSystemdService, cg.ContainerType)
+
+	cg, err = NewFromProcessCgroupFile(path.Join("fixtures/proc/2000/cgroup"))
+	assert.Nil(t, err)
+	assert.Equal(t, "/kubepods/burstable/pod8833712d-6e69-4f5c-95f3-aebd020ce2e7/95cbe853416f52d927dec41f1406dd75015ea131244a1ca875a7cd4ebe927ac8", cg.Id)
+	assert.Equal(t, "95cbe853416f52d927dec41f1406dd75015ea131244a1ca875a7cd4ebe927ac8", cg.ContainerId)
+	assert.Equal(t, ContainerTypeDocker, cg.ContainerType)
 
 	baseCgroupPath = "/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-podc83d0428_58af_41eb_8dba_b9e6eddffe7b.slice/docker-0e612005fd07e7f47e2cd07df99a2b4e909446814d71d0b5e4efc7159dd51252.scope"
 	defer func() {
@@ -89,7 +81,6 @@ func TestNewFromProcessCgroupFile(t *testing.T) {
 	}()
 	cg, err = NewFromProcessCgroupFile(path.Join("fixtures/proc/500/cgroup"))
 	assert.Nil(t, err)
-	assert.Equal(t, V2, cg.Version)
 	assert.Equal(t, "/system.slice/docker-ba7b10d15d16e10e3de7a2dcd408a3d971169ae303f46cfad4c5453c6326fee2.scope", cg.Id)
 	assert.Equal(t, "ba7b10d15d16e10e3de7a2dcd408a3d971169ae303f46cfad4c5453c6326fee2", cg.ContainerId)
 	assert.Equal(t, ContainerTypeDocker, cg.ContainerType)
@@ -138,6 +129,11 @@ func TestContainerByCgroup(t *testing.T) {
 	as.Equal("49f9e8e5395d57c1083996c09e2e6f042d5fe1ec0310facab32f94912b35ce59", id)
 	as.Nil(err)
 
+	typ, id, err = containerByCgroup("/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podea19ff5d_943a_4466_a07e_a71e9e50cc62.slice/crio-21572039dd8398ff8272b031fa5422a40165145ab37f2f8794e1e7f844fe8118.scope/container")
+	as.Equal(typ, ContainerTypeCrio)
+	as.Equal("21572039dd8398ff8272b031fa5422a40165145ab37f2f8794e1e7f844fe8118", id)
+	as.Nil(err)
+
 	typ, id, err = containerByCgroup("/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod3e61c214bc3ed9ff81e21474dd6cba17.slice/cri-containerd-c74b0f5062f0bc726cae1e9369ad4a95deed6b298d247f0407475adb23fa3190")
 	as.Equal(typ, ContainerTypeContainerd)
 	as.Equal("c74b0f5062f0bc726cae1e9369ad4a95deed6b298d247f0407475adb23fa3190", id)
@@ -151,6 +147,11 @@ func TestContainerByCgroup(t *testing.T) {
 	typ, id, err = containerByCgroup("/runtime.slice/kubelet.service")
 	as.Equal(typ, ContainerTypeSystemdService)
 	as.Equal("/runtime.slice/kubelet.service", id)
+	as.Nil(err)
+
+	typ, id, err = containerByCgroup("/reserved.slice/kubelet.service")
+	as.Equal(typ, ContainerTypeSystemdService)
+	as.Equal("/reserved.slice/kubelet.service", id)
 	as.Nil(err)
 
 	typ, id, err = containerByCgroup("/system.slice/system-postgresql.slice/postgresql@9.4-main.service")

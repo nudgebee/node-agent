@@ -52,6 +52,9 @@ var metrics = struct {
 
 	PythonThreadLockWaitTime *prometheus.Desc
 
+	GpuUsagePercent       *prometheus.Desc
+	GpuMemoryUsagePercent *prometheus.Desc
+
 	Ip2Fqdn *prometheus.Desc
 }{
 	ContainerInfo: metric("container_info", "Meta information about the container", "image", "systemd_triggered_by"),
@@ -84,8 +87,8 @@ var metrics = struct {
 	NetConnectionsActive:     metric("container_net_tcp_active_connections", "Number of active outbound connections used by the container", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
 	NetRetransmits:           metric("container_net_tcp_retransmits_total", "Total number of retransmitted TCP segments", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
 	NetLatency:               metric("container_net_latency_seconds", "Round-trip time between the container and a remote IP", "destination_ip", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind"),
-	NetBytesSent:             metric("container_net_tcp_bytes_sent_total", "Total number of bytes sent to the peer", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
-	NetBytesReceived:         metric("container_net_tcp_bytes_received_total", "Total number of bytes received from the peer", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
+	NetBytesSent:             metric("container_net_tcp_bytes_sent_total", "Total number of bytes sent to the peer", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind", "src_region", "src_az", "destination_region", "destination_az"),
+	NetBytesReceived:         metric("container_net_tcp_bytes_received_total", "Total number of bytes received from the peer", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind", "src_region", "src_az", "destination_region", "destination_az"),
 
 	LogMessages:          metric("container_log_messages_total", "Number of messages grouped by the automatically extracted repeated pattern", "source", "level", "pattern_hash", "sample"),
 	SensitiveLogMessages: metric("container_sensitive_log_messages_total", "Number of messages that contain sensitive information", "source", "pattern", "sample", "regex", "name", "pattern_hash"),
@@ -102,6 +105,9 @@ var metrics = struct {
 	Ip2Fqdn: metric("ip_to_fqdn", "Mapping IP addresses to FQDNs based on DNS requests initiated by containers", "ip", "fqdn"),
 
 	PythonThreadLockWaitTime: metric("container_python_thread_lock_wait_time_seconds", "Time spent waiting acquiring GIL in seconds"),
+
+	GpuUsagePercent:       metric("container_resources_gpu_usage_percent", "Percent of GPU compute resources used by the container", "gpu_uuid"),
+	GpuMemoryUsagePercent: metric("container_resources_gpu_memory_usage_percent", "Percent of GPU memory used by the container", "gpu_uuid"),
 }
 
 var (
