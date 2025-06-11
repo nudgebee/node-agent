@@ -38,7 +38,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          file: 'Dockerfile.alpine'
+          file: 'Dockerfile'
           push: true
           tags: |
             740395098545.dkr.ecr.us-east-1.amazonaws.com/nudgebee-node-agent:${{ env.tag }}

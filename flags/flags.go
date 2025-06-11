@@ -1,6 +1,7 @@
 package flags
 
 import (
+	"fmt"
 	"os"
 	"strings"
 
@@ -13,6 +14,11 @@ var (
 	DisableLogParsing = kingpin.Flag("disable-log-parsing", "Disable container log parsing").Default("false").Envar("DISABLE_LOG_PARSING").Bool()
 	DisablePinger     = kingpin.Flag("disable-pinger", "Don't ping upstreams").Default("true").Envar("DISABLE_PINGER").Bool()
 	DisableL7Tracing  = kingpin.Flag("disable-l7-tracing", "Disable L7 tracing").Default("false").Envar("DISABLE_L7_TRACING").Bool()
+
+	ContainerAllowlist = kingpin.Flag("container-allowlist", "List of allowed containers (regex patterns)").Envar("CONTAINER_ALLOWLIST").Strings()
+	ContainerDenylist  = kingpin.Flag("container-denylist", "List of denied containers (regex patterns)").Envar("CONTAINER_DENYLIST").Strings()
+
+	ExcludeHTTPMetricsByPath = kingpin.Flag("exclude-http-requests-by-path", "Skip HTTP metrics and traces by path").Envar("EXCLUDE_HTTP_REQUESTS_BY_PATH").Strings()
 
 	ExternalNetworksWhitelist = kingpin.
 					Flag("track-public-network", "Allow track connections to the specified IP networks, all private networks are allowed by default (e.g., Y.Y.Y.Y/mask)").
@@ -30,6 +36,8 @@ var (
 	LogPerSecond      = kingpin.Flag("log-per-second", "The number of logs per second").Default("10.0").Envar("LOG_PER_SECOND").Float64()
 	LogBurst          = kingpin.Flag("log-burst", "The maximum number of tokens that can be consumed in a single call to allow").Default("100").Envar("LOG_BURST").Int()
 
+	MaxLabelLength = kingpin.Flag("max-label-length", "Maximum length of a metric label value").Default("4096").Envar("MAX_LABEL_LENGTH").Int()
+
 	CollectorEndpoint  = kingpin.Flag("collector-endpoint", "A base endpoint URL for metrics, traces, logs, and profiles").Envar("COLLECTOR_ENDPOINT").URL()
 	ApiKey             = kingpin.Flag("api-key", "Coroot API key").Envar("API_KEY").String()
 	MetricsEndpoint    = kingpin.Flag("metrics-endpoint", "The URL of the endpoint to send metrics to").Envar("METRICS_ENDPOINT").URL()
@@ -40,6 +48,7 @@ var (
 
 	ScrapeInterval             = kingpin.Flag("scrape-interval", "How often to gather metrics from the agent").Default("15s").Envar("SCRAPE_INTERVAL").Duration()
 	WalDir                     = kingpin.Flag("wal-dir", "Path to where the agent stores data (e.g. the metrics Write-Ahead Log)").Default("/tmp/coroot-node-agent").Envar("WAL_DIR").String()
+	MaxSpoolSize               = kingpin.Flag("max-spool-size", "Maximum size of the on-disk spool used to buffer data when it cannot be sent to collector. Supports size suffixes like KB, MB, or GB.").Default("500MB").Envar("MAX_SPOOL_SIZE").Bytes()
 	ResolveDns                 = kingpin.Flag("resolve-dns", "should resolve DNS").Default("false").Envar("RESOLVE_DNS").Bool()
 	IgnoreControlPlane         = kingpin.Flag("ignore-control-plane", "ignore control plane like loki").Default("karpenter,loki,prometheus,grafana,kubelet,etcd,apiserver,victoria,nudgebee-agent,kube-system").Envar("IGNORE_CONTROL_PLANE").String()
 	SanitizeHeaders            = kingpin.Flag("sanitize-headers", "should sanitize headers").Default("true").Envar("SANITIZE_HEADERS").Bool()
@@ -47,6 +56,9 @@ var (
 	DisableKubeProbe           = kingpin.Flag("disable-kube-probe", "disable kube probe trace").Default("true").Envar("DISABLE_KUBE_PROBE").Bool()
 	DisableSensitiveLogParsing = kingpin.Flag("disable-sensitive-log-parsing", "disable sensitive log parsing").Default("false").Envar("DISABLE_SENSITIVE_LOG_PARSING").Bool()
 	TraceIdHeaders             = kingpin.Flag("trace-id-headers", "trace id headers").Default("Traceparent,X-Request-Id").Envar("TRACE_ID_HEADERS").String()
+
+	agentVersion = kingpin.Flag("version", "Print version and exit").Default("false").Bool()
+	Version      = "unknown"
 )
 
 func GetString(fl *string) string {
@@ -63,6 +75,11 @@ func init() {
 
 	kingpin.HelpFlag.Short('h').Hidden()
 	kingpin.Parse()
+
+	if *agentVersion {
+		fmt.Println("Version:", Version)
+		os.Exit(0)
+	}
 
 	if *CollectorEndpoint != nil {
 		u := *CollectorEndpoint
