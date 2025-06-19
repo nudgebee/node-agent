@@ -54,7 +54,7 @@ var (
 	SanitizeHeaders            = kingpin.Flag("sanitize-headers", "should sanitize headers").Default("true").Envar("SANITIZE_HEADERS").Bool()
 	SensitiveHeader            = kingpin.Flag("sensitive-headers", "sanitize headers using patterns").Default("Authorization, Cookie, X-Action-Token").Envar("SENSITIVE_HEADERS").String()
 	DisableKubeProbe           = kingpin.Flag("disable-kube-probe", "disable kube probe trace").Default("true").Envar("DISABLE_KUBE_PROBE").Bool()
-	DisableSensitiveLogParsing = kingpin.Flag("disable-sensitive-log-parsing", "disable sensitive log parsing").Default("false").Envar("DISABLE_SENSITIVE_LOG_PARSING").Bool()
+	DisableSensitiveLogParsing = kingpin.Flag("disable-sensitive-log-parsing", "disable sensitive log parsing").Default("true").Envar("DISABLE_SENSITIVE_LOG_PARSING").Bool()
 	TraceIdHeaders             = kingpin.Flag("trace-id-headers", "trace id headers").Default("Traceparent,X-Request-Id").Envar("TRACE_ID_HEADERS").String()
 
 	agentVersion = kingpin.Flag("version", "Print version and exit").Default("false").Bool()
