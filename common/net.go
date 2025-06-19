@@ -218,18 +218,6 @@ func (d *Domain) String() string {
 
 func NewDomain(fqdn string, ips []netaddr.IP) *Domain {
 	d := &Domain{FQDN: fqdn, SpecifyIP: true}
-	if len(ips) > 1 {
-		containsPrivateIPs := false
-		for _, ip := range ips {
-			if !IsIpExternal(ip) {
-				containsPrivateIPs = true
-				break
-			}
-		}
-		if !containsPrivateIPs {
-			d.SpecifyIP = false
-		}
-	}
 	return d
 }
 
