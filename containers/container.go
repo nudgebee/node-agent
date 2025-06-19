@@ -763,7 +763,7 @@ func (c *Container) onDNSRequest(r *l7.RequestData) map[netaddr.IP]*common.Domai
 	return ip2fqdn
 }
 
-func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData, iqfqdn map[netaddr.IP]*common.Domain) map[netaddr.IP]*common.Domain {
+func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData) map[netaddr.IP]*common.Domain {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -777,17 +777,6 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	}
 	if timestamp != 0 && conn.Timestamp != timestamp {
 		return nil
-	}
-	if conn.dstWorkload.Namespace == "external" && (r.Protocol == l7.ProtocolHTTP || r.Protocol == l7.ProtocolHTTP2) {
-		if host, ok := iqfqdn[conn.DestinationKey.ActualDestination().IP()]; ok {
-			log.Printf("Setting external host %s", host)
-			conn.dstWorkload.Name = host.FQDN
-		} else {
-			host, error := l7.ParseHostFromHttpRequest(string(r.Payload))
-			if error == nil {
-				conn.dstWorkload.Name = host
-			}
-		}
 	}
 
 	// Parse HTTP request once if needed
