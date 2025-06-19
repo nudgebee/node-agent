@@ -249,6 +249,8 @@ func NewDestinationKey(dst, actualDst netaddr.IPPort, domain *Domain, dstWorkloa
 				Namespace: "external",
 			},
 		}
+	} else if IsIpExternal(actualDst.IP()) && domain != nil && domain.SpecifyIP {
+		klog.Infof("ip %q is external, but domain %q specifies IP, using IP as destination", actualDst.IP(), domain.FQDN)
 	}
 	return DestinationKey{
 		destination:               HostPortFromIPPort(dst),
