@@ -48,10 +48,10 @@ func TestDomain(t *testing.T) {
 		netaddr.MustParseIP("1.1.1.1"),
 		netaddr.MustParseIP("192.168.1.1"),
 	}).String())
-	assert.Equal(t, "Domain(fqdn,false)", NewDomain("fqdn", []netaddr.IP{
+	assert.Equal(t, "Domain(fqdn,true)", NewDomain("fqdn", []netaddr.IP{
 		netaddr.MustParseIP("1.1.1.1"),
 	}).String())
-	assert.Equal(t, "Domain(fqdn,false)", NewDomain("fqdn", []netaddr.IP{
+	assert.Equal(t, "Domain(fqdn,true)", NewDomain("fqdn", []netaddr.IP{
 		netaddr.MustParseIP("1.1.1.1"),
 		netaddr.MustParseIP("1.1.1.2"),
 	}).String())
