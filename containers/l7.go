@@ -38,7 +38,7 @@ func (m *L7Metrics) observe(status, method string, duration time.Duration) {
 
 type L7Stats map[l7.Protocol]map[common.DestinationKey]*L7Metrics // protocol -> dst:actual_dst -> metrics
 
-func (s L7Stats) get(protocol l7.Protocol, key common.DestinationKey, r *l7.RequestData, srcWorkload common.Workload, dstWorkload common.Workload, actualDstWorkload common.Workload, traceId string) *L7Metrics {
+func (s L7Stats) get(protocol l7.Protocol, key common.DestinationKey, r *l7.RequestData, srcWorkload common.Workload, traceId string) *L7Metrics {
 	if protocol == l7.ProtocolHTTP2 {
 		protocol = l7.ProtocolHTTP
 	}
@@ -53,15 +53,15 @@ func (s L7Stats) get(protocol l7.Protocol, key common.DestinationKey, r *l7.Requ
 		protoStats[key] = m
 		constLabels := map[string]string{"destination": key.DestinationLabelValue(),
 			"actual_destination":                    key.ActualDestinationLabelValue(),
-			"destination_workload_kind":             dstWorkload.Kind,
-			"destination_workload_name":             dstWorkload.Name,
-			"destination_workload_namespace":        dstWorkload.Namespace,
+			"destination_workload_kind":             key.GetDestinationWorkload().Kind,
+			"destination_workload_name":             key.GetDestinationWorkload().Name,
+			"destination_workload_namespace":        key.GetDestinationWorkload().Namespace,
 			"src_workload_kind":                     srcWorkload.Kind,
 			"src_workload_name":                     srcWorkload.Name,
 			"src_workload_namespace":                srcWorkload.Namespace,
-			"actual_destination_workload_kind":      actualDstWorkload.Kind,
-			"actual_destination_workload_name":      actualDstWorkload.Name,
-			"actual_destination_workload_namespace": actualDstWorkload.Namespace,
+			"actual_destination_workload_kind":      key.GetActualDestinationWorkload().Kind,
+			"actual_destination_workload_name":      key.GetActualDestinationWorkload().Name,
+			"actual_destination_workload_namespace": key.GetActualDestinationWorkload().Namespace,
 		}
 		if traceId != "" {
 			constLabels["trace_id"] = traceId

@@ -218,26 +218,27 @@ func (d *Domain) String() string {
 
 func NewDomain(fqdn string, ips []netaddr.IP) *Domain {
 	d := &Domain{FQDN: fqdn, SpecifyIP: true}
-	if len(ips) > 1 {
-		containsPrivateIPs := false
-		for _, ip := range ips {
-			if !IsIpExternal(ip) {
-				containsPrivateIPs = true
-				break
-			}
-		}
-		if !containsPrivateIPs {
-			d.SpecifyIP = false
-		}
-	}
 	return d
 }
 
 func NewDestinationKey(dst, actualDst netaddr.IPPort, domain *Domain, dstWorkload Workload, actualDestWorkload Workload) DestinationKey {
 	if IsIpExternal(actualDst.IP()) && domain != nil && !domain.SpecifyIP {
 		return DestinationKey{
-			destination: HostPortWithEmptyIP(domain.FQDN, dst.Port()),
+			destination:       HostPortWithEmptyIP(domain.FQDN, dst.Port()),
+			actualDestination: HostPortFromIPPort(actualDst),
+			destinationWorkload: Workload{
+				Kind:      "external",
+				Name:      domain.FQDN,
+				Namespace: "external",
+			},
+			actualDestinationWorkload: Workload{
+				Kind:      "external",
+				Name:      actualDst.IP().String(),
+				Namespace: "external",
+			},
 		}
+	} else if IsIpExternal(actualDst.IP()) && domain != nil && domain.SpecifyIP {
+		klog.Infof("ip %q is external, but domain %q specifies IP, using IP as destination", actualDst.IP(), domain.FQDN)
 	}
 	return DestinationKey{
 		destination:               HostPortFromIPPort(dst),

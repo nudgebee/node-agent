@@ -33,7 +33,7 @@ func TestDestinationKey(t *testing.T) {
 	assert.Equal(t, "1.1.1.1:443 (2.2.2.2:443)", NewDestinationKey(d, ad, nil, Workload{}, Workload{}).String())
 
 	assert.Equal(t,
-		"aa.bb.s3.amazonaws.com:443 ()",
+		"aa.bb.s3.amazonaws.com:443 (2.2.2.2:443)",
 		NewDestinationKey(d, ad, &Domain{FQDN: "aa.bb.s3.amazonaws.com", SpecifyIP: false}, Workload{}, Workload{}).String(),
 	)
 	assert.Equal(t,
@@ -51,7 +51,7 @@ func TestDomain(t *testing.T) {
 	assert.Equal(t, "Domain(fqdn,true)", NewDomain("fqdn", []netaddr.IP{
 		netaddr.MustParseIP("1.1.1.1"),
 	}).String())
-	assert.Equal(t, "Domain(fqdn,false)", NewDomain("fqdn", []netaddr.IP{
+	assert.Equal(t, "Domain(fqdn,true)", NewDomain("fqdn", []netaddr.IP{
 		netaddr.MustParseIP("1.1.1.1"),
 		netaddr.MustParseIP("1.1.1.2"),
 	}).String())
