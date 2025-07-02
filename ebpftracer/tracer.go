@@ -290,7 +290,7 @@ func isValidHTTPData(data []byte) bool {
 	if len(data) < 4 {
 		return false
 	}
-	
+
 	// Check for common HTTP methods (case-sensitive)
 	httpMethods := []string{"GET ", "POST", "PUT ", "HEAD", "DELE", "CONN", "OPTI", "PATC"}
 	for _, method := range httpMethods {
@@ -298,12 +298,12 @@ func isValidHTTPData(data []byte) bool {
 			return true
 		}
 	}
-	
+
 	// Check for HTTP response (starts with "HTTP/")
 	if len(data) >= 5 && string(data[:5]) == "HTTP/" {
 		return true
 	}
-	
+
 	// Check for printable ASCII characters (basic heuristic)
 	nonPrintable := 0
 	for i := 0; i < min(len(data), 100); i++ { // Check first 100 bytes
@@ -311,7 +311,7 @@ func isValidHTTPData(data []byte) bool {
 			nonPrintable++
 		}
 	}
-	
+
 	// If more than 50% non-printable, likely garbage
 	return float64(nonPrintable)/float64(min(len(data), 100)) < 0.5
 }
@@ -321,40 +321,40 @@ func isResponseTruncated(data []byte, protocol l7.Protocol) bool {
 	if len(data) == 0 {
 		return false
 	}
-	
+
 	switch protocol {
 	case l7.ProtocolHTTP:
 		// Check if HTTP response ends abruptly
 		dataStr := string(data)
-		
+
 		// Look for complete HTTP response indicators
 		if strings.Contains(dataStr, "Content-Length:") {
 			// TODO: Parse Content-Length and verify actual length
 			// For now, assume truncation if data ends without proper closure
-			return !strings.HasSuffix(strings.TrimSpace(dataStr), "}")  && 
-				   !strings.HasSuffix(strings.TrimSpace(dataStr), "</html>") &&
-				   !strings.HasSuffix(strings.TrimSpace(dataStr), "</body>") &&
-				   len(data) >= 5120 // Near max payload size
+			return !strings.HasSuffix(strings.TrimSpace(dataStr), "}") &&
+				!strings.HasSuffix(strings.TrimSpace(dataStr), "</html>") &&
+				!strings.HasSuffix(strings.TrimSpace(dataStr), "</body>") &&
+				len(data) >= 5120 // Near max payload size
 		}
-		
+
 		// Check for chunked encoding completion
 		if strings.Contains(dataStr, "Transfer-Encoding: chunked") {
 			return !strings.Contains(dataStr, "\r\n0\r\n\r\n") // Final chunk marker
 		}
-		
+
 	case l7.ProtocolHTTP2:
 		// For HTTP/2, check if we have incomplete frames
 		if len(data) < 9 {
 			return true // Need at least frame header
 		}
-		
+
 		// Basic HTTP/2 frame validation
 		frameLength := uint32(data[0])<<16 | uint32(data[1])<<8 | uint32(data[2])
 		if len(data) < int(frameLength)+9 {
 			return true // Incomplete frame
 		}
 	}
-	
+
 	return false
 }
 
