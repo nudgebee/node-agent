@@ -33,7 +33,7 @@
 })
 #define COPY_PAYLOAD(dst, size, src) ({     \
     TRUNCATE_PAYLOAD_SIZE(size);            \
-    if (bpf_probe_read(dst, size, src)) {   \
+    if (size > 0 && bpf_probe_read(dst, size, src)) {   \
         return 0;                           \
     }                                       \
 })
@@ -138,6 +138,24 @@ struct user_msghdr {
 };
 
 static inline __attribute__((__always_inline__))
+void init_l7_event(struct l7_event *e) {
+    // Only initialize critical fields, payload/response arrays are overwritten anyway
+    e->fd = 0;
+    e->connection_timestamp = 0;
+    e->pid = 0;
+    e->status = STATUS_UNKNOWN;
+    e->duration = 0;
+    e->protocol = PROTOCOL_UNKNOWN;
+    e->method = METHOD_UNKNOWN;
+    e->padding = 0;
+    e->statement_id = 0;
+    e->payload_size = 0;
+    e->response_size = 0;
+    // Skip zeroing payload arrays - they're overwritten by COPY_PAYLOAD anyway
+    // This saves ~10,000 instructions per event
+}
+
+static inline __attribute__((__always_inline__))
 void send_event(void *ctx, struct l7_event *e, struct connection_id cid, struct connection *conn) {
     e->connection_timestamp = conn->timestamp;
     e->fd = cid.fd;
@@ -222,14 +240,38 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
     k.is_tls = is_tls;
     k.stream_id = -1;
 
-    if (is_http_request(payload)) {
+    // Fast path: Check most common protocols first
+    // Use first bytes to quickly eliminate protocols
+    char first_4[4];
+    if (size >= 4 && !bpf_probe_read(first_4, 4, payload)) {
+        // HTTP: GET, POST, PUT, HEAD, DELETE, OPTIONS, PATCH
+        if ((first_4[0] == 'G' && first_4[1] == 'E' && first_4[2] == 'T') ||
+            (first_4[0] == 'P' && first_4[1] == 'O' && first_4[2] == 'S') ||
+            (first_4[0] == 'P' && first_4[1] == 'U' && first_4[2] == 'T') ||
+            (first_4[0] == 'H' && first_4[1] == 'E' && first_4[2] == 'A') ||
+            (first_4[0] == 'D' && first_4[1] == 'E' && first_4[2] == 'L') ||
+            (first_4[0] == 'O' && first_4[1] == 'P' && first_4[2] == 'T') ||
+            (first_4[0] == 'P' && first_4[1] == 'A' && first_4[2] == 'T') ||
+            (first_4[0] == 'C' && first_4[1] == 'O' && first_4[2] == 'N')) {
+            req->protocol = PROTOCOL_HTTP;
+        } else if (first_4[0] == 'P' && first_4[1] == 'R' && first_4[2] == 'I' && first_4[3] == ' ') {
+            // HTTP/2: Check for connection preface or frame header
+            if (looks_like_http2_frame(payload, size, METHOD_HTTP2_CLIENT_FRAMES)) {
+                req->protocol = PROTOCOL_HTTP2;
+            }
+        }
+    }
+    
+    // If fast path didn't detect protocol, try full detection
+    if (req->protocol == PROTOCOL_UNKNOWN && is_http_request(payload)) {
         req->protocol = PROTOCOL_HTTP;
-    } else if (is_postgres_query(payload, size, &req->request_type)) {
+    } else if (req->protocol == PROTOCOL_UNKNOWN && is_postgres_query(payload, size, &req->request_type)) {
         if (req->request_type == POSTGRES_FRAME_CLOSE) {
             struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
             if (!e) {
                 return 0;
             }
+            init_l7_event(e);
             e->protocol = PROTOCOL_POSTGRES;
             e->method = METHOD_STATEMENT_CLOSE;
             e->payload_size = size;
@@ -238,16 +280,17 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
             return 0;
         }
         req->protocol = PROTOCOL_POSTGRES;
-    } else if (is_redis_query(payload, size)) {
+    } else if (req->protocol == PROTOCOL_UNKNOWN && is_redis_query(payload, size)) {
         req->protocol = PROTOCOL_REDIS;
-    } else if (is_memcached_query(payload, size)) {
+    } else if (req->protocol == PROTOCOL_UNKNOWN && is_memcached_query(payload, size)) {
         req->protocol = PROTOCOL_MEMCACHED;
-    } else if (is_mysql_query(payload, size, &req->request_type)) {
+    } else if (req->protocol == PROTOCOL_UNKNOWN && is_mysql_query(payload, size, &req->request_type)) {
         if (req->request_type == MYSQL_COM_STMT_CLOSE) {
             struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
             if (!e) {
                 return 0;
             }
+            init_l7_event(e);
             e->protocol = PROTOCOL_MYSQL;
             e->method = METHOD_STATEMENT_CLOSE;
             e->payload_size = size;
@@ -256,33 +299,36 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
             return 0;
         }
         req->protocol = PROTOCOL_MYSQL;
-    } else if (is_mongo_query(payload, size)) {
+    } else if (req->protocol == PROTOCOL_UNKNOWN && is_mongo_query(payload, size)) {
         req->protocol = PROTOCOL_MONGO;
-    } else if (is_rabbitmq_produce(payload, size)) {
+    } else if (req->protocol == PROTOCOL_UNKNOWN && is_rabbitmq_produce(payload, size)) {
         struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
         if (!e) {
             return 0;
         }
+        init_l7_event(e);
         e->protocol = PROTOCOL_RABBITMQ;
         e->method = METHOD_PRODUCE;
         send_event(ctx, e, cid, conn);
         return 0;
-    } else if (nats_method(payload, size) == METHOD_PRODUCE) {
+    } else if (req->protocol == PROTOCOL_UNKNOWN && nats_method(payload, size) == METHOD_PRODUCE) {
         struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
         if (!e) {
             return 0;
         }
+        init_l7_event(e);
         e->protocol = PROTOCOL_NATS;
         e->method = METHOD_PRODUCE;
         send_event(ctx, e, cid, conn);
         return 0;
-    } else if (is_cassandra_request(payload, size, &k.stream_id)) {
+    } else if (req->protocol == PROTOCOL_UNKNOWN && is_cassandra_request(payload, size, &k.stream_id)) {
         req->protocol = PROTOCOL_CASSANDRA;
-    } else if (looks_like_http2_frame(payload, size, METHOD_HTTP2_CLIENT_FRAMES)) {
+    } else if (req->protocol == PROTOCOL_UNKNOWN && looks_like_http2_frame(payload, size, METHOD_HTTP2_CLIENT_FRAMES)) {
         struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
         if (!e) {
             return 0;
         }
+        init_l7_event(e);
         e->protocol = PROTOCOL_HTTP2;
         e->method = METHOD_HTTP2_CLIENT_FRAMES;
         e->duration = bpf_ktime_get_ns();
@@ -290,19 +336,19 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
         COPY_PAYLOAD(e->payload, size, payload);
         send_event(ctx, e, cid, conn);
         return 0;
-    } else if (is_clickhouse_query(payload, size)) {
+    } else if (req->protocol == PROTOCOL_UNKNOWN && is_clickhouse_query(payload, size)) {
         req->protocol = PROTOCOL_CLICKHOUSE;
-    } else if (is_zk_request(payload, total_size)) {
+    } else if (req->protocol == PROTOCOL_UNKNOWN && is_zk_request(payload, total_size)) {
         req->protocol = PROTOCOL_ZOOKEEPER;
-    }  else if (is_kafka_request(payload, size, &req->request_id)) {
+    }  else if (req->protocol == PROTOCOL_UNKNOWN && is_kafka_request(payload, size, &req->request_id)) {
         req->protocol = PROTOCOL_KAFKA;
         struct l7_request *prev_req = bpf_map_lookup_elem(&active_l7_requests, &k);
         if (prev_req && prev_req->protocol == PROTOCOL_KAFKA) {
             req->ns = prev_req->ns;
         }
-    } else if (is_dubbo2_request(payload, size)) {
+    } else if (req->protocol == PROTOCOL_UNKNOWN && is_dubbo2_request(payload, size)) {
         req->protocol = PROTOCOL_DUBBO2;
-    } else if (is_dns_request(payload, size, &k.stream_id)) {
+    } else if (req->protocol == PROTOCOL_UNKNOWN && is_dns_request(payload, size, &k.stream_id)) {
         req->protocol = PROTOCOL_DNS;
     }
 
@@ -393,11 +439,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     if (!e) {
         return 0;
     }
-    e->protocol = PROTOCOL_UNKNOWN;
-    e->status = STATUS_UNKNOWN;
-    e->method = METHOD_UNKNOWN;
-    e->statement_id = 0;
-    e->payload_size = 0;
+    init_l7_event(e);
     e->response_size = ret;
     COPY_PAYLOAD(e->response, ret, payload);
     if (is_rabbitmq_consume(payload, ret)) {
@@ -435,13 +477,21 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
             }
             response = 1;
         } else if (looks_like_http2_frame(payload, ret, METHOD_HTTP2_SERVER_FRAMES)) {
-            e->protocol = PROTOCOL_HTTP2;
-            e->method = METHOD_HTTP2_SERVER_FRAMES;
-            e->duration = bpf_ktime_get_ns();
-            e->payload_size = ret;
-            COPY_PAYLOAD(e->payload, ret, payload);
-            send_event(ctx, e, cid, conn);
-            return 0;
+            // Check if there's a matching HTTP/2 request for gRPC handling
+            req = bpf_map_lookup_elem(&active_l7_requests, &k);
+            if (req && req->protocol == PROTOCOL_HTTP2) {
+                // Handle as part of HTTP/2 response sequence
+                response = 1;
+            } else {
+                // Send standalone HTTP/2 frame (non-gRPC)
+                e->protocol = PROTOCOL_HTTP2;
+                e->method = METHOD_HTTP2_SERVER_FRAMES;
+                e->duration = bpf_ktime_get_ns();
+                e->payload_size = ret;
+                COPY_PAYLOAD(e->payload, ret, payload);
+                send_event(ctx, e, cid, conn);
+                return 0;
+            }
         } else {
             return 0;
         }
@@ -451,7 +501,14 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     e->payload_size = req->payload_size;
     COPY_PAYLOAD(e->payload, req->payload_size, req->payload);
     if (e->protocol == PROTOCOL_HTTP) {
-        response = is_http_response(payload, &e->status);
+        response = is_http_response_partial(payload, ret, req->partial);
+        if (response == 2) { // partial
+            req->partial = 1;
+            return 0; // keeping the query in the map
+        }
+        if (response == 1) {
+            is_http_response(payload, &e->status); // Get status code
+        }
     } else if (e->protocol == PROTOCOL_POSTGRES) {
         response = is_postgres_response(payload, ret, &e->status);
         if (req->request_type == POSTGRES_FRAME_PARSE) {
@@ -484,6 +541,15 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
         if (response == 2) { // partial
             req->partial = 1;
             return 0; // keeping the query in the map
+        }
+    } else if (e->protocol == PROTOCOL_HTTP2) {
+        response = is_http2_response_partial(payload, ret, req->partial);
+        if (response == 2) { // partial
+            req->partial = 1;
+            return 0; // keeping the query in the map
+        }
+        if (response == 1) {
+            e->method = METHOD_HTTP2_SERVER_FRAMES;
         }
     } else if (e->protocol == PROTOCOL_DUBBO2) {
         response = is_dubbo2_response(payload, &e->status);

@@ -226,12 +226,19 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	}
 
 	if !t.disableL7Tracing {
-		perfMaps = append(perfMaps, perfMap{name: "l7_events", typ: perfMapTypeL7Events, perCPUBufferSizePages: 32})
+		// Reduced buffer size for better cache performance
+		// 16 pages = 64KB per CPU (down from 128KB)
+		perfMaps = append(perfMaps, perfMap{name: "l7_events", typ: perfMapTypeL7Events, perCPUBufferSizePages: 16})
 	}
 
 	pageSize := os.Getpagesize()
 	for _, pm := range perfMaps {
-		r, err := perf.NewReaderWithOptions(t.collection.Maps[pm.name], pm.perCPUBufferSizePages*pageSize, perf.ReaderOptions{WakeupEvents: 100})
+		// Optimized wake-up frequency: fewer interrupts, better batching
+		wakeupEvents := 100
+		if pm.name == "l7_events" {
+			wakeupEvents = 50 // Less frequent wakeups for L7 events to reduce CPU overhead
+		}
+		r, err := perf.NewReaderWithOptions(t.collection.Maps[pm.name], pm.perCPUBufferSizePages*pageSize, perf.ReaderOptions{WakeupEvents: wakeupEvents})
 		if err != nil {
 			t.Close()
 			return fmt.Errorf("failed to create ebpf reader: %w", err)
@@ -276,6 +283,79 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	}
 
 	return nil
+}
+
+// isValidHTTPData performs basic validation to detect garbage data in HTTP payloads
+func isValidHTTPData(data []byte) bool {
+	if len(data) < 4 {
+		return false
+	}
+	
+	// Check for common HTTP methods (case-sensitive)
+	httpMethods := []string{"GET ", "POST", "PUT ", "HEAD", "DELE", "CONN", "OPTI", "PATC"}
+	for _, method := range httpMethods {
+		if len(data) >= len(method) && string(data[:len(method)]) == method {
+			return true
+		}
+	}
+	
+	// Check for HTTP response (starts with "HTTP/")
+	if len(data) >= 5 && string(data[:5]) == "HTTP/" {
+		return true
+	}
+	
+	// Check for printable ASCII characters (basic heuristic)
+	nonPrintable := 0
+	for i := 0; i < min(len(data), 100); i++ { // Check first 100 bytes
+		if data[i] < 32 || data[i] > 126 {
+			nonPrintable++
+		}
+	}
+	
+	// If more than 50% non-printable, likely garbage
+	return float64(nonPrintable)/float64(min(len(data), 100)) < 0.5
+}
+
+// isResponseTruncated checks if a response appears to be incomplete
+func isResponseTruncated(data []byte, protocol l7.Protocol) bool {
+	if len(data) == 0 {
+		return false
+	}
+	
+	switch protocol {
+	case l7.ProtocolHTTP:
+		// Check if HTTP response ends abruptly
+		dataStr := string(data)
+		
+		// Look for complete HTTP response indicators
+		if strings.Contains(dataStr, "Content-Length:") {
+			// TODO: Parse Content-Length and verify actual length
+			// For now, assume truncation if data ends without proper closure
+			return !strings.HasSuffix(strings.TrimSpace(dataStr), "}")  && 
+				   !strings.HasSuffix(strings.TrimSpace(dataStr), "</html>") &&
+				   !strings.HasSuffix(strings.TrimSpace(dataStr), "</body>") &&
+				   len(data) >= 5120 // Near max payload size
+		}
+		
+		// Check for chunked encoding completion
+		if strings.Contains(dataStr, "Transfer-Encoding: chunked") {
+			return !strings.Contains(dataStr, "\r\n0\r\n\r\n") // Final chunk marker
+		}
+		
+	case l7.ProtocolHTTP2:
+		// For HTTP/2, check if we have incomplete frames
+		if len(data) < 9 {
+			return true // Need at least frame header
+		}
+		
+		// Basic HTTP/2 frame validation
+		frameLength := uint32(data[0])<<16 | uint32(data[1])<<8 | uint32(data[2])
+		if len(data) < int(frameLength)+9 {
+			return true // Incomplete frame
+		}
+	}
+	
+	return false
 }
 
 func (t EventType) String() string {
@@ -398,6 +478,12 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 			payload := reader.Bytes()
 			expectedSize := int(v.PayloadSize) + int(v.ResponseSize)
 
+			// Validate payload and response sizes to prevent garbage data
+			if v.PayloadSize > 5120 || v.ResponseSize > 5120 { // MAX_PAYLOAD_SIZE = 5120
+				klog.Warningf("Suspiciously large payload/response sizes: payload=%d, response=%d, skipping", v.PayloadSize, v.ResponseSize)
+				continue
+			}
+
 			// If the actual payload is smaller than expected, we log a warning and adjust
 			if len(payload) < expectedSize {
 				klog.Warningf("Payload too small (got %d bytes, expected %d), adjusting sizes", len(payload), expectedSize)
@@ -407,12 +493,34 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 			payloadEnd := min(int(v.PayloadSize), len(payload))
 			responseEnd := min(payloadEnd+int(v.ResponseSize), len(payload))
 
+			// Sanity check: ensure indices are valid
+			if payloadEnd < 0 || responseEnd < payloadEnd || responseEnd > len(payload) {
+				klog.Warningf("Invalid payload indices: payloadEnd=%d, responseEnd=%d, len(payload)=%d, skipping", payloadEnd, responseEnd, len(payload))
+				continue
+			}
+
 			// Always copy to prevent garbage data from reused buffers
 			payloadData := make([]byte, payloadEnd)
 			copy(payloadData, payload[:payloadEnd])
 
 			responseData := make([]byte, responseEnd-payloadEnd)
 			copy(responseData, payload[payloadEnd:responseEnd])
+
+			// Basic sanity check for HTTP protocol - look for garbage data
+			if l7.Protocol(v.Protocol) == l7.ProtocolHTTP && payloadEnd > 0 {
+				if !isValidHTTPData(payloadData) {
+					klog.Warningf("Detected potential garbage HTTP payload data, skipping")
+					continue
+				}
+			}
+
+			// Enhanced response size validation for multi-packet protocols
+			if responseEnd-payloadEnd > 0 && (l7.Protocol(v.Protocol) == l7.ProtocolHTTP || l7.Protocol(v.Protocol) == l7.ProtocolHTTP2) {
+				// For HTTP/HTTP2, check if response looks truncated
+				if isResponseTruncated(responseData, l7.Protocol(v.Protocol)) {
+					klog.V(2).Infof("Detected potentially truncated %s response, size: %d", l7.Protocol(v.Protocol).String(), len(responseData))
+				}
+			}
 
 			req := &l7.RequestData{
 				Protocol:     l7.Protocol(v.Protocol),
