@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"strings"
 	"time"
@@ -33,6 +34,7 @@ var (
 	commonResourceAttrs []attribute.KeyValue
 	agentVersion        string
 	initialized         bool
+	samplingRate        float64
 )
 
 func Init(machineId, hostname, version string) {
@@ -41,6 +43,15 @@ func Init(machineId, hostname, version string) {
 	if endpointUrl == nil {
 		klog.Infoln("no OpenTelemetry traces collector endpoint configured")
 		return
+	}
+
+	samplingRate = *flags.TracesSampling
+	if samplingRate < 0.0 || samplingRate > 1.0 {
+		klog.Warningf("invalid traces-sampling value %f, must be between 0.0 and 1.0, using default 1.0", samplingRate)
+		samplingRate = 1.0
+	}
+	if samplingRate < 1.0 {
+		klog.Infof("trace sampling rate set to %f", samplingRate)
 	}
 	klog.Infoln("OpenTelemetry traces collector endpoint:", endpointUrl.String())
 	path := endpointUrl.Path
@@ -97,6 +108,17 @@ func Init(machineId, hostname, version string) {
 
 type Tracer struct {
 	otel trace.Tracer
+}
+
+func shouldSample() bool {
+	if samplingRate >= 1.0 {
+		return true
+	}
+	if samplingRate <= 0.0 {
+		return false
+	}
+
+	return rand.Float64() < samplingRate
 }
 
 func GetContainerTracer(containerId string) *Tracer {
@@ -159,6 +181,11 @@ func (t *Trace) createSpan(name string, duration time.Duration, error bool, trac
 		return
 	}
 	end := time.Now()
+
+	if !shouldSample() {
+		return
+	}
+
 	start := end.Add(-duration)
 	ctx := context.Background()
 	if traceId != "" {

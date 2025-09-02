@@ -298,12 +298,12 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	if disks, err := node.GetDisks(); err == nil {
 		ioStat := c.cgroup.IOStat()
 		for majorMinor, mounts := range c.getMounts() {
-			dev := disks.GetParentBlockDevice(majorMinor)
-			if dev == nil {
-				continue
+			var device string
+			if dev := disks.GetParentBlockDevice(majorMinor); dev != nil {
+				device = dev.Name
 			}
 			for mountPoint, fsStat := range mounts {
-				dls := []string{mountPoint, dev.Name, c.metadata.volumes[mountPoint]}
+				dls := []string{mountPoint, device, c.metadata.volumes[mountPoint]}
 				ch <- gauge(metrics.DiskSize, float64(fsStat.CapacityBytes), dls...)
 				ch <- gauge(metrics.DiskUsed, float64(fsStat.UsedBytes), dls...)
 				ch <- gauge(metrics.DiskReserved, float64(fsStat.ReservedBytes), dls...)
@@ -790,10 +790,20 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		}
 	}
 
-	trace := c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown(), conn.srcWorkload, conn.DestinationKey.GetDestinationWorkload(), conn.DestinationKey.GetActualDestinationWorkload())
+	ebpfTracesDisabled := false
+	for _, p := range c.processes {
+		if p.Flags.EbpfTracesDisabled {
+			ebpfTracesDisabled = true
+			break
+		}
+	}
+	var trace *tracing.Trace
 	traceId := ""
-	if headers != nil {
-		traceId = trace.ExtractTraceId(headers)
+	if !ebpfTracesDisabled {
+		trace := c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown(), conn.srcWorkload, conn.DestinationKey.GetDestinationWorkload(), conn.DestinationKey.GetActualDestinationWorkload())
+		if headers != nil {
+			traceId = trace.ExtractTraceId(headers)
+		}
 	}
 	stats := c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, traceId)
 	switch r.Protocol {
@@ -883,6 +893,8 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		stats.observe(r.Status.Zookeeper(), "", r.Duration)
 		op, arg := l7.ParseZookeeper(r.Payload)
 		trace.ZookeeperRequest(op, arg, r.Status, r.Duration)
+	case l7.ProtocolFoundationDB:
+		stats.observe(r.Status.String(), "", r.Duration)
 	}
 	return nil
 }
@@ -1084,6 +1096,13 @@ func (c *Container) ping() map[netaddr.IP]float64 {
 func (c *Container) runLogParser(logPath string) {
 	if *flags.DisableLogParsing {
 		return
+	}
+
+	for _, p := range c.processes {
+		if p.Flags.LogMonitoringDisabled {
+			klog.InfoS("skipping log monitoring due to COROOT_LOG_MONITORING=disabled", "cg", c.cgroup.Id)
+			return
+		}
 	}
 
 	containerId := string(c.id)

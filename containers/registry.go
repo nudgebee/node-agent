@@ -40,6 +40,7 @@ type ProcessInfo struct {
 	Pid         uint32
 	ContainerId ContainerID
 	StartedAt   time.Time
+	Flags       proc.Flags
 }
 
 type IPResolver interface {
@@ -245,7 +246,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
 					p := c.onProcessStart(e.Pid)
 					if r.processInfoCh != nil && p != nil {
-						r.processInfoCh <- ProcessInfo{Pid: p.Pid, ContainerId: c.id, StartedAt: p.StartedAt}
+						r.processInfoCh <- ProcessInfo{Pid: p.Pid, ContainerId: c.id, StartedAt: p.StartedAt, Flags: p.Flags}
 					}
 				}
 			case ebpftracer.EventTypeProcessExit:
