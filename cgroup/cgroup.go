@@ -158,7 +158,7 @@ func containerByCgroup(cgroupPath string) (ContainerType, string, error) {
 	if len(parts) == 0 {
 		return ContainerTypeStandaloneProcess, "", nil
 	}
-	if *flags.DisableKubeProbe && len(parts) >= 1 && parts[1] == "kubelet.service" {
+	if *flags.DisableKubeProbe && len(parts) >= 2 && parts[1] == "kubelet.service" {
 		return ContainerTypeStandaloneProcess, "", nil
 	}
 	prefix := parts[0]
