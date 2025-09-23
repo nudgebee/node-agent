@@ -2,15 +2,12 @@ package containers
 
 import (
 	"errors"
-	"io"
-	"log"
 	"net/http"
 	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"encoding/base64"
 
@@ -796,16 +793,16 @@ func (c *Container) trackLLMRequest(provider LLMProvider, host, payloadBase64, r
 
 	// Parse response data for token usage
 	llmResp, _ := ParseLLMResponse(provider, responseBase64)
-	
+
 	// Store LLM metrics for collection during next Collect() call
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	
+
 	// Initialize LLM stats if needed
 	if c.llmStats == nil {
 		c.llmStats = make(map[string]*LLMStats)
 	}
-	
+
 	key := string(provider) + ":" + llmReq.Model + ":" + host
 	stats := c.llmStats[key]
 	if stats == nil {
@@ -816,11 +813,11 @@ func (c *Container) trackLLMRequest(provider LLMProvider, host, payloadBase64, r
 		}
 		c.llmStats[key] = stats
 	}
-	
+
 	// Update counters
 	stats.RequestCount++
 	stats.TotalLatency += duration
-	
+
 	if llmResp != nil {
 		stats.PromptTokens += int64(llmResp.PromptTokens)
 		stats.CompletionTokens += int64(llmResp.CompletionTokens)
@@ -868,19 +865,12 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 			response = base64.StdEncoding.EncodeToString(r.Response)
 		}
 		host := conn.dstWorkload.Name
-		// For external services, use FQDN if available from DNS resolution
-		if conn.dstWorkload.Kind == "external" {
-			if domain := c.registry.getDomain(conn.dst.IP()); domain != nil && domain.FQDN != "" {
-				host = domain.FQDN
-			}
-		}
-		
 		// LLM API tracking
 		provider := DetectLLMProvider(host)
 		if provider != ProviderUnknown {
 			c.trackLLMRequest(provider, host, payload, response, r.Duration)
 		}
-		
+
 		trace.HttpRequest(method, uri, r.Status, r.Duration, r.PayloadSize, payload, headers, response, host)
 	case l7.ProtocolHTTP2:
 		if conn.http2Parser == nil {
