@@ -356,6 +356,8 @@ type l7Event struct {
 	StatementId         uint32
 	PayloadSize         uint64
 	ResponseSize        uint64
+	Payload             [5120]byte // Must match MAX_PAYLOAD_SIZE in eBPF
+	Response            [5120]byte // Must match MAX_PAYLOAD_SIZE in eBPF
 }
 
 type pythonThreadEvent struct {
@@ -387,32 +389,22 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 		case perfMapTypeL7Events:
 			v := &l7Event{}
 			data := rec.RawSample
-			reader := bytes.NewBuffer(data)
-
-			// Ensure binary.Read does not fail before proceeding
-			if err := binary.Read(reader, binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read msg:", err)
+			
+			if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, v); err != nil {
+				klog.Warningln("failed to read l7 event:", err)
 				continue
 			}
 
-			payload := reader.Bytes()
-			expectedSize := int(v.PayloadSize) + int(v.ResponseSize)
+			// Extract payload data directly from the struct arrays
+			payloadSize := min(int(v.PayloadSize), len(v.Payload))
+			responseSize := min(int(v.ResponseSize), len(v.Response))
 
-			// If the actual payload is smaller than expected, we log a warning and adjust
-			if len(payload) < expectedSize {
-				klog.Warningf("Payload too small (got %d bytes, expected %d), adjusting sizes", len(payload), expectedSize)
-			}
+			// Copy the actual data (preventing garbage from unused buffer space)
+			payloadData := make([]byte, payloadSize)
+			copy(payloadData, v.Payload[:payloadSize])
 
-			// Compute safe slicing limits
-			payloadEnd := min(int(v.PayloadSize), len(payload))
-			responseEnd := min(payloadEnd+int(v.ResponseSize), len(payload))
-
-			// Always copy to prevent garbage data from reused buffers
-			payloadData := make([]byte, payloadEnd)
-			copy(payloadData, payload[:payloadEnd])
-
-			responseData := make([]byte, responseEnd-payloadEnd)
-			copy(responseData, payload[payloadEnd:responseEnd])
+			responseData := make([]byte, responseSize)
+			copy(responseData, v.Response[:responseSize])
 
 			req := &l7.RequestData{
 				Protocol:     l7.Protocol(v.Protocol),

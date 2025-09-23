@@ -64,6 +64,17 @@ type Delays struct {
 	disk time.Duration
 }
 
+type LLMStats struct {
+	Provider         LLMProvider
+	Model            string
+	Host             string
+	RequestCount     int64
+	PromptTokens     int64
+	CompletionTokens int64
+	TotalTokens      int64
+	TotalLatency     time.Duration
+}
+
 type LogParser struct {
 	parser *logparser.Parser
 	stop   func()
@@ -146,6 +157,7 @@ type Container struct {
 
 	l7Stats  L7Stats
 	dnsStats *L7Metrics
+	llmStats map[string]*LLMStats
 
 	gpuStats map[string]*GpuUsage
 
@@ -438,6 +450,18 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	}
 	if c.pythonThreadLockWaitTime > 0 {
 		ch <- counter(metrics.PythonThreadLockWaitTime, c.pythonThreadLockWaitTime.Seconds())
+	}
+
+	// LLM metrics collection
+	for _, stats := range c.llmStats {
+		ch <- counter(metrics.LLMRequests, float64(stats.RequestCount), string(stats.Provider), stats.Model, stats.Host)
+		ch <- counter(metrics.LLMTokensUsed, float64(stats.PromptTokens), string(stats.Provider), stats.Model, "prompt", stats.Host)
+		ch <- counter(metrics.LLMTokensUsed, float64(stats.CompletionTokens), string(stats.Provider), stats.Model, "completion", stats.Host)
+		ch <- counter(metrics.LLMTokensUsed, float64(stats.TotalTokens), string(stats.Provider), stats.Model, "total", stats.Host)
+		if stats.RequestCount > 0 {
+			avgLatency := float64(stats.TotalLatency) / float64(stats.RequestCount) / float64(time.Second)
+			ch <- gauge(metrics.LLMLatency, avgLatency, string(stats.Provider), stats.Model, stats.Host)
+		}
 	}
 
 	if c.dnsStats.Requests != nil {
@@ -763,6 +787,47 @@ func (c *Container) onDNSRequest(r *l7.RequestData) map[netaddr.IP]*common.Domai
 	return ip2fqdn
 }
 
+func (c *Container) trackLLMRequest(provider LLMProvider, host, payloadBase64, responseBase64 string, duration time.Duration) {
+	// Parse request data
+	llmReq, err := ParseLLMRequest(provider, payloadBase64)
+	if err != nil || llmReq == nil {
+		return // Skip tracking if we can't parse the request
+	}
+
+	// Parse response data for token usage
+	llmResp, _ := ParseLLMResponse(provider, responseBase64)
+	
+	// Store LLM metrics for collection during next Collect() call
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	
+	// Initialize LLM stats if needed
+	if c.llmStats == nil {
+		c.llmStats = make(map[string]*LLMStats)
+	}
+	
+	key := string(provider) + ":" + llmReq.Model + ":" + host
+	stats := c.llmStats[key]
+	if stats == nil {
+		stats = &LLMStats{
+			Provider: provider,
+			Model:    llmReq.Model,
+			Host:     host,
+		}
+		c.llmStats[key] = stats
+	}
+	
+	// Update counters
+	stats.RequestCount++
+	stats.TotalLatency += duration
+	
+	if llmResp != nil {
+		stats.PromptTokens += int64(llmResp.PromptTokens)
+		stats.CompletionTokens += int64(llmResp.CompletionTokens)
+		stats.TotalTokens += int64(llmResp.TotalTokens)
+	}
+}
+
 func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData) map[netaddr.IP]*common.Domain {
 	c.lock.Lock()
 	defer c.lock.Unlock()
@@ -779,13 +844,10 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		return nil
 	}
 
-	// Parse HTTP request once if needed
-	var req *http.Request
-	var err error
+	// Extract headers for trace correlation
 	var headers http.Header = http.Header{}
 	if r.Protocol == l7.ProtocolHTTP {
-		req, err = l7.ParseHTTPRequest(r.Payload)
-		if err == nil && req != nil && req.Header != nil {
+		if req, err := l7.ParseHTTPRequest(r.Payload); err == nil && req != nil && req.Header != nil {
 			headers = req.Header
 		}
 	}
@@ -799,32 +861,26 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	switch r.Protocol {
 	case l7.ProtocolHTTP:
 		stats.observe(r.Status.Http(), "", r.Duration)
-		payload := ""
-		method := ""
-		uri := ""
+		payload := base64.StdEncoding.EncodeToString(r.Payload)
+		method, uri := l7.ParseHttp(r.Payload)
 		response := ""
-		host := conn.dstWorkload.Name
-		if err != nil {
-			log.Printf("Failed to parse payload %s, %q", err, string(r.Payload))
-			method, uri = l7.ParseHttp(r.Payload)
-		} else {
-			if req != nil && req.Body != nil {
-				body, _ := io.ReadAll(req.Body)
-				base64String := base64.StdEncoding.EncodeToString(body)
-				payload = string(base64String)
-			}
-			method = req.Method
-			if utf8.ValidString(req.URL.Path) {
-				uri = req.URL.Path
-			} else {
-				// remove non-utf8 characters
-				klog.Warningf("Non-utf8 characters in uri %q", req.URL.Path)
-				uri = string([]rune(req.URL.Path))
-			}
-		}
 		if r.Response != nil {
 			response = base64.StdEncoding.EncodeToString(r.Response)
 		}
+		host := conn.dstWorkload.Name
+		// For external services, use FQDN if available from DNS resolution
+		if conn.dstWorkload.Kind == "external" {
+			if domain := c.registry.getDomain(conn.dst.IP()); domain != nil && domain.FQDN != "" {
+				host = domain.FQDN
+			}
+		}
+		
+		// LLM API tracking
+		provider := DetectLLMProvider(host)
+		if provider != ProviderUnknown {
+			c.trackLLMRequest(provider, host, payload, response, r.Duration)
+		}
+		
 		trace.HttpRequest(method, uri, r.Status, r.Duration, r.PayloadSize, payload, headers, response, host)
 	case l7.ProtocolHTTP2:
 		if conn.http2Parser == nil {

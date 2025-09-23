@@ -53,7 +53,10 @@ require (
 	k8s.io/klog/v2 v2.130.1
 )
 
-require github.com/gobwas/glob v0.2.3
+require (
+	github.com/gobwas/glob v0.2.3
+	gotest.tools v2.2.0+incompatible
+)
 
 require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
