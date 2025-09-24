@@ -30,6 +30,7 @@
 
 #define TRUNCATE_PAYLOAD_SIZE(size) ({                                  \
     size = MIN(size, MAX_PAYLOAD_SIZE-1);                               \
+    asm volatile ("%0 &= %1" : "+r"(size) : "i"(MAX_PAYLOAD_SIZE-1));   \
 })
 #define COPY_PAYLOAD(dst, size, src) ({     \
     TRUNCATE_PAYLOAD_SIZE(size);            \
@@ -38,7 +39,7 @@
     }                                       \
 })
 
-#define IOVEC_BUF_SIZE MAX_PAYLOAD_SIZE  // Reduced to avoid eBPF verifier issues
+#define IOVEC_BUF_SIZE MAX_PAYLOAD_SIZE * 2  // must be double of MAX_PAYLOAD_SIZE
 #define MAX_IOVEC_SIZE 32
 
 
@@ -245,7 +246,7 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
         }
         *total_size += iov.size;
         if (offset < max) {
-            size = MIN(iov.size, max - offset);
+            size = MIN(iov.size, max-offset);
             TRUNCATE_PAYLOAD_SIZE(size);
             TRUNCATE_PAYLOAD_SIZE(offset);
             if (bpf_probe_read(buf + offset, size, (void *)iov.buf)) {
@@ -254,7 +255,7 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
             offset += size;
         }
     }
-    return MIN(offset, IOVEC_BUF_SIZE);
+    return offset;
 }
 
 
