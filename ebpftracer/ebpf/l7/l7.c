@@ -244,14 +244,9 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
             continue;
         }
         *total_size += iov.size;
-        if (offset < IOVEC_BUF_SIZE) {
-            size = MIN(iov.size, IOVEC_BUF_SIZE - offset);
-            // Apply payload size limit first, then bounds check
+        if (offset < max) {
+            size = MIN(iov.size, max - offset);
             TRUNCATE_PAYLOAD_SIZE(size);
-            // Ensure we don't exceed buffer bounds after truncation
-            if (offset + size > IOVEC_BUF_SIZE) {
-                size = IOVEC_BUF_SIZE - offset;
-            }
             TRUNCATE_PAYLOAD_SIZE(offset);
             if (bpf_probe_read(buf + offset, size, (void *)iov.buf)) {
                 return 0;
