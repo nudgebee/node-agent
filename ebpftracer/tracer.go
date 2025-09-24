@@ -305,6 +305,93 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		t.links = append(t.links, l)
 	}
 
+	// Attach SSL uprobes for HTTPS LLM API observability
+	if !t.disableL7Tracing {
+		if err := t.attachSSLUprobes(); err != nil {
+			klog.Warningf("Failed to attach SSL uprobes: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// attachSSLUprobes attaches uprobes to SSL/TLS libraries for HTTPS tracing
+func (t *Tracer) attachSSLUprobes() error {
+	// SSL libraries to probe - industry standard approach
+	sslLibraries := []string{
+		"/usr/lib/x86_64-linux-gnu/libssl.so.3",     // OpenSSL 3.x
+		"/usr/lib/x86_64-linux-gnu/libssl.so.1.1",   // OpenSSL 1.1.x  
+		"/lib/x86_64-linux-gnu/libssl.so.3",
+		"/lib/x86_64-linux-gnu/libssl.so.1.1",
+		"/usr/lib64/libssl.so.3",                     // RHEL/CentOS
+		"/usr/lib64/libssl.so.1.1",
+		"/usr/lib/x86_64-linux-gnu/libgnutls.so.30", // GnuTLS
+		"/lib/x86_64-linux-gnu/libgnutls.so.30",
+	}
+	
+	// SSL function uprobes to attach
+	sslFunctions := []struct {
+		name     string
+		symbol   string
+		progName string
+	}{
+		{"SSL_write", "SSL_write", "ssl_write_entry"},
+		{"SSL_read", "SSL_read", "ssl_read_entry"}, 
+		{"SSL_read_ret", "SSL_read", "ssl_read_exit"},
+		{"gnutls_record_send", "gnutls_record_send", "gnutls_write_entry"},
+		{"gnutls_record_recv", "gnutls_record_recv", "gnutls_read_exit"},
+	}
+	
+	attachedAny := false
+	
+	// Iterate through libraries and attach uprobes where possible
+	for _, libPath := range sslLibraries {
+		if _, err := os.Stat(libPath); os.IsNotExist(err) {
+			continue // Library not found, skip
+		}
+		
+		klog.V(2).Infof("Found SSL library: %s", libPath)
+		
+		// Open executable once for this library
+		ex, err := link.OpenExecutable(libPath)
+		if err != nil {
+			klog.V(3).Infof("Failed to open executable %s: %v", libPath, err)
+			continue
+		}
+		
+		for _, fn := range sslFunctions {
+			prog, exists := t.uprobes[fn.progName]
+			if !exists {
+				continue // Program not found in collection
+			}
+			
+			var l link.Link
+			var err error
+			
+			if strings.Contains(fn.name, "_ret") {
+				// Return probe (uretprobe)
+				l, err = ex.Uretprobe(fn.symbol, prog, nil)
+			} else {
+				// Entry probe (uprobe)  
+				l, err = ex.Uprobe(fn.symbol, prog, nil)
+			}
+			
+			if err != nil {
+				klog.V(3).Infof("Failed to attach %s to %s: %v", fn.name, libPath, err)
+				continue
+			}
+			
+			klog.V(2).Infof("Attached SSL uprobe %s to %s", fn.name, libPath)
+			t.links = append(t.links, l)
+			attachedAny = true
+		}
+	}
+	
+	if !attachedAny {
+		return fmt.Errorf("no SSL libraries found or attached")
+	}
+	
+	klog.V(1).Infoln("SSL uprobes attached successfully - HTTPS LLM API tracing enabled")
 	return nil
 }
 
