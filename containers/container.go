@@ -976,7 +976,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 				c.trackLLMRequest(provider, host, payloadBase64, responseBase64, req.Duration)
 			}
 			
-			trace.Http2Request(req.Method, req.Path, req.Scheme, req.Status, req.Duration, string(payload))
+			trace.Http2Request(req.Method, req.Path, req.Scheme, req.Status, -1, req.Duration)
 		}
 	case l7.ProtocolPostgres:
 		if r.Method != l7.MethodStatementClose {
