@@ -247,8 +247,6 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
         *total_size += iov.size;
         if (offset < max) {
             size = MIN(iov.size, max-offset);
-            TRUNCATE_PAYLOAD_SIZE(size);
-            TRUNCATE_PAYLOAD_SIZE(offset);
             if (bpf_probe_read(buf + offset, size, (void *)iov.buf)) {
                 return 0;
             }
