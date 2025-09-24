@@ -329,13 +329,6 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 					}
 					r.ip2fqdnLock.Unlock()
 				}
-			case ebpftracer.EventTypeHTTPFragment:
-				if e.HTTPFragment == nil {
-					continue
-				}
-				if c := r.containersByPid[e.Pid]; c != nil {
-					c.onHTTPFragment(e.HTTPFragment)
-				}
 			}
 		}
 	}
@@ -501,7 +494,7 @@ func (r *Registry) handleHostDNSRequest(req *l7.RequestData) map[netaddr.IP]*com
 	if status == "" {
 		return nil
 	}
-	
+
 	t, fqdn, ips := l7.ParseDns(req.Payload)
 	if t == "" {
 		return nil

@@ -73,19 +73,7 @@ type LLMStats struct {
 	TotalLatency     time.Duration
 }
 
-// HTTP fragment reassembly types
-type HTTPFragmentKey struct {
-	Fd                  uint64
-	ConnectionTimestamp uint64
-}
-
-type HTTPResponseReassembly struct {
-	Fragments     map[uint32]*ebpftracer.HTTPResponseFragment
-	TotalExpected uint32
-	Status        uint16
-	StartTime     time.Time
-	LastFragment  time.Time
-}
+// Removed complex HTTP fragment reassembly - using simple 5KB L7 events instead
 
 type LogParser struct {
 	parser *logparser.Parser
@@ -185,10 +173,6 @@ type Container struct {
 
 	registry *Registry
 
-	// HTTP fragment reassembly state
-	httpFragments     map[HTTPFragmentKey]*HTTPResponseReassembly
-	httpFragmentsLock sync.Mutex
-
 	lock sync.RWMutex
 
 	done        chan struct{}
@@ -243,8 +227,6 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		seenMounts: map[uint64]struct{}{},
 
 		logParsers: map[string]*LogParser{},
-
-		httpFragments: make(map[HTTPFragmentKey]*HTTPResponseReassembly),
 
 		tracer: tracing.GetContainerTracer(string(id)),
 
@@ -908,14 +890,9 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		payload := base64.StdEncoding.EncodeToString(r.Payload)
 		method, uri := l7.ParseHttp(r.Payload)
 
-		// Try to get complete response from fragments first, fallback to L7 response
+		// Use L7 response data (5KB limit - covers most LLM responses)
 		response := ""
-		completeResponse := c.getCompleteHTTPResponse(conn.Fd, conn.Timestamp)
-		if completeResponse != nil && len(completeResponse) > 0 {
-			// Use complete multi-packet response for better LLM token tracking
-			response = base64.StdEncoding.EncodeToString(completeResponse)
-		} else if r.Response != nil {
-			// Fallback to original L7 response (5KB limit)
+		if r.Response != nil {
 			response = base64.StdEncoding.EncodeToString(r.Response)
 		}
 
@@ -924,7 +901,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		provider := DetectLLMProvider(host)
 		if provider == ProviderUnknown {
 			// Fallback: Try to detect from HTTP request URL and response structure
-			provider = c.detectLLMFromHTTPRequest(r.Payload, response)
+			provider = detectLLMFromHTTPRequest(r.Payload, response)
 		}
 		if provider != ProviderUnknown {
 			c.trackLLMRequest(provider, host, payload, response, r.Duration)
@@ -951,19 +928,16 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 			// Enhanced LLM API tracking for HTTP/2 (including gRPC-based LLM services)
 			host := conn.dstWorkload.Name
 
-			// Prepare response data for LLM detection and tracking
+			// Prepare response data for LLM detection and tracking (5KB limit)
 			responseBase64 := ""
-			completeResponse := c.getCompleteHTTPResponse(conn.Fd, conn.Timestamp)
-			if completeResponse != nil && len(completeResponse) > 0 {
-				responseBase64 = base64.StdEncoding.EncodeToString(completeResponse)
-			} else if r.Response != nil {
+			if r.Response != nil {
 				responseBase64 = base64.StdEncoding.EncodeToString(r.Response)
 			}
 
 			provider := DetectLLMProvider(host)
 			if provider == ProviderUnknown {
 				// Fallback: Try to detect from HTTP/2 request and response structure
-				provider = c.detectLLMFromHTTPRequest(r.Payload, responseBase64)
+				provider = detectLLMFromHTTPRequest(r.Payload, responseBase64)
 			}
 			if provider != ProviderUnknown {
 				payloadBase64 := base64.StdEncoding.EncodeToString(r.Payload)
@@ -1489,143 +1463,8 @@ func resolveFd(pid uint32, fd uint64) (mntId string, logPath string) {
 	return
 }
 
-// onHTTPFragment handles HTTP response fragments and reassembles complete responses
-func (c *Container) onHTTPFragment(fragment *ebpftracer.HTTPResponseFragment) {
-	c.httpFragmentsLock.Lock()
-	defer c.httpFragmentsLock.Unlock()
-
-	key := HTTPFragmentKey{
-		Fd:                  fragment.Fd,
-		ConnectionTimestamp: fragment.ConnectionTimestamp,
-	}
-
-	// Get or create reassembly state
-	reassembly, exists := c.httpFragments[key]
-	if !exists {
-		reassembly = &HTTPResponseReassembly{
-			Fragments:     make(map[uint32]*ebpftracer.HTTPResponseFragment),
-			TotalExpected: fragment.TotalExpected,
-			Status:        fragment.HttpStatus,
-			StartTime:     time.Now(),
-			LastFragment:  time.Now(),
-		}
-		c.httpFragments[key] = reassembly
-	}
-
-	// Add fragment to reassembly
-	reassembly.Fragments[fragment.FragmentId] = fragment
-	reassembly.LastFragment = time.Now()
-
-	// Check if response is complete - but don't process here, let L7 events handle it
-	if fragment.IsFinal || len(reassembly.Fragments) >= int(reassembly.TotalExpected/2048) {
-		// Response is complete - L7 event processing will pick it up via getCompleteHTTPResponse()
-		// Don't delete here - let getCompleteHTTPResponse() clean up after use
-		return
-	}
-
-	// Clean up old incomplete reassemblies (memory pressure handling)
-	if len(c.httpFragments) > 1000 { // Max 1000 concurrent reassemblies
-		now := time.Now()
-		for k, r := range c.httpFragments {
-			if now.Sub(r.LastFragment) > 30*time.Second {
-				delete(c.httpFragments, k)
-			}
-		}
-	}
-}
-
-// reassembleHTTPResponse combines fragments into a complete HTTP response
-func (c *Container) reassembleHTTPResponse(reassembly *HTTPResponseReassembly) []byte {
-	if len(reassembly.Fragments) == 0 {
-		return nil
-	}
-
-	// Sort fragments by ID and reassemble
-	var sortedIds []uint32
-	totalSize := 0
-	for id, frag := range reassembly.Fragments {
-		sortedIds = append(sortedIds, id)
-		totalSize += int(frag.FragmentSize)
-	}
-
-	// Simple sort for fragment IDs
-	for i := 0; i < len(sortedIds)-1; i++ {
-		for j := i + 1; j < len(sortedIds); j++ {
-			if sortedIds[i] > sortedIds[j] {
-				sortedIds[i], sortedIds[j] = sortedIds[j], sortedIds[i]
-			}
-		}
-	}
-
-	// Reassemble response data
-	response := make([]byte, 0, totalSize)
-	for _, id := range sortedIds {
-		frag := reassembly.Fragments[id]
-		response = append(response, frag.Data[:frag.FragmentSize]...)
-	}
-
-	return response
-}
-
-// Note: LLM processing is now handled directly in the L7 HTTP processing
-// via the existing trackLLMRequest() method using complete fragment data
-
-// getCompleteHTTPResponse retrieves a complete HTTP response from fragments if available
-// Includes brief retry mechanism to handle L7/fragment timing issues
-func (c *Container) getCompleteHTTPResponse(fd uint64, connectionTimestamp uint64) []byte {
-	key := HTTPFragmentKey{
-		Fd:                  fd,
-		ConnectionTimestamp: connectionTimestamp,
-	}
-
-	// Try up to 3 times with small delays to allow fragments to arrive
-	for attempt := 0; attempt < 3; attempt++ {
-		c.httpFragmentsLock.Lock()
-
-		// Check if we have a complete response for this connection
-		if reassembly, exists := c.httpFragments[key]; exists {
-			// Check if response is complete or has enough fragments
-			hasEnoughFragments := len(reassembly.Fragments) > 0
-			isComplete := false
-
-			// Check if marked as complete by eBPF or timeout
-			if time.Since(reassembly.LastFragment) < 100*time.Millisecond {
-				// Recent activity, check if complete
-				for _, frag := range reassembly.Fragments {
-					if frag.IsFinal {
-						isComplete = true
-						break
-					}
-				}
-			} else {
-				// Timeout - consider complete if we have fragments
-				isComplete = hasEnoughFragments
-			}
-
-			if isComplete && hasEnoughFragments {
-				complete := c.reassembleHTTPResponse(reassembly)
-				if complete != nil && len(complete) > 0 {
-					// Clean up after retrieval
-					delete(c.httpFragments, key)
-					c.httpFragmentsLock.Unlock()
-					return complete
-				}
-			}
-		}
-
-		c.httpFragmentsLock.Unlock()
-
-		// If not found and this isn't the last attempt, wait briefly
-		if attempt < 2 {
-			time.Sleep(5 * time.Millisecond) // Brief delay to allow fragments to arrive
-		}
-	}
-
-	return nil // No complete response available
-}
-
 // detectLLMFromHTTPRequest detects LLM provider from HTTP request URL and response when hostname detection fails
-func (c *Container) detectLLMFromHTTPRequest(requestPayload []byte, responseBase64 string) LLMProvider {
+func detectLLMFromHTTPRequest(requestPayload []byte, responseBase64 string) LLMProvider {
 	// Parse HTTP request to extract URL path
 	requestStr := string(requestPayload)
 
@@ -1665,7 +1504,7 @@ func (c *Container) detectLLMFromHTTPRequest(requestPayload []byte, responseBase
 	// Fallback: Analyze response structure if available
 	if responseBase64 != "" {
 		if responseBytes, err := base64.StdEncoding.DecodeString(responseBase64); err == nil {
-			return c.detectProviderFromResponseStructure(responseBytes)
+			return detectProviderFromResponseStructure(responseBytes)
 		}
 	}
 
@@ -1699,7 +1538,7 @@ func extractHTTPPath(request string) string {
 }
 
 // detectProviderFromResponseStructure analyzes response JSON to identify provider
-func (c *Container) detectProviderFromResponseStructure(responseData []byte) LLMProvider {
+func detectProviderFromResponseStructure(responseData []byte) LLMProvider {
 	// Look for JSON in response (skip HTTP headers)
 	jsonStart := bytes.Index(responseData, []byte("{"))
 	if jsonStart == -1 {
