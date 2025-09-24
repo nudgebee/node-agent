@@ -928,23 +928,25 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 			// Enhanced LLM API tracking for HTTP/2 (including gRPC-based LLM services)
 			host := conn.dstWorkload.Name
 
-			// Prepare response data for LLM detection and tracking (5KB limit)
-			responseBase64 := ""
-			if r.Response != nil {
-				responseBase64 = base64.StdEncoding.EncodeToString(r.Response)
+			// Use extracted HTTP/2 DATA frame payloads for LLM tracking
+			requestPayloadBase64 := ""
+			if len(req.RequestPayload) > 0 {
+				requestPayloadBase64 = base64.StdEncoding.EncodeToString(req.RequestPayload)
+			}
+
+			responsePayloadBase64 := ""
+			if len(req.ResponsePayload) > 0 {
+				responsePayloadBase64 = base64.StdEncoding.EncodeToString(req.ResponsePayload)
 			}
 
 			provider := DetectLLMProvider(host)
-			if provider == ProviderUnknown {
-				// Fallback: Try to detect from HTTP/2 request and response structure
-				provider = detectLLMFromHTTPRequest(r.Payload, responseBase64)
+			if provider == ProviderUnknown && len(req.RequestPayload) > 0 {
+				// Fallback: Try to detect from HTTP/2 request and response payload
+				provider = detectLLMFromHTTPRequest(req.RequestPayload, responsePayloadBase64)
 			}
-			if provider != ProviderUnknown {
-				payloadBase64 := base64.StdEncoding.EncodeToString(r.Payload)
-				c.trackLLMRequest(provider, host, payloadBase64, responseBase64, req.Duration)
+			if provider != ProviderUnknown && len(req.RequestPayload) > 0 {
+				c.trackLLMRequest(provider, host, requestPayloadBase64, responsePayloadBase64, req.Duration)
 			}
-
-			trace.Http2Request(req.Method, req.Path, req.Scheme, req.Status, -1, req.Duration)
 		}
 	case l7.ProtocolPostgres:
 		if r.Method != l7.MethodStatementClose {
