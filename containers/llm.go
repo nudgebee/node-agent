@@ -53,14 +53,14 @@ func DetectLLMProvider(hostname string) LLMProvider {
 	if provider, exists := llmProviders[hostname]; exists {
 		return provider
 	}
-	
+
 	// Subdomain matching for cases like "chat.openai.com"
 	for host, provider := range llmProviders {
 		if strings.HasSuffix(hostname, "."+host) || strings.HasSuffix(hostname, host) {
 			return provider
 		}
 	}
-	
+
 	return ProviderUnknown
 }
 
@@ -84,9 +84,9 @@ func ParseLLMRequest(provider LLMProvider, payloadBase64 string) (*LLMRequest, e
 			return nil, nil // No JSON found
 		}
 	}
-	
+
 	jsonPayload := payloadStr[jsonStart:]
-	
+
 	// Parse based on provider
 	switch provider {
 	case ProviderOpenAI:
@@ -107,7 +107,7 @@ func ParseLLMResponse(provider LLMProvider, responseBase64 string) (*LLMResponse
 	if responseBase64 == "" {
 		return nil, nil
 	}
-	
+
 	// Decode base64 response
 	responseBytes, err := base64.StdEncoding.DecodeString(responseBase64)
 	if err != nil {
@@ -126,9 +126,9 @@ func ParseLLMResponse(provider LLMProvider, responseBase64 string) (*LLMResponse
 			return nil, nil // No JSON found
 		}
 	}
-	
+
 	jsonResponse := responseStr[jsonStart:]
-	
+
 	// Parse based on provider
 	switch provider {
 	case ProviderOpenAI:
@@ -151,12 +151,12 @@ func parseOpenAIRequest(jsonPayload string) (*LLMRequest, error) {
 		MaxTokens   int     `json:"max_tokens"`
 		Temperature float64 `json:"temperature"`
 	}
-	
+
 	if err := json.Unmarshal([]byte(jsonPayload), &req); err != nil {
 		log.Printf("Failed to parse OpenAI request: %v", err)
 		return nil, err
 	}
-	
+
 	return &LLMRequest{
 		Provider:    ProviderOpenAI,
 		Model:       req.Model,
@@ -175,12 +175,12 @@ func parseOpenAIResponse(jsonResponse string) (*LLMResponse, error) {
 			TotalTokens      int `json:"total_tokens"`
 		} `json:"usage"`
 	}
-	
+
 	if err := json.Unmarshal([]byte(jsonResponse), &resp); err != nil {
 		log.Printf("Failed to parse OpenAI response: %v", err)
 		return nil, err
 	}
-	
+
 	return &LLMResponse{
 		Provider:         ProviderOpenAI,
 		Model:            resp.Model,
@@ -197,12 +197,12 @@ func parseAnthropicRequest(jsonPayload string) (*LLMRequest, error) {
 		MaxTokens   int     `json:"max_tokens"`
 		Temperature float64 `json:"temperature"`
 	}
-	
+
 	if err := json.Unmarshal([]byte(jsonPayload), &req); err != nil {
 		log.Printf("Failed to parse Anthropic request: %v", err)
 		return nil, err
 	}
-	
+
 	return &LLMRequest{
 		Provider:    ProviderAnthropic,
 		Model:       req.Model,
@@ -220,12 +220,12 @@ func parseAnthropicResponse(jsonResponse string) (*LLMResponse, error) {
 			OutputTokens int `json:"output_tokens"`
 		} `json:"usage"`
 	}
-	
+
 	if err := json.Unmarshal([]byte(jsonResponse), &resp); err != nil {
 		log.Printf("Failed to parse Anthropic response: %v", err)
 		return nil, err
 	}
-	
+
 	return &LLMResponse{
 		Provider:         ProviderAnthropic,
 		Model:            resp.Model,
@@ -243,15 +243,15 @@ func parseGoogleRequest(jsonPayload string) (*LLMRequest, error) {
 			Temperature     float64 `json:"temperature"`
 		} `json:"generationConfig"`
 	}
-	
+
 	if err := json.Unmarshal([]byte(jsonPayload), &req); err != nil {
 		log.Printf("Failed to parse Google request: %v", err)
 		return nil, err
 	}
-	
+
 	// Extract model from URL path if available
 	model := "gemini" // Default
-	
+
 	return &LLMRequest{
 		Provider:    ProviderGoogle,
 		Model:       model,
@@ -269,12 +269,12 @@ func parseGoogleResponse(jsonResponse string) (*LLMResponse, error) {
 			TotalTokenCount      int `json:"totalTokenCount"`
 		} `json:"usageMetadata"`
 	}
-	
+
 	if err := json.Unmarshal([]byte(jsonResponse), &resp); err != nil {
 		log.Printf("Failed to parse Google response: %v", err)
 		return nil, err
 	}
-	
+
 	return &LLMResponse{
 		Provider:         ProviderGoogle,
 		Model:            "gemini",
@@ -291,12 +291,12 @@ func parseCohereRequest(jsonPayload string) (*LLMRequest, error) {
 		MaxTokens   int     `json:"max_tokens"`
 		Temperature float64 `json:"temperature"`
 	}
-	
+
 	if err := json.Unmarshal([]byte(jsonPayload), &req); err != nil {
 		log.Printf("Failed to parse Cohere request: %v", err)
 		return nil, err
 	}
-	
+
 	return &LLMRequest{
 		Provider:    ProviderCohere,
 		Model:       req.Model,
@@ -315,12 +315,12 @@ func parseCohereResponse(jsonResponse string) (*LLMResponse, error) {
 			} `json:"tokens"`
 		} `json:"meta"`
 	}
-	
+
 	if err := json.Unmarshal([]byte(jsonResponse), &resp); err != nil {
 		log.Printf("Failed to parse Cohere response: %v", err)
 		return nil, err
 	}
-	
+
 	return &LLMResponse{
 		Provider:         ProviderCohere,
 		Model:            "cohere", // Default

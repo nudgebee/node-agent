@@ -426,7 +426,7 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 		case perfMapTypeL7Events:
 			v := &l7Event{}
 			data := rec.RawSample
-			
+
 			if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, v); err != nil {
 				klog.Warningln("failed to read l7 event:", err)
 				continue
