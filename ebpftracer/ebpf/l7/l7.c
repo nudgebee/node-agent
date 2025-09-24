@@ -38,7 +38,7 @@
     }                                       \
 })
 
-#define IOVEC_BUF_SIZE MAX_PAYLOAD_SIZE * 2  // must be double of MAX_PAYLOAD_SIZE
+#define IOVEC_BUF_SIZE MAX_PAYLOAD_SIZE  // Reduced to avoid eBPF verifier issues
 #define MAX_IOVEC_SIZE 32
 
 
