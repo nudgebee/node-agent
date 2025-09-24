@@ -31,7 +31,9 @@ type Http2Request struct {
 	GrpcStatus Status
 	Duration   time.Duration
 
-	kernelTime uint64
+	RequestPayload  []byte
+	ResponsePayload []byte
+	kernelTime      uint64
 }
 
 type Http2Parser struct {
@@ -87,7 +89,30 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64) []
 			StreamId: binary.BigEndian.Uint32(payload[offset+5:]) & (1<<31 - 1),
 		}
 		offset += http2FrameHeaderLength
-		if h.Type != http2.FrameHeaders {
+		if h.Type == http2.FrameData {
+			// Extract DATA frame payload
+			if len(payload)-offset < h.Length {
+				break
+			}
+			dataPayload := payload[offset : offset+h.Length]
+
+			switch method {
+			case MethodHttp2ClientFrames:
+				// Client DATA frame = request payload
+				req := p.activeRequests[h.StreamId]
+				if req != nil {
+					req.RequestPayload = append(req.RequestPayload, dataPayload...)
+				}
+			case MethodHttp2ServerFrames:
+				// Server DATA frame = response payload
+				req := p.activeRequests[h.StreamId]
+				if req != nil {
+					req.ResponsePayload = append(req.ResponsePayload, dataPayload...)
+				}
+			}
+			offset += h.Length
+			continue
+		} else if h.Type != http2.FrameHeaders {
 			if len(payload)-offset < h.Length {
 				break
 			}
