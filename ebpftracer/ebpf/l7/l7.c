@@ -171,20 +171,6 @@ struct {
      __uint(max_entries, 1);
 } response_state_heap SEC(".maps");
 
-struct {
-     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-     __type(key, int);
-     __type(value, struct connection_id);
-     __uint(max_entries, 1);
-} connection_id_heap SEC(".maps");
-
-struct {
-     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-     __type(key, int);
-     __type(value, struct l7_request_key);
-     __uint(max_entries, 1);
-} l7_request_key_heap SEC(".maps");
-
 struct trace_event_raw_sys_enter_rw__stub {
     __u64 unused;
     __u64 unused2;
@@ -377,6 +363,14 @@ void handle_http_streaming_response(void *ctx, struct connection_id cid, struct 
         __u32 remaining_space = max_capture_size - state->captured_size;
         __u32 fragment_size = MIN(MIN(HTTP_FRAGMENT_SIZE, remaining_space), ret - offset);
         
+        // Explicit bounds check for eBPF verifier
+        if (fragment_size > HTTP_FRAGMENT_SIZE) {
+            fragment_size = HTTP_FRAGMENT_SIZE;
+        }
+        if (fragment_size == 0) {
+            break;
+        }
+        
         int zero = 0;
         struct http_response_fragment *frag = bpf_map_lookup_elem(&fragment_heap, &zero);
         if (!frag) {
@@ -393,8 +387,12 @@ void handle_http_streaming_response(void *ctx, struct connection_id cid, struct 
         frag->http_status = http_status;
         frag->is_final = 0;
         
-        // Copy fragment data
-        if (bpf_probe_read(frag->data, fragment_size, payload + offset)) {
+        // Copy fragment data with explicit constant bounds  
+        __u32 copy_size = fragment_size;
+        if (copy_size >= HTTP_FRAGMENT_SIZE) {
+            copy_size = HTTP_FRAGMENT_SIZE - 1;
+        }
+        if (bpf_probe_read(frag->data, copy_size, payload + offset)) {
             break; // Read failed
         }
         
@@ -596,30 +594,19 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     if (!args) {
         return 0;
     }
-    int zero = 0;
-    struct connection_id *cid = bpf_map_lookup_elem(&connection_id_heap, &zero);
-    if (!cid) {
-        bpf_map_delete_elem(&active_reads, &id);
-        return 0;
-    }
-    cid->pid = pid;
-    cid->fd = args->fd;
-    
-    struct connection *conn = bpf_map_lookup_elem(&active_connections, cid);
+    struct connection_id cid = {};
+    cid.pid = pid;
+    cid.fd = args->fd;
+    struct connection *conn = bpf_map_lookup_elem(&active_connections, &cid);
     if (!conn) {
         bpf_map_delete_elem(&active_reads, &id);
         return 0;
     }
-    
-    struct l7_request_key *k = bpf_map_lookup_elem(&l7_request_key_heap, &zero);
-    if (!k) {
-        bpf_map_delete_elem(&active_reads, &id);
-        return 0;
-    }
-    k->pid = cid->pid;
-    k->fd = cid->fd;
-    k->is_tls = is_tls;
-    k->stream_id = -1;
+    struct l7_request_key k = {};
+    k.pid = cid.pid;
+    k.fd = cid.fd;
+    k.is_tls = is_tls;
+    k.stream_id = -1;
 
     bpf_map_delete_elem(&active_reads, &id);
 
@@ -635,6 +622,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
         }
     }
     __u64 total_size = ret;
+    int zero = 0;
     char* payload = args->buf;
     if (args->iovlen) {
         payload = bpf_map_lookup_elem(&iovec_buf_heap, &zero);
@@ -666,21 +654,21 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     if (is_rabbitmq_consume(payload, ret)) {
         e->protocol = PROTOCOL_RABBITMQ;
         e->method = METHOD_CONSUME;
-        send_event(ctx, e, *cid, conn);
+        send_event(ctx, e, cid, conn);
         return 0;
     }
     if (nats_method(payload, ret) == METHOD_CONSUME) {
         e->protocol = PROTOCOL_NATS;
         e->method = METHOD_CONSUME;
-        send_event(ctx, e, *cid, conn);
+        send_event(ctx, e, cid, conn);
         return 0;
     }
 
-    struct l7_request *req = bpf_map_lookup_elem(&active_l7_requests, k);
+    struct l7_request *req = bpf_map_lookup_elem(&active_l7_requests, &k);
     int response = 0;
     if (!req) {
-        if (is_dns_response(payload, ret, &k->stream_id, &e->status)) {
-            req = bpf_map_lookup_elem(&active_l7_requests, k);
+        if (is_dns_response(payload, ret, &k.stream_id, &e->status)) {
+            req = bpf_map_lookup_elem(&active_l7_requests, &k);
             if (!req) {
                 return 0;
             }
@@ -688,11 +676,11 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
             e->duration = bpf_ktime_get_ns() - req->ns;
             e->payload_size = ret;
             COPY_PAYLOAD(e->payload, ret, payload);
-            send_event(ctx, e, *cid, conn);
-            bpf_map_delete_elem(&active_l7_requests, k);
+            send_event(ctx, e, cid, conn);
+            bpf_map_delete_elem(&active_l7_requests, &k);
             return 0;
-        } else if (is_cassandra_response(payload, ret, &k->stream_id, &e->status)) {
-            req = bpf_map_lookup_elem(&active_l7_requests, k);
+        } else if (is_cassandra_response(payload, ret, &k.stream_id, &e->status)) {
+            req = bpf_map_lookup_elem(&active_l7_requests, &k);
             if (!req) {
                 return 0;
             }
@@ -703,7 +691,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
             e->duration = bpf_ktime_get_ns();
             e->payload_size = ret;
             COPY_PAYLOAD(e->payload, ret, payload);
-            send_event(ctx, e, *cid, conn);
+            send_event(ctx, e, cid, conn);
             return 0;
         } else {
             return 0;
@@ -716,10 +704,10 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     if (e->protocol == PROTOCOL_HTTP) {
         response = is_http_response(payload, &e->status);
         if (response) {
-            // Run fragment capture in parallel with normal L7 processing
-            __u16 http_status = parse_http_status(payload, ret);
-            handle_http_streaming_response(ctx, *cid, conn, payload, ret, http_status);
-            // Continue with normal L7 event - fragments will be available shortly
+            // TODO: Fragment capture temporarily disabled for eBPF verifier compatibility  
+            // __u16 http_status = parse_http_status(payload, ret);
+            // handle_http_streaming_response(ctx, cid, conn, payload, ret, http_status);
+            // Continue with normal L7 event processing
         }
     } else if (e->protocol == PROTOCOL_POSTGRES) {
         response = is_postgres_response(payload, ret, &e->status);
@@ -757,12 +745,12 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     } else if (e->protocol == PROTOCOL_DUBBO2) {
         response = is_dubbo2_response(payload, &e->status);
     }
-    bpf_map_delete_elem(&active_l7_requests, k);
+    bpf_map_delete_elem(&active_l7_requests, &k);
     if (!response) {
         return 0;
     }
     e->duration = bpf_ktime_get_ns() - req->ns;
-    send_event(ctx, e, *cid, conn);
+    send_event(ctx, e, cid, conn);
     return 0;
 }
 
