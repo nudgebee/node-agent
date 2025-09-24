@@ -318,6 +318,8 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 					r.ip2fqdnLock.Lock()
 					for ip, domain := range ip2fqdn {
 						r.ip2fqdn[ip] = domain
+						// Also update IP resolver cache for trace hostname display
+						r.ip_resolver.CacheDNS(ip.String(), domain.FQDN)
 					}
 					r.ip2fqdnLock.Unlock()
 				} else if e.L7Request.Protocol == l7.ProtocolDNS {
@@ -326,6 +328,8 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 					r.ip2fqdnLock.Lock()
 					for ip, domain := range ip2fqdn {
 						r.ip2fqdn[ip] = domain
+						// Also update IP resolver cache for trace hostname display
+						r.ip_resolver.CacheDNS(ip.String(), domain.FQDN)
 					}
 					r.ip2fqdnLock.Unlock()
 				}

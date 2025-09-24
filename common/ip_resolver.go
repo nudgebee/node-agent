@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"sync"
 	"time"
 
@@ -102,13 +101,8 @@ func (resolver *K8sIPResolver) ResolveActualIP(ip string) Workload {
 		val, ok := resolver.dnsResolvedIps.Get(ip)
 		if ok {
 			host = val
-		} else {
-			hosts, err := net.LookupAddr(ip)
-			if err == nil && len(hosts) > 0 {
-				host = hosts[0]
-			}
-			resolver.dnsResolvedIps.Add(ip, host)
 		}
+		// Note: Removed net.LookupAddr() - only use eBPF-captured DNS data for accuracy
 	}
 	return Workload{
 		Name:      host,
@@ -138,13 +132,8 @@ func (resolver *K8sIPResolver) ResolveIP(ip string) Workload {
 		val, ok := resolver.dnsResolvedIps.Get(ip)
 		if ok {
 			host = val
-		} else {
-			hosts, err := net.LookupAddr(ip)
-			if err == nil && len(hosts) > 0 {
-				host = hosts[0]
-			}
-			resolver.dnsResolvedIps.Add(ip, host)
 		}
+		// Note: Removed net.LookupAddr() - only use eBPF-captured DNS data for accuracy
 	}
 	return Workload{
 		Name:      host,
