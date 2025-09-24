@@ -296,8 +296,15 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
             continue;
         }
         *total_size += iov.size;
-        if (offset < max) {
-            size = MIN(iov.size, max-offset);
+        if (offset < IOVEC_BUF_SIZE) {
+            size = MIN(iov.size, IOVEC_BUF_SIZE - offset);
+            // Additional safety check to prevent buffer overflow
+            if (size > MAX_PAYLOAD_SIZE) {
+                size = MAX_PAYLOAD_SIZE;
+            }
+            if (offset + size > IOVEC_BUF_SIZE) {
+                size = IOVEC_BUF_SIZE - offset;
+            }
             TRUNCATE_PAYLOAD_SIZE(size);
             TRUNCATE_PAYLOAD_SIZE(offset);
             if (bpf_probe_read(buf + offset, size, (void *)iov.buf)) {
@@ -306,7 +313,7 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
             offset += size;
         }
     }
-    return offset;
+    return MIN(offset, IOVEC_BUF_SIZE);
 }
 
 // HTTP multi-packet response handler (parallel with L7 events)
@@ -759,42 +766,45 @@ int sys_enter_write(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     return trace_enter_write(ctx, ctx->fd, 0, ctx->buf, ctx->size, 0);
 }
 
-SEC("tracepoint/syscalls/sys_enter_writev")
-int sys_enter_writev(struct trace_event_raw_sys_enter_rw__stub* ctx) {
-    return trace_enter_write(ctx, ctx->fd, 0, ctx->buf, 0, ctx->size);
-}
+// Temporarily disabled due to eBPF verifier issues
+// SEC("tracepoint/syscalls/sys_enter_writev")
+// int sys_enter_writev(struct trace_event_raw_sys_enter_rw__stub* ctx) {
+//     return trace_enter_write(ctx, ctx->fd, 0, ctx->buf, 0, ctx->size);
+// }
 
-SEC("tracepoint/syscalls/sys_enter_sendmsg")
-int sys_enter_sendmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
-    struct user_msghdr msghdr = {};
-    if (bpf_probe_read(&msghdr, sizeof(msghdr), (void *)ctx->buf)) {
-        return 0;
-    }
-    return trace_enter_write(ctx, ctx->fd, 0, (char*)msghdr.msg_iov, 0, msghdr.msg_iovlen);
-}
+// Temporarily disabled due to potential eBPF verifier stack issues
+// SEC("tracepoint/syscalls/sys_enter_sendmsg")
+// int sys_enter_sendmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
+//     struct user_msghdr msghdr = {};
+//     if (bpf_probe_read(&msghdr, sizeof(msghdr), (void *)ctx->buf)) {
+//         return 0;
+//     }
+//     return trace_enter_write(ctx, ctx->fd, 0, (char*)msghdr.msg_iov, 0, msghdr.msg_iovlen);
+// }
 
 struct mmsghdr {
 	struct user_msghdr msg_hdr;
 	__u32 msg_len;
 };
 
-SEC("tracepoint/syscalls/sys_enter_sendmmsg")
-int sys_enter_sendmmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
-    __u64 offset = 0;
-    #pragma unroll
-    for (int i = 0; i <= 1; i++) {
-        if (i >= ctx->size) {
-            break;
-        }
-        struct mmsghdr h = {};
-        if (bpf_probe_read(&h , sizeof(h), (void *)(ctx->buf + offset))) {
-            return 0;
-        }
-        offset += sizeof(h);
-        trace_enter_write(ctx, ctx->fd, 0, (char*)h.msg_hdr.msg_iov, 0, h.msg_hdr.msg_iovlen);
-    }
-    return 0;
-}
+// Temporarily disabled due to potential eBPF verifier complexity
+// SEC("tracepoint/syscalls/sys_enter_sendmmsg")
+// int sys_enter_sendmmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
+//     __u64 offset = 0;
+//     #pragma unroll
+//     for (int i = 0; i <= 1; i++) {
+//         if (i >= ctx->size) {
+//             break;
+//         }
+//         struct mmsghdr h = {};
+//         if (bpf_probe_read(&h , sizeof(h), (void *)(ctx->buf + offset))) {
+//             return 0;
+//         }
+//         offset += sizeof(h);
+//         trace_enter_write(ctx, ctx->fd, 0, (char*)h.msg_hdr.msg_iov, 0, h.msg_hdr.msg_iovlen);
+//     }
+//     return 0;
+// }
 
 SEC("tracepoint/syscalls/sys_enter_sendto")
 int sys_enter_sendto(struct trace_event_raw_sys_enter_rw__stub* ctx) {
