@@ -64,17 +64,14 @@ type InstanceMeta struct {
 
 func NewK8sIPResolver(clientset kubernetes.Interface, resolveDns bool) (*K8sIPResolver, error) {
 	var dnsCache *lrucache.Cache[string, string]
-	if resolveDns {
-		var err error
-		dnsCache, err = lrucache.New[string, string](MAX_RESOLVED_DNS)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		dnsCache = nil
+	var err error
+	dnsCache, err = lrucache.New[string, string](MAX_RESOLVED_DNS)
+	if err != nil {
+		return nil, err
 	}
+
 	var podCache *lrucache.Cache[string, Workload]
-	podCache, err := lrucache.New[string, Workload](MAX_PODS_LIMIT)
+	podCache, err = lrucache.New[string, Workload](MAX_PODS_LIMIT)
 	if err != nil {
 		return nil, err
 	}
