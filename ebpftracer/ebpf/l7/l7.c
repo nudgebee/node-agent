@@ -41,11 +41,6 @@
 #define IOVEC_BUF_SIZE MAX_PAYLOAD_SIZE * 2  // must be double of MAX_PAYLOAD_SIZE
 #define MAX_IOVEC_SIZE 32
 
-// HTTP response capture configuration
-#define MAX_HTTP_CAPTURE_SIZE (64 * 1024)       // 64KB default max capture
-#define MAX_LARGE_RESPONSE_SIZE (1024 * 1024)   // 1MB threshold for "large" responses
-#define LARGE_RESPONSE_CAPTURE_LIMIT (16 * 1024) // 16KB limit for large responses
-#define MAX_FRAGMENTS_PER_RESPONSE 32            // Max fragments per response
 
 #include "http.c"
 #include "postgres.c"
@@ -80,30 +75,6 @@ struct l7_event {
     char response[MAX_PAYLOAD_SIZE];
 };
 
-// HTTP response tracking state (64 bytes per connection)
-// struct http_response_state {
-//     __u64 start_time;
-//     __u32 content_length;    // From HTTP Content-Length header
-//     __u32 captured_size;     // Bytes captured so far  
-//     __u16 fragment_count;
-//     __u8 has_content_length; // Whether we parsed Content-Length
-//     __u8 capture_complete;   // Response fully captured
-// };
-
-// HTTP response fragment (2KB each)
-// Fragment capture temporarily disabled for eBPF verifier compatibility
-// #define HTTP_FRAGMENT_SIZE 2048
-// struct http_response_fragment {
-//     __u64 fd;
-//     __u64 connection_timestamp;
-//     __u32 pid;
-//     __u32 fragment_id;       // Sequence number
-//     __u32 total_expected;    // From Content-Length (0 if unknown)
-//     __u16 fragment_size;     // This fragment size
-//     __u8 is_final;          // Last fragment flag
-//     __u8 http_status;       // 200, 404, 500, etc.
-//     char data[HTTP_FRAGMENT_SIZE];
-// };
 
 struct {
      __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -118,20 +89,6 @@ struct {
     __uint(value_size, sizeof(int));
 } l7_events SEC(".maps");
 
-// HTTP response tracking maps - temporarily disabled for eBPF verifier compatibility
-// struct {
-//     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-//     __uint(key_size, sizeof(struct connection_id));
-//     __uint(value_size, sizeof(struct http_response_state));
-//     __uint(max_entries, 10240);
-// } http_response_tracking SEC(".maps");
-
-// Fragment maps temporarily disabled for eBPF verifier compatibility
-// struct {
-//     __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-//     __uint(key_size, sizeof(int));
-//     __uint(value_size, sizeof(int));
-// } http_response_fragments SEC(".maps");
 
 struct read_args {
     __u64 fd;
@@ -161,19 +118,6 @@ struct {
      __uint(max_entries, 1);
 } iovec_buf_heap SEC(".maps");
 
-// struct {
-//      __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-//      __type(key, int);
-//      __type(value, struct http_response_fragment);
-//      __uint(max_entries, 1);
-// } fragment_heap SEC(".maps");
-
-// struct {
-//      __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-//      __type(key, int);
-//      __type(value, struct http_response_state);
-//      __uint(max_entries, 1);
-// } response_state_heap SEC(".maps");
 
 struct trace_event_raw_sys_enter_rw__stub {
     __u64 unused;
@@ -320,124 +264,6 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
     return MIN(offset, IOVEC_BUF_SIZE);
 }
 
-// HTTP multi-packet response handler (parallel with L7 events)
-// TEMPORARILY DISABLED for eBPF verifier compatibility
-// static inline __attribute__((__always_inline__))
-// void handle_http_streaming_response(void *ctx, struct connection_id cid, struct connection *conn, 
-//                                   char *payload, __u64 ret, __u16 http_status) {
-//     struct http_response_state *state = bpf_map_lookup_elem(&http_response_tracking, &cid);
-//     
-//     if (!state) {
-//         // First fragment - initialize response state using per-CPU map
-//         int zero = 0;
-//         struct http_response_state *new_state = bpf_map_lookup_elem(&response_state_heap, &zero);
-//         if (!new_state) return;
-//         
-//         // Initialize state manually
-//         new_state->start_time = bpf_ktime_get_ns();
-//         new_state->content_length = parse_http_content_length(payload, ret);
-//         new_state->has_content_length = (new_state->content_length > 0);
-//         new_state->captured_size = 0;
-//         new_state->fragment_count = 0;
-//         new_state->capture_complete = 0;
-//         
-//         bpf_map_update_elem(&http_response_tracking, &cid, new_state, BPF_ANY);
-//         state = bpf_map_lookup_elem(&http_response_tracking, &cid);
-//         if (!state) return;
-//     }
-//     
-//     // Determine capture strategy based on response size
-//     __u32 max_capture_size = MAX_HTTP_CAPTURE_SIZE;
-//     __u8 should_continue_capture = 1;
-//     
-//     if (state->has_content_length) {
-//         if (state->content_length > MAX_LARGE_RESPONSE_SIZE) {
-//             // Very large response - limit capture
-//             max_capture_size = LARGE_RESPONSE_CAPTURE_LIMIT;
-//             should_continue_capture = (state->captured_size < max_capture_size);
-//         }
-//     } else {
-//         // No Content-Length - use fragment count limit
-//         should_continue_capture = (state->fragment_count < MAX_FRAGMENTS_PER_RESPONSE);
-//     }
-//     
-//     if (!should_continue_capture) {
-//         // Response too large, stop fragment capture
-//         bpf_map_delete_elem(&http_response_tracking, &cid);
-//         return;
-//     }
-//     
-//     // Stream response in fragments
-//     __u32 offset = 0;
-//     while (offset < ret && state->captured_size < max_capture_size && 
-//            state->fragment_count < MAX_FRAGMENTS_PER_RESPONSE) {
-//         
-//         __u32 remaining_space = max_capture_size - state->captured_size;
-//         __u32 fragment_size = MIN(MIN(HTTP_FRAGMENT_SIZE, remaining_space), ret - offset);
-//         
-//         // Explicit bounds check for eBPF verifier
-//         if (fragment_size > HTTP_FRAGMENT_SIZE) {
-//             fragment_size = HTTP_FRAGMENT_SIZE;
-//         }
-//         if (fragment_size == 0) {
-//             break;
-//         }
-//         
-//         int zero = 0;
-//         struct http_response_fragment *frag = bpf_map_lookup_elem(&fragment_heap, &zero);
-//         if (!frag) {
-//             break; // Can't allocate fragment
-//         }
-//         
-//         // Initialize fragment (manual zeroing since we can't use = {})
-//         frag->fd = cid.fd;
-//         frag->connection_timestamp = conn->timestamp;
-//         frag->pid = cid.pid;
-//         frag->fragment_id = state->fragment_count;
-//         frag->total_expected = state->content_length;
-//         frag->fragment_size = fragment_size;
-//         frag->http_status = http_status;
-//         frag->is_final = 0;
-//         
-//         // Copy fragment data with explicit constant bounds  
-//         __u32 copy_size = fragment_size;
-//         if (copy_size >= HTTP_FRAGMENT_SIZE) {
-//             copy_size = HTTP_FRAGMENT_SIZE - 1;
-//         }
-//         if (bpf_probe_read(frag->data, copy_size, payload + offset)) {
-//             break; // Read failed
-//         }
-//         
-//         // Check if this is the final fragment
-//         __u8 is_response_complete = 0;
-//         if (state->has_content_length) {
-//             is_response_complete = (state->captured_size + fragment_size >= state->content_length);
-//         } else {
-//             // For chunked/streaming responses, assume complete if small fragment
-//             is_response_complete = (fragment_size < HTTP_FRAGMENT_SIZE / 2);
-//         }
-//         
-//         frag->is_final = is_response_complete || 
-//                        (state->captured_size + fragment_size >= max_capture_size) ||
-//                        (state->fragment_count >= MAX_FRAGMENTS_PER_RESPONSE - 1);
-//         
-//         // Send fragment
-//         bpf_perf_event_output(ctx, &http_response_fragments, BPF_F_CURRENT_CPU, 
-//                              frag, sizeof(*frag));
-//         
-//         offset += fragment_size;
-//         state->captured_size += fragment_size;
-//         state->fragment_count++;
-//         
-//         if (frag->is_final) {
-//             // Mark response as complete but don't delete - let L7 processing retrieve it
-//             state->capture_complete = 1;
-//             break;
-//         }
-//     }
-//     
-//     // Fragment capture complete or in progress
-// }
 
 static inline __attribute__((__always_inline__))
 int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, __u64 iovlen) {
@@ -717,12 +543,6 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     COPY_PAYLOAD(e->payload, req->payload_size, req->payload);
     if (e->protocol == PROTOCOL_HTTP) {
         response = is_http_response(payload, &e->status);
-        if (response) {
-            // TODO: Fragment capture temporarily disabled for eBPF verifier compatibility  
-            // __u16 http_status = parse_http_status(payload, ret);
-            // handle_http_streaming_response(ctx, cid, conn, payload, ret, http_status);
-            // Continue with normal L7 event processing
-        }
     } else if (e->protocol == PROTOCOL_POSTGRES) {
         response = is_postgres_response(payload, ret, &e->status);
         if (req->request_type == POSTGRES_FRAME_PARSE) {

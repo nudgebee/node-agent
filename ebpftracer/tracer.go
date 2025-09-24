@@ -93,7 +93,6 @@ const (
 	perfMapTypeFileEvents         perfMapType = 3
 	perfMapTypeL7Events           perfMapType = 4
 	perfMapTypePythonThreadEvents perfMapType = 5
-	// perfMapTypeHTTPFragments      perfMapType = 6  // Disabled for verifier compatibility
 )
 
 type Tracer struct {
@@ -258,7 +257,6 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 
 	if !t.disableL7Tracing {
 		perfMaps = append(perfMaps, perfMap{name: "l7_events", typ: perfMapTypeL7Events, perCPUBufferSizePages: 32})
-		// perfMaps = append(perfMaps, perfMap{name: "http_response_fragments", typ: perfMapTypeHTTPFragments, perCPUBufferSizePages: 16})  // Disabled
 	}
 
 	pageSize := os.Getpagesize()
@@ -464,39 +462,6 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 				Timestamp: v.ConnectionTimestamp,
 				L7Request: req,
 			}
-		// case perfMapTypeHTTPFragments:  // Disabled for verifier compatibility
-		//	v := &httpResponseFragment{}
-		//	data := rec.RawSample
-		//	
-		//	if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, v); err != nil {
-		//		klog.Warningln("failed to read HTTP fragment event:", err)
-		//		continue
-		//	}
-		//	
-		//	// Extract fragment data
-		//	fragmentSize := min(int(v.FragmentSize), len(v.Data))
-		//	fragmentData := make([]byte, fragmentSize)
-		//	copy(fragmentData, v.Data[:fragmentSize])
-		//	
-		//	fragment := &HTTPResponseFragment{
-		//		Fd:                  v.Fd,
-		//		ConnectionTimestamp: v.ConnectionTimestamp,
-		//		Pid:                 v.Pid,
-		//		FragmentId:          v.FragmentId,
-		//		TotalExpected:       v.TotalExpected,
-		//		FragmentSize:        v.FragmentSize,
-		//		IsFinal:             v.IsFinal == 1,
-		//		HttpStatus:          uint16(v.HttpStatus),
-		//		Data:                fragmentData,
-		//	}
-		//	
-		//	event = Event{
-		//		Type:         EventTypeHTTPFragment,
-		//		Pid:          v.Pid,
-		//		Fd:           v.Fd,
-		//		Timestamp:    v.ConnectionTimestamp,
-		//		HTTPFragment: fragment,
-		//	}
 		case perfMapTypeFileEvents:
 			v := &fileEvent{}
 			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
