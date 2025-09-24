@@ -319,14 +319,19 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 func (t *Tracer) attachSSLUprobes() error {
 	// SSL libraries to probe - industry standard approach
 	sslLibraries := []string{
-		"/usr/lib/x86_64-linux-gnu/libssl.so.3",     // OpenSSL 3.x
-		"/usr/lib/x86_64-linux-gnu/libssl.so.1.1",   // OpenSSL 1.1.x  
+		"/usr/lib/x86_64-linux-gnu/libssl.so.3",     // OpenSSL 3.x Debian/Ubuntu
+		"/usr/lib/x86_64-linux-gnu/libssl.so.1.1",   // OpenSSL 1.1.x Debian/Ubuntu
 		"/lib/x86_64-linux-gnu/libssl.so.3",
 		"/lib/x86_64-linux-gnu/libssl.so.1.1",
-		"/usr/lib64/libssl.so.3",                     // RHEL/CentOS
+		"/usr/lib64/libssl.so.3",                     // RHEL/CentOS/UBI9
 		"/usr/lib64/libssl.so.1.1",
+		"/usr/lib/libssl.so.3",                       // Alpine Linux
+		"/usr/lib/libssl.so.48",                      // Alpine OpenSSL 1.1.x
+		"/lib/libssl.so.3",
+		"/lib/libssl.so.48",
 		"/usr/lib/x86_64-linux-gnu/libgnutls.so.30", // GnuTLS
 		"/lib/x86_64-linux-gnu/libgnutls.so.30",
+		"/usr/lib/libgnutls.so.30",                   // Alpine GnuTLS
 	}
 	
 	// SSL function uprobes to attach
@@ -362,11 +367,22 @@ func (t *Tracer) attachSSLUprobes() error {
 		for _, fn := range sslFunctions {
 			prog, exists := t.uprobes[fn.progName]
 			if !exists {
+				klog.V(3).Infof("eBPF program %s not found in collection, skipping", fn.progName)
 				continue // Program not found in collection
 			}
 			
 			var l link.Link
 			var err error
+			
+			// Skip GnuTLS functions if this is not a GnuTLS library
+			if strings.Contains(fn.progName, "gnutls") && !strings.Contains(libPath, "gnutls") {
+				continue
+			}
+			
+			// Skip OpenSSL functions if this is not an OpenSSL library  
+			if strings.Contains(fn.progName, "ssl") && !strings.Contains(fn.progName, "gnutls") && strings.Contains(libPath, "gnutls") {
+				continue
+			}
 			
 			if strings.Contains(fn.name, "_ret") {
 				// Return probe (uretprobe)
@@ -388,7 +404,8 @@ func (t *Tracer) attachSSLUprobes() error {
 	}
 	
 	if !attachedAny {
-		return fmt.Errorf("no SSL libraries found or attached")
+		klog.Warningln("No SSL libraries found or attached - HTTPS tracing will be limited to HTTP/1.1 only")
+		return nil // Don't fail, just continue without SSL uprobes
 	}
 	
 	klog.V(1).Infoln("SSL uprobes attached successfully - HTTPS LLM API tracing enabled")

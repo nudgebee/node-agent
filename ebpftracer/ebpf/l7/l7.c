@@ -719,7 +719,7 @@ int sys_exit_recvfrom(struct trace_event_raw_sys_exit__stub* ctx) {
 // SSL/TLS uprobes for HTTPS LLM API observability
 // Based on GroundCover/Pixie approach - capture plaintext before/after encryption
 
-SEC("uprobe/SSL_write")
+SEC("uprobe")
 int ssl_write_entry(struct pt_regs *ctx) {
     // SSL_write(SSL *ssl, const void *buf, int num)
     void *ssl_ptr = (void *)PT_REGS_PARM1(ctx);
@@ -738,7 +738,7 @@ int ssl_write_entry(struct pt_regs *ctx) {
     return trace_enter_write(ctx, fd, 1, buf, num, 0); // is_tls = 1
 }
 
-SEC("uprobe/SSL_read") 
+SEC("uprobe") 
 int ssl_read_entry(struct pt_regs *ctx) {
     // SSL_read(SSL *ssl, void *buf, int num)
     void *ssl_ptr = (void *)PT_REGS_PARM1(ctx);
@@ -764,7 +764,7 @@ int ssl_read_entry(struct pt_regs *ctx) {
     return 0;
 }
 
-SEC("uretprobe/SSL_read")
+SEC("uretprobe")
 int ssl_read_exit(struct pt_regs *ctx) {
     int ret = PT_REGS_RC(ctx);
     __u64 id = bpf_get_current_pid_tgid();
@@ -780,7 +780,7 @@ int ssl_read_exit(struct pt_regs *ctx) {
 }
 
 // GnuTLS support for broader SSL library coverage
-SEC("uprobe/gnutls_record_send")
+SEC("uprobe")
 int gnutls_write_entry(struct pt_regs *ctx) {
     // gnutls_record_send(gnutls_session_t session, const void *data, size_t data_size)
     void *session = (void *)PT_REGS_PARM1(ctx);
@@ -795,7 +795,7 @@ int gnutls_write_entry(struct pt_regs *ctx) {
     return trace_enter_write(ctx, fd, 1, buf, size, 0); // is_tls = 1
 }
 
-SEC("uretprobe/gnutls_record_recv") 
+SEC("uretprobe") 
 int gnutls_read_exit(struct pt_regs *ctx) {
     long ret = PT_REGS_RC(ctx);
     __u64 id = bpf_get_current_pid_tgid();
