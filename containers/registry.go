@@ -13,6 +13,7 @@ import (
 	"github.com/coroot/coroot-node-agent/cgroup"
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer"
+	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/coroot/coroot-node-agent/flags"
 	"github.com/coroot/coroot-node-agent/gpu"
 	"github.com/coroot/coroot-node-agent/proc"
@@ -300,6 +301,21 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 						r.ip2fqdn[ip] = domain
 					}
 					r.ip2fqdnLock.Unlock()
+				} else if e.L7Request.Protocol == l7.ProtocolDNS {
+					// Handle DNS queries from non-monitored processes for global ip2fqdn mapping
+					ip2fqdn := r.handleHostDNSRequest(e.L7Request)
+					r.ip2fqdnLock.Lock()
+					for ip, domain := range ip2fqdn {
+						r.ip2fqdn[ip] = domain
+					}
+					r.ip2fqdnLock.Unlock()
+				}
+			case ebpftracer.EventTypeHTTPFragment:
+				if e.HTTPFragment == nil {
+					continue
+				}
+				if c := r.containersByPid[e.Pid]; c != nil {
+					c.onHTTPFragment(e.HTTPFragment)
 				}
 			case ebpftracer.EventTypePythonThreadLock:
 				if c := r.containersByPid[e.Pid]; c != nil {
@@ -423,6 +439,36 @@ func (r *Registry) getDomain(ip netaddr.IP) *common.Domain {
 	r.ip2fqdnLock.RLock()
 	defer r.ip2fqdnLock.RUnlock()
 	return r.ip2fqdn[ip]
+}
+
+// handleHostDNSRequest processes DNS queries from non-monitored processes
+// to populate global ip2fqdn mapping for hostname resolution
+func (r *Registry) handleHostDNSRequest(req *l7.RequestData) map[netaddr.IP]*common.Domain {
+	status := req.Status.DNS()
+	if status == "" {
+		return nil
+	}
+	
+	t, fqdn, ips := l7.ParseDns(req.Payload)
+	if t == "" {
+		return nil
+	}
+	fqdn = common.NormalizeFQDN(fqdn, t)
+
+	// Skip AAAA requests with empty results (same logic as Container.onDNSRequest)
+	if t == "TypeAAAA" && req.Status == 0 && len(ips) == 0 {
+		return nil
+	}
+
+	// Create ip2fqdn mapping without container-specific metrics
+	ip2fqdn := map[netaddr.IP]*common.Domain{}
+	if fqdn != "" {
+		d := common.NewDomain(fqdn, ips)
+		for _, ip := range ips {
+			ip2fqdn[ip] = d
+		}
+	}
+	return ip2fqdn
 }
 
 func calcId(cg *cgroup.Cgroup, md *ContainerMetadata) ContainerID {

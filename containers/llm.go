@@ -40,8 +40,11 @@ var llmProviders = map[string]LLMProvider{
 	"api.openai.com":                    ProviderOpenAI,
 	"api.anthropic.com":                 ProviderAnthropic,
 	"generativelanguage.googleapis.com": ProviderGoogle,
+	"ai.googleapis.com":                 ProviderGoogle, // Vertex AI
+	"aiplatform.googleapis.com":         ProviderGoogle, // Vertex AI Platform
 	"api.cohere.ai":                     ProviderCohere,
 	"api.cohere.com":                    ProviderCohere,
+	"claude.ai":                         ProviderAnthropic, // Claude web interface
 }
 
 // DetectLLMProvider identifies if a hostname belongs to an LLM provider
@@ -69,11 +72,17 @@ func ParseLLMRequest(provider LLMProvider, payloadBase64 string) (*LLMRequest, e
 		return nil, err
 	}
 
-	// Find JSON body in HTTP request
+	// Find JSON body in HTTP request or HTTP/2 frame
 	payloadStr := string(payloadBytes)
 	jsonStart := strings.Index(payloadStr, "{")
 	if jsonStart == -1 {
-		return nil, nil // No JSON found
+		// For HTTP/2, the payload might be the JSON directly
+		if strings.HasPrefix(strings.TrimSpace(payloadStr), "{") {
+			jsonStart = strings.Index(strings.TrimSpace(payloadStr), "{")
+			jsonStart += len(payloadStr) - len(strings.TrimSpace(payloadStr))
+		} else {
+			return nil, nil // No JSON found
+		}
 	}
 	
 	jsonPayload := payloadStr[jsonStart:]
@@ -105,11 +114,17 @@ func ParseLLMResponse(provider LLMProvider, responseBase64 string) (*LLMResponse
 		return nil, err
 	}
 
-	// Find JSON in HTTP response
+	// Find JSON in HTTP response or HTTP/2 frame
 	responseStr := string(responseBytes)
 	jsonStart := strings.Index(responseStr, "{")
 	if jsonStart == -1 {
-		return nil, nil // No JSON found
+		// For HTTP/2, the response might be the JSON directly
+		if strings.HasPrefix(strings.TrimSpace(responseStr), "{") {
+			jsonStart = strings.Index(strings.TrimSpace(responseStr), "{")
+			jsonStart += len(responseStr) - len(strings.TrimSpace(responseStr))
+		} else {
+			return nil, nil // No JSON found
+		}
 	}
 	
 	jsonResponse := responseStr[jsonStart:]

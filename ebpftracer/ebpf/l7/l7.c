@@ -29,7 +29,6 @@
 
 #define TRUNCATE_PAYLOAD_SIZE(size) ({                                  \
     size = MIN(size, MAX_PAYLOAD_SIZE-1);                               \
-    asm volatile ("%0 &= %1" : "+r"(size) : "i"(MAX_PAYLOAD_SIZE-1));   \
 })
 #define COPY_PAYLOAD(dst, size, src) ({     \
     TRUNCATE_PAYLOAD_SIZE(size);            \
@@ -40,6 +39,12 @@
 
 #define IOVEC_BUF_SIZE MAX_PAYLOAD_SIZE * 2  // must be double of MAX_PAYLOAD_SIZE
 #define MAX_IOVEC_SIZE 32
+
+// HTTP response capture configuration
+#define MAX_HTTP_CAPTURE_SIZE (64 * 1024)       // 64KB default max capture
+#define MAX_LARGE_RESPONSE_SIZE (1024 * 1024)   // 1MB threshold for "large" responses
+#define LARGE_RESPONSE_CAPTURE_LIMIT (16 * 1024) // 16KB limit for large responses
+#define MAX_FRAGMENTS_PER_RESPONSE 32            // Max fragments per response
 
 #include "http.c"
 #include "postgres.c"
@@ -73,6 +78,30 @@ struct l7_event {
     char response[MAX_PAYLOAD_SIZE];
 };
 
+// HTTP response tracking state (64 bytes per connection)
+struct http_response_state {
+    __u64 start_time;
+    __u32 content_length;    // From HTTP Content-Length header
+    __u32 captured_size;     // Bytes captured so far  
+    __u16 fragment_count;
+    __u8 has_content_length; // Whether we parsed Content-Length
+    __u8 capture_complete;   // Response fully captured
+};
+
+// HTTP response fragment (2KB each)
+#define HTTP_FRAGMENT_SIZE 2048
+struct http_response_fragment {
+    __u64 fd;
+    __u64 connection_timestamp;
+    __u32 pid;
+    __u32 fragment_id;       // Sequence number
+    __u32 total_expected;    // From Content-Length (0 if unknown)
+    __u16 fragment_size;     // This fragment size
+    __u8 is_final;          // Last fragment flag
+    __u8 http_status;       // 200, 404, 500, etc.
+    char data[HTTP_FRAGMENT_SIZE];
+};
+
 struct {
      __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
      __type(key, int);
@@ -85,6 +114,20 @@ struct {
     __uint(key_size, sizeof(int));
     __uint(value_size, sizeof(int));
 } l7_events SEC(".maps");
+
+// HTTP response tracking maps
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(key_size, sizeof(struct connection_id));
+    __uint(value_size, sizeof(struct http_response_state));
+    __uint(max_entries, 10240);
+} http_response_tracking SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    __uint(key_size, sizeof(int));
+    __uint(value_size, sizeof(int));
+} http_response_fragments SEC(".maps");
 
 struct read_args {
     __u64 fd;
@@ -113,6 +156,13 @@ struct {
      __type(value, char[IOVEC_BUF_SIZE]);
      __uint(max_entries, 1);
 } iovec_buf_heap SEC(".maps");
+
+struct {
+     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+     __type(key, int);
+     __type(value, struct http_response_fragment);
+     __uint(max_entries, 1);
+} fragment_heap SEC(".maps");
 
 struct trace_event_raw_sys_enter_rw__stub {
     __u64 unused;
@@ -145,6 +195,82 @@ void send_event(void *ctx, struct l7_event *e, struct connection_id cid, struct 
     bpf_perf_event_output(ctx, &l7_events, BPF_F_CURRENT_CPU, e, sizeof(*e));
 }
 
+// HTTP utility functions
+static inline __attribute__((__always_inline__))
+__u32 parse_http_content_length(char *response, __u32 size) {
+    // Look for "Content-Length: NNNN" in HTTP headers
+    char cl_pattern[] = "Content-Length:";
+    __u32 cl_len = 15; // Length of "Content-Length:"
+    
+    #pragma unroll
+    for (__u32 i = 0; i < MIN(size - cl_len, 1024); i++) {
+        if (response[i] == 'C' || response[i] == 'c') {
+            __u8 match = 1;
+            #pragma unroll
+            for (int j = 0; j < cl_len; j++) {
+                if (i + j >= size) {
+                    match = 0;
+                    break;
+                }
+                char c1 = response[i + j];
+                char c2 = cl_pattern[j];
+                // Case insensitive comparison
+                if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+                if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+                if (c1 != c2) {
+                    match = 0;
+                    break;
+                }
+            }
+            if (match) {
+                // Found Content-Length header, parse the number
+                __u32 start = i + cl_len;
+                while (start < size && response[start] == ' ') start++;
+                
+                __u32 content_length = 0;
+                #pragma unroll
+                for (int k = 0; k < 10; k++) { // Max 10 digits
+                    if (start + k >= size) break;
+                    char digit = response[start + k];
+                    if (digit >= '0' && digit <= '9') {
+                        content_length = content_length * 10 + (digit - '0');
+                    } else {
+                        break;
+                    }
+                }
+                return content_length;
+            }
+        }
+    }
+    return 0;
+}
+
+static inline __attribute__((__always_inline__))
+__u16 parse_http_status(char *response, __u32 size) {
+    // Look for "HTTP/1.x NNN" or "HTTP/2 NNN" pattern
+    if (size < 12) return 0;
+    
+    // Check for HTTP response pattern
+    if ((size >= 8 && response[0] == 'H' && response[1] == 'T' && 
+         response[2] == 'T' && response[3] == 'P' && response[4] == '/') ||
+        (size >= 8 && response[0] == 'h' && response[1] == 't' &&
+         response[2] == 't' && response[3] == 'p' && response[4] == '/')) {
+        
+        // Find the status code (skip "HTTP/x.x ")
+        __u32 status_pos = 9; // Position after "HTTP/1.1 "
+        if (size >= status_pos + 3) {
+            char c1 = response[status_pos];
+            char c2 = response[status_pos + 1];
+            char c3 = response[status_pos + 2];
+            
+            if (c1 >= '1' && c1 <= '5' && c2 >= '0' && c2 <= '9' && c3 >= '0' && c3 <= '9') {
+                return (__u16)((c1 - '0') * 100 + (c2 - '0') * 10 + (c3 - '0'));
+            }
+        }
+    }
+    return 0;
+}
+
 static inline __attribute__((__always_inline__))
 __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_size) {
     struct iovec iov = {};
@@ -174,6 +300,108 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
         }
     }
     return offset;
+}
+
+// HTTP multi-packet response handler (parallel with L7 events)
+static inline __attribute__((__always_inline__))
+void handle_http_streaming_response(void *ctx, struct connection_id cid, struct connection *conn, 
+                                  char *payload, __u64 ret, __u16 http_status) {
+    struct http_response_state *state = bpf_map_lookup_elem(&http_response_tracking, &cid);
+    
+    if (!state) {
+        // First fragment - initialize response state
+        struct http_response_state new_state = {};
+        new_state.start_time = bpf_ktime_get_ns();
+        new_state.content_length = parse_http_content_length(payload, ret);
+        new_state.has_content_length = (new_state.content_length > 0);
+        new_state.captured_size = 0;
+        new_state.fragment_count = 0;
+        new_state.capture_complete = 0;
+        
+        bpf_map_update_elem(&http_response_tracking, &cid, &new_state, BPF_ANY);
+        state = bpf_map_lookup_elem(&http_response_tracking, &cid);
+        if (!state) return;
+    }
+    
+    // Determine capture strategy based on response size
+    __u32 max_capture_size = MAX_HTTP_CAPTURE_SIZE;
+    __u8 should_continue_capture = 1;
+    
+    if (state->has_content_length) {
+        if (state->content_length > MAX_LARGE_RESPONSE_SIZE) {
+            // Very large response - limit capture
+            max_capture_size = LARGE_RESPONSE_CAPTURE_LIMIT;
+            should_continue_capture = (state->captured_size < max_capture_size);
+        }
+    } else {
+        // No Content-Length - use fragment count limit
+        should_continue_capture = (state->fragment_count < MAX_FRAGMENTS_PER_RESPONSE);
+    }
+    
+    if (!should_continue_capture) {
+        // Response too large, stop fragment capture
+        bpf_map_delete_elem(&http_response_tracking, &cid);
+        return;
+    }
+    
+    // Stream response in fragments
+    __u32 offset = 0;
+    while (offset < ret && state->captured_size < max_capture_size && 
+           state->fragment_count < MAX_FRAGMENTS_PER_RESPONSE) {
+        
+        __u32 remaining_space = max_capture_size - state->captured_size;
+        __u32 fragment_size = MIN(MIN(HTTP_FRAGMENT_SIZE, remaining_space), ret - offset);
+        
+        int zero = 0;
+        struct http_response_fragment *frag = bpf_map_lookup_elem(&fragment_heap, &zero);
+        if (!frag) {
+            break; // Can't allocate fragment
+        }
+        
+        // Initialize fragment (manual zeroing since we can't use = {})
+        frag->fd = cid.fd;
+        frag->connection_timestamp = conn->timestamp;
+        frag->pid = cid.pid;
+        frag->fragment_id = state->fragment_count;
+        frag->total_expected = state->content_length;
+        frag->fragment_size = fragment_size;
+        frag->http_status = http_status;
+        frag->is_final = 0;
+        
+        // Copy fragment data
+        if (bpf_probe_read(frag->data, fragment_size, payload + offset)) {
+            break; // Read failed
+        }
+        
+        // Check if this is the final fragment
+        __u8 is_response_complete = 0;
+        if (state->has_content_length) {
+            is_response_complete = (state->captured_size + fragment_size >= state->content_length);
+        } else {
+            // For chunked/streaming responses, assume complete if small fragment
+            is_response_complete = (fragment_size < HTTP_FRAGMENT_SIZE / 2);
+        }
+        
+        frag->is_final = is_response_complete || 
+                       (state->captured_size + fragment_size >= max_capture_size) ||
+                       (state->fragment_count >= MAX_FRAGMENTS_PER_RESPONSE - 1);
+        
+        // Send fragment
+        bpf_perf_event_output(ctx, &http_response_fragments, BPF_F_CURRENT_CPU, 
+                             frag, sizeof(*frag));
+        
+        offset += fragment_size;
+        state->captured_size += fragment_size;
+        state->fragment_count++;
+        
+        if (frag->is_final) {
+            // Mark response as complete but don't delete - let L7 processing retrieve it
+            state->capture_complete = 1;
+            break;
+        }
+    }
+    
+    // Fragment capture complete or in progress
 }
 
 static inline __attribute__((__always_inline__))
@@ -452,6 +680,12 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     COPY_PAYLOAD(e->payload, req->payload_size, req->payload);
     if (e->protocol == PROTOCOL_HTTP) {
         response = is_http_response(payload, &e->status);
+        if (response) {
+            // Run fragment capture in parallel with normal L7 processing
+            __u16 http_status = parse_http_status(payload, ret);
+            handle_http_streaming_response(ctx, cid, conn, payload, ret, http_status);
+            // Continue with normal L7 event - fragments will be available shortly
+        }
     } else if (e->protocol == PROTOCOL_POSTGRES) {
         response = is_postgres_response(payload, ret, &e->status);
         if (req->request_type == POSTGRES_FRAME_PARSE) {

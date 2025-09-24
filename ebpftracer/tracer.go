@@ -44,6 +44,7 @@ const (
 	EventTypeTCPRetransmit    EventType = 9
 	EventTypeL7Request        EventType = 10
 	EventTypePythonThreadLock EventType = 11
+	EventTypeHTTPFragment     EventType = 12
 
 	EventReasonNone    EventReason = 0
 	EventReasonOOMKill EventReason = 1
@@ -65,9 +66,23 @@ type Event struct {
 	Timestamp     uint64
 	Duration      time.Duration
 	L7Request     *l7.RequestData
+	HTTPFragment  *HTTPResponseFragment
 	TrafficStats  *TrafficStats
 	Mnt           uint64
 	Log           bool
+}
+
+// HTTP response fragment data
+type HTTPResponseFragment struct {
+	Fd                  uint64
+	ConnectionTimestamp uint64
+	Pid                 uint32
+	FragmentId          uint32
+	TotalExpected       uint32
+	FragmentSize        uint16
+	IsFinal             bool
+	HttpStatus          uint16
+	Data                []byte
 }
 
 type perfMapType uint8
@@ -78,6 +93,7 @@ const (
 	perfMapTypeFileEvents         perfMapType = 3
 	perfMapTypeL7Events           perfMapType = 4
 	perfMapTypePythonThreadEvents perfMapType = 5
+	perfMapTypeHTTPFragments      perfMapType = 6
 )
 
 type Tracer struct {
@@ -227,6 +243,7 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 
 	if !t.disableL7Tracing {
 		perfMaps = append(perfMaps, perfMap{name: "l7_events", typ: perfMapTypeL7Events, perCPUBufferSizePages: 32})
+		perfMaps = append(perfMaps, perfMap{name: "http_response_fragments", typ: perfMapTypeHTTPFragments, perCPUBufferSizePages: 16})
 	}
 
 	pageSize := os.Getpagesize()
@@ -360,6 +377,19 @@ type l7Event struct {
 	Response            [5120]byte // Must match MAX_PAYLOAD_SIZE in eBPF
 }
 
+// HTTP response fragment event (must match eBPF struct)
+type httpResponseFragment struct {
+	Fd                  uint64
+	ConnectionTimestamp uint64
+	Pid                 uint32
+	FragmentId          uint32
+	TotalExpected       uint32
+	FragmentSize        uint16
+	IsFinal             uint8
+	HttpStatus          uint8
+	Data                [2048]byte // Must match HTTP_FRAGMENT_SIZE in eBPF
+}
+
 type pythonThreadEvent struct {
 	Type     EventType
 	Pid      uint32
@@ -424,6 +454,39 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 				Fd:        v.Fd,
 				Timestamp: v.ConnectionTimestamp,
 				L7Request: req,
+			}
+		case perfMapTypeHTTPFragments:
+			v := &httpResponseFragment{}
+			data := rec.RawSample
+			
+			if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, v); err != nil {
+				klog.Warningln("failed to read HTTP fragment event:", err)
+				continue
+			}
+			
+			// Extract fragment data
+			fragmentSize := min(int(v.FragmentSize), len(v.Data))
+			fragmentData := make([]byte, fragmentSize)
+			copy(fragmentData, v.Data[:fragmentSize])
+			
+			fragment := &HTTPResponseFragment{
+				Fd:                  v.Fd,
+				ConnectionTimestamp: v.ConnectionTimestamp,
+				Pid:                 v.Pid,
+				FragmentId:          v.FragmentId,
+				TotalExpected:       v.TotalExpected,
+				FragmentSize:        v.FragmentSize,
+				IsFinal:             v.IsFinal == 1,
+				HttpStatus:          uint16(v.HttpStatus),
+				Data:                fragmentData,
+			}
+			
+			event = Event{
+				Type:         EventTypeHTTPFragment,
+				Pid:          v.Pid,
+				Fd:           v.Fd,
+				Timestamp:    v.ConnectionTimestamp,
+				HTTPFragment: fragment,
 			}
 		case perfMapTypeFileEvents:
 			v := &fileEvent{}
