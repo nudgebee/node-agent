@@ -1,6 +1,7 @@
 package containers
 
 import (
+	"bytes"
 	"errors"
 	"net/http"
 	"os"
@@ -918,6 +919,16 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 			
 			// Enhanced LLM API tracking for HTTP/2 (including gRPC-based LLM services)
 			host := conn.dstWorkload.Name
+			
+			// Prepare response data for LLM detection and tracking
+			responseBase64 := ""
+			completeResponse := c.getCompleteHTTPResponse(conn.Fd, conn.Timestamp)
+			if completeResponse != nil && len(completeResponse) > 0 {
+				responseBase64 = base64.StdEncoding.EncodeToString(completeResponse)
+			} else if r.Response != nil {
+				responseBase64 = base64.StdEncoding.EncodeToString(r.Response)
+			}
+			
 			provider := DetectLLMProvider(host)
 			if provider == ProviderUnknown {
 				// Fallback: Try to detect from HTTP/2 request and response structure
@@ -925,15 +936,6 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 			}
 			if provider != ProviderUnknown {
 				payloadBase64 := base64.StdEncoding.EncodeToString(r.Payload)
-				
-				// Try to get complete response from fragments first, fallback to L7 response
-				responseBase64 := ""
-				completeResponse := c.getCompleteHTTPResponse(conn.Fd, conn.Timestamp)
-				if completeResponse != nil && len(completeResponse) > 0 {
-					responseBase64 = base64.StdEncoding.EncodeToString(completeResponse)
-				} else if r.Response != nil {
-					responseBase64 = base64.StdEncoding.EncodeToString(r.Response)
-				}
 				c.trackLLMRequest(provider, host, payloadBase64, responseBase64, req.Duration)
 			}
 			
