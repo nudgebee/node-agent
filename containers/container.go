@@ -896,7 +896,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	if !ebpfTracesDisabled {
 		trace = c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown(), conn.srcWorkload, conn.DestinationKey.GetDestinationWorkload(), conn.DestinationKey.GetActualDestinationWorkload())
 	}
-	
+
 	traceId := ""
 	if trace != nil && headers != nil {
 		traceId = trace.ExtractTraceId(headers)
@@ -907,7 +907,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		stats.observe(r.Status.Http(), "", r.Duration)
 		payload := base64.StdEncoding.EncodeToString(r.Payload)
 		method, uri := l7.ParseHttp(r.Payload)
-		
+
 		// Try to get complete response from fragments first, fallback to L7 response
 		response := ""
 		completeResponse := c.getCompleteHTTPResponse(conn.Fd, conn.Timestamp)
@@ -918,7 +918,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 			// Fallback to original L7 response (5KB limit)
 			response = base64.StdEncoding.EncodeToString(r.Response)
 		}
-		
+
 		host := conn.dstWorkload.Name
 		// Enhanced LLM API tracking with fallback detection
 		provider := DetectLLMProvider(host)
@@ -947,16 +947,10 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 					trace.Http2Request(req.Method, req.Path, req.Scheme, req.Status, req.GrpcStatus, req.Duration)
 				}
 			}
-			
-			// Prepare payload for LLM detection (our feature)
-			payload := ""
-			if int(r.PayloadSize) < payloadThreshold {
-				payload = string(r.Payload)
-			}
-			
+
 			// Enhanced LLM API tracking for HTTP/2 (including gRPC-based LLM services)
 			host := conn.dstWorkload.Name
-			
+
 			// Prepare response data for LLM detection and tracking
 			responseBase64 := ""
 			completeResponse := c.getCompleteHTTPResponse(conn.Fd, conn.Timestamp)
@@ -965,7 +959,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 			} else if r.Response != nil {
 				responseBase64 = base64.StdEncoding.EncodeToString(r.Response)
 			}
-			
+
 			provider := DetectLLMProvider(host)
 			if provider == ProviderUnknown {
 				// Fallback: Try to detect from HTTP/2 request and response structure
@@ -975,7 +969,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 				payloadBase64 := base64.StdEncoding.EncodeToString(r.Payload)
 				c.trackLLMRequest(provider, host, payloadBase64, responseBase64, req.Duration)
 			}
-			
+
 			trace.Http2Request(req.Method, req.Path, req.Scheme, req.Status, -1, req.Duration)
 		}
 	case l7.ProtocolPostgres:
@@ -1499,12 +1493,12 @@ func resolveFd(pid uint32, fd uint64) (mntId string, logPath string) {
 func (c *Container) onHTTPFragment(fragment *ebpftracer.HTTPResponseFragment) {
 	c.httpFragmentsLock.Lock()
 	defer c.httpFragmentsLock.Unlock()
-	
+
 	key := HTTPFragmentKey{
 		Fd:                  fragment.Fd,
 		ConnectionTimestamp: fragment.ConnectionTimestamp,
 	}
-	
+
 	// Get or create reassembly state
 	reassembly, exists := c.httpFragments[key]
 	if !exists {
@@ -1517,18 +1511,18 @@ func (c *Container) onHTTPFragment(fragment *ebpftracer.HTTPResponseFragment) {
 		}
 		c.httpFragments[key] = reassembly
 	}
-	
+
 	// Add fragment to reassembly
 	reassembly.Fragments[fragment.FragmentId] = fragment
 	reassembly.LastFragment = time.Now()
-	
+
 	// Check if response is complete - but don't process here, let L7 events handle it
 	if fragment.IsFinal || len(reassembly.Fragments) >= int(reassembly.TotalExpected/2048) {
 		// Response is complete - L7 event processing will pick it up via getCompleteHTTPResponse()
 		// Don't delete here - let getCompleteHTTPResponse() clean up after use
 		return
 	}
-	
+
 	// Clean up old incomplete reassemblies (memory pressure handling)
 	if len(c.httpFragments) > 1000 { // Max 1000 concurrent reassemblies
 		now := time.Now()
@@ -1545,7 +1539,7 @@ func (c *Container) reassembleHTTPResponse(reassembly *HTTPResponseReassembly) [
 	if len(reassembly.Fragments) == 0 {
 		return nil
 	}
-	
+
 	// Sort fragments by ID and reassemble
 	var sortedIds []uint32
 	totalSize := 0
@@ -1553,7 +1547,7 @@ func (c *Container) reassembleHTTPResponse(reassembly *HTTPResponseReassembly) [
 		sortedIds = append(sortedIds, id)
 		totalSize += int(frag.FragmentSize)
 	}
-	
+
 	// Simple sort for fragment IDs
 	for i := 0; i < len(sortedIds)-1; i++ {
 		for j := i + 1; j < len(sortedIds); j++ {
@@ -1562,14 +1556,14 @@ func (c *Container) reassembleHTTPResponse(reassembly *HTTPResponseReassembly) [
 			}
 		}
 	}
-	
+
 	// Reassemble response data
 	response := make([]byte, 0, totalSize)
 	for _, id := range sortedIds {
 		frag := reassembly.Fragments[id]
 		response = append(response, frag.Data[:frag.FragmentSize]...)
 	}
-	
+
 	return response
 }
 
@@ -1583,17 +1577,17 @@ func (c *Container) getCompleteHTTPResponse(fd uint64, connectionTimestamp uint6
 		Fd:                  fd,
 		ConnectionTimestamp: connectionTimestamp,
 	}
-	
+
 	// Try up to 3 times with small delays to allow fragments to arrive
 	for attempt := 0; attempt < 3; attempt++ {
 		c.httpFragmentsLock.Lock()
-		
+
 		// Check if we have a complete response for this connection
 		if reassembly, exists := c.httpFragments[key]; exists {
 			// Check if response is complete or has enough fragments
 			hasEnoughFragments := len(reassembly.Fragments) > 0
 			isComplete := false
-			
+
 			// Check if marked as complete by eBPF or timeout
 			if time.Since(reassembly.LastFragment) < 100*time.Millisecond {
 				// Recent activity, check if complete
@@ -1607,7 +1601,7 @@ func (c *Container) getCompleteHTTPResponse(fd uint64, connectionTimestamp uint6
 				// Timeout - consider complete if we have fragments
 				isComplete = hasEnoughFragments
 			}
-			
+
 			if isComplete && hasEnoughFragments {
 				complete := c.reassembleHTTPResponse(reassembly)
 				if complete != nil && len(complete) > 0 {
@@ -1618,15 +1612,15 @@ func (c *Container) getCompleteHTTPResponse(fd uint64, connectionTimestamp uint6
 				}
 			}
 		}
-		
+
 		c.httpFragmentsLock.Unlock()
-		
+
 		// If not found and this isn't the last attempt, wait briefly
 		if attempt < 2 {
 			time.Sleep(5 * time.Millisecond) // Brief delay to allow fragments to arrive
 		}
 	}
-	
+
 	return nil // No complete response available
 }
 
@@ -1634,47 +1628,47 @@ func (c *Container) getCompleteHTTPResponse(fd uint64, connectionTimestamp uint6
 func (c *Container) detectLLMFromHTTPRequest(requestPayload []byte, responseBase64 string) LLMProvider {
 	// Parse HTTP request to extract URL path
 	requestStr := string(requestPayload)
-	
+
 	// Look for URL patterns in the HTTP request
 	if path := extractHTTPPath(requestStr); path != "" {
 		// Google Gemini API patterns
-		if strings.Contains(path, "/v1beta/models/gemini") || 
-		   strings.Contains(path, "generativelanguage.googleapis.com") ||
-		   strings.Contains(path, ":streamGenerateContent") ||
-		   strings.Contains(path, ":generateContent") {
+		if strings.Contains(path, "/v1beta/models/gemini") ||
+			strings.Contains(path, "generativelanguage.googleapis.com") ||
+			strings.Contains(path, ":streamGenerateContent") ||
+			strings.Contains(path, ":generateContent") {
 			return ProviderGoogle
 		}
-		
+
 		// OpenAI API patterns
 		if strings.Contains(path, "/v1/chat/completions") ||
-		   strings.Contains(path, "/v1/completions") ||
-		   strings.Contains(path, "api.openai.com") {
+			strings.Contains(path, "/v1/completions") ||
+			strings.Contains(path, "api.openai.com") {
 			return ProviderOpenAI
 		}
-		
-		// Anthropic API patterns  
+
+		// Anthropic API patterns
 		if strings.Contains(path, "/v1/messages") ||
-		   strings.Contains(path, "api.anthropic.com") ||
-		   strings.Contains(path, "claude") {
+			strings.Contains(path, "api.anthropic.com") ||
+			strings.Contains(path, "claude") {
 			return ProviderAnthropic
 		}
-		
+
 		// Cohere API patterns
 		if strings.Contains(path, "/v1/generate") ||
-		   strings.Contains(path, "/v1/chat") ||
-		   strings.Contains(path, "api.cohere.ai") ||
-		   strings.Contains(path, "api.cohere.com") {
+			strings.Contains(path, "/v1/chat") ||
+			strings.Contains(path, "api.cohere.ai") ||
+			strings.Contains(path, "api.cohere.com") {
 			return ProviderCohere
 		}
 	}
-	
+
 	// Fallback: Analyze response structure if available
 	if responseBase64 != "" {
 		if responseBytes, err := base64.StdEncoding.DecodeString(responseBase64); err == nil {
 			return c.detectProviderFromResponseStructure(responseBytes)
 		}
 	}
-	
+
 	return ProviderUnknown
 }
 
@@ -1689,18 +1683,18 @@ func extractHTTPPath(request string) string {
 			return parts[1] // URL path
 		}
 	}
-	
+
 	// Also check Host header and full URLs
 	if hostStart := strings.Index(request, "Host: "); hostStart != -1 {
 		hostEnd := strings.Index(request[hostStart:], "\n")
 		if hostEnd != -1 {
-			hostLine := request[hostStart:hostStart+hostEnd]
+			hostLine := request[hostStart : hostStart+hostEnd]
 			if host := strings.TrimPrefix(hostLine, "Host: "); host != "" {
 				return strings.TrimSpace(host)
 			}
 		}
 	}
-	
+
 	return ""
 }
 
@@ -1711,33 +1705,33 @@ func (c *Container) detectProviderFromResponseStructure(responseData []byte) LLM
 	if jsonStart == -1 {
 		return ProviderUnknown
 	}
-	
+
 	jsonStr := string(responseData[jsonStart:])
-	
+
 	// Google Gemini: "candidates" array with "content" objects
 	if (strings.Contains(jsonStr, `"candidates"`) && strings.Contains(jsonStr, `"content"`)) ||
-	   strings.Contains(jsonStr, `"usageMetadata"`) {
+		strings.Contains(jsonStr, `"usageMetadata"`) {
 		return ProviderGoogle
 	}
-	
-	// OpenAI: "choices" array with "message" objects  
+
+	// OpenAI: "choices" array with "message" objects
 	if (strings.Contains(jsonStr, `"choices"`) && strings.Contains(jsonStr, `"message"`)) ||
-	   (strings.Contains(jsonStr, `"usage"`) && strings.Contains(jsonStr, `"prompt_tokens"`)) {
+		(strings.Contains(jsonStr, `"usage"`) && strings.Contains(jsonStr, `"prompt_tokens"`)) {
 		return ProviderOpenAI
 	}
-	
+
 	// Anthropic: "content" array with "text" objects
 	if (strings.Contains(jsonStr, `"content"`) && strings.Contains(jsonStr, `"text"`)) ||
-	   (strings.Contains(jsonStr, `"usage"`) && strings.Contains(jsonStr, `"input_tokens"`)) {
+		(strings.Contains(jsonStr, `"usage"`) && strings.Contains(jsonStr, `"input_tokens"`)) {
 		return ProviderAnthropic
 	}
-	
+
 	// Cohere: "generations" array or "message" with "text"
 	if strings.Contains(jsonStr, `"generations"`) ||
-	   (strings.Contains(jsonStr, `"meta"`) && strings.Contains(jsonStr, `"tokens"`)) {
+		(strings.Contains(jsonStr, `"meta"`) && strings.Contains(jsonStr, `"tokens"`)) {
 		return ProviderCohere
 	}
-	
+
 	return ProviderUnknown
 }
 
