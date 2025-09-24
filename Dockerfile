@@ -1,9 +1,5 @@
-FROM golang:1.23.10-bullseye AS builder
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends libsystemd-dev \
- && rm -rf /var/lib/apt/lists/*
-
+FROM golang:1.24.7-trixie AS builder
+RUN apt update && apt install -y libsystemd-dev
 WORKDIR /tmp/src
 COPY go.mod .
 COPY go.sum .

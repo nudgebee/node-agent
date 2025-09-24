@@ -41,6 +41,7 @@ type ProcessInfo struct {
 	Pid         uint32
 	ContainerId ContainerID
 	StartedAt   time.Time
+	Flags       proc.Flags
 }
 
 type IPResolver interface {
@@ -68,9 +69,11 @@ type Registry struct {
 	processInfoCh chan<- ProcessInfo
 	ip_resolver   IPResolver
 
-	trafficStatsLastUpdated time.Time
-	trafficStatsLock        sync.Mutex
-	trafficStatsUpdateCh    chan *TrafficStatsUpdate
+	ebpfStatsLastUpdated time.Time
+	ebpfStatsLock        sync.Mutex
+	trafficStatsUpdateCh chan *TrafficStatsUpdate
+	nodejsStatsUpdateCh  chan *NodejsStatsUpdate
+	pythonStatsUpdateCh  chan *PythonStatsUpdate
 
 	gpuProcessUsageSampleChan chan gpu.ProcessUsageSample
 }
@@ -126,6 +129,8 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, ip
 		ip_resolver:          ip_resolver,
 		tracer:               ebpftracer.NewTracer(hostNetNs, selfNetNs, *flags.DisableL7Tracing),
 		trafficStatsUpdateCh: make(chan *TrafficStatsUpdate),
+		nodejsStatsUpdateCh:  make(chan *NodejsStatsUpdate),
+		pythonStatsUpdateCh:  make(chan *PythonStatsUpdate),
 
 		gpuProcessUsageSampleChan: gpuProcessUsageSampleChan,
 	}
@@ -220,6 +225,20 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			if c := r.containersByPid[u.Pid]; c != nil {
 				c.updateTrafficStats(u)
 			}
+		case u := <-r.nodejsStatsUpdateCh:
+			if u == nil {
+				continue
+			}
+			if c := r.containersByPid[u.Pid]; c != nil {
+				c.updateNodejsStats(*u)
+			}
+		case u := <-r.pythonStatsUpdateCh:
+			if u == nil {
+				continue
+			}
+			if c := r.containersByPid[u.Pid]; c != nil {
+				c.updatePythonStats(*u)
+			}
 		case sample := <-r.gpuProcessUsageSampleChan:
 			if c := r.containersByPid[sample.Pid]; c != nil {
 				if p := c.processes[sample.Pid]; p != nil {
@@ -246,7 +265,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
 					p := c.onProcessStart(e.Pid)
 					if r.processInfoCh != nil && p != nil {
-						r.processInfoCh <- ProcessInfo{Pid: p.Pid, ContainerId: c.id, StartedAt: p.StartedAt}
+						r.processInfoCh <- ProcessInfo{Pid: p.Pid, ContainerId: c.id, StartedAt: p.StartedAt, Flags: p.Flags}
 					}
 				}
 			case ebpftracer.EventTypeProcessExit:
@@ -316,10 +335,6 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				}
 				if c := r.containersByPid[e.Pid]; c != nil {
 					c.onHTTPFragment(e.HTTPFragment)
-				}
-			case ebpftracer.EventTypePythonThreadLock:
-				if c := r.containersByPid[e.Pid]; c != nil {
-					c.pythonThreadLockWaitTime += e.Duration
 				}
 			}
 		}
@@ -410,13 +425,22 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	return c
 }
 
-func (r *Registry) updateTrafficStatsIfNecessary() {
-	r.trafficStatsLock.Lock()
-	defer r.trafficStatsLock.Unlock()
+func (r *Registry) updateStatsFromEbpfMapsIfNecessary() {
+	r.ebpfStatsLock.Lock()
+	defer r.ebpfStatsLock.Unlock()
 
-	if time.Now().Sub(r.trafficStatsLastUpdated) < MinTrafficStatsUpdateInterval {
+	if time.Now().Sub(r.ebpfStatsLastUpdated) < MinTrafficStatsUpdateInterval {
 		return
 	}
+
+	r.updateTrafficStats()
+	r.updateNodejsStats()
+	r.updatePythonStats()
+
+	r.ebpfStatsLastUpdated = time.Now()
+}
+
+func (r *Registry) updateTrafficStats() {
 	iter := r.tracer.ActiveConnectionsIterator()
 	cid := ebpftracer.ConnectionId{}
 	stats := ebpftracer.Connection{}
@@ -432,7 +456,36 @@ func (r *Registry) updateTrafficStatsIfNecessary() {
 		klog.Warningln(err)
 	}
 	r.trafficStatsUpdateCh <- nil
-	r.trafficStatsLastUpdated = time.Now()
+}
+
+func (r *Registry) updateNodejsStats() {
+	iter := r.tracer.NodejsStatsIterator()
+	var pid uint64
+	stats := ebpftracer.NodejsStats{}
+
+	for iter.Next(&pid, &stats) {
+		r.nodejsStatsUpdateCh <- &NodejsStatsUpdate{Pid: uint32(pid), Stats: stats}
+	}
+
+	if err := iter.Err(); err != nil {
+		klog.Warningln(err)
+	}
+	r.nodejsStatsUpdateCh <- nil
+}
+
+func (r *Registry) updatePythonStats() {
+	iter := r.tracer.PythonStatsIterator()
+	var pid uint64
+	stats := ebpftracer.PythonStats{}
+
+	for iter.Next(&pid, &stats) {
+		r.pythonStatsUpdateCh <- &PythonStatsUpdate{Pid: uint32(pid), Stats: stats}
+	}
+
+	if err := iter.Err(); err != nil {
+		klog.Warningln(err)
+	}
+	r.pythonStatsUpdateCh <- nil
 }
 
 func (r *Registry) getDomain(ip netaddr.IP) *common.Domain {
@@ -575,4 +628,14 @@ type TrafficStatsUpdate struct {
 	FD            uint64
 	BytesSent     uint64
 	BytesReceived uint64
+}
+
+type NodejsStatsUpdate struct {
+	Pid   uint32
+	Stats ebpftracer.NodejsStats
+}
+
+type PythonStatsUpdate struct {
+	Pid   uint32
+	Stats ebpftracer.PythonStats
 }

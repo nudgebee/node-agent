@@ -28,6 +28,8 @@ type Process struct {
 	Pid       uint32
 	StartedAt time.Time
 
+	Flags proc.Flags
+
 	netNsId string
 
 	ctx        context.Context
@@ -40,12 +42,16 @@ type Process struct {
 	goTlsUprobesChecked   bool
 	openSslUprobesChecked bool
 	pythonGilChecked      bool
+	nodejsChecked         bool
+	nodejsPrevStats       *ebpftracer.NodejsStats
+	pythonPrevStats       *ebpftracer.PythonStats
 
 	gpuUsageSamples []gpu.ProcessUsageSample
 }
 
 func NewProcess(pid uint32, stats *taskstats.Stats, tracer *ebpftracer.Tracer) *Process {
 	p := &Process{Pid: pid, StartedAt: stats.BeginTime}
+	p.Flags, _ = proc.GetFlags(pid)
 	p.ctx, p.cancelFunc = context.WithCancel(context.Background())
 	go p.instrument(tracer)
 	return p
@@ -81,6 +87,7 @@ func (p *Process) instrument(tracer *ebpftracer.Tracer) {
 			cmdline := proc.GetCmdline(p.Pid)
 			if dest != "/" && len(cmdline) > 0 {
 				p.instrumentPython(cmdline, tracer)
+				p.instrumentNodejs(dest, tracer)
 				if dotNetAppName, err := dotNetApp(cmdline, p.Pid); err == nil {
 					if dotNetAppName != "" {
 						p.dotNetMonitor = NewDotNetMonitor(p.ctx, p.Pid, dotNetAppName)
@@ -107,7 +114,20 @@ func (p *Process) instrumentPython(cmdline []byte, tracer *ebpftracer.Tracer) {
 	if !pythonCmd.Match(cmd) {
 		return
 	}
+	p.pythonPrevStats = &ebpftracer.PythonStats{}
 	p.uprobes = append(p.uprobes, tracer.AttachPythonThreadLockProbes(p.Pid)...)
+}
+
+func (p *Process) instrumentNodejs(exe string, tracer *ebpftracer.Tracer) {
+	if p.nodejsChecked {
+		return
+	}
+	p.nodejsChecked = true
+	if !nodejsCmd.MatchString(exe) {
+		return
+	}
+	p.nodejsPrevStats = &ebpftracer.NodejsStats{}
+	p.uprobes = append(p.uprobes, tracer.AttachNodejsProbes(p.Pid, exe)...)
 }
 
 func (p *Process) addGpuUsageSample(sample gpu.ProcessUsageSample) {

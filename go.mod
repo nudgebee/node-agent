@@ -1,6 +1,6 @@
 module github.com/coroot/coroot-node-agent
 
-go 1.23.8
+go 1.24.7
 
 require (
 	cloud.google.com/go/compute/metadata v0.6.0
@@ -8,7 +8,7 @@ require (
 	github.com/NVIDIA/go-nvml v0.12.4-1
 	github.com/agoda-com/opentelemetry-logs-go v0.4.1
 	github.com/cilium/cilium v1.17.3
-	github.com/cilium/ebpf v0.17.3
+	github.com/cilium/ebpf v0.19.0
 	github.com/containerd/cgroups v1.0.4
 	github.com/containerd/containerd v1.6.38
 	github.com/coreos/go-systemd/v22 v22.5.0
@@ -42,7 +42,7 @@ require (
 	golang.org/x/arch v0.4.0
 	golang.org/x/exp v0.0.0-20240808152545-0cdaa3abc0fa
 	golang.org/x/net v0.38.0
-	golang.org/x/sys v0.32.0
+	golang.org/x/sys v0.36.0
 	golang.org/x/time v0.8.0
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
 	gopkg.in/yaml.v2 v2.4.0
