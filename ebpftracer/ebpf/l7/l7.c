@@ -34,7 +34,7 @@
 })
 #define COPY_PAYLOAD(dst, size, src) ({     \
     TRUNCATE_PAYLOAD_SIZE(size);            \
-    if (bpf_probe_read(dst, size, src)) {   \
+    if (bpf_probe_read_user(dst, size, src)) {   \
         return 0;                           \
     }                                       \
 })
@@ -238,7 +238,7 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
         if (i >= iovlen) {
             break;
         }
-        if (bpf_probe_read(&iov, sizeof(iov), (void *)(iovec+i*sizeof(iov)))) {
+        if (bpf_probe_read_user(&iov, sizeof(iov), (void *)(iovec+i*sizeof(iov)))) {
             return 0;
         }
         if (iov.size <= 0) {
@@ -249,7 +249,7 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
             size = MIN(iov.size, max-offset);
             TRUNCATE_PAYLOAD_SIZE(size);
             TRUNCATE_PAYLOAD_SIZE(offset);
-            if (bpf_probe_read(buf + offset, size, (void *)iov.buf)) {
+            if (bpf_probe_read_user(buf + offset, size, (void *)iov.buf)) {
                 return 0;
             }
             offset += size;
@@ -456,7 +456,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
         return 0;
     }
     if (args->ret) {
-        if (bpf_probe_read(&ret, sizeof(ret), (void*)args->ret)) {
+        if (bpf_probe_read_user(&ret, sizeof(ret), (void*)args->ret)) {
             return 0;
         };
         if (ret <= 0) {
@@ -621,7 +621,7 @@ int sys_enter_write(struct trace_event_raw_sys_enter_rw__stub* ctx) {
 // SEC("tracepoint/syscalls/sys_enter_sendmsg")
 // int sys_enter_sendmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
 //     struct user_msghdr msghdr = {};
-//     if (bpf_probe_read(&msghdr, sizeof(msghdr), (void *)ctx->buf)) {
+//     if (bpf_probe_read_user(&msghdr, sizeof(msghdr), (void *)ctx->buf)) {
 //         return 0;
 //     }
 //     return trace_enter_write(ctx, ctx->fd, 0, (char*)msghdr.msg_iov, 0, msghdr.msg_iovlen);
@@ -674,7 +674,7 @@ SEC("tracepoint/syscalls/sys_enter_recvmsg")
 int sys_enter_recvmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     __u64 id = bpf_get_current_pid_tgid();
     struct user_msghdr msghdr = {};
-    if (bpf_probe_read(&msghdr, sizeof(msghdr), (void *)ctx->buf)) {
+    if (bpf_probe_read_user(&msghdr, sizeof(msghdr), (void *)ctx->buf)) {
         return 0;
     }
     __u32 pid = id >> 32;
