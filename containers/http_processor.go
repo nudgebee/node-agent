@@ -2,7 +2,6 @@ package containers
 
 import (
 	"encoding/base64"
-	"fmt"
 	"net"
 	"net/http"
 	"strings"

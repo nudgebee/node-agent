@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"log"
-	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -1458,7 +1457,7 @@ func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32) {
 
 		// Debug logging for SSL uprobes (enable via environment variable)
 		if os.Getenv("DEBUG_SSL_UPROBES") == "true" && len(openSslUprobes) > 0 {
-			log.Printf("SSL Debug: %s PID %d - OpenSSL uprobes attached: %d", p.workload.Name, pid, len(openSslUprobes))
+			log.Printf("SSL Debug: %s PID %d - OpenSSL uprobes attached: %d", c.srcWorkload.Name, pid, len(openSslUprobes))
 		}
 	}
 	if !p.goTlsUprobesChecked {
@@ -1469,7 +1468,7 @@ func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32) {
 
 		// Debug logging for Go TLS uprobes (enable via environment variable)
 		if os.Getenv("DEBUG_SSL_UPROBES") == "true" && len(uprobes) > 0 {
-			log.Printf("SSL Debug: %s PID %d - Go TLS uprobes attached: %d, isGolangApp: %v", p.workload.Name, pid, len(uprobes), isGolangApp)
+			log.Printf("SSL Debug: %s PID %d - Go TLS uprobes attached: %d, isGolangApp: %v", c.srcWorkload.Name, pid, len(uprobes), isGolangApp)
 		}
 	}
 }
