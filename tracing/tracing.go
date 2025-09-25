@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
@@ -27,6 +28,25 @@ import (
 const (
 	MemcacheDBItemKeyName attribute.Key = "db.memcached.item"
 )
+
+func sanitizeUTF8(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+
+	// Remove invalid UTF-8 characters by converting to valid UTF-8
+	var result strings.Builder
+	result.Grow(len(s))
+
+	for _, r := range s {
+		if r == utf8.RuneError {
+			continue // Skip invalid runes
+		}
+		result.WriteRune(r)
+	}
+
+	return result.String()
+}
 
 var (
 	batcher             sdktrace.TracerProviderOption
@@ -244,11 +264,11 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 	if host == "" {
 		host = t.destination.String()
 	}
-	requestPayload := payload
+	requestPayload := sanitizeUTF8(payload)
 	requestHeaders := ""
-	responsePayload := response
-	requestPath := path
-	requestHost := host
+	responsePayload := sanitizeUTF8(response)
+	requestPath := sanitizeUTF8(path)
+	requestHost := sanitizeUTF8(host)
 
 	if headers != nil {
 		requestHeaders = l7.ConvertHeadersToBase64String(headers)
