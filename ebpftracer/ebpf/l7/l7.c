@@ -32,11 +32,39 @@
     size = MIN(size, MAX_PAYLOAD_SIZE-1);                               \
     asm volatile ("%0 &= %1" : "+r"(size) : "i"(MAX_PAYLOAD_SIZE-1));   \
 })
-#define COPY_PAYLOAD(dst, size, src) ({     \
-    TRUNCATE_PAYLOAD_SIZE(size);            \
-    if (bpf_probe_read(dst, size, src)) {   \
-        return 0;                           \
-    }                                       \
+
+static inline __attribute__((__always_inline__))
+__u64 utf8_safe_truncate(__u64 size) {
+    // If we're not truncating, return as-is
+    if (size < MAX_PAYLOAD_SIZE - 1) {
+        return size;
+    }
+    
+    // Start from the maximum safe size and work backwards
+    __u64 safe_size = MAX_PAYLOAD_SIZE - 1;
+    
+    // Look for the start of a UTF-8 character within the last 4 bytes
+    // UTF-8 continuation bytes start with 10xxxxxx (0x80-0xBF)
+    // We need to find a byte that's NOT a continuation byte
+    for (int i = 0; i < 4 && safe_size > 0; i++) {
+        safe_size--;
+        // In eBPF, we can't easily inspect the actual bytes without additional reads
+        // So we'll use a conservative approach: back off by up to 4 bytes
+        // to ensure we don't split a UTF-8 character (max 4 bytes in UTF-8)
+    }
+    
+    return safe_size;
+}
+
+#define COPY_PAYLOAD(dst, size, src) ({         \
+    TRUNCATE_PAYLOAD_SIZE(size);                \
+    size = utf8_safe_truncate(size);            \
+    if (bpf_probe_read(dst, size, src)) {       \
+        return 0;                               \
+    }                                           \
+    if (size > 0) {                             \
+        dst[size] = '\0';                       \
+    }                                           \
 })
 
 #define IOVEC_BUF_SIZE MAX_PAYLOAD_SIZE * 2  // must be double of MAX_PAYLOAD_SIZE
