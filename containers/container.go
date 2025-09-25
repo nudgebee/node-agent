@@ -667,7 +667,7 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 	if ignoreControlPlane(dstWorkload.Name) {
 		return
 	}
-	actualDstWorkload := c.ip_resolver.ResolveIP(actualDst.IP().String())
+	actualDstWorkload := c.ip_resolver.ResolveActualIP(actualDst.IP().String())
 	if actualDst.IP().IsLoopback() && !p.isHostNs() {
 		return
 	}

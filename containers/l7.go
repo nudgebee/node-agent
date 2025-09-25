@@ -51,6 +51,8 @@ func (s L7Stats) get(protocol l7.Protocol, key common.DestinationKey, r *l7.Requ
 	if m == nil {
 		m = &L7Metrics{}
 		protoStats[key] = m
+		actualDestWorkload := key.GetActualDestinationWorkload()
+		
 		constLabels := map[string]string{"destination": key.DestinationLabelValue(),
 			"actual_destination":                    key.ActualDestinationLabelValue(),
 			"destination_workload_kind":             key.GetDestinationWorkload().Kind,
@@ -59,9 +61,9 @@ func (s L7Stats) get(protocol l7.Protocol, key common.DestinationKey, r *l7.Requ
 			"src_workload_kind":                     srcWorkload.Kind,
 			"src_workload_name":                     srcWorkload.Name,
 			"src_workload_namespace":                srcWorkload.Namespace,
-			"actual_destination_workload_kind":      key.GetActualDestinationWorkload().Kind,
-			"actual_destination_workload_name":      key.GetActualDestinationWorkload().Name,
-			"actual_destination_workload_namespace": key.GetActualDestinationWorkload().Namespace,
+			"actual_destination_workload_kind":      actualDestWorkload.Kind,
+			"actual_destination_workload_name":      actualDestWorkload.Name,
+			"actual_destination_workload_namespace": actualDestWorkload.Namespace,
 		}
 		if traceId != "" {
 			constLabels["trace_id"] = traceId
