@@ -34,7 +34,7 @@
 })
 #define COPY_PAYLOAD(dst, size, src) ({     \
     TRUNCATE_PAYLOAD_SIZE(size);            \
-    if (bpf_probe_read_user(dst, size, src)) {   \
+    if (bpf_probe_read(dst, size, src)) {   \
         return 0;                           \
     }                                       \
 })
