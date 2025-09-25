@@ -873,18 +873,18 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 
 	// For HTTP requests, get stats with trace ID from processor
 	var stats *L7Metrics
-	
+
 	switch r.Protocol {
 	case l7.ProtocolHTTP:
 		// Use new HTTP processor - parse once, use everywhere
 		httpCtx := NewHTTPRequestProcessor(r, conn)
-		
+
 		// Get stats with extracted trace ID
 		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, httpCtx.TraceID)
-		
+
 		// Update stats
 		stats.observe(r.Status.Http(), "", r.Duration)
-		
+
 		// Debug logging for SSL payload capture (enable via environment variable)
 		if os.Getenv("DEBUG_SSL_PAYLOAD") == "true" {
 			log.Printf("SSL Payload Debug: %s -> %s: payload_len=%d, response_len=%d",
@@ -899,13 +899,13 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 
 		// Create trace with processed context
 		if trace != nil {
-			trace.HttpRequest(httpCtx.Method, httpCtx.Path, r.Status, r.Duration, r.PayloadSize, 
+			trace.HttpRequest(httpCtx.Method, httpCtx.Path, r.Status, r.Duration, r.PayloadSize,
 				httpCtx.PayloadBase64, httpCtx.Headers, httpCtx.ResponseBase64, httpCtx.Host)
 		}
 	case l7.ProtocolHTTP2:
 		// Get stats with empty trace ID for HTTP/2 (for now)
 		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
-		
+
 		if conn.http2Parser == nil {
 			conn.http2Parser = l7.NewHttp2Parser()
 		}

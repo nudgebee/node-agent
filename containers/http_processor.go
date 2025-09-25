@@ -15,11 +15,11 @@ import (
 // Parse once, use everywhere to eliminate duplication
 type HTTPRequestContext struct {
 	// Parsed HTTP data
-	Method   string
-	Path     string
-	Host     string
-	Headers  http.Header
-	TraceID  string
+	Method  string
+	Path    string
+	Host    string
+	Headers http.Header
+	TraceID string
 
 	// Encoded payloads for consumers
 	PayloadBase64  string
@@ -29,11 +29,11 @@ type HTTPRequestContext struct {
 	Connection *ActiveConnection
 	Duration   time.Duration
 	Status     l7.Status
-	
+
 	// Raw data (for specialized processing)
 	RawPayload  []byte
 	RawResponse []byte
-	
+
 	// Processing flags
 	HasValidUTF8Payload  bool
 	HasValidUTF8Response bool
@@ -48,19 +48,19 @@ func NewHTTPRequestProcessor(r *l7.RequestData, conn *ActiveConnection) *HTTPReq
 		RawPayload:  r.Payload,
 		RawResponse: r.Response,
 	}
-	
+
 	// Parse HTTP request once
 	ctx.parseHTTPRequest()
-	
+
 	// Encode payloads once
 	ctx.encodePayloads()
-	
+
 	// Extract host information
 	ctx.resolveHost()
-	
+
 	// Extract trace ID if available
 	ctx.extractTraceID()
-	
+
 	return ctx
 }
 
@@ -68,7 +68,7 @@ func NewHTTPRequestProcessor(r *l7.RequestData, conn *ActiveConnection) *HTTPReq
 func (ctx *HTTPRequestContext) parseHTTPRequest() {
 	// Parse method and path from raw payload
 	ctx.Method, ctx.Path = l7.ParseHttp(ctx.RawPayload)
-	
+
 	// Parse headers if available
 	if req, err := l7.ParseHTTPRequest(ctx.RawPayload); err == nil && req != nil && req.Header != nil {
 		ctx.Headers = req.Header
@@ -84,7 +84,7 @@ func (ctx *HTTPRequestContext) encodePayloads() {
 		ctx.HasValidUTF8Payload = utf8.Valid(ctx.RawPayload)
 		ctx.PayloadBase64 = base64.StdEncoding.EncodeToString(ctx.RawPayload)
 	}
-	
+
 	// Validate and encode response payload
 	if len(ctx.RawResponse) > 0 {
 		ctx.HasValidUTF8Response = utf8.Valid(ctx.RawResponse)
@@ -96,7 +96,7 @@ func (ctx *HTTPRequestContext) encodePayloads() {
 func (ctx *HTTPRequestContext) resolveHost() {
 	// Primary: Get host from destination workload
 	ctx.Host = ctx.Connection.DestinationKey.GetDestinationWorkload().Name
-	
+
 	// Fallback: Extract from headers if primary is empty or IP
 	if ctx.Host == "" || isIPAddress(ctx.Host) {
 		if hostHeader := ctx.Headers.Get("Host"); hostHeader != "" {
@@ -139,13 +139,13 @@ func (ctx *HTTPRequestContext) IsLLMRequest() bool {
 	if provider != ProviderUnknown {
 		return true
 	}
-	
+
 	// Fallback detection from request content
 	if ctx.HasValidUTF8Payload {
 		provider = detectLLMFromHTTPRequest(ctx.RawPayload, ctx.ResponseBase64)
 		return provider != ProviderUnknown
 	}
-	
+
 	return false
 }
 
@@ -155,12 +155,12 @@ func (ctx *HTTPRequestContext) GetLLMProvider() LLMProvider {
 	if provider != ProviderUnknown {
 		return provider
 	}
-	
+
 	// Fallback detection
 	if ctx.HasValidUTF8Payload {
 		return detectLLMFromHTTPRequest(ctx.RawPayload, ctx.ResponseBase64)
 	}
-	
+
 	return ProviderUnknown
 }
 
