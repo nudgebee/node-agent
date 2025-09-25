@@ -314,7 +314,6 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	return nil
 }
 
-
 func (t EventType) String() string {
 	switch t {
 	case EventTypeProcessStart:
