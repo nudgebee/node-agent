@@ -235,7 +235,7 @@ func NewDestinationKey(dst, actualDst netaddr.IPPort, domain *Domain, dstWorkloa
 			},
 			actualDestinationWorkload: Workload{
 				Kind:      "external",
-				Name:      actualDst.IP().String(),
+				Name:      domain.FQDN, // Use domain name instead of IP for better tracing
 				Namespace: "external",
 			},
 		}
