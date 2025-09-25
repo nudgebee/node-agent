@@ -62,9 +62,6 @@ __u64 utf8_safe_truncate(__u64 size) {
     if (bpf_probe_read(dst, size, src)) {       \
         return 0;                               \
     }                                           \
-    if (size > 0) {                             \
-        dst[size] = '\0';                       \
-    }                                           \
 })
 
 #define IOVEC_BUF_SIZE MAX_PAYLOAD_SIZE * 2  // must be double of MAX_PAYLOAD_SIZE
