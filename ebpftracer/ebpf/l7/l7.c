@@ -116,7 +116,7 @@ struct {
      __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
      __type(key, int);
      __type(value, char[IOVEC_BUF_SIZE]);
-     __uint(max_entries, 64);  // Conservative expansion: 64 buffers per CPU
+     __uint(max_entries, 64);
 } iovec_buf_heap SEC(".maps");
 
 
@@ -275,17 +275,11 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
 
     char* payload = buf;
     if (iovlen) {
-        // Use time-based per-connection buffer key to minimize race conditions
-        __u64 ktime = bpf_ktime_get_ns();
-        int buffer_key = ((cid.pid * 31) ^ (cid.fd * 17) ^ (ktime >> 20)) & 63;  // Hash to [0-63]
+        // Use connection-specific buffer key to avoid collisions
+        int buffer_key = (cid.pid ^ cid.fd) & 63;  // Simple XOR hash to [0-63]
         payload = bpf_map_lookup_elem(&iovec_buf_heap, &buffer_key);
         if (!payload) {
-            // Fallback: try a few more slots to avoid blocking
-            buffer_key = (buffer_key + 1) & 63;
-            payload = bpf_map_lookup_elem(&iovec_buf_heap, &buffer_key);
-            if (!payload) {
-                return 0;
-            }
+            return 0;
         }
         total_size = 0;
         size = read_iovec(buf, iovlen, 0, payload, &total_size);
@@ -467,20 +461,14 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     int zero = 0;
     char* payload = args->buf;
     if (args->iovlen) {
-        // Use time-based per-connection buffer key to minimize race conditions  
+        // Use connection-specific buffer key to avoid collisions
         struct connection_id buffer_cid = {};
         buffer_cid.pid = pid;
         buffer_cid.fd = args->fd;
-        __u64 ktime = bpf_ktime_get_ns();
-        int buffer_key = ((buffer_cid.pid * 31) ^ (buffer_cid.fd * 17) ^ (ktime >> 20)) & 63;  // Hash to [0-63]
+        int buffer_key = (buffer_cid.pid ^ buffer_cid.fd) & 63;  // Simple XOR hash to [0-63]
         payload = bpf_map_lookup_elem(&iovec_buf_heap, &buffer_key);
         if (!payload) {
-            // Fallback: try a few more slots to avoid blocking
-            buffer_key = (buffer_key + 1) & 63;
-            payload = bpf_map_lookup_elem(&iovec_buf_heap, &buffer_key);
-            if (!payload) {
-                return 0;
-            }
+            return 0;
         }
         total_size = 0;
         ret = read_iovec(args->buf, args->iovlen, ret, payload, &total_size);
