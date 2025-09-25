@@ -52,7 +52,7 @@ func (s L7Stats) get(protocol l7.Protocol, key common.DestinationKey, r *l7.Requ
 		m = &L7Metrics{}
 		protoStats[key] = m
 		actualDestWorkload := key.GetActualDestinationWorkload()
-		
+
 		constLabels := map[string]string{"destination": key.DestinationLabelValue(),
 			"actual_destination":                    key.ActualDestinationLabelValue(),
 			"destination_workload_kind":             key.GetDestinationWorkload().Kind,

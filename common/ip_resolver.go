@@ -262,14 +262,22 @@ func (resolve *K8sIPResolver) addServiceHandlers(serviceInformer cache.SharedInd
 		AddFunc: func(obj interface{}) {
 			service := obj.(*v1.Service)
 			resolve.snapshot.Services.Store(service.UID, *service)
+			resolve.handleServiceUpdate(*service)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			service := newObj.(*v1.Service)
 			resolve.snapshot.Services.Store(service.UID, *service)
+			resolve.handleServiceUpdate(*service)
 		},
 		DeleteFunc: func(obj interface{}) {
 			service := obj.(*v1.Service)
 			resolve.snapshot.Services.Delete(service.UID)
+			// Remove service IPs from ipsMap
+			for _, clusterIp := range service.Spec.ClusterIPs {
+				if clusterIp != "None" {
+					resolve.ipsMap.Delete(clusterIp)
+				}
+			}
 		},
 	})
 }
@@ -516,7 +524,32 @@ func (resolver *K8sIPResolver) updateIpMapping() {
 			Instance:  "",
 		}
 
-		// TODO maybe try to match service to workload
+		// Try to resolve service to its underlying workload by finding a matching pod
+		if len(service.Spec.Selector) > 0 {
+			resolver.snapshot.Pods.Range(func(key any, value any) bool {
+				pod, ok := value.(v1.Pod)
+				if !ok || pod.Namespace != service.Namespace || pod.Labels == nil {
+					return true // continue
+				}
+
+				// Check if pod labels match service selector
+				matches := true
+				for selectorKey, selectorValue := range service.Spec.Selector {
+					if pod.Labels[selectorKey] != selectorValue {
+						matches = false
+						break
+					}
+				}
+
+				if matches {
+					// Found matching pod, get its owner workload
+					workload = resolver.ResolvePodOwner(pod.Name, pod.Namespace)
+					return false // stop iteration
+				}
+
+				return true // continue
+			})
+		}
 		for _, clusterIp := range service.Spec.ClusterIPs {
 			if clusterIp != "None" {
 				resolver.storeWorkloadsIP(clusterIp, &workload)
@@ -608,6 +641,52 @@ func (resolver *K8sIPResolver) storeWorkloadsIP(ip string, newWorkload *Workload
 
 func (resolver *K8sIPResolver) storePodsIP(ip string, newWorkload *Workload) {
 	resolver.podIpsMap.Add(ip, *newWorkload)
+}
+
+// handleServiceUpdate re-resolves a service to its deployment when service is added/updated
+func (resolver *K8sIPResolver) handleServiceUpdate(service v1.Service) {
+	workload := Workload{
+		Name:      service.Name,
+		Namespace: service.Namespace,
+		Kind:      "Service",
+		Zone:      "",
+		Region:    "",
+		Instance:  "",
+	}
+
+	// Try to resolve service to its underlying workload by finding a matching pod
+	if len(service.Spec.Selector) > 0 {
+		resolver.snapshot.Pods.Range(func(key any, value any) bool {
+			pod, ok := value.(v1.Pod)
+			if !ok || pod.Namespace != service.Namespace || pod.Labels == nil {
+				return true // continue
+			}
+
+			// Check if pod labels match service selector
+			matches := true
+			for selectorKey, selectorValue := range service.Spec.Selector {
+				if pod.Labels[selectorKey] != selectorValue {
+					matches = false
+					break
+				}
+			}
+
+			if matches {
+				// Found matching pod, get its owner workload
+				workload = resolver.ResolvePodOwner(pod.Name, pod.Namespace)
+				return false // stop iteration
+			}
+
+			return true // continue
+		})
+	}
+
+	// Update ipsMap with resolved workload
+	for _, clusterIp := range service.Spec.ClusterIPs {
+		if clusterIp != "None" {
+			resolver.storeWorkloadsIP(clusterIp, &workload)
+		}
+	}
 }
 
 // an ugly function to go up one level in hierarchy. maybe there's a better way to do it
