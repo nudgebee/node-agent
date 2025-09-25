@@ -217,7 +217,9 @@ func (d *Domain) String() string {
 }
 
 func NewDomain(fqdn string, ips []netaddr.IP) *Domain {
-	d := &Domain{FQDN: fqdn, SpecifyIP: true}
+	// For external domains, prefer showing domain names over IP addresses in traces
+	// This allows external API calls to show meaningful service names instead of IPs
+	d := &Domain{FQDN: fqdn, SpecifyIP: false}
 	return d
 }
 

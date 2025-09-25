@@ -12,7 +12,7 @@ import (
 func TestLogParser(t *testing.T) {
 
 	ch := make(chan logparser.LogEntry)
-	parser := logparser.NewParser(ch, nil, nil, 0, false)
+	parser := logparser.NewParser(ch, nil, nil, 1*time.Second, false)
 
 	ch <- logparser.LogEntry{Timestamp: time.Now(), Content: "INFO:root:AWS access key: AKIAUCTZOIG66SPQV67B", Level: logparser.LevelInfo}
 
@@ -27,7 +27,7 @@ func TestGetCgroup(t *testing.T) {
 	split := strings.Split(string("/k8s/kube-system/fluentbit-gke-pmknp/fluentbit"), "/")
 	namespace := split[2]
 	podName := split[3]
-	assert.Equal(t, 1, len(split))
+	assert.Equal(t, 5, len(split)) // ["", "k8s", "kube-system", "fluentbit-gke-pmknp", "fluentbit"]
 	assert.Equal(t, "kube-system", namespace)
 	assert.Equal(t, "fluentbit-gke-pmknp", podName)
 }
