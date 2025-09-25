@@ -3,8 +3,11 @@ package containers
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"log"
 	"strings"
+	"time"
+	"unicode/utf8"
 )
 
 // LLMProvider represents supported LLM providers
@@ -73,6 +76,10 @@ func ParseLLMRequest(provider LLMProvider, payloadBase64 string) (*LLMRequest, e
 	}
 
 	// Find JSON body in HTTP request or HTTP/2 frame
+	// Validate payload contains valid UTF-8 before processing
+	if !utf8.Valid(payloadBytes) {
+		return nil, fmt.Errorf("payload contains invalid UTF-8 data")
+	}
 	payloadStr := string(payloadBytes)
 	jsonStart := strings.Index(payloadStr, "{")
 	if jsonStart == -1 {
@@ -115,6 +122,10 @@ func ParseLLMResponse(provider LLMProvider, responseBase64 string) (*LLMResponse
 	}
 
 	// Find JSON in HTTP response or HTTP/2 frame
+	// Validate response contains valid UTF-8 before processing
+	if !utf8.Valid(responseBytes) {
+		return nil, fmt.Errorf("response contains invalid UTF-8 data")
+	}
 	responseStr := string(responseBytes)
 	jsonStart := strings.Index(responseStr, "{")
 	if jsonStart == -1 {

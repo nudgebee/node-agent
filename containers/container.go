@@ -3,6 +3,7 @@ package containers
 import (
 	"bytes"
 	"errors"
+	"log"
 	"net/http"
 	"os"
 	"sort"
@@ -865,50 +866,47 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		}
 	}
 
-	// Extract headers for trace correlation (our LLM feature)
-	var headers http.Header = http.Header{}
-	if r.Protocol == l7.ProtocolHTTP {
-		if req, err := l7.ParseHTTPRequest(r.Payload); err == nil && req != nil && req.Header != nil {
-			headers = req.Header
-		}
-	}
-
 	// Create trace with proper parameters (enhanced version)
 	var trace *tracing.Trace
 	if !ebpfTracesDisabled {
 		trace = c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown(), conn.srcWorkload, conn.DestinationKey.GetDestinationWorkload(), conn.DestinationKey.GetActualDestinationWorkload())
 	}
 
-	traceId := ""
-	if trace != nil && headers != nil {
-		traceId = trace.ExtractTraceId(headers)
-	}
-	stats := c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, traceId)
+	// For HTTP requests, get stats with trace ID from processor
+	var stats *L7Metrics
+	
 	switch r.Protocol {
 	case l7.ProtocolHTTP:
+		// Use new HTTP processor - parse once, use everywhere
+		httpCtx := NewHTTPRequestProcessor(r, conn)
+		
+		// Get stats with extracted trace ID
+		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, httpCtx.TraceID)
+		
+		// Update stats
 		stats.observe(r.Status.Http(), "", r.Duration)
-		payload := base64.StdEncoding.EncodeToString(r.Payload)
-		method, uri := l7.ParseHttp(r.Payload)
-
-		// Use L7 response data (5KB limit - covers most LLM responses)
-		response := ""
-		if r.Response != nil {
-			response = base64.StdEncoding.EncodeToString(r.Response)
+		
+		// Debug logging for SSL payload capture (enable via environment variable)
+		if os.Getenv("DEBUG_SSL_PAYLOAD") == "true" {
+			log.Printf("SSL Payload Debug: %s -> %s: payload_len=%d, response_len=%d",
+				conn.srcWorkload.Name, httpCtx.Host, len(r.Payload), len(r.Response))
 		}
 
-		host := conn.dstWorkload.Name
-		// Enhanced LLM API tracking with fallback detection
-		provider := DetectLLMProvider(host)
-		if provider == ProviderUnknown {
-			// Fallback: Try to detect from HTTP request URL and response structure
-			provider = detectLLMFromHTTPRequest(r.Payload, response)
-		}
-		if provider != ProviderUnknown {
-			c.trackLLMRequest(provider, host, payload, response, r.Duration)
+		// LLM tracking with improved detection
+		if httpCtx.IsLLMRequest() {
+			provider := httpCtx.GetLLMProvider()
+			c.trackLLMRequest(provider, httpCtx.Host, httpCtx.PayloadBase64, httpCtx.ResponseBase64, r.Duration)
 		}
 
-		trace.HttpRequest(method, uri, r.Status, r.Duration, r.PayloadSize, payload, headers, response, host)
+		// Create trace with processed context
+		if trace != nil {
+			trace.HttpRequest(httpCtx.Method, httpCtx.Path, r.Status, r.Duration, r.PayloadSize, 
+				httpCtx.PayloadBase64, httpCtx.Headers, httpCtx.ResponseBase64, httpCtx.Host)
+		}
 	case l7.ProtocolHTTP2:
+		// Get stats with empty trace ID for HTTP/2 (for now)
+		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
+		
 		if conn.http2Parser == nil {
 			conn.http2Parser = l7.NewHttp2Parser()
 		}
@@ -926,7 +924,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 			}
 
 			// Enhanced LLM API tracking for HTTP/2 (including gRPC-based LLM services)
-			host := conn.dstWorkload.Name
+			host := conn.DestinationKey.GetDestinationWorkload().Name
 
 			// Use extracted HTTP/2 DATA frame payloads for LLM tracking
 			requestPayloadBase64 := ""
@@ -944,11 +942,14 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 				// Fallback: Try to detect from HTTP/2 request and response payload
 				provider = detectLLMFromHTTPRequest(req.RequestPayload, responsePayloadBase64)
 			}
+
 			if provider != ProviderUnknown && len(req.RequestPayload) > 0 {
 				c.trackLLMRequest(provider, host, requestPayloadBase64, responsePayloadBase64, req.Duration)
 			}
 		}
 	case l7.ProtocolPostgres:
+		// Get stats with empty trace ID for Postgres
+		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
 		if r.Method != l7.MethodStatementClose {
 			stats.observe(r.Status.String(), "", r.Duration)
 		}
@@ -958,6 +959,8 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		query := conn.postgresParser.Parse(r.Payload)
 		trace.PostgresQuery(query, r.Status.Error(), r.Duration)
 	case l7.ProtocolMysql:
+		// Get stats with empty trace ID for MySQL
+		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
 		if r.Method != l7.MethodStatementClose {
 			stats.observe(r.Status.String(), "", r.Duration)
 		}
@@ -967,33 +970,54 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		query := conn.mysqlParser.Parse(r.Payload, r.StatementId)
 		trace.MysqlQuery(query, r.Status.Error(), r.Duration)
 	case l7.ProtocolMemcached:
+		// Get stats with empty trace ID for Memcached
+		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
 		stats.observe(r.Status.String(), "", r.Duration)
 		cmd, items := l7.ParseMemcached(r.Payload)
 		trace.MemcachedQuery(cmd, items, r.Status.Error(), r.Duration)
 	case l7.ProtocolRedis:
+		// Get stats with empty trace ID for Redis
+		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
 		stats.observe(r.Status.String(), "", r.Duration)
 		cmd, args := l7.ParseRedis(r.Payload)
 		trace.RedisQuery(cmd, args, r.Status.Error(), r.Duration)
 	case l7.ProtocolMongo:
+		// Get stats with empty trace ID for Mongo
+		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
 		stats.observe(r.Status.String(), "", r.Duration)
 		query := l7.ParseMongo(r.Payload)
 		trace.MongoQuery(query, r.Status.Error(), r.Duration)
 	case l7.ProtocolKafka, l7.ProtocolCassandra:
+		// Get stats with empty trace ID for Kafka/Cassandra
+		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
 		stats.observe(r.Status.String(), "", r.Duration)
 	case l7.ProtocolRabbitmq, l7.ProtocolNats:
+		// Get stats with empty trace ID for RabbitMQ/Nats
+		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
 		stats.observe(r.Status.String(), r.Method.String(), 0)
 	case l7.ProtocolDubbo2:
+		// Get stats with empty trace ID for Dubbo2
+		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
 		stats.observe(r.Status.String(), "", r.Duration)
 	case l7.ProtocolClickhouse:
+		// Get stats with empty trace ID for Clickhouse
+		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
 		stats.observe(r.Status.String(), "", r.Duration)
 		query := l7.ParseClickhouse(r.Payload)
 		trace.ClickhouseQuery(query, r.Status.Error(), r.Duration)
 	case l7.ProtocolZookeeper:
+		// Get stats with empty trace ID for Zookeeper
+		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
 		stats.observe(r.Status.Zookeeper(), "", r.Duration)
 		op, arg := l7.ParseZookeeper(r.Payload)
 		trace.ZookeeperRequest(op, arg, r.Status, r.Duration)
 	case l7.ProtocolFoundationDB:
+		// Get stats with empty trace ID for FoundationDB
+		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
 		stats.observe(r.Status.String(), "", r.Duration)
+	default:
+		// For all other protocols, get stats with empty trace ID
+		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
 	}
 	return nil
 }
@@ -1428,14 +1452,25 @@ func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32) {
 		return
 	}
 	if !p.openSslUprobesChecked {
-		p.uprobes = append(p.uprobes, tracer.AttachOpenSslUprobes(pid)...)
+		openSslUprobes := tracer.AttachOpenSslUprobes(pid)
+		p.uprobes = append(p.uprobes, openSslUprobes...)
 		p.openSslUprobesChecked = true
+
+		// Debug logging for SSL uprobes (enable via environment variable)
+		if os.Getenv("DEBUG_SSL_UPROBES") == "true" && len(openSslUprobes) > 0 {
+			log.Printf("SSL Debug: %s PID %d - OpenSSL uprobes attached: %d", p.workload.Name, pid, len(openSslUprobes))
+		}
 	}
 	if !p.goTlsUprobesChecked {
 		uprobes, isGolangApp := tracer.AttachGoTlsUprobes(pid)
 		p.isGolangApp = isGolangApp
 		p.uprobes = append(p.uprobes, uprobes...)
 		p.goTlsUprobesChecked = true
+
+		// Debug logging for Go TLS uprobes (enable via environment variable)
+		if os.Getenv("DEBUG_SSL_UPROBES") == "true" && len(uprobes) > 0 {
+			log.Printf("SSL Debug: %s PID %d - Go TLS uprobes attached: %d, isGolangApp: %v", p.workload.Name, pid, len(uprobes), isGolangApp)
+		}
 	}
 }
 

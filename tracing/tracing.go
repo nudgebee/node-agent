@@ -245,23 +245,11 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 	if host == "" {
 		host = t.destination.String()
 	}
-	requestPayload := ""
-	if utf8.ValidString(payload) {
-		requestPayload = payload
-	}
+	requestPayload := payload
 	requestHeaders := ""
-	responsePayload := ""
-	if utf8.ValidString(response) {
-		responsePayload = response
-	}
-	requestPath := ""
-	if utf8.ValidString(path) {
-		requestPath = path
-	}
-	requestHost := ""
-	if utf8.ValidString(host) {
-		requestHost = host
-	}
+	responsePayload := response
+	requestPath := path
+	requestHost := host
 
 	if headers != nil {
 		requestHeaders = l7.ConvertHeadersToBase64String(headers)

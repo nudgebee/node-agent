@@ -380,9 +380,9 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	id := calcId(cg, md)
 	if id == "" {
 		if cg.Id == "/init.scope" && pid != 1 {
-			klog.InfoS("ignoring without persisting", "cg", cg.Id, "pid", pid)
+			klog.V(5).InfoS("ignoring without persisting", "cg", cg.Id, "pid", pid)
 		} else {
-			klog.InfoS("ignoring", "cg", cg.Id, "pid", pid)
+			klog.V(5).InfoS("ignoring", "cg", cg.Id, "pid", pid)
 			t := time.Now()
 			r.containersByPidIgnored[pid] = &t
 		}

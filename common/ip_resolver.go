@@ -11,6 +11,7 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
 
 	lrucache "github.com/hashicorp/golang-lru/v2"
 	appsv1 "k8s.io/api/apps/v1"
@@ -323,7 +324,7 @@ func (resolver *K8sIPResolver) handlePodAdd(pod *v1.Pod) bool {
 			region = instanceMeta.Region
 			zone = instanceMeta.Zone
 		} else {
-			log.Printf("Type confusion in instance meta for node %s", pod.Spec.NodeName)
+			klog.V(5).Infof("type confusion in instance meta for node %s", pod.Spec.NodeName)
 		}
 	}
 	for _, podIp := range pod.Status.PodIPs {
@@ -572,7 +573,7 @@ func (resolver *K8sIPResolver) updateIpMapping() {
 					region = instanceMeta.Region
 					zone = instanceMeta.Zone
 				} else {
-					log.Printf("Type confusion in instance meta for node %s", pod.Spec.NodeName)
+					klog.V(5).Infof("type confusion in instance meta for node %s", pod.Spec.NodeName)
 				}
 			} else {
 				log.Printf("Missing instance meta for node %s", pod.Spec.NodeName)
@@ -703,7 +704,7 @@ func (resolver *K8sIPResolver) resolvePodDescriptor(pod *v1.Pod) Workload {
 		kind = owner.Kind
 		owner, err = resolver.getControllerOfOwner(owner)
 		if err != nil {
-			log.Printf("Warning: couldn't retrieve owner of %v - %v. This might happen when starting up", name, err)
+			klog.V(5).Infof("couldn't retrieve owner of %v - %v (during startup)", name, err)
 		}
 	}
 	instanceMeta, ok := resolver.instanceMetaMap.Load(pod.Spec.NodeName)
@@ -715,14 +716,16 @@ func (resolver *K8sIPResolver) resolvePodDescriptor(pod *v1.Pod) Workload {
 			region = instanceMeta.Region
 			zone = instanceMeta.Zone
 		} else {
-			log.Printf("Type confusion in instance meta for node %s", pod.Spec.NodeName)
+			klog.V(5).Infof("type confusion in instance meta for node %s", pod.Spec.NodeName)
 		}
 	} else {
-		log.Printf("Missing instance meta for node %s", pod.Spec.NodeName)
-		resolver.instanceMetaMap.Range(func(key, value interface{}) bool {
-			log.Printf("key: %s, value: %v", key, value)
-			return true
-		})
+		klog.V(5).Infof("missing instance meta for node %s", pod.Spec.NodeName)
+		if klog.V(5).Enabled() {
+			resolver.instanceMetaMap.Range(func(key, value interface{}) bool {
+				klog.V(5).Infof("instance meta key: %s, value: %v", key, value)
+				return true
+			})
+		}
 	}
 	result := Workload{
 		Name:      name,
