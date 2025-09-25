@@ -256,12 +256,16 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	}
 
 	if !t.disableL7Tracing {
-		perfMaps = append(perfMaps, perfMap{name: "l7_events", typ: perfMapTypeL7Events, perCPUBufferSizePages: 32})
+		perfMaps = append(perfMaps, perfMap{name: "l7_events", typ: perfMapTypeL7Events, perCPUBufferSizePages: 128}) // Increased for high-volume LLM API tracing
 	}
 
 	pageSize := os.Getpagesize()
 	for _, pm := range perfMaps {
-		r, err := perf.NewReaderWithOptions(t.collection.Maps[pm.name], pm.perCPUBufferSizePages*pageSize, perf.ReaderOptions{WakeupEvents: 100})
+		wakeupEvents := 100
+		if pm.typ == perfMapTypeL7Events {
+			wakeupEvents = 50 // Process L7 events more frequently to reduce buffer pressure
+		}
+		r, err := perf.NewReaderWithOptions(t.collection.Maps[pm.name], pm.perCPUBufferSizePages*pageSize, perf.ReaderOptions{WakeupEvents: wakeupEvents})
 		if err != nil {
 			t.Close()
 			return fmt.Errorf("failed to create ebpf reader: %w", err)
@@ -305,112 +309,11 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		t.links = append(t.links, l)
 	}
 
-	// Attach SSL uprobes for HTTPS LLM API observability
-	if !t.disableL7Tracing {
-		if err := t.attachSSLUprobes(); err != nil {
-			klog.Warningf("Failed to attach SSL uprobes: %v", err)
-		}
-	}
+	// SSL uprobes are handled per-process in tls.go via AttachOpenSslUprobes()
 
 	return nil
 }
 
-// attachSSLUprobes attaches uprobes to SSL/TLS libraries for HTTPS tracing
-func (t *Tracer) attachSSLUprobes() error {
-	// SSL libraries to probe - industry standard approach
-	sslLibraries := []string{
-		"/usr/lib/x86_64-linux-gnu/libssl.so.3",   // OpenSSL 3.x Debian/Ubuntu
-		"/usr/lib/x86_64-linux-gnu/libssl.so.1.1", // OpenSSL 1.1.x Debian/Ubuntu
-		"/lib/x86_64-linux-gnu/libssl.so.3",
-		"/lib/x86_64-linux-gnu/libssl.so.1.1",
-		"/usr/lib64/libssl.so.3", // RHEL/CentOS/UBI9
-		"/usr/lib64/libssl.so.1.1",
-		"/usr/lib/libssl.so.3",  // Alpine Linux
-		"/usr/lib/libssl.so.48", // Alpine OpenSSL 1.1.x
-		"/lib/libssl.so.3",
-		"/lib/libssl.so.48",
-		"/usr/lib/x86_64-linux-gnu/libgnutls.so.30", // GnuTLS
-		"/lib/x86_64-linux-gnu/libgnutls.so.30",
-		"/usr/lib/libgnutls.so.30", // Alpine GnuTLS
-	}
-
-	// SSL function uprobes to attach
-	sslFunctions := []struct {
-		name     string
-		symbol   string
-		progName string
-	}{
-		{"SSL_write", "SSL_write", "ssl_write_entry"},
-		{"SSL_read", "SSL_read", "ssl_read_entry"},
-		{"SSL_read_ret", "SSL_read", "ssl_read_exit"},
-		{"gnutls_record_send", "gnutls_record_send", "gnutls_write_entry"},
-		{"gnutls_record_recv", "gnutls_record_recv", "gnutls_read_exit"},
-	}
-
-	attachedAny := false
-
-	// Iterate through libraries and attach uprobes where possible
-	for _, libPath := range sslLibraries {
-		if _, err := os.Stat(libPath); os.IsNotExist(err) {
-			continue // Library not found, skip
-		}
-
-		klog.V(2).Infof("Found SSL library: %s", libPath)
-
-		// Open executable once for this library
-		ex, err := link.OpenExecutable(libPath)
-		if err != nil {
-			klog.V(3).Infof("Failed to open executable %s: %v", libPath, err)
-			continue
-		}
-
-		for _, fn := range sslFunctions {
-			prog, exists := t.uprobes[fn.progName]
-			if !exists {
-				klog.V(3).Infof("eBPF program %s not found in collection, skipping", fn.progName)
-				continue // Program not found in collection
-			}
-
-			var l link.Link
-			var err error
-
-			// Skip GnuTLS functions if this is not a GnuTLS library
-			if strings.Contains(fn.progName, "gnutls") && !strings.Contains(libPath, "gnutls") {
-				continue
-			}
-
-			// Skip OpenSSL functions if this is not an OpenSSL library
-			if strings.Contains(fn.progName, "ssl") && !strings.Contains(fn.progName, "gnutls") && strings.Contains(libPath, "gnutls") {
-				continue
-			}
-
-			if strings.Contains(fn.name, "_ret") {
-				// Return probe (uretprobe)
-				l, err = ex.Uretprobe(fn.symbol, prog, nil)
-			} else {
-				// Entry probe (uprobe)
-				l, err = ex.Uprobe(fn.symbol, prog, nil)
-			}
-
-			if err != nil {
-				klog.V(3).Infof("Failed to attach %s to %s: %v", fn.name, libPath, err)
-				continue
-			}
-
-			klog.V(2).Infof("Attached SSL uprobe %s to %s", fn.name, libPath)
-			t.links = append(t.links, l)
-			attachedAny = true
-		}
-	}
-
-	if !attachedAny {
-		klog.Warningln("No SSL libraries found or attached - HTTPS tracing will be limited to HTTP/1.1 only")
-		return nil // Don't fail, just continue without SSL uprobes
-	}
-
-	klog.V(1).Infoln("SSL uprobes attached successfully - HTTPS LLM API tracing enabled")
-	return nil
-}
 
 func (t EventType) String() string {
 	switch t {
