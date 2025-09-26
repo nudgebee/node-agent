@@ -32,11 +32,19 @@ func ParseHttp(payload []byte) (string, string) {
 func ParseHTTPRequest(data []byte) (*http.Request, error) {
 	method, rest, ok := bytes.Cut(data, space)
 	if !ok {
-		log.Printf("invalid metheod")
+		debugLen := 50
+		if len(data) < debugLen {
+			debugLen = len(data)
+		}
+		log.Printf("invalid method - no space found in payload: %q", string(data[:debugLen]))
 		return nil, errors.New("invalid payload")
 	}
 	if !isHttpMethod(string(method)) {
-		log.Printf("invalid method")
+		debugLen := 50
+		if len(data) < debugLen {
+			debugLen = len(data)
+		}
+		log.Printf("invalid method: %q (hex: %x) from payload start: %q", string(method), method, string(data[:debugLen]))
 		return nil, errors.New("invalid payload")
 	}
 	uri, rest, ok := bytes.Cut(rest, space)
