@@ -13,7 +13,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -397,71 +396,6 @@ type l7Event struct {
 	Response            [5120]byte // Must match MAX_PAYLOAD_SIZE in eBPF
 }
 
-// Optimized binary parsing - reuse buffers to avoid allocation overhead
-var (
-	bufferPool = sync.Pool{
-		New: func() interface{} {
-			return bytes.NewBuffer(make([]byte, 0, 16384)) // Pre-allocate for largest structs
-		},
-	}
-)
-
-func parseL7EventOptimized(data []byte) (*l7Event, error) {
-	buf := bufferPool.Get().(*bytes.Buffer)
-	defer bufferPool.Put(buf)
-	
-	buf.Reset()
-	buf.Write(data)
-	
-	v := &l7Event{}
-	if err := binary.Read(buf, binary.LittleEndian, v); err != nil {
-		return nil, err
-	}
-	return v, nil
-}
-
-func parseProcEventOptimized(data []byte) (*procEvent, error) {
-	buf := bufferPool.Get().(*bytes.Buffer)
-	defer bufferPool.Put(buf)
-	
-	buf.Reset()
-	buf.Write(data)
-	
-	v := &procEvent{}
-	if err := binary.Read(buf, binary.LittleEndian, v); err != nil {
-		return nil, err
-	}
-	return v, nil
-}
-
-func parseTcpEventOptimized(data []byte) (*tcpEvent, error) {
-	buf := bufferPool.Get().(*bytes.Buffer)
-	defer bufferPool.Put(buf)
-	
-	buf.Reset() 
-	buf.Write(data)
-	
-	v := &tcpEvent{}
-	if err := binary.Read(buf, binary.LittleEndian, v); err != nil {
-		return nil, err
-	}
-	return v, nil
-}
-
-func parseFileEventOptimized(data []byte) (*fileEvent, error) {
-	buf := bufferPool.Get().(*bytes.Buffer)
-	defer bufferPool.Put(buf)
-	
-	buf.Reset()
-	buf.Write(data)
-	
-	v := &fileEvent{}
-	if err := binary.Read(buf, binary.LittleEndian, v); err != nil {
-		return nil, err
-	}
-	return v, nil
-}
-
 // HTTP response fragment event (must match eBPF struct)
 type httpResponseFragment struct {
 	Fd                  uint64
@@ -496,10 +430,11 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 
 		switch typ {
 		case perfMapTypeL7Events:
+			v := &l7Event{}
 			data := rec.RawSample
-			v, err := parseL7EventOptimized(data)
-			if err != nil {
-				klog.Warningln("failed to parse l7 event:", err)
+
+			if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, v); err != nil {
+				klog.Warningln("failed to read l7 event:", err)
 				continue
 			}
 
@@ -534,23 +469,23 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 				L7Request: req,
 			}
 		case perfMapTypeFileEvents:
-			v, err := parseFileEventOptimized(rec.RawSample)
-			if err != nil {
-				klog.Warningln("failed to parse file event:", err)
+			v := &fileEvent{}
+			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
+				klog.Warningln("failed to read msg:", err)
 				continue
 			}
 			event = Event{Type: v.Type, Pid: v.Pid, Fd: v.Fd, Mnt: v.Mnt, Log: v.Log > 0}
 		case perfMapTypeProcEvents:
-			v, err := parseProcEventOptimized(rec.RawSample)
-			if err != nil {
-				klog.Warningln("failed to parse proc event:", err)
+			v := &procEvent{}
+			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
+				klog.Warningln("failed to read msg:", err)
 				continue
 			}
 			event = Event{Type: v.Type, Reason: EventReason(v.Reason), Pid: v.Pid}
 		case perfMapTypeTCPEvents:
-			v, err := parseTcpEventOptimized(rec.RawSample)
-			if err != nil {
-				klog.Warningln("failed to parse tcp event:", err)
+			v := &tcpEvent{}
+			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
+				klog.Warningln("failed to read msg:", err)
 				continue
 			}
 			event = Event{
