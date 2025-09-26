@@ -471,21 +471,21 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 		case perfMapTypeFileEvents:
 			v := &fileEvent{}
 			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read msg:", err)
+				klog.Warningln("failed to read file event:", err)
 				continue
 			}
 			event = Event{Type: v.Type, Pid: v.Pid, Fd: v.Fd, Mnt: v.Mnt, Log: v.Log > 0}
 		case perfMapTypeProcEvents:
 			v := &procEvent{}
 			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read msg:", err)
+				klog.Warningln("failed to read proc event:", err)
 				continue
 			}
 			event = Event{Type: v.Type, Reason: EventReason(v.Reason), Pid: v.Pid}
 		case perfMapTypeTCPEvents:
 			v := &tcpEvent{}
 			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read msg:", err)
+				klog.Warningln("failed to read tcp event:", err)
 				continue
 			}
 			event = Event{
