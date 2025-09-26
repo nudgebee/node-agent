@@ -433,7 +433,7 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 			v := &l7Event{}
 			data := rec.RawSample
 
-			if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, v); err != nil {
+			if err := binary.Read(bytes.NewReader(data), binary.LittleEndian, v); err != nil {
 				klog.Warningln("failed to read l7 event:", err)
 				continue
 			}
@@ -470,22 +470,22 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 			}
 		case perfMapTypeFileEvents:
 			v := &fileEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read msg:", err)
+			if err := binary.Read(bytes.NewReader(rec.RawSample), binary.LittleEndian, v); err != nil {
+				klog.Warningln("failed to read file event:", err)
 				continue
 			}
 			event = Event{Type: v.Type, Pid: v.Pid, Fd: v.Fd, Mnt: v.Mnt, Log: v.Log > 0}
 		case perfMapTypeProcEvents:
 			v := &procEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read msg:", err)
+			if err := binary.Read(bytes.NewReader(rec.RawSample), binary.LittleEndian, v); err != nil {
+				klog.Warningln("failed to read proc event:", err)
 				continue
 			}
 			event = Event{Type: v.Type, Reason: EventReason(v.Reason), Pid: v.Pid}
 		case perfMapTypeTCPEvents:
 			v := &tcpEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read msg:", err)
+			if err := binary.Read(bytes.NewReader(rec.RawSample), binary.LittleEndian, v); err != nil {
+				klog.Warningln("failed to read tcp event:", err)
 				continue
 			}
 			event = Event{
