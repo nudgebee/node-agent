@@ -172,20 +172,20 @@ func (t *Tracer) NewTrace(destination common.HostPort, srcWorkload common.Worklo
 		node = actualDstWorkload.Instance
 	}
 	return &Trace{tracer: t, destination: destination, commonAttrs: []attribute.KeyValue{
-		semconv.NetPeerName(destination.Host()),
+		semconv.NetPeerName(sanitizeUTF8(destination.Host())),
 		semconv.NetPeerPort(int(destination.Port())),
-		attribute.Key("destination.workload_name").String(dstWorkload.Name),
-		attribute.Key("destination.workload_namespace").String(dstWorkload.Namespace),
-		attribute.Key("destination.workload_kind").String(dstWorkload.Kind),
-		attribute.Key("source.workload_name").String(srcWorkload.Name),
-		attribute.Key("source.workload_namespace").String(srcWorkload.Namespace),
-		attribute.Key("source.workload_kind").String(srcWorkload.Kind),
-		attribute.Key("destination.name").String(actualDstWorkload.Name),
-		attribute.Key("destination.namespace").String(actualDstWorkload.Namespace),
-		attribute.Key("destination.kind").String(actualDstWorkload.Kind),
-		attribute.Key("destination.cloud.availablity_zone").String(zone),
-		attribute.Key("destination.cloud.region").String(region),
-		attribute.Key("destination.node").String(node),
+		attribute.Key("destination.workload_name").String(sanitizeUTF8(dstWorkload.Name)),
+		attribute.Key("destination.workload_namespace").String(sanitizeUTF8(dstWorkload.Namespace)),
+		attribute.Key("destination.workload_kind").String(sanitizeUTF8(dstWorkload.Kind)),
+		attribute.Key("source.workload_name").String(sanitizeUTF8(srcWorkload.Name)),
+		attribute.Key("source.workload_namespace").String(sanitizeUTF8(srcWorkload.Namespace)),
+		attribute.Key("source.workload_kind").String(sanitizeUTF8(srcWorkload.Kind)),
+		attribute.Key("destination.name").String(sanitizeUTF8(actualDstWorkload.Name)),
+		attribute.Key("destination.namespace").String(sanitizeUTF8(actualDstWorkload.Namespace)),
+		attribute.Key("destination.kind").String(sanitizeUTF8(actualDstWorkload.Kind)),
+		attribute.Key("destination.cloud.availablity_zone").String(sanitizeUTF8(zone)),
+		attribute.Key("destination.cloud.region").String(sanitizeUTF8(region)),
+		attribute.Key("destination.node").String(sanitizeUTF8(node)),
 	}}
 }
 
@@ -271,14 +271,14 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 	requestHost := sanitizeUTF8(host)
 
 	if headers != nil {
-		requestHeaders = l7.ConvertHeadersToBase64String(headers)
+		requestHeaders = sanitizeUTF8(l7.ConvertHeadersToBase64String(headers))
 	}
 
-	traceId := t.ExtractTraceId(headers)
-	t.createSpan(method, duration, status >= 400,
+	traceId := sanitizeUTF8(t.ExtractTraceId(headers))
+	t.createSpan(sanitizeUTF8(method), duration, status >= 400,
 		traceId,
 		semconv.HTTPURL(fmt.Sprintf("http://%s%s", requestHost, requestPath)),
-		semconv.HTTPMethod(method),
+		semconv.HTTPMethod(sanitizeUTF8(method)),
 		semconv.HTTPStatusCode(int(status)),
 		semconv.HTTPRequestContentLength(int(requestSize)),
 		attribute.Key("http.request_payload").String(requestPayload),

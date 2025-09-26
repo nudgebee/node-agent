@@ -220,6 +220,7 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		connectionsByPidFd:       map[PidFd]*ActiveConnection{},
 		l7Stats:                  L7Stats{},
 		dnsStats:                 &L7Metrics{},
+		llmStats:                 map[string]*LLMStats{},
 
 		gpuStats: map[string]*GpuUsage{},
 
@@ -812,11 +813,6 @@ func (c *Container) trackLLMRequest(provider LLMProvider, host, payloadBase64, r
 	// Store LLM metrics for collection during next Collect() call
 	c.lock.Lock()
 	defer c.lock.Unlock()
-
-	// Initialize LLM stats if needed
-	if c.llmStats == nil {
-		c.llmStats = make(map[string]*LLMStats)
-	}
 
 	key := string(provider) + ":" + llmReq.Model + ":" + host
 	stats := c.llmStats[key]
