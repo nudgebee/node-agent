@@ -189,7 +189,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			r.containersByPidIgnored = map[uint32]*time.Time{}
 			activeIPs := map[netaddr.IP]struct{}{}
 			deadContainers := []*Container{}
-			
+
 			// First pass: collect active IPs and identify dead containers with read lock
 			r.containerLock.RLock()
 			for _, c := range r.containersById {
@@ -201,7 +201,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				}
 			}
 			r.containerLock.RUnlock()
-			
+
 			// Second pass: cleanup dead containers with write lock
 			if len(deadContainers) > 0 {
 				r.containerLock.Lock()
@@ -211,7 +211,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 						continue
 					}
 					klog.Infoln("deleting dead container:", c.id)
-					
+
 					// Remove from all maps
 					for cg, cc := range r.containersByCgroupId {
 						if cc == c {
@@ -224,7 +224,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 						}
 					}
 					delete(r.containersById, c.id)
-					
+
 					// Unregister from Prometheus (do this after removing from maps)
 					if ok := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(c.id), "app_id": c.appId}, r.reg).Unregister(c); !ok {
 						klog.Warningln("failed to unregister container:", c.id)
@@ -417,7 +417,7 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		}
 		return nil
 	}
-	
+
 	// Check if container exists by cgroup ID with read lock
 	r.containerLock.RLock()
 	if c := r.containersByCgroupId[cg.Id]; c != nil {
@@ -474,7 +474,7 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	// Acquire write lock for container creation to prevent race conditions
 	r.containerLock.Lock()
 	defer r.containerLock.Unlock()
-	
+
 	// Double-check pattern: verify container doesn't exist after acquiring write lock
 	if c := r.containersByPid[pid]; c != nil {
 		return c
@@ -494,7 +494,7 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		r.containersByCgroupId[cg.Id] = c
 		return c
 	}
-	
+
 	// Create new container while holding write lock
 	c, err := NewContainer(id, cg, md, pid, r)
 	if err != nil {
@@ -506,7 +506,7 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		klog.Warningln("failed to register container:", err)
 		return nil
 	}
-	
+
 	// Update all maps atomically while holding the lock
 	r.containersByPid[pid] = c
 	r.containersByCgroupId[cg.Id] = c
