@@ -1,63 +1,174 @@
 
 static __always_inline
+int is_valid_http_char(char c) {
+    // Valid HTTP header characters: printable ASCII except control chars
+    return (c >= 0x21 && c <= 0x7E) || c == 0x20 || c == 0x09; // printable + space + tab
+}
+
+static __always_inline
+int is_binary_data(char *buf, int len) {
+    // Quick binary data detection - check for common binary signatures
+    if (len < 4) return 0;
+    
+    // TLS handshake detection (starts with 0x16 0x03)
+    if (buf[0] == 0x16 && buf[1] == 0x03) {
+        return 1;
+    }
+    
+    // Check for high percentage of non-printable chars (>25% indicates binary)
+    int non_printable = 0;
+    int check_len = len < 16 ? len : 16;
+    
+    #pragma unroll
+    for (int i = 0; i < 16 && i < check_len; i++) {
+        if (buf[i] < 0x20 && buf[i] != 0x09 && buf[i] != 0x0A && buf[i] != 0x0D) {
+            non_printable++;
+        }
+    }
+    
+    return (non_printable > (check_len / 4)); // >25% non-printable
+}
+
+static __always_inline
+int validate_http_structure(char *buf, int len) {
+    // Must have minimum structure: METHOD + SPACE + URI + SPACE + VERSION
+    if (len < 14) return 0; // "GET / HTTP/1.1" = 14 chars minimum
+    
+    // Find first space (after method)
+    int space1_pos = -1;
+    #pragma unroll
+    for (int i = 3; i < 12 && i < len; i++) { // Methods are 3-7 chars
+        if (buf[i] == ' ') {
+            space1_pos = i;
+            break;
+        }
+    }
+    
+    if (space1_pos == -1 || space1_pos > 10) return 0; // No space or method too long
+    
+    // Check URI starts with '/' or 'h' (for http://...)
+    if (buf[space1_pos + 1] != '/' && buf[space1_pos + 1] != 'h') return 0;
+    
+    // Find second space (after URI) - bounded loop for eBPF
+    int space2_pos = -1;
+    int search_start = space1_pos + 2;
+    int search_end = len < search_start + 64 ? len : search_start + 64; // Limit search to 64 chars
+    
+    #pragma unroll
+    for (int i = 0; i < 64; i++) {
+        int pos = search_start + i;
+        if (pos >= search_end) break;
+        if (buf[pos] == ' ') {
+            space2_pos = pos;
+            break;
+        }
+    }
+    
+    if (space2_pos == -1) return 0; // No second space found
+    
+    // Check for HTTP version pattern
+    if (space2_pos + 8 > len) return 0; // Not enough space for "HTTP/1.1"
+    if (buf[space2_pos + 1] != 'H' || buf[space2_pos + 2] != 'T' || 
+        buf[space2_pos + 3] != 'T' || buf[space2_pos + 4] != 'P' || 
+        buf[space2_pos + 5] != '/') return 0;
+    
+    return 1;
+}
+
+static __always_inline
 int is_http_request(char *buf) {
-    char b[16];
-    // Use modern API but keep original logic that worked for Gemini/LLM calls
-    if (bpf_probe_read_user_str(b, sizeof(b), (void *)buf) < 16) {
+    char b[64]; // Increased buffer for better validation
+    int read_len = bpf_probe_read_user_str(b, sizeof(b), (void *)buf);
+    if (read_len < 14) { // Minimum "GET / HTTP/1.1"
         return 0;
     }
-    if (b[0] == 'G' && b[1] == 'E' && b[2] == 'T') {
-        return 1;
+    
+    // Quick binary data rejection
+    if (is_binary_data(b, read_len)) {
+        return 0;
     }
-    if (b[0] == 'P' && b[1] == 'O' && b[2] == 'S' && b[3] == 'T') {
-        return 1;
+    
+    // Method validation with space requirement
+    int method_matched = 0;
+    
+    if (b[0] == 'G' && b[1] == 'E' && b[2] == 'T' && b[3] == ' ') {
+        method_matched = 1;
+    } else if (b[0] == 'P' && b[1] == 'O' && b[2] == 'S' && b[3] == 'T' && b[4] == ' ') {
+        method_matched = 1;
+    } else if (b[0] == 'H' && b[1] == 'E' && b[2] == 'A' && b[3] == 'D' && b[4] == ' ') {
+        method_matched = 1;
+    } else if (b[0] == 'P' && b[1] == 'U' && b[2] == 'T' && b[3] == ' ') {
+        method_matched = 1;
+    } else if (b[0] == 'D' && b[1] == 'E' && b[2] == 'L' && b[3] == 'E' && 
+               b[4] == 'T' && b[5] == 'E' && b[6] == ' ') {
+        method_matched = 1;
+    } else if (b[0] == 'C' && b[1] == 'O' && b[2] == 'N' && b[3] == 'N' && 
+               b[4] == 'E' && b[5] == 'C' && b[6] == 'T' && b[7] == ' ') {
+        method_matched = 1;
+    } else if (b[0] == 'O' && b[1] == 'P' && b[2] == 'T' && b[3] == 'I' && 
+               b[4] == 'O' && b[5] == 'N' && b[6] == 'S' && b[7] == ' ') {
+        method_matched = 1;
+    } else if (b[0] == 'P' && b[1] == 'A' && b[2] == 'T' && b[3] == 'C' && 
+               b[4] == 'H' && b[5] == ' ') {
+        method_matched = 1;
     }
-    if (b[0] == 'H' && b[1] == 'E' && b[2] == 'A' && b[3] == 'D') {
-        return 1;
+    
+    if (!method_matched) {
+        return 0;
     }
-    if (b[0] == 'P' && b[1] == 'U' && b[2] == 'T') {
-        return 1;
-    }
-    if (b[0] == 'D' && b[1] == 'E' && b[2] == 'L' && b[3] == 'E' && b[4] == 'T' && b[5] == 'E') {
-        return 1;
-    }
-    if (b[0] == 'C' && b[1] == 'O' && b[2] == 'N' && b[3] == 'N' && b[4] == 'E' && b[5] == 'C' && b[6] == 'T') {
-        return 1;
-    }
-    if (b[0] == 'O' && b[1] == 'P' && b[2] == 'T' && b[3] == 'I' && b[4] == 'O' && b[5] == 'N' && b[6] == 'S') {
-        return 1;
-    }
-    if (b[0] == 'P' && b[1] == 'A' && b[2] == 'T' && b[3] == 'C' && b[4] == 'H') {
-        return 1;
-    }
-    return 0;
+    
+    // Validate complete HTTP structure
+    return validate_http_structure(b, read_len);
 }
 
 static __always_inline
 int is_http_response(char *buf, __s32 *status) {
-    char b[16];
-    // Use modern API but keep original logic that worked for Gemini/LLM calls
-    if (bpf_probe_read_user_str(b, sizeof(b), (void *)buf) < 16) {
+    char b[32]; // Increased buffer for better validation
+    int read_len = bpf_probe_read_user_str(b, sizeof(b), (void *)buf);
+    if (read_len < 12) { // Minimum "HTTP/1.1 200"
         return 0;
     }
+    
+    // Quick binary data rejection for responses too
+    if (is_binary_data(b, read_len)) {
+        return 0;
+    }
+    
+    // Strict HTTP response validation
     if (b[0] != 'H' || b[1] != 'T' || b[2] != 'T' || b[3] != 'P' || b[4] != '/') {
         return 0;
     }
-    if (b[5] < '0' || b[5] > '9') {
+    
+    // Version validation: 1.0, 1.1, 2.0
+    if (b[5] < '1' || b[5] > '2') {
         return 0;
     }
     if (b[6] != '.') {
         return 0;
     }
-    if (b[7] < '0' || b[7] > '9') {
+    if (b[7] < '0' || b[7] > '1') {
         return 0;
     }
     if (b[8] != ' ') {
         return 0;
     }
-    if (b[9] < '0' || b[9] > '9' || b[10] < '0' || b[10] > '9' || b[11] < '0' || b[11] > '9') {
+    
+    // Status code validation (3 digits)
+    if (b[9] < '1' || b[9] > '5' || b[10] < '0' || b[10] > '9' || b[11] < '0' || b[11] > '9') {
         return 0;
     }
-    *status = (b[9]-'0')*100 + (b[10]-'0')*10 + (b[11]-'0');
+    
+    // Optional: validate status code ranges
+    int status_code = (b[9]-'0')*100 + (b[10]-'0')*10 + (b[11]-'0');
+    if (status_code < 100 || status_code > 599) {
+        return 0;
+    }
+    
+    // Must have space or end after status code
+    if (read_len > 12 && b[12] != ' ' && b[12] != '\r' && b[12] != '\n') {
+        return 0;
+    }
+    
+    *status = status_code;
     return 1;
 }

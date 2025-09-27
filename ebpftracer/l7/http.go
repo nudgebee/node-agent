@@ -10,23 +10,34 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/coroot/coroot-node-agent/flags"
 )
+
+// safeString converts bytes to string with UTF-8 validation
+// If bytes contain invalid UTF-8, returns base64 encoded version as fallback
+func safeString(data []byte) string {
+	if !utf8.Valid(data) {
+		// Return base64 encoded version for invalid UTF-8 data
+		return "base64:" + base64.StdEncoding.EncodeToString(data)
+	}
+	return string(data)
+}
 
 func ParseHttp(payload []byte) (string, string) {
 	method, rest, ok := bytes.Cut(payload, space)
 	if !ok {
 		return "", ""
 	}
-	if !isHttpMethod(string(method)) {
+	if !isHttpMethod(safeString(method)) {
 		return "", ""
 	}
 	uri, _, ok := bytes.Cut(rest, space)
 	if !ok {
 		uri = append(uri, []byte("...")...)
 	}
-	return string(method), string(uri)
+	return safeString(method), safeString(uri)
 }
 
 func ParseHTTPRequest(data []byte) (*http.Request, error) {
@@ -36,15 +47,15 @@ func ParseHTTPRequest(data []byte) (*http.Request, error) {
 		if len(data) < debugLen {
 			debugLen = len(data)
 		}
-		log.Printf("invalid method - no space found in payload: %q", string(data[:debugLen]))
+		log.Printf("invalid method - no space found in payload: %q", safeString(data[:debugLen]))
 		return nil, errors.New("invalid payload")
 	}
-	if !isHttpMethod(string(method)) {
+	if !isHttpMethod(safeString(method)) {
 		debugLen := 50
 		if len(data) < debugLen {
 			debugLen = len(data)
 		}
-		log.Printf("invalid method: %q (hex: %x) from payload start: %q", string(method), method, string(data[:debugLen]))
+		log.Printf("invalid method: %q (hex: %x) from payload start: %q", safeString(method), method, safeString(data[:debugLen]))
 		return nil, errors.New("invalid payload")
 	}
 	uri, rest, ok := bytes.Cut(rest, space)
@@ -62,7 +73,7 @@ func ParseHTTPRequest(data []byte) (*http.Request, error) {
 	if !ok {
 		return nil, errors.New("invalid headers")
 	}
-	parsedURL, err := url.ParseRequestURI(string(uri))
+	parsedURL, err := url.ParseRequestURI(safeString(uri))
 
 	if err != nil {
 		return nil, errors.New("invalid uri")
@@ -87,19 +98,19 @@ func ParseHTTPRequest(data []byte) (*http.Request, error) {
 		if !ok {
 			continue
 		}
-		if strings.HasPrefix(string(part1), "Host") {
-			host = strings.TrimSpace(string(part2))
+		if strings.HasPrefix(safeString(part1), "Host") {
+			host = strings.TrimSpace(safeString(part2))
 		}
 
-		key := strings.TrimSpace(string(part1))
-		val := strings.TrimSpace(string(part2))
+		key := strings.TrimSpace(safeString(part1))
+		val := strings.TrimSpace(safeString(part2))
 		if sensitiveHeaders[strings.ToLower(key)] {
 			val = SanitizeString(val)
 		}
 		header.Add(key, val)
 	}
 	req := &http.Request{
-		Method:     string(method),
+		Method:     safeString(method),
 		URL:        u,
 		Proto:      string(httpVersion),
 		ProtoMajor: 1,
