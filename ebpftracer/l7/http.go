@@ -172,6 +172,13 @@ func SanitizeString(value string) string {
 
 // ParseHTTPResponse parses HTTP response data and returns status code and headers
 func ParseHTTPResponse(data []byte) (*http.Response, error) {
+	// DEBUG: Log what data is being processed as HTTP response
+	debugLen := 50
+	if len(data) < debugLen {
+		debugLen = len(data)
+	}
+	log.Printf("DEBUG: Processing as HTTP response: %q (hex: %x)", safeString(data[:debugLen]), data[:debugLen])
+	
 	// Check if it starts with HTTP/
 	if !bytes.HasPrefix(data, []byte("HTTP/")) {
 		debugLen := 20
