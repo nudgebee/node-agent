@@ -16,17 +16,29 @@ int is_binary_data(char *buf, int len) {
     }
     
     // Check for high percentage of non-printable chars (>25% indicates binary)
+    // Use fixed bounds to avoid eBPF verifier issues
     int non_printable = 0;
-    int check_len = len < 16 ? len : 16;
+    int actual_len = len < 16 ? len : 16;
     
-    #pragma unroll
-    for (int i = 0; i < 16 && i < check_len; i++) {
-        if (buf[i] < 0x20 && buf[i] != 0x09 && buf[i] != 0x0A && buf[i] != 0x0D) {
-            non_printable++;
-        }
-    }
+    // Manual unroll to avoid verifier back-edge issues
+    if (actual_len > 0 && buf[0] < 0x20 && buf[0] != 0x09 && buf[0] != 0x0A && buf[0] != 0x0D) non_printable++;
+    if (actual_len > 1 && buf[1] < 0x20 && buf[1] != 0x09 && buf[1] != 0x0A && buf[1] != 0x0D) non_printable++;
+    if (actual_len > 2 && buf[2] < 0x20 && buf[2] != 0x09 && buf[2] != 0x0A && buf[2] != 0x0D) non_printable++;
+    if (actual_len > 3 && buf[3] < 0x20 && buf[3] != 0x09 && buf[3] != 0x0A && buf[3] != 0x0D) non_printable++;
+    if (actual_len > 4 && buf[4] < 0x20 && buf[4] != 0x09 && buf[4] != 0x0A && buf[4] != 0x0D) non_printable++;
+    if (actual_len > 5 && buf[5] < 0x20 && buf[5] != 0x09 && buf[5] != 0x0A && buf[5] != 0x0D) non_printable++;
+    if (actual_len > 6 && buf[6] < 0x20 && buf[6] != 0x09 && buf[6] != 0x0A && buf[6] != 0x0D) non_printable++;
+    if (actual_len > 7 && buf[7] < 0x20 && buf[7] != 0x09 && buf[7] != 0x0A && buf[7] != 0x0D) non_printable++;
+    if (actual_len > 8 && buf[8] < 0x20 && buf[8] != 0x09 && buf[8] != 0x0A && buf[8] != 0x0D) non_printable++;
+    if (actual_len > 9 && buf[9] < 0x20 && buf[9] != 0x09 && buf[9] != 0x0A && buf[9] != 0x0D) non_printable++;
+    if (actual_len > 10 && buf[10] < 0x20 && buf[10] != 0x09 && buf[10] != 0x0A && buf[10] != 0x0D) non_printable++;
+    if (actual_len > 11 && buf[11] < 0x20 && buf[11] != 0x09 && buf[11] != 0x0A && buf[11] != 0x0D) non_printable++;
+    if (actual_len > 12 && buf[12] < 0x20 && buf[12] != 0x09 && buf[12] != 0x0A && buf[12] != 0x0D) non_printable++;
+    if (actual_len > 13 && buf[13] < 0x20 && buf[13] != 0x09 && buf[13] != 0x0A && buf[13] != 0x0D) non_printable++;
+    if (actual_len > 14 && buf[14] < 0x20 && buf[14] != 0x09 && buf[14] != 0x0A && buf[14] != 0x0D) non_printable++;
+    if (actual_len > 15 && buf[15] < 0x20 && buf[15] != 0x09 && buf[15] != 0x0A && buf[15] != 0x0D) non_printable++;
     
-    return (non_printable > (check_len / 4)); // >25% non-printable
+    return (non_printable > (actual_len / 4)); // >25% non-printable
 }
 
 static __always_inline
