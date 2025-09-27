@@ -46,35 +46,45 @@ int validate_http_structure(char *buf, int len) {
     // Must have minimum structure: METHOD + SPACE + URI + SPACE + VERSION
     if (len < 14) return 0; // "GET / HTTP/1.1" = 14 chars minimum
     
-    // Find first space (after method)
+    // Find first space (after method) - manual unroll to avoid verifier issues
     int space1_pos = -1;
-    #pragma unroll
-    for (int i = 3; i < 12 && i < len; i++) { // Methods are 3-7 chars
-        if (buf[i] == ' ') {
-            space1_pos = i;
-            break;
-        }
-    }
+    if (len > 3 && buf[3] == ' ') space1_pos = 3;
+    else if (len > 4 && buf[4] == ' ') space1_pos = 4;
+    else if (len > 5 && buf[5] == ' ') space1_pos = 5;
+    else if (len > 6 && buf[6] == ' ') space1_pos = 6;
+    else if (len > 7 && buf[7] == ' ') space1_pos = 7;
+    else if (len > 8 && buf[8] == ' ') space1_pos = 8;
+    else if (len > 9 && buf[9] == ' ') space1_pos = 9;
+    else if (len > 10 && buf[10] == ' ') space1_pos = 10;
+    else if (len > 11 && buf[11] == ' ') space1_pos = 11;
     
     if (space1_pos == -1 || space1_pos > 10) return 0; // No space or method too long
     
     // Check URI starts with '/' or 'h' (for http://...)
     if (buf[space1_pos + 1] != '/' && buf[space1_pos + 1] != 'h') return 0;
     
-    // Find second space (after URI) - bounded loop for eBPF
+    // Find second space (after URI) - manual unroll to avoid verifier issues
     int space2_pos = -1;
     int search_start = space1_pos + 2;
-    int search_end = len < search_start + 64 ? len : search_start + 64; // Limit search to 64 chars
+    int search_end = len < search_start + 32 ? len : search_start + 32; // Limit to 32 chars for manual unroll
     
-    #pragma unroll
-    for (int i = 0; i < 64; i++) {
-        int pos = search_start + i;
-        if (pos >= search_end) break;
-        if (buf[pos] == ' ') {
-            space2_pos = pos;
-            break;
-        }
-    }
+    // Manual unroll for up to 32 positions to find space after URI
+    if (search_start < search_end && buf[search_start] == ' ') space2_pos = search_start;
+    else if (search_start + 1 < search_end && buf[search_start + 1] == ' ') space2_pos = search_start + 1;
+    else if (search_start + 2 < search_end && buf[search_start + 2] == ' ') space2_pos = search_start + 2;
+    else if (search_start + 3 < search_end && buf[search_start + 3] == ' ') space2_pos = search_start + 3;
+    else if (search_start + 4 < search_end && buf[search_start + 4] == ' ') space2_pos = search_start + 4;
+    else if (search_start + 5 < search_end && buf[search_start + 5] == ' ') space2_pos = search_start + 5;
+    else if (search_start + 6 < search_end && buf[search_start + 6] == ' ') space2_pos = search_start + 6;
+    else if (search_start + 7 < search_end && buf[search_start + 7] == ' ') space2_pos = search_start + 7;
+    else if (search_start + 8 < search_end && buf[search_start + 8] == ' ') space2_pos = search_start + 8;
+    else if (search_start + 9 < search_end && buf[search_start + 9] == ' ') space2_pos = search_start + 9;
+    else if (search_start + 10 < search_end && buf[search_start + 10] == ' ') space2_pos = search_start + 10;
+    else if (search_start + 11 < search_end && buf[search_start + 11] == ' ') space2_pos = search_start + 11;
+    else if (search_start + 12 < search_end && buf[search_start + 12] == ' ') space2_pos = search_start + 12;
+    else if (search_start + 13 < search_end && buf[search_start + 13] == ' ') space2_pos = search_start + 13;
+    else if (search_start + 14 < search_end && buf[search_start + 14] == ' ') space2_pos = search_start + 14;
+    else if (search_start + 15 < search_end && buf[search_start + 15] == ' ') space2_pos = search_start + 15;
     
     if (space2_pos == -1) return 0; // No second space found
     
