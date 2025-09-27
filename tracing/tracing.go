@@ -281,10 +281,10 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 		semconv.HTTPMethod(sanitizeUTF8(method)),
 		semconv.HTTPStatusCode(int(status)),
 		semconv.HTTPRequestContentLength(int(requestSize)),
-		attribute.Key("http.request_payload").String(requestPayload),
-		attribute.Key("http.headers").String(requestHeaders),
-		attribute.Key("http.response").String(responsePayload),
-		attribute.Key("http.path").String(requestPath),
+		attribute.Key("http.request_payload").String(sanitizeUTF8(requestPayload)),
+		attribute.Key("http.headers").String(sanitizeUTF8(requestHeaders)),
+		attribute.Key("http.response").String(sanitizeUTF8(responsePayload)),
+		attribute.Key("http.path").String(sanitizeUTF8(requestPath)),
 	)
 }
 
@@ -352,9 +352,13 @@ func (t *Trace) MemcachedQuery(cmd string, items []string, error bool, duration 
 		semconv.DBOperation(cmd),
 	}
 	if len(items) == 1 {
-		attrs = append(attrs, MemcacheDBItemKeyName.String(items[0]))
+		attrs = append(attrs, MemcacheDBItemKeyName.String(sanitizeUTF8(items[0])))
 	} else if len(items) > 1 {
-		attrs = append(attrs, MemcacheDBItemKeyName.StringSlice(items))
+		sanitizedItems := make([]string, len(items))
+		for i, item := range items {
+			sanitizedItems[i] = sanitizeUTF8(item)
+		}
+		attrs = append(attrs, MemcacheDBItemKeyName.StringSlice(sanitizedItems))
 	}
 	t.createSpan(cmd, duration, error, "", attrs...)
 }
@@ -398,7 +402,7 @@ func (t *Trace) ZookeeperRequest(op string, args string, status l7.Status, durat
 	t.createSpan(op, duration, status.Zookeeper() != "ok", "",
 		semconv.DBSystemKey.String("zookeeper"),
 		semconv.DBOperation(op),
-		semconv.DBStatementKey.String(statement),
+		semconv.DBStatementKey.String(sanitizeUTF8(statement)),
 		attribute.Key("zookeeper.status_code").Int(int(status)),
 	)
 }
