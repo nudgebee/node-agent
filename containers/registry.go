@@ -192,7 +192,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			
 			// First pass: collect active IPs and identify dead containers with read lock
 			r.containerLock.RLock()
-			for id, c := range r.containersById {
+			for _, c := range r.containersById {
 				for dst := range c.lastConnectionAttempts {
 					activeIPs[dst.IP()] = struct{}{}
 				}
