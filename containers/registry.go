@@ -63,6 +63,7 @@ type Registry struct {
 	containersByCgroupId   map[string]*Container
 	containersByPid        map[uint32]*Container
 	containersByPidIgnored map[uint32]*time.Time
+	containerLock          sync.RWMutex // Protects container maps and registration
 	ip2fqdn                map[netaddr.IP]*common.Domain
 	ip2fqdnLock            sync.RWMutex
 
@@ -187,29 +188,50 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			}
 			r.containersByPidIgnored = map[uint32]*time.Time{}
 			activeIPs := map[netaddr.IP]struct{}{}
+			deadContainers := []*Container{}
+			
+			// First pass: collect active IPs and identify dead containers with read lock
+			r.containerLock.RLock()
 			for id, c := range r.containersById {
 				for dst := range c.lastConnectionAttempts {
 					activeIPs[dst.IP()] = struct{}{}
 				}
-				if !c.Dead(now) {
-					continue
+				if c.Dead(now) {
+					deadContainers = append(deadContainers, c)
 				}
-				klog.Infoln("deleting dead container:", id)
-				for cg, cc := range r.containersByCgroupId {
-					if cc == c {
-						delete(r.containersByCgroupId, cg)
+			}
+			r.containerLock.RUnlock()
+			
+			// Second pass: cleanup dead containers with write lock
+			if len(deadContainers) > 0 {
+				r.containerLock.Lock()
+				for _, c := range deadContainers {
+					// Double-check that container is still dead after acquiring write lock
+					if !c.Dead(now) {
+						continue
 					}
-				}
-				for pid, cc := range r.containersByPid {
-					if cc == c {
-						delete(r.containersByPid, pid)
+					klog.Infoln("deleting dead container:", c.id)
+					
+					// Remove from all maps
+					for cg, cc := range r.containersByCgroupId {
+						if cc == c {
+							delete(r.containersByCgroupId, cg)
+						}
 					}
+					for pid, cc := range r.containersByPid {
+						if cc == c {
+							delete(r.containersByPid, pid)
+						}
+					}
+					delete(r.containersById, c.id)
+					
+					// Unregister from Prometheus (do this after removing from maps)
+					if ok := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(c.id), "app_id": c.appId}, r.reg).Unregister(c); !ok {
+						klog.Warningln("failed to unregister container:", c.id)
+					}
+					c.Close()
 				}
-				if ok := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(c.id), "app_id": c.appId}, r.reg).Unregister(c); !ok {
-					klog.Warningln("failed to unregister container:", id)
-				}
-				delete(r.containersById, id)
-				c.Close()
+				r.containerLock.Unlock()
 			}
 			r.ip2fqdnLock.Lock()
 			for ip := range r.ip2fqdn {
@@ -222,25 +244,37 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			if u == nil {
 				continue
 			}
-			if c := r.containersByPid[u.Pid]; c != nil {
+			r.containerLock.RLock()
+			c := r.containersByPid[u.Pid]
+			r.containerLock.RUnlock()
+			if c != nil {
 				c.updateTrafficStats(u)
 			}
 		case u := <-r.nodejsStatsUpdateCh:
 			if u == nil {
 				continue
 			}
-			if c := r.containersByPid[u.Pid]; c != nil {
+			r.containerLock.RLock()
+			c := r.containersByPid[u.Pid]
+			r.containerLock.RUnlock()
+			if c != nil {
 				c.updateNodejsStats(*u)
 			}
 		case u := <-r.pythonStatsUpdateCh:
 			if u == nil {
 				continue
 			}
-			if c := r.containersByPid[u.Pid]; c != nil {
+			r.containerLock.RLock()
+			c := r.containersByPid[u.Pid]
+			r.containerLock.RUnlock()
+			if c != nil {
 				c.updatePythonStats(*u)
 			}
 		case sample := <-r.gpuProcessUsageSampleChan:
-			if c := r.containersByPid[sample.Pid]; c != nil {
+			r.containerLock.RLock()
+			c := r.containersByPid[sample.Pid]
+			r.containerLock.RUnlock()
+			if c != nil {
 				if p := c.processes[sample.Pid]; p != nil {
 					p.addGpuUsageSample(sample)
 				}
@@ -251,14 +285,20 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			}
 			switch e.Type {
 			case ebpftracer.EventTypeProcessStart:
+				r.containerLock.RLock()
 				c, seen := r.containersByPid[e.Pid]
+				r.containerLock.RUnlock()
 				switch { // possible pids wraparound + missed `process-exit` event
 				case c == nil && seen: // ignored
+					r.containerLock.Lock()
 					delete(r.containersByPid, e.Pid)
+					r.containerLock.Unlock()
 				case c != nil: // revalidating by cgroup
 					cg, err := proc.ReadCgroup(e.Pid)
 					if err != nil || cg.Id != c.cgroup.Id {
+						r.containerLock.Lock()
 						delete(r.containersByPid, e.Pid)
+						r.containerLock.Unlock()
 						c.onProcessExit(e.Pid, false)
 					}
 				}
@@ -269,10 +309,15 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 					}
 				}
 			case ebpftracer.EventTypeProcessExit:
-				if c := r.containersByPid[e.Pid]; c != nil {
+				r.containerLock.RLock()
+				c := r.containersByPid[e.Pid]
+				r.containerLock.RUnlock()
+				if c != nil {
 					c.onProcessExit(e.Pid, e.Reason == ebpftracer.EventReasonOOMKill)
 				}
+				r.containerLock.Lock()
 				delete(r.containersByPid, e.Pid)
+				r.containerLock.Unlock()
 
 			case ebpftracer.EventTypeFileOpen:
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
@@ -284,7 +329,10 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 					c.onListenOpen(e.Pid, e.SrcAddr, false)
 				}
 			case ebpftracer.EventTypeListenClose:
-				if c := r.containersByPid[e.Pid]; c != nil {
+				r.containerLock.RLock()
+				c := r.containersByPid[e.Pid]
+				r.containerLock.RUnlock()
+				if c != nil {
 					c.onListenClose(e.Pid, e.SrcAddr)
 				}
 
@@ -300,11 +348,20 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 					klog.Infoln("TCP connection error from unknown container", e)
 				}
 			case ebpftracer.EventTypeConnectionClose:
-				if c := r.containersByPid[e.Pid]; c != nil {
+				r.containerLock.RLock()
+				c := r.containersByPid[e.Pid]
+				r.containerLock.RUnlock()
+				if c != nil {
 					c.onConnectionClose(e)
 				}
 			case ebpftracer.EventTypeTCPRetransmit:
+				r.containerLock.RLock()
+				containers := make([]*Container, 0, len(r.containersById))
 				for _, c := range r.containersById {
+					containers = append(containers, c)
+				}
+				r.containerLock.RUnlock()
+				for _, c := range containers {
 					if c.onRetransmission(e.SrcAddr, e.DstAddr) {
 						break
 					}
@@ -339,17 +396,20 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 }
 
 func (r *Registry) getOrCreateContainer(pid uint32) *Container {
+	// Fast path: try to find existing container with read lock
+	r.containerLock.RLock()
 	if c := r.containersByPid[pid]; c != nil {
+		r.containerLock.RUnlock()
 		return c
-	} else {
-		if t := r.containersByPidIgnored[pid]; t != nil {
-			if time.Since(*t) < IgnoredContainersCacheTTL {
-				return nil
-			} else {
-				delete(r.containersByPidIgnored, pid)
-			}
-		}
 	}
+	if t := r.containersByPidIgnored[pid]; t != nil {
+		if time.Since(*t) < IgnoredContainersCacheTTL {
+			r.containerLock.RUnlock()
+			return nil
+		}
+		// Will clean up ignored container later with write lock
+	}
+	r.containerLock.RUnlock()
 	cg, err := proc.ReadCgroup(pid)
 	if err != nil {
 		if !common.IsNotExist(err) {
@@ -357,10 +417,18 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		}
 		return nil
 	}
+	
+	// Check if container exists by cgroup ID with read lock
+	r.containerLock.RLock()
 	if c := r.containersByCgroupId[cg.Id]; c != nil {
+		r.containerLock.RUnlock()
+		// Need write lock to update PID mapping
+		r.containerLock.Lock()
 		r.containersByPid[pid] = c
+		r.containerLock.Unlock()
 		return c
 	}
+	r.containerLock.RUnlock()
 	if cg.ContainerType == cgroup.ContainerTypeSandbox {
 		cmdline := proc.GetCmdline(pid)
 		parts := bytes.Split(cmdline, []byte{0})
@@ -383,18 +451,38 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 			klog.V(5).InfoS("ignoring without persisting", "cg", cg.Id, "pid", pid)
 		} else {
 			klog.V(5).InfoS("ignoring", "cg", cg.Id, "pid", pid)
+			r.containerLock.Lock()
 			t := time.Now()
 			r.containersByPidIgnored[pid] = &t
+			// Clean up stale ignored PIDs while we have the lock
+			if oldT := r.containersByPidIgnored[pid]; oldT != nil && time.Since(*oldT) >= IgnoredContainersCacheTTL {
+				delete(r.containersByPidIgnored, pid)
+			}
+			r.containerLock.Unlock()
 		}
 		return nil
 	}
 	if common.ContainerFilter.ShouldBeSkipped(string(id)) {
 		klog.InfoS("skipping due to user-defined settings", "id", id, "pid", pid)
+		r.containerLock.Lock()
 		t := time.Now()
 		r.containersByPidIgnored[pid] = &t
+		r.containerLock.Unlock()
 		return nil
 	}
 
+	// Acquire write lock for container creation to prevent race conditions
+	r.containerLock.Lock()
+	defer r.containerLock.Unlock()
+	
+	// Double-check pattern: verify container doesn't exist after acquiring write lock
+	if c := r.containersByPid[pid]; c != nil {
+		return c
+	}
+	if c := r.containersByCgroupId[cg.Id]; c != nil {
+		r.containersByPid[pid] = c
+		return c
+	}
 	if c := r.containersById[id]; c != nil {
 		klog.Warningln("id conflict:", id)
 		if cg.CreatedAt().After(c.cgroup.CreatedAt()) {
@@ -406,6 +494,8 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		r.containersByCgroupId[cg.Id] = c
 		return c
 	}
+	
+	// Create new container while holding write lock
 	c, err := NewContainer(id, cg, md, pid, r)
 	if err != nil {
 		klog.Warningf("failed to create container pid=%d cg=%s id=%s: %s", pid, cg.Id, id, err)
@@ -416,6 +506,8 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		klog.Warningln("failed to register container:", err)
 		return nil
 	}
+	
+	// Update all maps atomically while holding the lock
 	r.containersByPid[pid] = c
 	r.containersByCgroupId[cg.Id] = c
 	r.containersById[id] = c
