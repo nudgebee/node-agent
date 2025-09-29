@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"math/rand"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -261,23 +262,35 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 	if t == nil || method == "" {
 		return
 	}
-	if host == "" {
-		host = t.destination.String()
+	
+	// Use destination hostname for external services, fallback to provided host
+	requestHost := sanitizeUTF8(host)
+	if host == "" || isIPAddress(host) {
+		// Use destination hostname if host is empty or an IP address
+		if t.destination != nil {
+			requestHost = sanitizeUTF8(t.destination.String())
+		}
 	}
+	
 	requestPayload := sanitizeUTF8(payload)
 	requestHeaders := ""
 	responsePayload := sanitizeUTF8(response)
 	requestPath := sanitizeUTF8(path)
-	requestHost := sanitizeUTF8(host)
 
 	if headers != nil {
 		requestHeaders = sanitizeUTF8(l7.ConvertHeadersToBase64String(headers))
 	}
 
+	// Determine protocol based on port or known LLM APIs
+	protocol := "http"
+	if isHTTPSService(requestHost) || t.destination.Port == 443 {
+		protocol = "https"
+	}
+
 	traceId := sanitizeUTF8(t.ExtractTraceId(headers))
 	t.createSpan(sanitizeUTF8(method), duration, status >= 400,
 		traceId,
-		semconv.HTTPURL(fmt.Sprintf("http://%s%s", requestHost, requestPath)),
+		semconv.HTTPURL(fmt.Sprintf("%s://%s%s", protocol, requestHost, requestPath)),
 		semconv.HTTPMethod(sanitizeUTF8(method)),
 		semconv.HTTPStatusCode(int(status)),
 		semconv.HTTPRequestContentLength(int(requestSize)),
@@ -405,4 +418,33 @@ func (t *Trace) ZookeeperRequest(op string, args string, status l7.Status, durat
 		semconv.DBStatementKey.String(sanitizeUTF8(statement)),
 		attribute.Key("zookeeper.status_code").Int(int(status)),
 	)
+}
+
+// isIPAddress checks if a string is an IP address
+func isIPAddress(host string) bool {
+	return net.ParseIP(host) != nil
+}
+
+// isHTTPSService checks if a hostname is known to use HTTPS
+func isHTTPSService(host string) bool {
+	// Common LLM API services that use HTTPS
+	httpsServices := []string{
+		"api.openai.com",
+		"api.anthropic.com",
+		"api.cohere.ai",
+		"api.cohere.com", 
+		"generativelanguage.googleapis.com",
+		"ai.googleapis.com",
+		"aiplatform.googleapis.com",
+		"claude.ai",
+	}
+	
+	hostLower := strings.ToLower(host)
+	for _, service := range httpsServices {
+		if strings.Contains(hostLower, service) {
+			return true
+		}
+	}
+	
+	return false
 }

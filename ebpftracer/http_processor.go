@@ -224,9 +224,9 @@ func (hp *HTTPProcessor) sanitizeForUTF8(data []byte, dataType string) string {
 		return ""
 	}
 	
-	// Check for binary data patterns
+	// Check for binary data patterns - return empty instead of [BINARY] label
 	if hp.isBinaryData(data) {
-		return fmt.Sprintf("[BINARY %s DATA: %d bytes]", strings.ToUpper(dataType), len(data))
+		return ""
 	}
 	
 	// Convert to string and handle invalid UTF-8

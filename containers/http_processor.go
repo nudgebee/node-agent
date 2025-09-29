@@ -5,8 +5,10 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
+	"github.com/coroot/coroot-node-agent/flags"
 )
 
 // HTTPRequestContext provides minimal HTTP request context for existing code compatibility
@@ -17,6 +19,10 @@ type HTTPRequestContext struct {
 	Host    string
 	TraceID string
 	Headers http.Header
+
+	// Separated HTTP components
+	HTTPBody     string // Just the HTTP body/payload without headers
+	HTTPResponse string // Just the HTTP response body without headers
 
 	// Encoded payloads for compatibility
 	PayloadBase64  string
@@ -55,7 +61,7 @@ func NewHTTPRequestProcessor(r *l7.RequestData, conn *ActiveConnection) *HTTPReq
 	return ctx
 }
 
-// parseHTTPRequest extracts basic HTTP information
+// parseHTTPRequest extracts basic HTTP information and separates headers from body
 func (ctx *HTTPRequestContext) parseHTTPRequest() {
 	if len(ctx.RawPayload) == 0 {
 		return
@@ -64,9 +70,30 @@ func (ctx *HTTPRequestContext) parseHTTPRequest() {
 	// Initialize headers map
 	ctx.Headers = make(http.Header)
 
+	// Check if payload contains binary data - if so, skip parsing
+	if !isValidHTTPData(ctx.RawPayload) {
+		// For binary data, set empty values instead of invalid parsing results
+		ctx.Method = ""
+		ctx.Path = ""
+		ctx.Host = ""
+		ctx.HTTPBody = ""
+		return
+	}
+
+	// Build sensitive headers map from flags
+	sensitiveHeaders := make(map[string]bool)
+	if flags.SensitiveHeader != nil {
+		sensitiveKeysList := strings.Split(*flags.SensitiveHeader, ",")
+		for _, key := range sensitiveKeysList {
+			sensitiveHeaders[strings.ToLower(strings.TrimSpace(key))] = true
+		}
+	}
+
 	// Convert to string safely
 	payload := string(ctx.RawPayload)
 	lines := strings.Split(payload, "\n")
+	
+	headerEndIndex := 0
 	
 	if len(lines) > 0 {
 		// Parse request line: "METHOD /path HTTP/1.1"
@@ -76,11 +103,13 @@ func (ctx *HTTPRequestContext) parseHTTPRequest() {
 			ctx.Path = parts[1]
 		}
 
-		// Parse headers
-		for _, line := range lines[1:] {
+		// Parse headers and find where they end
+		for i, line := range lines[1:] {
 			line = strings.TrimSpace(line)
 			if line == "" {
-				break // End of headers
+				// Empty line marks end of headers
+				headerEndIndex = i + 2 // +1 for skipping first line, +1 for current line
+				break
 			}
 			
 			if colonIdx := strings.Index(line, ":"); colonIdx != -1 {
@@ -88,23 +117,37 @@ func (ctx *HTTPRequestContext) parseHTTPRequest() {
 				headerValue := strings.TrimSpace(line[colonIdx+1:])
 				
 				if headerName != "" {
-					ctx.Headers.Set(headerName, headerValue)
-					
-					// Extract Host specifically
+					// Extract Host specifically (before sanitization)
 					if strings.ToLower(headerName) == "host" {
 						ctx.Host = headerValue
 					}
+					
+					// Apply sanitization if needed
+					if sensitiveHeaders[strings.ToLower(headerName)] {
+						headerValue = l7.SanitizeString(headerValue)
+					}
+					
+					ctx.Headers.Set(headerName, headerValue)
 				}
 			}
+		}
+		
+		// Extract HTTP body (everything after headers)
+		if headerEndIndex > 0 && headerEndIndex < len(lines) {
+			bodyLines := lines[headerEndIndex:]
+			ctx.HTTPBody = strings.Join(bodyLines, "\n")
 		}
 	}
 }
 
-// encodePayloads encodes raw payloads to base64 for compatibility
+// encodePayloads encodes payloads to base64 for compatibility
 func (ctx *HTTPRequestContext) encodePayloads() {
-	if len(ctx.RawPayload) > 0 {
-		ctx.PayloadBase64 = base64.StdEncoding.EncodeToString(ctx.RawPayload)
+	// For request: encode just the HTTP body (without headers)
+	if ctx.HTTPBody != "" {
+		ctx.PayloadBase64 = base64.StdEncoding.EncodeToString([]byte(ctx.HTTPBody))
 	}
+	
+	// For response: keep legacy format (full response)
 	if len(ctx.RawResponse) > 0 {
 		ctx.ResponseBase64 = base64.StdEncoding.EncodeToString(ctx.RawResponse)
 	}
@@ -189,4 +232,41 @@ func (ctx *HTTPRequestContext) GetLLMProvider() LLMProvider {
 	default:
 		return ProviderUnknown
 	}
+}
+
+// isValidHTTPData checks if the data looks like valid HTTP request data
+func isValidHTTPData(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	
+	// Must be valid UTF-8
+	if !utf8.Valid(data) {
+		return false
+	}
+	
+	// Convert to string and check for HTTP method patterns
+	text := string(data)
+	lines := strings.Split(text, "\n")
+	if len(lines) == 0 {
+		return false
+	}
+	
+	// First line should look like "METHOD /path HTTP/1.1"
+	firstLine := strings.TrimSpace(lines[0])
+	if firstLine == "" {
+		return false
+	}
+	
+	// Check for common HTTP methods
+	httpMethods := []string{"GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD", "CONNECT", "TRACE"}
+	for _, method := range httpMethods {
+		if strings.HasPrefix(firstLine, method+" ") {
+			parts := strings.Fields(firstLine)
+			// Should have at least "METHOD /path HTTP/version"
+			return len(parts) >= 3 && strings.HasPrefix(parts[2], "HTTP/")
+		}
+	}
+	
+	return false
 }
