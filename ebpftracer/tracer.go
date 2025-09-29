@@ -100,10 +100,11 @@ type Tracer struct {
 	hostNetNs        netns.NsHandle
 	selfNetNs        netns.NsHandle
 
-	collection *ebpf.Collection
-	readers    map[string]*perf.Reader
-	links      []link.Link
-	uprobes    map[string]*ebpf.Program
+	collection   *ebpf.Collection
+	readers      map[string]*perf.Reader
+	links        []link.Link
+	uprobes      map[string]*ebpf.Program
+	httpProcessor *HTTPProcessor // Complete HTTP data processor
 }
 
 func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool) *Tracer {
@@ -115,8 +116,9 @@ func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool) *Trac
 		hostNetNs:        hostNetNs,
 		selfNetNs:        selfNetNs,
 
-		readers: map[string]*perf.Reader{},
-		uprobes: map[string]*ebpf.Program{},
+		readers:       map[string]*perf.Reader{},
+		uprobes:       map[string]*ebpf.Program{},
+		httpProcessor: NewHTTPProcessor(), // Initialize complete HTTP processor
 	}
 }
 
@@ -271,7 +273,7 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 			return fmt.Errorf("failed to create ebpf reader: %w", err)
 		}
 		t.readers[pm.name] = r
-		go runEventsReader(pm.name, r, ch, pm.typ, pm.readTimeout)
+		go runEventsReader(pm.name, r, ch, pm.typ, pm.readTimeout, t.httpProcessor)
 	}
 
 	for _, programSpec := range collectionSpec.Programs {
@@ -392,6 +394,10 @@ type l7Event struct {
 	StatementId         uint32
 	PayloadSize         uint64
 	ResponseSize        uint64
+	RequestBufferAddr   uint64 // Buffer address for complete request data
+	ResponseBufferAddr  uint64 // Buffer address for complete response data
+	RequestDataSize     uint32 // Actual size of request data
+	ResponseDataSize    uint32 // Actual size of response data
 	Payload             [5120]byte // Must match MAX_PAYLOAD_SIZE in eBPF
 	Response            [5120]byte // Must match MAX_PAYLOAD_SIZE in eBPF
 }
@@ -409,7 +415,7 @@ type httpResponseFragment struct {
 	Data                [2048]byte // Must match HTTP_FRAGMENT_SIZE in eBPF
 }
 
-func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapType, readTimeout time.Duration) {
+func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapType, readTimeout time.Duration, httpProcessor *HTTPProcessor) {
 	if readTimeout == 0 {
 		readTimeout = 100 * time.Millisecond
 	}
@@ -438,27 +444,36 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 				continue
 			}
 
-			// Extract payload data directly from the struct arrays
-			payloadSize := min(int(v.PayloadSize), len(v.Payload))
-			responseSize := min(int(v.ResponseSize), len(v.Response))
+			// Use HTTP processor for complete data processing
+			req, err := httpProcessor.ProcessL7Event(v)
+			if err != nil {
+				klog.Warningf("failed to process L7 event: %v", err)
+				continue
+			}
+			
+			// Skip if not HTTP or processing failed
+			if req == nil {
+				// Fall back to original processing for non-HTTP protocols
+				payloadSize := min(int(v.PayloadSize), len(v.Payload))
+				responseSize := min(int(v.ResponseSize), len(v.Response))
 
-			// Copy the actual data (preventing garbage from unused buffer space)
-			payloadData := make([]byte, payloadSize)
-			copy(payloadData, v.Payload[:payloadSize])
+				payloadData := make([]byte, payloadSize)
+				copy(payloadData, v.Payload[:payloadSize])
 
-			responseData := make([]byte, responseSize)
-			copy(responseData, v.Response[:responseSize])
+				responseData := make([]byte, responseSize)
+				copy(responseData, v.Response[:responseSize])
 
-			req := &l7.RequestData{
-				Protocol:     l7.Protocol(v.Protocol),
-				Status:       l7.Status(v.Status),
-				Duration:     time.Duration(v.Duration),
-				Method:       l7.Method(v.Method),
-				StatementId:  v.StatementId,
-				PayloadSize:  v.PayloadSize,
-				ResponseSize: v.ResponseSize,
-				Payload:      payloadData,
-				Response:     responseData,
+				req = &l7.RequestData{
+					Protocol:     l7.Protocol(v.Protocol),
+					Status:       l7.Status(v.Status),
+					Duration:     time.Duration(v.Duration),
+					Method:       l7.Method(v.Method),
+					StatementId:  v.StatementId,
+					PayloadSize:  v.PayloadSize,
+					ResponseSize: v.ResponseSize,
+					Payload:      payloadData,
+					Response:     responseData,
+				}
 			}
 
 			event = Event{

@@ -97,6 +97,10 @@ struct l7_event {
     __u32 statement_id;
     __u64 payload_size;
     __u64 response_size;
+    __u64 request_buffer_addr;  // Buffer address for complete request data
+    __u64 response_buffer_addr; // Buffer address for complete response data
+    __u32 request_data_size;    // Actual size of request data
+    __u32 response_data_size;   // Actual size of response data
     char payload[MAX_PAYLOAD_SIZE];
     char response[MAX_PAYLOAD_SIZE];
 };
@@ -326,6 +330,8 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
     req->request_id = 0;
     req->ns = 0;
     req->payload_size = size;
+    req->buffer_addr = (__u64)buf;  // Store original buffer address
+    req->data_size = (__u32)size;              // Store actual data size
     struct l7_request_key k = {};
     k.pid = cid.pid;
     k.fd = cid.fd;
@@ -566,6 +572,10 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
 
     e->protocol = req->protocol;
     e->payload_size = req->payload_size;
+    e->request_buffer_addr = req->buffer_addr;      // Request buffer address
+    e->request_data_size = req->data_size;          // Request data size
+    e->response_buffer_addr = (__u64)args->buf;  // Response buffer address
+    e->response_data_size = (__u32)ret;             // Response data size
     COPY_PAYLOAD(e->payload, req->payload_size, req->payload);
     if (e->protocol == PROTOCOL_HTTP) {
         response = is_http_response(payload, &e->status);

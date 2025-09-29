@@ -97,6 +97,9 @@ struct l7_request {
     __u8 request_type;
     __s32 request_id;
     __u64 payload_size;
+    __u64 buffer_addr;  // Buffer address for complete request data
+    __u32 data_size;    // Actual size of request data
+    __u32 padding;      // Alignment padding
     char payload[MAX_PAYLOAD_SIZE];
 };
 
