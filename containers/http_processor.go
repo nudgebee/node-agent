@@ -2,6 +2,7 @@ package containers
 
 import (
 	"encoding/base64"
+	"net/http"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ type HTTPRequestContext struct {
 	Path    string
 	Host    string
 	TraceID string
+	Headers http.Header
 
 	// Encoded payloads for compatibility
 	PayloadBase64  string
@@ -59,6 +61,9 @@ func (ctx *HTTPRequestContext) parseHTTPRequest() {
 		return
 	}
 
+	// Initialize headers map
+	ctx.Headers = make(http.Header)
+
 	// Convert to string safely
 	payload := string(ctx.RawPayload)
 	lines := strings.Split(payload, "\n")
@@ -71,12 +76,25 @@ func (ctx *HTTPRequestContext) parseHTTPRequest() {
 			ctx.Path = parts[1]
 		}
 
-		// Extract Host header
+		// Parse headers
 		for _, line := range lines[1:] {
 			line = strings.TrimSpace(line)
-			if strings.HasPrefix(strings.ToLower(line), "host:") {
-				ctx.Host = strings.TrimSpace(line[5:])
-				break
+			if line == "" {
+				break // End of headers
+			}
+			
+			if colonIdx := strings.Index(line, ":"); colonIdx != -1 {
+				headerName := strings.TrimSpace(line[:colonIdx])
+				headerValue := strings.TrimSpace(line[colonIdx+1:])
+				
+				if headerName != "" {
+					ctx.Headers.Set(headerName, headerValue)
+					
+					// Extract Host specifically
+					if strings.ToLower(headerName) == "host" {
+						ctx.Host = headerValue
+					}
+				}
 			}
 		}
 	}
@@ -94,30 +112,81 @@ func (ctx *HTTPRequestContext) encodePayloads() {
 
 // extractTraceID attempts to extract trace ID from headers
 func (ctx *HTTPRequestContext) extractTraceID() {
-	if len(ctx.RawPayload) == 0 {
+	if ctx.Headers == nil {
 		return
 	}
 
-	// Convert to string safely
-	payload := string(ctx.RawPayload)
-	lines := strings.Split(payload, "\n")
-
-	// Look for common trace ID headers
+	// Look for common trace ID headers in parsed headers
 	traceHeaders := []string{
-		"x-trace-id:",
-		"x-request-id:",
-		"traceparent:",
-		"x-amzn-trace-id:",
-		"x-correlation-id:",
+		"X-Trace-Id",
+		"X-Request-Id", 
+		"Traceparent",
+		"X-Amzn-Trace-Id",
+		"X-Correlation-Id",
 	}
 
-	for _, line := range lines {
-		line = strings.TrimSpace(strings.ToLower(line))
-		for _, header := range traceHeaders {
-			if strings.HasPrefix(line, header) {
-				ctx.TraceID = strings.TrimSpace(line[len(header):])
-				return
-			}
+	for _, header := range traceHeaders {
+		if value := ctx.Headers.Get(header); value != "" {
+			ctx.TraceID = value
+			return
 		}
+	}
+}
+
+// IsLLMRequest checks if this is a request to an LLM provider
+func (ctx *HTTPRequestContext) IsLLMRequest() bool {
+	if ctx.Host == "" && ctx.Path == "" {
+		return false
+	}
+
+	// Common LLM API patterns
+	llmPatterns := []string{
+		"api.openai.com",
+		"api.anthropic.com", 
+		"api.cohere.ai",
+		"generativelanguage.googleapis.com",
+		"bedrock",
+		"azure.com/openai",
+		"/v1/chat/completions",
+		"/v1/completions",
+		"/v1/messages",
+	}
+
+	hostLower := strings.ToLower(ctx.Host)
+	pathLower := strings.ToLower(ctx.Path)
+
+	for _, pattern := range llmPatterns {
+		if strings.Contains(hostLower, pattern) || strings.Contains(pathLower, pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// GetLLMProvider attempts to identify the LLM provider
+func (ctx *HTTPRequestContext) GetLLMProvider() string {
+	if !ctx.IsLLMRequest() {
+		return ""
+	}
+
+	hostLower := strings.ToLower(ctx.Host)
+	pathLower := strings.ToLower(ctx.Path)
+
+	switch {
+	case strings.Contains(hostLower, "openai.com") || strings.Contains(hostLower, "azure.com/openai"):
+		return "openai"
+	case strings.Contains(hostLower, "anthropic.com"):
+		return "anthropic"
+	case strings.Contains(hostLower, "cohere"):
+		return "cohere"
+	case strings.Contains(hostLower, "googleapis.com"):
+		return "google"
+	case strings.Contains(hostLower, "bedrock"):
+		return "aws-bedrock"
+	case strings.Contains(pathLower, "/v1/chat/completions") || strings.Contains(pathLower, "/v1/completions"):
+		return "openai-compatible"
+	default:
+		return "unknown"
 	}
 }
