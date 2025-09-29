@@ -25,6 +25,31 @@ func safeString(data []byte) string {
 	return string(data)
 }
 
+// isValidHeaderKey checks if a string is a valid HTTP header key
+func isValidHeaderKey(key string) bool {
+	if len(key) == 0 {
+		return false
+	}
+	
+	// Check for non-printable characters or base64 prefix
+	if strings.HasPrefix(key, "base64:") {
+		return false
+	}
+	
+	// HTTP header keys should only contain printable ASCII characters
+	for _, r := range key {
+		if r < 33 || r > 126 {
+			return false
+		}
+		// Header keys shouldn't contain certain characters
+		if r == ':' || r == ' ' || r == '\t' {
+			return false
+		}
+	}
+	
+	return true
+}
+
 func ParseHttp(payload []byte) (string, string) {
 	method, rest, ok := bytes.Cut(payload, space)
 	if !ok {
@@ -94,15 +119,32 @@ func ParseHTTPRequest(data []byte) (*http.Request, error) {
 		sensitiveHeaders[strings.ToLower(strings.TrimSpace(key))] = true
 	}
 	for _, line := range headerLines {
+		// Skip empty lines
+		if len(line) == 0 {
+			continue
+		}
+		
+		// Stop processing if we encounter binary data (invalid UTF-8)
+		if !utf8.Valid(line) {
+			break
+		}
+		
 		part1, part2, ok := bytes.Cut(line, []byte(":"))
 		if !ok {
 			continue
 		}
-		if strings.HasPrefix(safeString(part1), "Host") {
+		
+		// Skip if header key contains binary data or non-printable characters
+		keyStr := strings.TrimSpace(safeString(part1))
+		if !isValidHeaderKey(keyStr) {
+			continue
+		}
+		
+		if strings.HasPrefix(keyStr, "Host") {
 			host = strings.TrimSpace(safeString(part2))
 		}
 
-		key := strings.TrimSpace(safeString(part1))
+		key := keyStr
 		val := strings.TrimSpace(safeString(part2))
 		if sensitiveHeaders[strings.ToLower(key)] {
 			val = SanitizeString(val)
@@ -246,15 +288,28 @@ func ParseHTTPResponse(data []byte) (*http.Response, error) {
 	}
 
 	for _, line := range headerLines {
+		// Skip empty lines
 		if len(line) == 0 {
 			continue
 		}
+		
+		// Stop processing if we encounter binary data (invalid UTF-8)
+		if !utf8.Valid(line) {
+			break
+		}
+		
 		key, value, ok := bytes.Cut(line, []byte(":"))
 		if !ok {
 			continue
 		}
 
 		keyStr := strings.TrimSpace(safeString(key))
+		
+		// Skip if header key contains binary data or non-printable characters
+		if !isValidHeaderKey(keyStr) {
+			continue
+		}
+		
 		valueStr := strings.TrimSpace(safeString(value))
 		
 		if sensitiveHeaders[strings.ToLower(keyStr)] {
