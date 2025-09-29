@@ -13,11 +13,13 @@ import (
 type LLMProvider string
 
 const (
-	ProviderOpenAI    LLMProvider = "openai"
-	ProviderAnthropic LLMProvider = "anthropic"
-	ProviderGoogle    LLMProvider = "google"
-	ProviderCohere    LLMProvider = "cohere"
-	ProviderUnknown   LLMProvider = "unknown"
+	ProviderOpenAI         LLMProvider = "openai"
+	ProviderAnthropic      LLMProvider = "anthropic"
+	ProviderGoogle         LLMProvider = "google"
+	ProviderCohere         LLMProvider = "cohere"
+	ProviderAWSBedrock     LLMProvider = "aws-bedrock"
+	ProviderOpenAICompatible LLMProvider = "openai-compatible"
+	ProviderUnknown        LLMProvider = "unknown"
 )
 
 // LLMRequest represents parsed LLM request data

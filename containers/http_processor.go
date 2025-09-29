@@ -165,9 +165,9 @@ func (ctx *HTTPRequestContext) IsLLMRequest() bool {
 }
 
 // GetLLMProvider attempts to identify the LLM provider
-func (ctx *HTTPRequestContext) GetLLMProvider() string {
+func (ctx *HTTPRequestContext) GetLLMProvider() LLMProvider {
 	if !ctx.IsLLMRequest() {
-		return ""
+		return ProviderUnknown
 	}
 
 	hostLower := strings.ToLower(ctx.Host)
@@ -175,18 +175,18 @@ func (ctx *HTTPRequestContext) GetLLMProvider() string {
 
 	switch {
 	case strings.Contains(hostLower, "openai.com") || strings.Contains(hostLower, "azure.com/openai"):
-		return "openai"
+		return ProviderOpenAI
 	case strings.Contains(hostLower, "anthropic.com"):
-		return "anthropic"
+		return ProviderAnthropic
 	case strings.Contains(hostLower, "cohere"):
-		return "cohere"
+		return ProviderCohere
 	case strings.Contains(hostLower, "googleapis.com"):
-		return "google"
+		return ProviderGoogle
 	case strings.Contains(hostLower, "bedrock"):
-		return "aws-bedrock"
+		return ProviderAWSBedrock
 	case strings.Contains(pathLower, "/v1/chat/completions") || strings.Contains(pathLower, "/v1/completions"):
-		return "openai-compatible"
+		return ProviderOpenAICompatible
 	default:
-		return "unknown"
+		return ProviderUnknown
 	}
 }
