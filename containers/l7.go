@@ -28,6 +28,12 @@ func (s L7Stats) observe(protocol l7.Protocol, status, method string, duration t
 	s.ensureInitialized(protocol)
 
 	actualDestWorkload := key.GetActualDestinationWorkload()
+	
+	// Convert HTTP2 to HTTP for metrics (same as ensureInitialized)
+	metricsProtocol := protocol
+	if protocol == l7.ProtocolHTTP2 {
+		metricsProtocol = l7.ProtocolHTTP
+	}
 
 	// Base labels that all protocols use
 	labelValues := []string{
@@ -52,8 +58,8 @@ func (s L7Stats) observe(protocol l7.Protocol, status, method string, duration t
 		labelValues = append(labelValues, "")
 	}
 
-	// Protocol-specific labels
-	switch protocol {
+	// Protocol-specific labels (use metricsProtocol, not original protocol)
+	switch metricsProtocol {
 	case l7.ProtocolRabbitmq, l7.ProtocolNats:
 		labelValues = append(labelValues, method)
 	case l7.ProtocolHTTP:
