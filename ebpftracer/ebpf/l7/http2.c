@@ -21,21 +21,6 @@ int is_server_preface(__u8 frame_type, __u32 stream_id, __u8 method) {
 
 static __always_inline
 int looks_like_http2_frame(char *buf, __u64 size, __u8 method) {
-    // Reject obvious HTTP/1.1 patterns first
-    if (size > 4) {
-        char prefix[5];
-        bpf_read(buf, prefix);
-        // Check for HTTP/1.1 method patterns: GET, POST, PUT, etc.
-        if ((prefix[0] == 'G' && prefix[1] == 'E' && prefix[2] == 'T' && prefix[3] == ' ') ||
-            (prefix[0] == 'P' && prefix[1] == 'O' && prefix[2] == 'S' && prefix[3] == 'T' && prefix[4] == ' ') ||
-            (prefix[0] == 'P' && prefix[1] == 'U' && prefix[2] == 'T' && prefix[3] == ' ') ||
-            (prefix[0] == 'D' && prefix[1] == 'E' && prefix[2] == 'L' && prefix[3] == 'E') ||
-            (prefix[0] == 'H' && prefix[1] == 'E' && prefix[2] == 'A' && prefix[3] == 'D') ||
-            (prefix[0] == 'O' && prefix[1] == 'P' && prefix[2] == 'T' && prefix[3] == 'I')) {
-            return 0; // This is HTTP/1.1, not HTTP/2
-        }
-    }
-    
     __u32 frame_length;
     bpf_read(buf, frame_length);
     frame_length = bpf_htonl(frame_length) >> 8;

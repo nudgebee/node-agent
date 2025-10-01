@@ -32,41 +32,15 @@
     size = MIN(size, MAX_PAYLOAD_SIZE-1);                               \
     asm volatile ("%0 &= %1" : "+r"(size) : "i"(MAX_PAYLOAD_SIZE-1));   \
 })
-
-static inline __attribute__((__always_inline__))
-__u64 utf8_safe_truncate(__u64 size) {
-    // If we're not truncating, return as-is
-    if (size < MAX_PAYLOAD_SIZE - 1) {
-        return size;
-    }
-    
-    // Start from the maximum safe size and work backwards
-    __u64 safe_size = MAX_PAYLOAD_SIZE - 1;
-    
-    // Look for the start of a UTF-8 character within the last 4 bytes
-    // UTF-8 continuation bytes start with 10xxxxxx (0x80-0xBF)
-    // We need to find a byte that's NOT a continuation byte
-    for (int i = 0; i < 4 && safe_size > 0; i++) {
-        safe_size--;
-        // In eBPF, we can't easily inspect the actual bytes without additional reads
-        // So we'll use a conservative approach: back off by up to 4 bytes
-        // to ensure we don't split a UTF-8 character (max 4 bytes in UTF-8)
-    }
-    
-    return safe_size;
-}
-
-#define COPY_PAYLOAD(dst, size, src) ({         \
-    TRUNCATE_PAYLOAD_SIZE(size);                \
-    size = utf8_safe_truncate(size);            \
-    if (bpf_probe_read(dst, size, src)) {       \
-        return 0;                               \
-    }                                           \
+#define COPY_PAYLOAD(dst, size, src) ({     \
+    TRUNCATE_PAYLOAD_SIZE(size);            \
+    if (bpf_probe_read(dst, size, src)) {   \
+        return 0;                           \
+    }                                       \
 })
 
 #define IOVEC_BUF_SIZE MAX_PAYLOAD_SIZE * 2  // must be double of MAX_PAYLOAD_SIZE
 #define MAX_IOVEC_SIZE 32
-
 
 #include "http.c"
 #include "postgres.c"
@@ -96,11 +70,8 @@ struct l7_event {
     __u16 padding;
     __u32 statement_id;
     __u64 payload_size;
-    __u64 response_size;
     char payload[MAX_PAYLOAD_SIZE];
-    char response[MAX_PAYLOAD_SIZE];
 };
-
 
 struct {
      __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -114,7 +85,6 @@ struct {
     __uint(key_size, sizeof(int));
     __uint(value_size, sizeof(int));
 } l7_events SEC(".maps");
-
 
 struct read_args {
     __u64 fd;
@@ -141,9 +111,8 @@ struct {
      __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
      __type(key, int);
      __type(value, char[IOVEC_BUF_SIZE]);
-     __uint(max_entries, 64);
+     __uint(max_entries, 1);
 } iovec_buf_heap SEC(".maps");
-
 
 struct trace_event_raw_sys_enter_rw__stub {
     __u64 unused;
@@ -176,82 +145,6 @@ void send_event(void *ctx, struct l7_event *e, struct connection_id cid, struct 
     bpf_perf_event_output(ctx, &l7_events, BPF_F_CURRENT_CPU, e, sizeof(*e));
 }
 
-// HTTP utility functions
-static inline __attribute__((__always_inline__))
-__u32 parse_http_content_length(char *response, __u32 size) {
-    // Look for "Content-Length: NNNN" in HTTP headers
-    char cl_pattern[] = "Content-Length:";
-    __u32 cl_len = 15; // Length of "Content-Length:"
-    
-    #pragma unroll
-    for (__u32 i = 0; i < MIN(size - cl_len, 1024); i++) {
-        if (response[i] == 'C' || response[i] == 'c') {
-            __u8 match = 1;
-            #pragma unroll
-            for (int j = 0; j < cl_len; j++) {
-                if (i + j >= size) {
-                    match = 0;
-                    break;
-                }
-                char c1 = response[i + j];
-                char c2 = cl_pattern[j];
-                // Case insensitive comparison
-                if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
-                if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
-                if (c1 != c2) {
-                    match = 0;
-                    break;
-                }
-            }
-            if (match) {
-                // Found Content-Length header, parse the number
-                __u32 start = i + cl_len;
-                while (start < size && response[start] == ' ') start++;
-                
-                __u32 content_length = 0;
-                #pragma unroll
-                for (int k = 0; k < 10; k++) { // Max 10 digits
-                    if (start + k >= size) break;
-                    char digit = response[start + k];
-                    if (digit >= '0' && digit <= '9') {
-                        content_length = content_length * 10 + (digit - '0');
-                    } else {
-                        break;
-                    }
-                }
-                return content_length;
-            }
-        }
-    }
-    return 0;
-}
-
-static inline __attribute__((__always_inline__))
-__u16 parse_http_status(char *response, __u32 size) {
-    // Look for "HTTP/1.x NNN" or "HTTP/2 NNN" pattern
-    if (size < 12) return 0;
-    
-    // Check for HTTP response pattern
-    if ((size >= 8 && response[0] == 'H' && response[1] == 'T' && 
-         response[2] == 'T' && response[3] == 'P' && response[4] == '/') ||
-        (size >= 8 && response[0] == 'h' && response[1] == 't' &&
-         response[2] == 't' && response[3] == 'p' && response[4] == '/')) {
-        
-        // Find the status code (skip "HTTP/x.x ")
-        __u32 status_pos = 9; // Position after "HTTP/1.1 "
-        if (size >= status_pos + 3) {
-            char c1 = response[status_pos];
-            char c2 = response[status_pos + 1];
-            char c3 = response[status_pos + 2];
-            
-            if (c1 >= '1' && c1 <= '5' && c2 >= '0' && c2 <= '9' && c3 >= '0' && c3 <= '9') {
-                return (__u16)((c1 - '0') * 100 + (c2 - '0') * 10 + (c3 - '0'));
-            }
-        }
-    }
-    return 0;
-}
-
 static inline __attribute__((__always_inline__))
 __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_size) {
     struct iovec iov = {};
@@ -263,7 +156,7 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
         if (i >= iovlen) {
             break;
         }
-        if (bpf_probe_read_user(&iov, sizeof(iov), (void *)(iovec+i*sizeof(iov)))) {
+        if (bpf_probe_read(&iov, sizeof(iov), (void *)(iovec+i*sizeof(iov)))) {
             return 0;
         }
         if (iov.size <= 0) {
@@ -274,7 +167,7 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
             size = MIN(iov.size, max-offset);
             TRUNCATE_PAYLOAD_SIZE(size);
             TRUNCATE_PAYLOAD_SIZE(offset);
-            if (bpf_probe_read_user(buf + offset, size, (void *)iov.buf)) {
+            if (bpf_probe_read(buf + offset, size, (void *)iov.buf)) {
                 return 0;
             }
             offset += size;
@@ -282,7 +175,6 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
     }
     return offset;
 }
-
 
 static inline __attribute__((__always_inline__))
 int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, __u64 iovlen) {
@@ -300,9 +192,7 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
 
     char* payload = buf;
     if (iovlen) {
-        // Use connection-specific buffer key to avoid collisions
-        int buffer_key = (cid.pid ^ cid.fd) & 63;  // Simple XOR hash to [0-63]
-        payload = bpf_map_lookup_elem(&iovec_buf_heap, &buffer_key);
+        payload = bpf_map_lookup_elem(&iovec_buf_heap, &zero);
         if (!payload) {
             return 0;
         }
@@ -475,7 +365,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
         return 0;
     }
     if (args->ret) {
-        if (bpf_probe_read_user(&ret, sizeof(ret), (void*)args->ret)) {
+        if (bpf_probe_read(&ret, sizeof(ret), (void*)args->ret)) {
             return 0;
         };
         if (ret <= 0) {
@@ -486,12 +376,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     int zero = 0;
     char* payload = args->buf;
     if (args->iovlen) {
-        // Use connection-specific buffer key to avoid collisions
-        struct connection_id buffer_cid = {};
-        buffer_cid.pid = pid;
-        buffer_cid.fd = args->fd;
-        int buffer_key = (buffer_cid.pid ^ buffer_cid.fd) & 63;  // Simple XOR hash to [0-63]
-        payload = bpf_map_lookup_elem(&iovec_buf_heap, &buffer_key);
+        payload = bpf_map_lookup_elem(&iovec_buf_heap, &zero);
         if (!payload) {
             return 0;
         }
@@ -515,8 +400,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     e->method = METHOD_UNKNOWN;
     e->statement_id = 0;
     e->payload_size = 0;
-    e->response_size = ret;
-    COPY_PAYLOAD(e->response, ret, payload);
+
     if (is_rabbitmq_consume(payload, ret)) {
         e->protocol = PROTOCOL_RABBITMQ;
         e->method = METHOD_CONSUME;
@@ -632,7 +516,7 @@ int sys_enter_writev(struct trace_event_raw_sys_enter_rw__stub* ctx) {
 SEC("tracepoint/syscalls/sys_enter_sendmsg")
 int sys_enter_sendmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     struct user_msghdr msghdr = {};
-    if (bpf_probe_read_user(&msghdr, sizeof(msghdr), (void *)ctx->buf)) {
+    if (bpf_probe_read(&msghdr, sizeof(msghdr), (void *)ctx->buf)) {
         return 0;
     }
     return trace_enter_write(ctx, ctx->fd, 0, (char*)msghdr.msg_iov, 0, msghdr.msg_iovlen);
@@ -652,7 +536,7 @@ int sys_enter_sendmmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
             break;
         }
         struct mmsghdr h = {};
-        if (bpf_probe_read_user(&h , sizeof(h), (void *)(ctx->buf + offset))) {
+        if (bpf_probe_read(&h , sizeof(h), (void *)(ctx->buf + offset))) {
             return 0;
         }
         offset += sizeof(h);
@@ -684,7 +568,7 @@ SEC("tracepoint/syscalls/sys_enter_recvmsg")
 int sys_enter_recvmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     __u64 id = bpf_get_current_pid_tgid();
     struct user_msghdr msghdr = {};
-    if (bpf_probe_read_user(&msghdr, sizeof(msghdr), (void *)ctx->buf)) {
+    if (bpf_probe_read(&msghdr, sizeof(msghdr), (void *)ctx->buf)) {
         return 0;
     }
     __u32 pid = id >> 32;
@@ -725,4 +609,3 @@ int sys_exit_recvfrom(struct trace_event_raw_sys_exit__stub* ctx) {
     __u32 pid = pid_tgid >> 32;
     return trace_exit_read(ctx, pid_tgid, pid, 0, ctx->ret);
 }
-

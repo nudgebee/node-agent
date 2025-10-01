@@ -218,7 +218,7 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		lastConnectionAttempts:   map[common.HostPort]time.Time{},
 		activeConnections:        map[ConnectionKey]*ActiveConnection{},
 		connectionsByPidFd:       map[PidFd]*ActiveConnection{},
-		l7Stats:                  L7Stats{},
+		l7Stats:                  NewL7Stats(),
 		dnsStats:                 &L7Metrics{},
 		llmStats:                 map[string]*LLMStats{},
 
@@ -271,6 +271,8 @@ func (c *Container) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *Container) Collect(ch chan<- prometheus.Metric) {
+	c.registry.updateStatsFromEbpfMapsIfNecessary()
+
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -865,19 +867,14 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		trace = c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown(), conn.srcWorkload, conn.DestinationKey.GetDestinationWorkload(), conn.DestinationKey.GetActualDestinationWorkload())
 	}
 
-	// For HTTP requests, get stats with trace ID from processor
-	var stats *L7Metrics
-
+	// Process L7 requests and update metrics
 	switch r.Protocol {
 	case l7.ProtocolHTTP:
 		// Use new HTTP processor - parse once, use everywhere
 		httpCtx := NewHTTPRequestProcessor(r, conn)
 
-		// Get stats with extracted trace ID
-		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, httpCtx.TraceID)
-
-		// Update stats
-		stats.observe(r.Status.Http(), "", r.Duration)
+		// Update stats with extracted trace ID
+		c.l7Stats.observe(r.Protocol, r.Status.Http(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, httpCtx.TraceID)
 
 		// Debug logging for SSL payload capture (enable via environment variable)
 		if os.Getenv("DEBUG_SSL_PAYLOAD") == "true" {
@@ -897,8 +894,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 				httpCtx.PayloadBase64, httpCtx.Headers, httpCtx.ResponseBase64, httpCtx.Host)
 		}
 	case l7.ProtocolHTTP2:
-		// Get stats with empty trace ID for HTTP/2 (for now)
-		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
+		// HTTP/2 stats will be updated in the loop below
 
 		if conn.http2Parser == nil {
 			conn.http2Parser = l7.NewHttp2Parser()
@@ -910,7 +906,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 				if req.GrpcStatus >= 0 {
 					status = req.GrpcStatus.GRPC()
 				}
-				stats.observe(status, "", req.Duration)
+				c.l7Stats.observe(r.Protocol, status, "", req.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 				if trace != nil {
 					trace.Http2Request(req.Method, req.Path, req.Scheme, req.Status, req.GrpcStatus, req.Duration)
 				}
@@ -941,76 +937,79 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 			}
 		}
 	case l7.ProtocolPostgres:
-		// Get stats with empty trace ID for Postgres
-		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
+		// Update stats for Postgres
 		if r.Method != l7.MethodStatementClose {
-			stats.observe(r.Status.String(), "", r.Duration)
+			c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		}
 		if conn.postgresParser == nil {
 			conn.postgresParser = l7.NewPostgresParser()
 		}
 		query := conn.postgresParser.Parse(r.Payload)
-		trace.PostgresQuery(query, r.Status.Error(), r.Duration)
+		if trace != nil {
+			trace.PostgresQuery(query, r.Status.Error(), r.Duration)
+		}
 	case l7.ProtocolMysql:
-		// Get stats with empty trace ID for MySQL
-		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
+		// Update stats for MySQL
 		if r.Method != l7.MethodStatementClose {
-			stats.observe(r.Status.String(), "", r.Duration)
+			c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		}
 		if conn.mysqlParser == nil {
 			conn.mysqlParser = l7.NewMysqlParser()
 		}
 		query := conn.mysqlParser.Parse(r.Payload, r.StatementId)
-		trace.MysqlQuery(query, r.Status.Error(), r.Duration)
+		if trace != nil {
+			trace.MysqlQuery(query, r.Status.Error(), r.Duration)
+		}
 	case l7.ProtocolMemcached:
-		// Get stats with empty trace ID for Memcached
-		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
-		stats.observe(r.Status.String(), "", r.Duration)
+		// Update stats for Memcached
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		cmd, items := l7.ParseMemcached(r.Payload)
-		trace.MemcachedQuery(cmd, items, r.Status.Error(), r.Duration)
+		if trace != nil {
+			trace.MemcachedQuery(cmd, items, r.Status.Error(), r.Duration)
+		}
 	case l7.ProtocolRedis:
-		// Get stats with empty trace ID for Redis
-		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
-		stats.observe(r.Status.String(), "", r.Duration)
+		// Update stats for Redis
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		cmd, args := l7.ParseRedis(r.Payload)
-		trace.RedisQuery(cmd, args, r.Status.Error(), r.Duration)
+		if trace != nil {
+			trace.RedisQuery(cmd, args, r.Status.Error(), r.Duration)
+		}
 	case l7.ProtocolMongo:
-		// Get stats with empty trace ID for Mongo
-		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
-		stats.observe(r.Status.String(), "", r.Duration)
+		// Update stats for Mongo
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		query := l7.ParseMongo(r.Payload)
-		trace.MongoQuery(query, r.Status.Error(), r.Duration)
+		if trace != nil {
+			trace.MongoQuery(query, r.Status.Error(), r.Duration)
+		}
 	case l7.ProtocolKafka, l7.ProtocolCassandra:
-		// Get stats with empty trace ID for Kafka/Cassandra
-		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
-		stats.observe(r.Status.String(), "", r.Duration)
+		// Update stats for Kafka/Cassandra
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 	case l7.ProtocolRabbitmq, l7.ProtocolNats:
-		// Get stats with empty trace ID for RabbitMQ/Nats
-		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
-		stats.observe(r.Status.String(), r.Method.String(), 0)
+		// Update stats for RabbitMQ/Nats
+		c.l7Stats.observe(r.Protocol, r.Status.String(), r.Method.String(), 0, conn.DestinationKey, conn.srcWorkload, r, "")
 	case l7.ProtocolDubbo2:
-		// Get stats with empty trace ID for Dubbo2
-		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
-		stats.observe(r.Status.String(), "", r.Duration)
+		// Update stats for Dubbo2
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 	case l7.ProtocolClickhouse:
-		// Get stats with empty trace ID for Clickhouse
-		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
-		stats.observe(r.Status.String(), "", r.Duration)
+		// Update stats for Clickhouse
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		query := l7.ParseClickhouse(r.Payload)
-		trace.ClickhouseQuery(query, r.Status.Error(), r.Duration)
+		if trace != nil {
+			trace.ClickhouseQuery(query, r.Status.Error(), r.Duration)
+		}
 	case l7.ProtocolZookeeper:
-		// Get stats with empty trace ID for Zookeeper
-		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
-		stats.observe(r.Status.Zookeeper(), "", r.Duration)
+		// Update stats for Zookeeper
+		c.l7Stats.observe(r.Protocol, r.Status.Zookeeper(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		op, arg := l7.ParseZookeeper(r.Payload)
-		trace.ZookeeperRequest(op, arg, r.Status, r.Duration)
+		if trace != nil {
+			trace.ZookeeperRequest(op, arg, r.Status, r.Duration)
+		}
 	case l7.ProtocolFoundationDB:
-		// Get stats with empty trace ID for FoundationDB
-		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
-		stats.observe(r.Status.String(), "", r.Duration)
+		// Update stats for FoundationDB
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 	default:
-		// For all other protocols, get stats with empty trace ID
-		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey, r, conn.srcWorkload, "")
+		// For all other protocols, update stats
+		c.l7Stats.observe(r.Protocol, "unknown", "", 0, conn.DestinationKey, conn.srcWorkload, r, "")
 	}
 	return nil
 }

@@ -11,114 +11,164 @@ import (
 	"k8s.io/klog/v2"
 )
 
-type L7Metrics struct {
-	Requests *prometheus.CounterVec
-	Latency  prometheus.Histogram
+type L7Stats struct {
+	requests     map[l7.Protocol]*prometheus.CounterVec
+	latency      map[l7.Protocol]*prometheus.HistogramVec
+	initialized  map[l7.Protocol]bool
 }
 
-func (m *L7Metrics) observe(status, method string, duration time.Duration) {
-	if m.Requests != nil {
-		var err error
-		var c prometheus.Counter
-		if method != "" {
-			c, err = m.Requests.GetMetricWithLabelValues(status, method)
+func NewL7Stats() L7Stats {
+	return L7Stats{
+		requests:    make(map[l7.Protocol]*prometheus.CounterVec),
+		latency:     make(map[l7.Protocol]*prometheus.HistogramVec),
+		initialized: make(map[l7.Protocol]bool),
+	}
+}
+
+func (s L7Stats) observe(protocol l7.Protocol, status, method string, duration time.Duration, key common.DestinationKey, srcWorkload common.Workload, r *l7.RequestData, traceId string) {
+	s.ensureInitialized(protocol)
+
+	actualDestWorkload := key.GetActualDestinationWorkload()
+
+	// Base labels that all protocols use
+	labelValues := []string{
+		status,
+		key.DestinationLabelValue(),
+		key.ActualDestinationLabelValue(),
+		key.GetDestinationWorkload().Kind,
+		key.GetDestinationWorkload().Name,
+		key.GetDestinationWorkload().Namespace,
+		srcWorkload.Kind,
+		srcWorkload.Name,
+		srcWorkload.Namespace,
+		actualDestWorkload.Kind,
+		actualDestWorkload.Name,
+		actualDestWorkload.Namespace,
+	}
+
+	// Add trace_id if present
+	if traceId != "" {
+		labelValues = append(labelValues, traceId)
+	} else {
+		labelValues = append(labelValues, "")
+	}
+
+	// Protocol-specific labels
+	switch protocol {
+	case l7.ProtocolRabbitmq, l7.ProtocolNats:
+		labelValues = append(labelValues, method)
+	case l7.ProtocolHTTP:
+		parsedMethod, path := l7.ParseHttp(r.Payload)
+		if ValidUtf8([]byte(path)) {
+			labelValues = append(labelValues, path)
 		} else {
-			c, err = m.Requests.GetMetricWithLabelValues(status)
+			labelValues = append(labelValues, "")
 		}
-		if err != nil {
-			klog.Warningln(err)
+		labelValues = append(labelValues, parsedMethod)
+	}
+
+	// Update counter
+	if counter := s.requests[protocol]; counter != nil {
+		if c, err := counter.GetMetricWithLabelValues(labelValues...); err != nil {
+			klog.Warningln("Error getting counter metric:", err)
 		} else {
 			c.Inc()
 		}
 	}
-	if m.Latency != nil && duration != 0 {
-		m.Latency.Observe(duration.Seconds())
+
+	// Update histogram
+	if histogram := s.latency[protocol]; histogram != nil && duration != 0 {
+		if h, err := histogram.GetMetricWithLabelValues(labelValues...); err != nil {
+			klog.Warningln("Error getting histogram metric:", err)
+		} else {
+			h.Observe(duration.Seconds())
+		}
 	}
 }
 
-type L7Stats map[l7.Protocol]map[common.DestinationKey]*L7Metrics // protocol -> dst:actual_dst -> metrics
-
-func (s L7Stats) get(protocol l7.Protocol, key common.DestinationKey, r *l7.RequestData, srcWorkload common.Workload, traceId string) *L7Metrics {
+func (s L7Stats) ensureInitialized(protocol l7.Protocol) {
+	if s.initialized[protocol] {
+		return
+	}
+	
+	// Convert HTTP2 to HTTP for metrics
+	metricsProtocol := protocol
 	if protocol == l7.ProtocolHTTP2 {
-		protocol = l7.ProtocolHTTP
+		metricsProtocol = l7.ProtocolHTTP
 	}
-	protoStats := s[protocol]
-	if protoStats == nil {
-		protoStats = map[common.DestinationKey]*L7Metrics{}
-		s[protocol] = protoStats
+	
+	// Base labels for all protocols
+	baseLabels := []string{
+		"status",
+		"destination", 
+		"actual_destination",
+		"destination_workload_kind",
+		"destination_workload_name", 
+		"destination_workload_namespace",
+		"src_workload_kind",
+		"src_workload_name",
+		"src_workload_namespace", 
+		"actual_destination_workload_kind",
+		"actual_destination_workload_name",
+		"actual_destination_workload_namespace",
+		"trace_id",
 	}
-	m := protoStats[key]
-	if m == nil {
-		m = &L7Metrics{}
-		protoStats[key] = m
-		actualDestWorkload := key.GetActualDestinationWorkload()
-
-		constLabels := map[string]string{"destination": key.DestinationLabelValue(),
-			"actual_destination":                    key.ActualDestinationLabelValue(),
-			"destination_workload_kind":             key.GetDestinationWorkload().Kind,
-			"destination_workload_name":             key.GetDestinationWorkload().Name,
-			"destination_workload_namespace":        key.GetDestinationWorkload().Namespace,
-			"src_workload_kind":                     srcWorkload.Kind,
-			"src_workload_name":                     srcWorkload.Name,
-			"src_workload_namespace":                srcWorkload.Namespace,
-			"actual_destination_workload_kind":      actualDestWorkload.Kind,
-			"actual_destination_workload_name":      actualDestWorkload.Name,
-			"actual_destination_workload_namespace": actualDestWorkload.Namespace,
-		}
-		if traceId != "" {
-			constLabels["trace_id"] = traceId
-		}
-		labels := []string{"status"}
-		switch protocol {
-		case l7.ProtocolRabbitmq, l7.ProtocolNats:
-			labels = append(labels, "method")
-		case l7.ProtocolHTTP:
-			method, path := l7.ParseHttp(r.Payload)
-			if ValidUtf8([]byte(path)) {
-				constLabels["path"] = path
-			} else {
-				log.Printf("Failed to parse path %s", path)
-			}
-			constLabels["method"] = method
-			hOpts := L7Latency[protocol]
-			m.Latency = prometheus.NewHistogram(
-				prometheus.HistogramOpts{Name: hOpts.Name, Help: hOpts.Help, ConstLabels: constLabels},
-			)
-		default:
-			hOpts := L7Latency[protocol]
-			m.Latency = prometheus.NewHistogram(
-				prometheus.HistogramOpts{Name: hOpts.Name, Help: hOpts.Help, ConstLabels: constLabels},
-			)
-		}
-		cOpts := L7Requests[protocol]
-		m.Requests = prometheus.NewCounterVec(
-			prometheus.CounterOpts{Name: cOpts.Name, Help: cOpts.Help, ConstLabels: constLabels}, labels,
+	
+	// Initialize request counter
+	requestLabels := make([]string, len(baseLabels))
+	copy(requestLabels, baseLabels)
+	
+	// Add protocol-specific labels for requests
+	switch metricsProtocol {
+	case l7.ProtocolRabbitmq, l7.ProtocolNats:
+		requestLabels = append(requestLabels, "method")
+	case l7.ProtocolHTTP:
+		requestLabels = append(requestLabels, "path", "method")
+	}
+	
+	if cOpts, exists := L7Requests[metricsProtocol]; exists {
+		s.requests[protocol] = prometheus.NewCounterVec(
+			prometheus.CounterOpts{Name: cOpts.Name, Help: cOpts.Help},
+			requestLabels,
 		)
 	}
-	return m
+	
+	// Initialize latency histogram
+	histogramLabels := make([]string, len(baseLabels))
+	copy(histogramLabels, baseLabels)
+	
+	// For HTTP, add path and method to histogram labels too
+	if metricsProtocol == l7.ProtocolHTTP {
+		histogramLabels = append(histogramLabels, "path", "method")
+	}
+	
+	if hOpts, exists := L7Latency[metricsProtocol]; exists {
+		s.latency[protocol] = prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{Name: hOpts.Name, Help: hOpts.Help},
+			histogramLabels,
+		)
+	}
+	
+	s.initialized[protocol] = true
 }
 
 func (s L7Stats) collect(ch chan<- prometheus.Metric) {
-	for _, protoStats := range s {
-		for _, m := range protoStats {
-			if m.Requests != nil {
-				m.Requests.Collect(ch)
-			}
-			if m.Latency != nil {
-				m.Latency.Collect(ch)
-			}
+	for _, counterVec := range s.requests {
+		if counterVec != nil {
+			counterVec.Collect(ch)
+		}
+	}
+	for _, histogramVec := range s.latency {
+		if histogramVec != nil {
+			histogramVec.Collect(ch)
 		}
 	}
 }
 
 func (s L7Stats) delete(dst common.HostPort) {
-	for _, protoStats := range s {
-		for d := range protoStats {
-			if d.Destination() == dst {
-				delete(protoStats, d)
-			}
-		}
-	}
+	// With the new architecture, we don't need to delete per-destination metrics
+	// since all metrics are shared across destinations with different label values
+	// This method can be kept for interface compatibility but doesn't need to do anything
 }
 
 func ValidUtf8(payload []byte) bool {
