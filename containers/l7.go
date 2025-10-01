@@ -71,13 +71,6 @@ func (s L7Stats) observe(protocol l7.Protocol, status, method string, duration t
 		actualDestWorkload.Namespace,
 	}
 
-	// Add trace_id if present
-	if traceId != "" {
-		labelValues = append(labelValues, traceId)
-	} else {
-		labelValues = append(labelValues, "")
-	}
-
 	// Protocol-specific labels (use metricsProtocol, not original protocol)
 	switch metricsProtocol {
 	case l7.ProtocolRabbitmq, l7.ProtocolNats:
@@ -139,7 +132,6 @@ func (s L7Stats) ensureInitialized(protocol l7.Protocol) {
 		"actual_destination_workload_kind",
 		"actual_destination_workload_name",
 		"actual_destination_workload_namespace",
-		"trace_id",
 	}
 
 	// Initialize request counter
