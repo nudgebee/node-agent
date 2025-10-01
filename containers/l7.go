@@ -64,6 +64,9 @@ func (s L7Stats) observe(protocol l7.Protocol, status, method string, duration t
 			labelValues = append(labelValues, "")
 		}
 		labelValues = append(labelValues, parsedMethod)
+	case l7.ProtocolDNS:
+		requestType, domain, _ := l7.ParseDns(r.Payload)
+		labelValues = append(labelValues, requestType, common.NormalizeFQDN(domain, requestType))
 	}
 
 	// Update counter
@@ -123,6 +126,8 @@ func (s L7Stats) ensureInitialized(protocol l7.Protocol) {
 		requestLabels = append(requestLabels, "method")
 	case l7.ProtocolHTTP:
 		requestLabels = append(requestLabels, "path", "method")
+	case l7.ProtocolDNS:
+		requestLabels = append(requestLabels, "request_type", "domain")
 	}
 	
 	if cOpts, exists := L7Requests[metricsProtocol]; exists {
@@ -136,9 +141,12 @@ func (s L7Stats) ensureInitialized(protocol l7.Protocol) {
 	histogramLabels := make([]string, len(baseLabels))
 	copy(histogramLabels, baseLabels)
 	
-	// For HTTP, add path and method to histogram labels too
-	if metricsProtocol == l7.ProtocolHTTP {
+	// For HTTP and DNS, add extra labels to histogram
+	switch metricsProtocol {
+	case l7.ProtocolHTTP:
 		histogramLabels = append(histogramLabels, "path", "method")
+	case l7.ProtocolDNS:
+		histogramLabels = append(histogramLabels, "request_type", "domain")
 	}
 	
 	if hOpts, exists := L7Latency[metricsProtocol]; exists {
@@ -168,41 +176,6 @@ func (s L7Stats) delete(dst common.HostPort) {
 	// With the new architecture, we don't need to delete per-destination metrics
 	// since all metrics are shared across destinations with different label values
 	// This method can be kept for interface compatibility but doesn't need to do anything
-}
-
-// L7Metrics for backward compatibility with DNS
-type L7Metrics struct {
-	Requests *prometheus.CounterVec
-	Latency  prometheus.Histogram
-}
-
-func (m *L7Metrics) observe(status, method string, duration time.Duration) {
-	if m.Requests != nil {
-		var err error
-		var c prometheus.Counter
-		if method != "" {
-			c, err = m.Requests.GetMetricWithLabelValues(status, method)
-		} else {
-			c, err = m.Requests.GetMetricWithLabelValues(status)
-		}
-		if err != nil {
-			klog.Warningln(err)
-		} else {
-			c.Inc()
-		}
-	}
-	if m.Latency != nil && duration != 0 {
-		m.Latency.Observe(duration.Seconds())
-	}
-}
-
-func (m *L7Metrics) collect(ch chan<- prometheus.Metric) {
-	if m.Requests != nil {
-		m.Requests.Collect(ch)
-	}
-	if m.Latency != nil {
-		m.Latency.Collect(ch)
-	}
 }
 
 func ValidUtf8(payload []byte) bool {

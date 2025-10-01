@@ -155,7 +155,7 @@ type Container struct {
 	connectionsByPidFd       map[PidFd]*ActiveConnection
 
 	l7Stats  L7Stats
-	dnsStats *L7Metrics
+	
 	llmStats map[string]*LLMStats
 
 	gpuStats map[string]*GpuUsage
@@ -219,7 +219,7 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		activeConnections:        map[ConnectionKey]*ActiveConnection{},
 		connectionsByPidFd:       map[PidFd]*ActiveConnection{},
 		l7Stats:                  NewL7Stats(),
-		dnsStats:                 &L7Metrics{},
+		
 		llmStats:                 map[string]*LLMStats{},
 
 		gpuStats: map[string]*GpuUsage{},
@@ -477,7 +477,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
-	c.dnsStats.collect(ch)
+	
 	c.l7Stats.collect(ch)
 
 	if !*flags.DisablePinger {
@@ -750,50 +750,7 @@ func (c *Container) updateConnectionTrafficStats(ac *ActiveConnection, sent, rec
 	ac.BytesReceived = received
 }
 
-func (c *Container) onDNSRequest(r *l7.RequestData) map[netaddr.IP]*common.Domain {
-	status := r.Status.DNS()
-	if status == "" {
-		return nil
-	}
-	t, fqdn, ips := l7.ParseDns(r.Payload)
-	if t == "" {
-		return nil
-	}
-	fqdn = common.NormalizeFQDN(fqdn, t)
 
-	// To reduce the number of metrics, we ignore AAAA requests with empty results,
-	// as they are typically performed simultaneously with A requests and do not add
-	// any additional latency to the application.
-	if t == "TypeAAAA" && r.Status == 0 && len(ips) == 0 {
-		return nil
-	}
-
-	if c.dnsStats.Requests == nil {
-		dnsReq := L7Requests[l7.ProtocolDNS]
-		c.dnsStats.Requests = prometheus.NewCounterVec(
-			prometheus.CounterOpts{Name: dnsReq.Name, Help: dnsReq.Help},
-			[]string{"request_type", "domain", "status"},
-		)
-	}
-	if m, _ := c.dnsStats.Requests.GetMetricWithLabelValues(t, fqdn, status); m != nil {
-		m.Inc()
-	}
-	if r.Duration != 0 {
-		if c.dnsStats.Latency == nil {
-			dnsLatency := L7Latency[l7.ProtocolDNS]
-			c.dnsStats.Latency = prometheus.NewHistogram(prometheus.HistogramOpts{Name: dnsLatency.Name, Help: dnsLatency.Help})
-		}
-		c.dnsStats.Latency.Observe(r.Duration.Seconds())
-	}
-	ip2fqdn := map[netaddr.IP]*common.Domain{}
-	if fqdn != "" {
-		d := common.NewDomain(fqdn, ips)
-		for _, ip := range ips {
-			ip2fqdn[ip] = d
-		}
-	}
-	return ip2fqdn
-}
 
 func (c *Container) trackLLMRequest(provider LLMProvider, host, payloadBase64, responseBase64 string, duration time.Duration) {
 	// Parse request data
@@ -835,10 +792,6 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	if r.Protocol == l7.ProtocolDNS {
-		return c.onDNSRequest(r)
-	}
-
 	conn := c.connectionsByPidFd[PidFd{Pid: pid, Fd: fd}]
 	if conn == nil {
 		return nil
@@ -864,6 +817,29 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 
 	// Process L7 requests and update metrics
 	switch r.Protocol {
+	case l7.ProtocolDNS:
+		status := r.Status.DNS()
+		if status == "" {
+			return nil
+		}
+		t, fqdn, ips := l7.ParseDns(r.Payload)
+		if t == "" {
+			return nil
+		}
+		// To reduce the number of metrics, we ignore AAAA requests with empty results
+		if t == "TypeAAAA" && r.Status == 0 && len(ips) == 0 {
+			return nil
+		}
+		c.l7Stats.observe(r.Protocol, status, t, r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+
+		ip2fqdn := map[netaddr.IP]*common.Domain{}
+		if fqdn != "" {
+			d := common.NewDomain(common.NormalizeFQDN(fqdn, t), ips)
+			for _, ip := range ips {
+				ip2fqdn[ip] = d
+			}
+		}
+		return ip2fqdn
 	case l7.ProtocolHTTP:
 		// Use new HTTP processor - parse once, use everywhere
 		httpCtx := NewHTTPRequestProcessor(r, conn)
