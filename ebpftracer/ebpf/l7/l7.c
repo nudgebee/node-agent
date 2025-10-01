@@ -292,6 +292,8 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
         COPY_PAYLOAD(e->payload, size, payload);
         send_event(ctx, e, cid, conn);
         return 0;
+    } else if (is_rabbitmq_connection(payload, size)) {
+        req->protocol = PROTOCOL_RABBITMQ;
     } else if (is_clickhouse_query(payload, size)) {
         req->protocol = PROTOCOL_CLICKHOUSE;
     } else if (is_zk_request(payload, total_size)) {

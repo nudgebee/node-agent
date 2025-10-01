@@ -9,6 +9,19 @@
 #define RABBITMQ_METHOD_DELIVER 60
 
 static __always_inline
+int is_rabbitmq_connection(char *buf, __u64 buf_size) {
+    if (buf_size < 8) {
+        return 0;
+    }
+    char magic[8];
+    bpf_read(buf, magic);
+    if (magic[0] == 'A' && magic[1] == 'M' && magic[2] == 'Q' && magic[3] == 'P') {
+        return 1;
+    }
+    return 0;
+}
+
+static __always_inline
 int rabbitmq_method_is(char *buf, __u64 buf_size, __u16 expected_method) {
     if (buf_size < 12) {
         return 0;
