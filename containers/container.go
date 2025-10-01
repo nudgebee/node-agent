@@ -807,7 +807,14 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	// Create trace with proper parameters (enhanced version)
 	var trace *tracing.Trace
 	if !ebpfTracesDisabled {
-		trace = c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown(), conn.srcWorkload, conn.DestinationKey.GetDestinationWorkload(), conn.DestinationKey.GetActualDestinationWorkload())
+		// Last-minute DNS enrichment for traces
+		destWorkload := conn.DestinationKey.GetDestinationWorkload()
+		actualDestWorkload := conn.DestinationKey.GetActualDestinationWorkload()
+		if domain := c.registry.getDomain(conn.DestinationKey.ActualDestinationIfKnown().IP()); domain != nil {
+			destWorkload.Name = domain.FQDN
+			actualDestWorkload.Name = domain.FQDN
+		}
+		trace = c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown(), conn.srcWorkload, destWorkload, actualDestWorkload)
 	}
 
 	// Process L7 requests and update metrics
