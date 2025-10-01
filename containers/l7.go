@@ -153,6 +153,8 @@ func (s L7Stats) ensureInitialized(protocol l7.Protocol) {
 
 	// Add protocol-specific labels for requests
 	switch metricsProtocol {
+	case l7.ProtocolRabbitmq, l7.ProtocolNats:
+		requestLabels = append(requestLabels, "method")
 	case l7.ProtocolHTTP:
 		requestLabels = append(requestLabels, "path", "method")
 	case l7.ProtocolDNS:
