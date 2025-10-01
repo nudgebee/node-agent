@@ -11,9 +11,9 @@ import (
 )
 
 type L7Stats struct {
-	requests     map[l7.Protocol]*prometheus.CounterVec
-	latency      map[l7.Protocol]*prometheus.HistogramVec
-	initialized  map[l7.Protocol]bool
+	requests    map[l7.Protocol]*prometheus.CounterVec
+	latency     map[l7.Protocol]*prometheus.HistogramVec
+	initialized map[l7.Protocol]bool
 }
 
 func NewL7Stats() L7Stats {
@@ -28,7 +28,7 @@ func (s L7Stats) observe(protocol l7.Protocol, status, method string, duration t
 	s.ensureInitialized(protocol)
 
 	actualDestWorkload := key.GetActualDestinationWorkload()
-	
+
 	// Convert HTTP2 to HTTP for metrics (same as ensureInitialized)
 	metricsProtocol := protocol
 	if protocol == l7.ProtocolHTTP2 {
@@ -98,34 +98,34 @@ func (s L7Stats) ensureInitialized(protocol l7.Protocol) {
 	if s.initialized[protocol] {
 		return
 	}
-	
+
 	// Convert HTTP2 to HTTP for metrics
 	metricsProtocol := protocol
 	if protocol == l7.ProtocolHTTP2 {
 		metricsProtocol = l7.ProtocolHTTP
 	}
-	
+
 	// Base labels for all protocols
 	baseLabels := []string{
 		"status",
-		"destination", 
+		"destination",
 		"actual_destination",
 		"destination_workload_kind",
-		"destination_workload_name", 
+		"destination_workload_name",
 		"destination_workload_namespace",
 		"src_workload_kind",
 		"src_workload_name",
-		"src_workload_namespace", 
+		"src_workload_namespace",
 		"actual_destination_workload_kind",
 		"actual_destination_workload_name",
 		"actual_destination_workload_namespace",
 		"trace_id",
 	}
-	
+
 	// Initialize request counter
 	requestLabels := make([]string, len(baseLabels))
 	copy(requestLabels, baseLabels)
-	
+
 	// Add protocol-specific labels for requests
 	switch metricsProtocol {
 	case l7.ProtocolRabbitmq, l7.ProtocolNats:
@@ -135,18 +135,18 @@ func (s L7Stats) ensureInitialized(protocol l7.Protocol) {
 	case l7.ProtocolDNS:
 		requestLabels = append(requestLabels, "request_type", "domain")
 	}
-	
+
 	if cOpts, exists := L7Requests[metricsProtocol]; exists {
 		s.requests[protocol] = prometheus.NewCounterVec(
 			prometheus.CounterOpts{Name: cOpts.Name, Help: cOpts.Help},
 			requestLabels,
 		)
 	}
-	
+
 	// Initialize latency histogram
 	histogramLabels := make([]string, len(baseLabels))
 	copy(histogramLabels, baseLabels)
-	
+
 	// For HTTP and DNS, add extra labels to histogram
 	switch metricsProtocol {
 	case l7.ProtocolHTTP:
@@ -154,14 +154,14 @@ func (s L7Stats) ensureInitialized(protocol l7.Protocol) {
 	case l7.ProtocolDNS:
 		histogramLabels = append(histogramLabels, "request_type", "domain")
 	}
-	
+
 	if hOpts, exists := L7Latency[metricsProtocol]; exists {
 		s.latency[protocol] = prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{Name: hOpts.Name, Help: hOpts.Help},
 			histogramLabels,
 		)
 	}
-	
+
 	s.initialized[protocol] = true
 }
 

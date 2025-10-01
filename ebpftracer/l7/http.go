@@ -30,12 +30,12 @@ func isValidHeaderKey(key string) bool {
 	if len(key) == 0 {
 		return false
 	}
-	
+
 	// Check for non-printable characters or base64 prefix
 	if strings.HasPrefix(key, "base64:") {
 		return false
 	}
-	
+
 	// HTTP header keys should only contain printable ASCII characters
 	for _, r := range key {
 		if r < 33 || r > 126 {
@@ -46,7 +46,7 @@ func isValidHeaderKey(key string) bool {
 			return false
 		}
 	}
-	
+
 	return true
 }
 
@@ -123,23 +123,23 @@ func ParseHTTPRequest(data []byte) (*http.Request, error) {
 		if len(line) == 0 {
 			continue
 		}
-		
+
 		// Stop processing if we encounter binary data (invalid UTF-8)
 		if !utf8.Valid(line) {
 			break
 		}
-		
+
 		part1, part2, ok := bytes.Cut(line, []byte(":"))
 		if !ok {
 			continue
 		}
-		
+
 		// Skip if header key contains binary data or non-printable characters
 		keyStr := strings.TrimSpace(safeString(part1))
 		if !isValidHeaderKey(keyStr) {
 			continue
 		}
-		
+
 		if strings.HasPrefix(keyStr, "Host") {
 			host = strings.TrimSpace(safeString(part2))
 		}
@@ -220,7 +220,7 @@ func ParseHTTPResponse(data []byte) (*http.Response, error) {
 		debugLen = len(data)
 	}
 	log.Printf("DEBUG: Processing as HTTP response: %q (hex: %x)", safeString(data[:debugLen]), data[:debugLen])
-	
+
 	// Check if it starts with HTTP/
 	if !bytes.HasPrefix(data, []byte("HTTP/")) {
 		debugLen := 20
@@ -232,7 +232,7 @@ func ParseHTTPResponse(data []byte) (*http.Response, error) {
 	}
 
 	var space = []byte{' '}
-	
+
 	// Parse status line: HTTP/1.1 200 OK
 	statusLine, rest, ok := bytes.Cut(data, []byte{'\r', '\n'})
 	if !ok {
@@ -292,26 +292,26 @@ func ParseHTTPResponse(data []byte) (*http.Response, error) {
 		if len(line) == 0 {
 			continue
 		}
-		
+
 		// Stop processing if we encounter binary data (invalid UTF-8)
 		if !utf8.Valid(line) {
 			break
 		}
-		
+
 		key, value, ok := bytes.Cut(line, []byte(":"))
 		if !ok {
 			continue
 		}
 
 		keyStr := strings.TrimSpace(safeString(key))
-		
+
 		// Skip if header key contains binary data or non-printable characters
 		if !isValidHeaderKey(keyStr) {
 			continue
 		}
-		
+
 		valueStr := strings.TrimSpace(safeString(value))
-		
+
 		if sensitiveHeaders[strings.ToLower(keyStr)] {
 			valueStr = SanitizeString(valueStr)
 		}
@@ -340,7 +340,7 @@ func parseStatusCode(code string) int {
 	if len(code) != 3 {
 		return 0
 	}
-	
+
 	// Manual parsing to avoid strconv dependency in critical path
 	if code[0] < '1' || code[0] > '5' {
 		return 0
@@ -351,7 +351,7 @@ func parseStatusCode(code string) int {
 	if code[2] < '0' || code[2] > '9' {
 		return 0
 	}
-	
+
 	return int(code[0]-'0')*100 + int(code[1]-'0')*10 + int(code[2]-'0')
 }
 
@@ -360,24 +360,24 @@ func ParseHttpResponse(payload []byte) (string, string) {
 	if !bytes.HasPrefix(payload, []byte("HTTP/")) {
 		return "", ""
 	}
-	
+
 	// Parse HTTP response: HTTP/1.1 200 OK
 	var space = []byte{' '}
 	protocol, rest, ok := bytes.Cut(payload, space)
 	if !ok {
 		return "", ""
 	}
-	
+
 	statusCode, statusText, ok := bytes.Cut(rest, space)
 	if !ok {
 		statusCode = rest
 		statusText = []byte("Unknown")
 	}
-	
+
 	// Extract just the status text before any line breaks
 	if newlineIdx := bytes.IndexAny(statusText, "\r\n"); newlineIdx >= 0 {
 		statusText = statusText[:newlineIdx]
 	}
-	
+
 	return safeString(protocol), safeString(statusCode) + " " + safeString(statusText)
 }

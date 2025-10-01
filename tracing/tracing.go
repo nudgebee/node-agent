@@ -262,7 +262,7 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 	if t == nil || method == "" {
 		return
 	}
-	
+
 	// Use destination hostname for external services, fallback to provided host
 	requestHost := sanitizeUTF8(host)
 	if host == "" || isIPAddress(host) {
@@ -271,7 +271,7 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 			requestHost = sanitizeUTF8(t.destination.String())
 		}
 	}
-	
+
 	requestPayload := sanitizeUTF8(payload)
 	requestHeaders := ""
 	responsePayload := sanitizeUTF8(response)
@@ -432,19 +432,19 @@ func isHTTPSService(host string) bool {
 		"api.openai.com",
 		"api.anthropic.com",
 		"api.cohere.ai",
-		"api.cohere.com", 
+		"api.cohere.com",
 		"generativelanguage.googleapis.com",
 		"ai.googleapis.com",
 		"aiplatform.googleapis.com",
 		"claude.ai",
 	}
-	
+
 	hostLower := strings.ToLower(host)
 	for _, service := range httpsServices {
 		if strings.Contains(hostLower, service) {
 			return true
 		}
 	}
-	
+
 	return false
 }

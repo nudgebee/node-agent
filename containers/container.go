@@ -154,8 +154,8 @@ type Container struct {
 	activeConnections        map[ConnectionKey]*ActiveConnection
 	connectionsByPidFd       map[PidFd]*ActiveConnection
 
-	l7Stats  L7Stats
-	
+	l7Stats L7Stats
+
 	llmStats map[string]*LLMStats
 
 	gpuStats map[string]*GpuUsage
@@ -219,8 +219,8 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		activeConnections:        map[ConnectionKey]*ActiveConnection{},
 		connectionsByPidFd:       map[PidFd]*ActiveConnection{},
 		l7Stats:                  NewL7Stats(),
-		
-		llmStats:                 map[string]*LLMStats{},
+
+		llmStats: map[string]*LLMStats{},
 
 		gpuStats: map[string]*GpuUsage{},
 
@@ -475,7 +475,6 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
-	
 	c.l7Stats.collect(ch)
 
 	if !*flags.DisablePinger {
@@ -747,8 +746,6 @@ func (c *Container) updateConnectionTrafficStats(ac *ActiveConnection, sent, rec
 	ac.BytesSent = sent
 	ac.BytesReceived = received
 }
-
-
 
 func (c *Container) trackLLMRequest(provider LLMProvider, host, payloadBase64, responseBase64 string, duration time.Duration) {
 	// Parse request data
