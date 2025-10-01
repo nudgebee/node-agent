@@ -1,6 +1,7 @@
 package containers
 
 import (
+	"regexp"
 	"time"
 	"unicode/utf8"
 
@@ -9,6 +10,25 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/klog/v2"
 )
+
+var (
+	// path normalization rules are applied in order
+	httpPathNormalizationRules = []struct {
+		pattern     *regexp.Regexp
+		replacement string
+	}{
+		{regexp.MustCompile(`/_next/static/chunks/[^/]+\.js`), "/_next/static/chunks/{file}.js"},
+		{regexp.MustCompile(`/[a-f0-9]{8,}`), "/:hex"},
+		{regexp.MustCompile(`/\d+`), "/:number"},
+	}
+)
+
+func normalizeHttpPath(path string) string {
+	for _, rule := range httpPathNormalizationRules {
+		path = rule.pattern.ReplaceAllString(path, rule.replacement)
+	}
+	return path
+}
 
 type L7Stats struct {
 	requests    map[l7.Protocol]*prometheus.CounterVec
@@ -65,7 +85,7 @@ func (s L7Stats) observe(protocol l7.Protocol, status, method string, duration t
 	case l7.ProtocolHTTP:
 		parsedMethod, path := l7.ParseHttp(r.Payload)
 		if ValidUtf8([]byte(path)) {
-			labelValues = append(labelValues, path)
+			labelValues = append(labelValues, normalizeHttpPath(path))
 		} else {
 			labelValues = append(labelValues, "")
 		}
