@@ -271,8 +271,6 @@ func (c *Container) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *Container) Collect(ch chan<- prometheus.Metric) {
-	c.registry.updateStatsFromEbpfMapsIfNecessary()
-
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
