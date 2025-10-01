@@ -1,7 +1,6 @@
 package containers
 
 import (
-	"log"
 	"time"
 	"unicode/utf8"
 
@@ -169,6 +168,41 @@ func (s L7Stats) delete(dst common.HostPort) {
 	// With the new architecture, we don't need to delete per-destination metrics
 	// since all metrics are shared across destinations with different label values
 	// This method can be kept for interface compatibility but doesn't need to do anything
+}
+
+// L7Metrics for backward compatibility with DNS
+type L7Metrics struct {
+	Requests *prometheus.CounterVec
+	Latency  prometheus.Histogram
+}
+
+func (m *L7Metrics) observe(status, method string, duration time.Duration) {
+	if m.Requests != nil {
+		var err error
+		var c prometheus.Counter
+		if method != "" {
+			c, err = m.Requests.GetMetricWithLabelValues(status, method)
+		} else {
+			c, err = m.Requests.GetMetricWithLabelValues(status)
+		}
+		if err != nil {
+			klog.Warningln(err)
+		} else {
+			c.Inc()
+		}
+	}
+	if m.Latency != nil && duration != 0 {
+		m.Latency.Observe(duration.Seconds())
+	}
+}
+
+func (m *L7Metrics) collect(ch chan<- prometheus.Metric) {
+	if m.Requests != nil {
+		m.Requests.Collect(ch)
+	}
+	if m.Latency != nil {
+		m.Latency.Collect(ch)
+	}
 }
 
 func ValidUtf8(payload []byte) bool {

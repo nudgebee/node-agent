@@ -477,12 +477,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
-	if c.dnsStats.Requests != nil {
-		c.dnsStats.Requests.Collect(ch)
-	}
-	if c.dnsStats.Latency != nil {
-		c.dnsStats.Latency.Collect(ch)
-	}
+	c.dnsStats.collect(ch)
 	c.l7Stats.collect(ch)
 
 	if !*flags.DisablePinger {
