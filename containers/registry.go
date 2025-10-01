@@ -515,7 +515,9 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 }
 
 func (r *Registry) updateStatsFromEbpfMapsIfNecessary() {
-	r.ebpfStatsLock.Lock()
+	if !r.ebpfStatsLock.TryLock() {
+		return // Skip update if another one is already in progress.
+	}
 	defer r.ebpfStatsLock.Unlock()
 
 	if time.Now().Sub(r.ebpfStatsLastUpdated) < MinTrafficStatsUpdateInterval {
