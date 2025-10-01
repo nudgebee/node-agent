@@ -77,19 +77,35 @@ func (ctx *HTTPRequestContext) parseHTTPRequest() {
 	}
 }
 
-// encodePayloads converts raw payloads to base64 with UTF-8 validation
+// encodePayloads converts raw payloads to base64 with UTF-8 validation, separating body from headers.
 func (ctx *HTTPRequestContext) encodePayloads() {
 	// Validate and encode request payload
 	if len(ctx.RawPayload) > 0 {
-		ctx.HasValidUTF8Payload = utf8.Valid(ctx.RawPayload)
-		ctx.PayloadBase64 = base64.StdEncoding.EncodeToString(ctx.RawPayload)
+		body, _ := splitHTTPPayload(ctx.RawPayload)
+		ctx.HasValidUTF8Payload = utf8.Valid(body)
+		if len(body) > 0 {
+			ctx.PayloadBase64 = base64.StdEncoding.EncodeToString(body)
+		}
 	}
 
 	// Validate and encode response payload
 	if len(ctx.RawResponse) > 0 {
-		ctx.HasValidUTF8Response = utf8.Valid(ctx.RawResponse)
-		ctx.ResponseBase64 = base64.StdEncoding.EncodeToString(ctx.RawResponse)
+		body, _ := splitHTTPPayload(ctx.RawResponse)
+		ctx.HasValidUTF8Response = utf8.Valid(body)
+		if len(body) > 0 {
+			ctx.ResponseBase64 = base64.StdEncoding.EncodeToString(body)
+		}
 	}
+}
+
+// splitHTTPPayload separates the headers from the body of an HTTP message.
+func splitHTTPPayload(payload []byte) (body []byte, headers []byte) {
+	separator := []byte("\r\n\r\n")
+	if i := strings.Index(string(payload), string(separator)); i != -1 {
+		return payload[i+len(separator):], payload[:i]
+	}
+	// If no separator is found, assume the whole payload is the body (e.g., for gRPC-like traffic)
+	return payload, nil
 }
 
 // resolveHost determines the host from connection or headers
