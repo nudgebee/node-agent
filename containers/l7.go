@@ -2,6 +2,7 @@ package containers
 
 import (
 	"regexp"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -17,13 +18,25 @@ var (
 		pattern     *regexp.Regexp
 		replacement string
 	}{
-		{regexp.MustCompile(`/_next/static/chunks/[^/]+\.js`), "/_next/static/chunks/{file}.js"},
-		{regexp.MustCompile(`/[a-f0-9]{8,}`), "/:hex"},
-		{regexp.MustCompile(`/\d+`), "/:number"},
+		// Next.js specific pages, e.g., /_next/static/chunks/pages/cart-4042ca3ed7b203d7.js
+		{regexp.MustCompile(`/_next/static/chunks/pages/.*-[a-f0-9]{16,}\.js`), "/_next/static/chunks/pages/{page}.js"},
+		// Next.js specific chunks, e.g., /_next/static/chunks/framework-123abc.js
+		{regexp.MustCompile(`/_next/static/chunks/.*-[a-f0-9]{8,}\.js`), "/_next/static/chunks/{chunk}.js"},
+		// Next.js build manifests, e.g., /_next/static/aBcDeF/_buildManifest.js
+		{regexp.MustCompile(`/_next/static/[^/]+/_buildManifest\.js`), "/_next/static/{buildID}/_buildManifest.js"},
+		{regexp.MustCompile(`/_next/static/[^/]+/_ssgManifest\.js`), "/_next/static/{buildID}/_ssgManifest.js"},
+		// Next.js CSS chunks, e.g., /_next/static/css/a1b2c3d4.css
+		{regexp.MustCompile(`/_next/static/css/.*\.css`), "/_next/static/css/{stylesheet}.css"},
+		// Generic rules for other dynamic paths
+		{regexp.MustCompile(`\b[a-fA-F0-9]{8,}\b`), ":hex"},
+		{regexp.MustCompile(`\b\d{4,}\b`), ":number"},
 	}
 )
 
 func normalizeHttpPath(path string) string {
+	if i := strings.Index(path, "?"); i != -1 {
+		path = path[:i]
+	}
 	for _, rule := range httpPathNormalizationRules {
 		path = rule.pattern.ReplaceAllString(path, rule.replacement)
 	}
@@ -140,8 +153,6 @@ func (s L7Stats) ensureInitialized(protocol l7.Protocol) {
 
 	// Add protocol-specific labels for requests
 	switch metricsProtocol {
-	case l7.ProtocolRabbitmq, l7.ProtocolNats:
-		requestLabels = append(requestLabels, "method")
 	case l7.ProtocolHTTP:
 		requestLabels = append(requestLabels, "path", "method")
 	case l7.ProtocolDNS:
