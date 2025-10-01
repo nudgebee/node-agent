@@ -503,8 +503,12 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	}
 	klog.InfoS("detected a new container", "pid", pid, "cg", cg.Id, "id", id, "app", c.appId)
 	if err := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(id), "app_id": c.appId}, r.reg).Register(c); err != nil {
-		klog.Warningln("failed to register container:", err)
-		return nil
+		if _, ok := err.(prometheus.AlreadyRegisteredError); ok {
+			klog.V(5).InfoS("container collector already registered, skipping", "container_id", string(id), "app_id", c.appId)
+		} else {
+			klog.Warningln("failed to register container:", err)
+			return nil
+		}
 	}
 
 	// Update all maps atomically while holding the lock

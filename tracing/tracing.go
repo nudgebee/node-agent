@@ -267,7 +267,7 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 	requestHost := sanitizeUTF8(host)
 	if host == "" || isIPAddress(host) {
 		// Use destination hostname if host is empty or an IP address
-		if t.destination != nil {
+		if t.destination.Port() != 0 {
 			requestHost = sanitizeUTF8(t.destination.String())
 		}
 	}
@@ -283,7 +283,7 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 
 	// Determine protocol based on port or known LLM APIs
 	protocol := "http"
-	if isHTTPSService(requestHost) || t.destination.Port == 443 {
+	if isHTTPSService(requestHost) || t.destination.Port() == 443 {
 		protocol = "https"
 	}
 
