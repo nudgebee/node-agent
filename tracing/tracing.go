@@ -34,19 +34,14 @@ func sanitizeUTF8(s string) string {
 	if utf8.ValidString(s) {
 		return s
 	}
-
-	// Remove invalid UTF-8 characters by converting to valid UTF-8
-	var result strings.Builder
-	result.Grow(len(s))
-
+	var b strings.Builder
+	b.Grow(len(s))
 	for _, r := range s {
-		if r == utf8.RuneError {
-			continue // Skip invalid runes
+		if utf8.ValidRune(r) {
+			b.WriteRune(r)
 		}
-		result.WriteRune(r)
 	}
-
-	return result.String()
+	return b.String()
 }
 
 var (

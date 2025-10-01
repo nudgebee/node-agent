@@ -156,9 +156,7 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 	r.ip2fqdnLock.RLock()
 	defer r.ip2fqdnLock.RUnlock()
 	for ip, domain := range r.ip2fqdn {
-		if domain.SpecifyIP {
-			ch <- gauge(metrics.Ip2Fqdn, 1, ip.String(), domain.FQDN)
-		}
+		ch <- gauge(metrics.Ip2Fqdn, 1, ip.String(), domain.FQDN)
 	}
 }
 

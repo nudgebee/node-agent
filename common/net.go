@@ -225,19 +225,13 @@ func NewDomain(fqdn string, ips []netaddr.IP) *Domain {
 
 func NewDestinationKey(dst, actualDst netaddr.IPPort, domain *Domain, dstWorkload Workload, actualDestWorkload Workload) DestinationKey {
 	if IsIpExternal(actualDst.IP()) && domain != nil && !domain.SpecifyIP {
+		dstWorkload.Name = domain.FQDN
+		actualDestWorkload.Name = domain.FQDN
 		return DestinationKey{
-			destination:       HostPortWithEmptyIP(domain.FQDN, dst.Port()),
-			actualDestination: HostPortFromIPPort(actualDst),
-			destinationWorkload: Workload{
-				Kind:      "external",
-				Name:      domain.FQDN,
-				Namespace: "external",
-			},
-			actualDestinationWorkload: Workload{
-				Kind:      "external",
-				Name:      domain.FQDN, // Use domain name instead of IP for better tracing
-				Namespace: "external",
-			},
+			destination:               HostPortWithEmptyIP(domain.FQDN, dst.Port()),
+			actualDestination:         HostPortFromIPPort(actualDst),
+			destinationWorkload:       dstWorkload,
+			actualDestinationWorkload: actualDestWorkload,
 		}
 	} else if IsIpExternal(actualDst.IP()) && domain != nil && domain.SpecifyIP {
 		// Note: This case should rarely happen now that we default SpecifyIP to false
