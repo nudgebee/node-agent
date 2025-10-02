@@ -31,17 +31,7 @@ const (
 )
 
 func sanitizeUTF8(s string) string {
-	if utf8.ValidString(s) {
-		return s
-	}
-	var b strings.Builder
-	b.Grow(len(s))
-	for _, r := range s {
-		if utf8.ValidRune(r) {
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
+	return strings.ToValidUTF8(s, "�")
 }
 
 var (
@@ -327,7 +317,7 @@ func (t *Trace) PostgresQuery(query string, error bool, duration time.Duration) 
 	}
 	t.createSpan("query", duration, error, "",
 		semconv.DBSystemPostgreSQL,
-		semconv.DBStatement(query),
+		semconv.DBStatement(sanitizeUTF8(query)),
 	)
 }
 
@@ -337,7 +327,7 @@ func (t *Trace) MysqlQuery(query string, error bool, duration time.Duration) {
 	}
 	t.createSpan("query", duration, error, "",
 		semconv.DBSystemMySQL,
-		semconv.DBStatement(query),
+		semconv.DBStatement(sanitizeUTF8(query)),
 	)
 }
 
@@ -347,7 +337,7 @@ func (t *Trace) MongoQuery(query string, error bool, duration time.Duration) {
 	}
 	t.createSpan("query", duration, error, "",
 		semconv.DBSystemMongoDB,
-		semconv.DBStatement(query),
+		semconv.DBStatement(sanitizeUTF8(query)),
 	)
 }
 
@@ -381,8 +371,8 @@ func (t *Trace) RedisQuery(cmd, args string, error bool, duration time.Duration)
 	}
 	t.createSpan(cmd, duration, error, "",
 		semconv.DBSystemRedis,
-		semconv.DBOperation(cmd),
-		semconv.DBStatement(statement),
+		semconv.DBOperation(sanitizeUTF8(cmd)),
+		semconv.DBStatement(sanitizeUTF8(statement)),
 	)
 }
 
@@ -392,7 +382,7 @@ func (t *Trace) ClickhouseQuery(query string, error bool, duration time.Duration
 	}
 	t.createSpan("query", duration, error, "",
 		semconv.DBSystemClickhouse,
-		semconv.DBStatement(query),
+		semconv.DBStatement(sanitizeUTF8(query)),
 	)
 }
 

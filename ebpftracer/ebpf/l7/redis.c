@@ -3,24 +3,38 @@
 
 static __always_inline
 int is_redis_query(char *buf, __u64 buf_size) {
-    if (buf_size < 5) {
+    if (buf_size < 4) { // Smallest command is 4 bytes, e.g., "PING\r\n"
         return 0;
     }
     char b[5];
     bpf_read(buf, b);
-    if (b[0] != '*' || b[1] < '0' || b[1] > '9') {
+
+    // Check for RESP Array format, e.g., "*3\r\n..."
+    if (b[0] == '*') {
+        if (b[1] >= '0' && b[1] <= '9' && b[2] == '\r' && b[3] == '\n') {
+            return 1;
+        }
+        if (b[1] >= '0' && b[1] <= '9' && b[2] >= '0' && b[2] <= '9' && b[3] == '\r' && b[4] == '\n') {
+            return 1;
+        }
         return 0;
     }
-    // *3\r\n...
-    if (b[2] == '\r' && b[3] == '\n') {
+
+    // Check for Inline Command format.
+    // This is a best-effort check. We assume it's an inline command if it starts
+    // with an uppercase letter and ends with \r\n. This is not perfect but will
+    // catch the vast majority of cases, including the "POST..." from the logs,
+    // without misidentifying other protocols.
+    if (b[0] >= 'A' && b[0] <= 'Z') {
+        // To avoid being too greedy, we don't check for the trailing \r\n here,
+        // as the buffer might be small. The response check is more reliable.
+        // This is enough to classify it as potentially Redis.
         return 1;
     }
-    // *12\r\n...
-    if (b[2] >= '0' && b[2] <= '9' && b[3] == '\r' && b[4] == '\n') {
-        return 1;
-    }
+
     return 0;
 }
+
 
 static __always_inline
 int is_redis_response(char *buf, __u64 buf_size, __s32 *status) {
