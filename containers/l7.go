@@ -82,6 +82,11 @@ func (s L7Stats) observe(protocol l7.Protocol, status, method string, duration t
 		actualDestWorkload.Kind,
 		actualDestWorkload.Name,
 		actualDestWorkload.Namespace,
+		srcWorkload.Region,
+		srcWorkload.Zone,
+		actualDestWorkload.Region,
+		actualDestWorkload.Zone,
+		actualDestWorkload.Instance,
 	}
 
 	// Protocol-specific labels (use metricsProtocol, not original protocol)
@@ -145,6 +150,11 @@ func (s L7Stats) ensureInitialized(protocol l7.Protocol) {
 		"actual_destination_workload_kind",
 		"actual_destination_workload_name",
 		"actual_destination_workload_namespace",
+		"src_region",
+		"src_az",
+		"destination_region",
+		"destination_az",
+		"destination_instance",
 	}
 
 	// Initialize request counter

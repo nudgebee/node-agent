@@ -353,17 +353,17 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		workload_src := c.srcWorkload
 		workload_dest := d.GetDestinationWorkload()
 		actualDestWorkload := d.GetActualDestinationWorkload()
-		ch <- counter(metrics.NetConnectionsSuccessful, float64(stats.Count), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, actualDestWorkload.Region, actualDestWorkload.Zone)
-		ch <- counter(metrics.NetConnectionsTotalTime, stats.TotalTime.Seconds(), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, actualDestWorkload.Region, actualDestWorkload.Zone)
+		ch <- counter(metrics.NetConnectionsSuccessful, float64(stats.Count), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
+		ch <- counter(metrics.NetConnectionsTotalTime, stats.TotalTime.Seconds(), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
 		if stats.Retransmissions > 0 {
-			ch <- counter(metrics.NetRetransmits, float64(stats.Retransmissions), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, actualDestWorkload.Region, actualDestWorkload.Zone)
+			ch <- counter(metrics.NetRetransmits, float64(stats.Retransmissions), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
 		}
-		ch <- counter(metrics.NetBytesSent, float64(stats.BytesSent), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, actualDestWorkload.Region, actualDestWorkload.Zone)
-		ch <- counter(metrics.NetBytesReceived, float64(stats.BytesReceived), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, actualDestWorkload.Region, actualDestWorkload.Zone)
+		ch <- counter(metrics.NetBytesSent, float64(stats.BytesSent), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
+		ch <- counter(metrics.NetBytesReceived, float64(stats.BytesReceived), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
 	}
 	for dst, count := range c.failedConnectionAttempts {
 		workload := c.ip_resolver.ResolveIP(dst.IP().String())
-		ch <- counter(metrics.NetConnectionsFailed, float64(count), dst.String(), workload.Name, workload.Namespace, workload.Kind, workload.Name, workload.Namespace, workload.Kind, c.srcWorkload.Region, c.srcWorkload.Zone, workload.Region, workload.Zone)
+		ch <- counter(metrics.NetConnectionsFailed, float64(count), dst.String(), workload.Name, workload.Namespace, workload.Kind, workload.Name, workload.Namespace, workload.Kind, c.srcWorkload.Region, c.srcWorkload.Zone, workload.Region, workload.Zone, workload.Instance)
 	}
 
 	connections := map[common.DestinationKey]int{}
@@ -376,7 +376,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	for d, count := range connections {
 		actualDestWorkload := d.GetActualDestinationWorkload()
 		destWorkload := d.GetDestinationWorkload()
-		ch <- gauge(metrics.NetConnectionsActive, float64(count), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), c.srcWorkload.Name, c.srcWorkload.Namespace, c.srcWorkload.Kind, destWorkload.Name, destWorkload.Namespace, destWorkload.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, c.srcWorkload.Region, c.srcWorkload.Zone, actualDestWorkload.Region, actualDestWorkload.Zone)
+		ch <- gauge(metrics.NetConnectionsActive, float64(count), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), c.srcWorkload.Name, c.srcWorkload.Namespace, c.srcWorkload.Kind, destWorkload.Name, destWorkload.Namespace, destWorkload.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, c.srcWorkload.Region, c.srcWorkload.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
 	}
 
 	for source, p := range c.logParsers {
@@ -481,7 +481,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	if !*flags.DisablePinger {
 		for ip, rtt := range c.ping() {
 			destination_workload := c.ip_resolver.ResolveIP(ip.String())
-			ch <- gauge(metrics.NetLatency, rtt, ip.String(), destination_workload.Name, destination_workload.Namespace, destination_workload.Kind)
+			ch <- gauge(metrics.NetLatency, rtt, ip.String(), destination_workload.Name, destination_workload.Namespace, destination_workload.Kind, destination_workload.Instance)
 		}
 	}
 }
@@ -668,9 +668,46 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 	if common.ConnectionFilter.ShouldBeSkipped(dst.IP(), actualDst.IP()) {
 		return
 	}
-	key := common.NewDestinationKey(dst, actualDst, c.registry.getDomain(dst.IP()), dstWorkload, actualDstWorkload)
+
 	c.lock.Lock()
 	defer c.lock.Unlock()
+
+	// --- START: New "Lazy Lookup" and "Fix-up" Logic ---
+
+	// Check if the resolved workload is incomplete (missing the node name).
+	// This indicates a potential race condition.
+	isIncomplete := actualDstWorkload.Instance == ""
+
+	if isIncomplete {
+		// Slow Path: The metadata is incomplete. Let's see if we already have a more complete
+		// entry for this destination from a previous connection.
+		for existingKey, stats := range c.connectionStats {
+			// Check if this existing entry is for the same logical destination
+			if existingKey.ActualDestination().IPPort() == actualDst &&
+				existingKey.GetActualDestinationWorkload().Instance != "" { // and is more complete
+
+				// We found a better, existing entry. Merge the stats into it.
+				if failed {
+					// For failed connections, we just increment a simple counter.
+					// We'll find the corresponding HostPort key.
+					hp := existingKey.Destination()
+					c.failedConnectionAttempts[hp]++
+				} else {
+					stats.Count++
+					stats.TotalTime += duration
+				}
+				// Mark the last attempt time and exit. Do not create a new polluted entry.
+				c.lastConnectionAttempts[existingKey.Destination()] = time.Now()
+				return
+			}
+		}
+	}
+	// --- END: New Logic ---
+
+	// Fast Path (or slow path that found no match):
+	// Proceed with creating the key and updating stats as usual.
+	key := common.NewDestinationKey(dst, actualDst, c.registry.getDomain(dst.IP()), dstWorkload, actualDstWorkload)
+
 	if failed {
 		c.failedConnectionAttempts[key.Destination()]++
 	} else {
