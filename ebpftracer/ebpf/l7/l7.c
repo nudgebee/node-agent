@@ -533,9 +533,14 @@ struct mmsghdr {
 SEC("tracepoint/syscalls/sys_enter_sendmmsg")
 int sys_enter_sendmmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     __u64 offset = 0;
+    __u64 size = ctx->size;
+    // The verifier needs to know that size is bounded.
+    if (size > 2) {
+        size = 2;
+    }
     #pragma unroll
     for (int i = 0; i <= 1; i++) {
-        if (i >= ctx->size) {
+        if (i >= size) {
             break;
         }
         struct mmsghdr h = {};

@@ -35,6 +35,9 @@ int rabbitmq_method_is(char *buf, __u64 buf_size, __u16 expected_method) {
     __u32 size = 0;
     bpf_read(buf+3, size);
     size = bpf_htonl(size);
+    if (size > MAX_PAYLOAD_SIZE) {
+        return 0;
+    }
     if (7 + size + 1 > buf_size) {
         return 0;
     }
