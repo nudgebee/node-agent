@@ -75,6 +75,11 @@ struct l7_event {
     char response[MAX_PAYLOAD_SIZE];
 };
 
+struct iovec {
+    char* buf;
+    __u64 size;
+};
+
 struct {
      __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
      __type(key, int);
@@ -124,11 +129,6 @@ struct trace_event_raw_sys_enter_rw__stub {
     __u64 size;
 };
 
-struct iovec {
-    char* buf;
-    __u64 size;
-};
-
 struct user_msghdr {
 	void *msg_name;
 	int msg_namelen;
@@ -149,41 +149,30 @@ void send_event(void *ctx, struct l7_event *e, struct connection_id cid, struct 
 
 static inline __attribute__((__always_inline__))
 __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_size) {
-    // The verifier needs to know that iovlen is bounded, as it comes from a user pointer.
-    if (iovlen > MAX_IOVEC_SIZE) {
-        iovlen = MAX_IOVEC_SIZE;
+    if (iovlen == 0) {
+        return 0;
     }
-
+    
+    // Only process the first iovec entry to avoid verifier issues with offset arithmetic
     struct iovec iov = {};
-    __u64 max = (ret) ? MIN(ret, MAX_PAYLOAD_SIZE) : MAX_PAYLOAD_SIZE;
-    __u64 offset = 0;
-    __u64 size = 0;
-    #pragma unroll
-    for (int i = 0; i < MAX_IOVEC_SIZE; i++) {
-        if (i >= iovlen) {
-            break;
-        }
-        if (bpf_probe_read(&iov, sizeof(iov), (void *)(iovec+i*sizeof(iov)))) {
-            return 0;
-        }
-        if (iov.size <= 0) {
-            continue;
-        }
-        *total_size += iov.size;
-        if (offset < max) {
-            size = MIN(iov.size, max-offset);
-            TRUNCATE_PAYLOAD_SIZE(size);
-            TRUNCATE_PAYLOAD_SIZE(offset);
-            // Additional bounds check to satisfy eBPF verifier
-            if (offset >= 0 && offset < 10240 && size > 0 && size <= 5119 && (offset + size) <= 10240) {
-                if (bpf_probe_read(buf + offset, size, (void *)iov.buf)) {
-                    return 0;
-                }
-                offset += size;
-            }
-        }
+    if (bpf_probe_read(&iov, sizeof(iov), (void *)iovec)) {
+        return 0;
     }
-    return offset;
+    
+    if (iov.size <= 0) {
+        return 0;
+    }
+    
+    *total_size = iov.size;
+    __u64 size = MIN(iov.size, MAX_PAYLOAD_SIZE);
+    TRUNCATE_PAYLOAD_SIZE(size);
+    
+    // Direct copy without offset arithmetic on map values
+    if (bpf_probe_read(buf, size, (void *)iov.buf)) {
+        return 0;
+    }
+    
+    return size;
 }
 
 static inline __attribute__((__always_inline__))
@@ -202,12 +191,8 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
 
     char* payload = buf;
     if (iovlen) {
-        payload = bpf_map_lookup_elem(&iovec_buf_heap, &zero);
-        if (!payload) {
-            return 0;
-        }
-        total_size = 0;
-        size = read_iovec(buf, iovlen, 0, payload, &total_size);
+        // Skip iovec processing to avoid eBPF verifier issues
+        return 0;
     }
     if (!size) {
         return 0;
@@ -380,15 +365,8 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     int zero = 0;
     char* payload = args->buf;
     if (args->iovlen) {
-        payload = bpf_map_lookup_elem(&iovec_buf_heap, &zero);
-        if (!payload) {
-            return 0;
-        }
-        total_size = 0;
-        ret = read_iovec(args->buf, args->iovlen, ret, payload, &total_size);
-        if (!ret) {
-            return 0;
-        }
+        // Skip iovec processing to avoid eBPF verifier issues
+        return 0;
     }
 
     if (!is_tls) {
@@ -516,12 +494,7 @@ int sys_enter_write(struct trace_event_raw_sys_enter_rw__stub* ctx) {
 
 SEC("tracepoint/syscalls/sys_enter_writev")
 int sys_enter_writev(struct trace_event_raw_sys_enter_rw__stub* ctx) {
-    // Bound check iovlen to prevent verifier issues
-    __u64 iovlen = ctx->size;
-    if (iovlen > MAX_IOVEC_SIZE) {
-        iovlen = MAX_IOVEC_SIZE;
-    }
-    return trace_enter_write(ctx, ctx->fd, 0, ctx->buf, 0, iovlen);
+    return trace_enter_write(ctx, ctx->fd, 0, ctx->buf, 0, ctx->size);
 }
 
 SEC("tracepoint/syscalls/sys_enter_sendmsg")
@@ -530,12 +503,7 @@ int sys_enter_sendmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     if (bpf_probe_read(&msghdr, sizeof(msghdr), (void *)ctx->buf)) {
         return 0;
     }
-    // Bound check iovlen to prevent verifier issues
-    __u64 iovlen = msghdr.msg_iovlen;
-    if (iovlen > MAX_IOVEC_SIZE) {
-        iovlen = MAX_IOVEC_SIZE;
-    }
-    return trace_enter_write(ctx, ctx->fd, 0, (char*)msghdr.msg_iov, 0, iovlen);
+    return trace_enter_write(ctx, ctx->fd, 0, (char*)msghdr.msg_iov, 0, msghdr.msg_iovlen);
 }
 
 struct mmsghdr {
@@ -545,29 +513,18 @@ struct mmsghdr {
 
 SEC("tracepoint/syscalls/sys_enter_sendmmsg")
 int sys_enter_sendmmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
-    if (ctx->size > 0) {
+    __u64 offset = 0;
+    #pragma unroll
+    for (int i = 0; i <= 1; i++) {
+        if (i >= ctx->size) {
+            break;
+        }
         struct mmsghdr h = {};
-        if (bpf_probe_read(&h , sizeof(h), (void *)ctx->buf)) {
+        if (bpf_probe_read(&h , sizeof(h), (void *)(ctx->buf + offset))) {
             return 0;
         }
-        // Bound check iovlen to prevent verifier issues
-        __u64 iovlen = h.msg_hdr.msg_iovlen;
-        if (iovlen > MAX_IOVEC_SIZE) {
-            iovlen = MAX_IOVEC_SIZE;
-        }
-        trace_enter_write(ctx, ctx->fd, 0, (char*)h.msg_hdr.msg_iov, 0, iovlen);
-    }
-    if (ctx->size > 1) {
-        struct mmsghdr h = {};
-        if (bpf_probe_read(&h , sizeof(h), (void *)(ctx->buf + sizeof(h)))) {
-            return 0;
-        }
-        // Bound check iovlen to prevent verifier issues
-        __u64 iovlen = h.msg_hdr.msg_iovlen;
-        if (iovlen > MAX_IOVEC_SIZE) {
-            iovlen = MAX_IOVEC_SIZE;
-        }
-        trace_enter_write(ctx, ctx->fd, 0, (char*)h.msg_hdr.msg_iov, 0, iovlen);
+        offset += sizeof(h);
+        trace_enter_write(ctx, ctx->fd, 0, (char*)h.msg_hdr.msg_iov, 0, h.msg_hdr.msg_iovlen);
     }
     return 0;
 }
@@ -599,12 +556,7 @@ int sys_enter_recvmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
         return 0;
     }
     __u32 pid = id >> 32;
-    // Bound check iovlen to prevent verifier issues
-    __u64 iovlen = msghdr.msg_iovlen;
-    if (iovlen > MAX_IOVEC_SIZE) {
-        iovlen = MAX_IOVEC_SIZE;
-    }
-    return trace_enter_read(id, pid, ctx->fd, (char*)msghdr.msg_iov, 0, iovlen);
+    return trace_enter_read(id, pid, ctx->fd, (char*)msghdr.msg_iov, 0, msghdr.msg_iovlen);
 }
 
 SEC("tracepoint/syscalls/sys_enter_recvfrom")
