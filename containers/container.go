@@ -106,6 +106,7 @@ type ActiveConnection struct {
 
 	BytesSent     uint64
 	BytesReceived uint64
+	Protocol      uint8
 
 	http2Parser    *l7.Http2Parser
 	postgresParser *l7.PostgresParser
@@ -761,7 +762,11 @@ func (c *Container) updateTrafficStats(u *TrafficStatsUpdate) {
 	}
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	c.updateConnectionTrafficStats(c.connectionsByPidFd[PidFd{Pid: u.Pid, Fd: u.FD}], u.BytesSent, u.BytesReceived)
+	conn := c.connectionsByPidFd[PidFd{Pid: u.Pid, Fd: u.FD}]
+	if conn != nil {
+		conn.Protocol = u.Protocol
+	}
+	c.updateConnectionTrafficStats(conn, u.BytesSent, u.BytesReceived)
 }
 
 func (c *Container) updateConnectionTrafficStats(ac *ActiveConnection, sent, received uint64) {

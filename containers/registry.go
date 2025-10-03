@@ -540,6 +540,7 @@ func (r *Registry) updateTrafficStats() {
 			FD:            cid.FD,
 			BytesSent:     stats.BytesSent,
 			BytesReceived: stats.BytesReceived,
+			Protocol:      stats.Protocol,
 		}
 	}
 	if err := iter.Err(); err != nil {
@@ -718,6 +719,7 @@ type TrafficStatsUpdate struct {
 	FD            uint64
 	BytesSent     uint64
 	BytesReceived uint64
+	Protocol      uint8
 }
 
 type NodejsStatsUpdate struct {

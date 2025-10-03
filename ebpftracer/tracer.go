@@ -173,9 +173,10 @@ type ConnectionId struct {
 }
 
 type Connection struct {
-	Timestamp     uint64
 	BytesSent     uint64
 	BytesReceived uint64
+	Timestamp     uint64
+	Protocol      uint8
 }
 
 type perfMap struct {
