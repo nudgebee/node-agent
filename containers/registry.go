@@ -225,8 +225,11 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 					delete(r.containersById, c.id)
 
 					// Unregister from Prometheus (do this after removing from maps)
+					klog.Infof("DEBUG: Unregistering container from Prometheus - id: %s, app_id: %s", c.id, c.appId)
 					if ok := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(c.id), "app_id": c.appId}, r.reg).Unregister(c); !ok {
-						klog.Warningln("failed to unregister container:", c.id)
+						klog.Warningf("DEBUG: failed to unregister container: %s", c.id)
+					} else {
+						klog.Infof("DEBUG: Successfully unregistered container from Prometheus - id: %s", c.id)
 					}
 					c.Close()
 				}
@@ -501,10 +504,12 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		return nil
 	}
 	klog.InfoS("detected a new container", "pid", pid, "cg", cg.Id, "id", id, "app", c.appId)
+	klog.Infof("DEBUG: Registering container with Prometheus - id: %s, app_id: %s", id, c.appId)
 	if err := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(id), "app_id": c.appId}, r.reg).Register(c); err != nil {
-		klog.Warningln("failed to register container:", err)
+		klog.Warningf("DEBUG: failed to register container: %v", err)
 		return nil
 	}
+	klog.Infof("DEBUG: Successfully registered container with Prometheus - id: %s", id)
 
 	// Update all maps atomically while holding the lock
 	r.containersByPid[pid] = c

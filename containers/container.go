@@ -178,6 +178,10 @@ type Container struct {
 	done        chan struct{}
 	ip_resolver IPResolver
 	srcWorkload common.Workload
+	
+	// Debug fields
+	collectCallCount    int
+	lastCollectTime     time.Time
 }
 
 func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid uint32, registry *Registry) (*Container, error) {
@@ -271,7 +275,12 @@ func (c *Container) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *Container) Collect(ch chan<- prometheus.Metric) {
+	// Debug logging to track collection calls
 	c.lock.Lock()
+	c.collectCallCount++
+	timeSinceLastCall := time.Since(c.lastCollectTime)
+	c.lastCollectTime = time.Now()
+	klog.Infof("DEBUG: Container.Collect() called for container %s (app_id: %s) - call #%d, time since last: %v", c.id, c.appId, c.collectCallCount, timeSinceLastCall)
 	defer c.lock.Unlock()
 
 	if c.metadata.image != "" || c.metadata.systemdTriggeredBy != "" {
@@ -348,10 +357,15 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
+	klog.Infof("DEBUG: Container %s emitting TCP metrics for %d destinations", c.id, len(c.connectionStats))
 	for d, stats := range c.connectionStats {
 		workload_src := c.srcWorkload
 		workload_dest := d.GetDestinationWorkload()
 		actualDestWorkload := d.GetActualDestinationWorkload()
+		
+		// Debug log each TCP metric emission
+		klog.Infof("DEBUG: Container %s emitting TCP metrics - dest: %s, actual: %s, count: %d", c.id, d.DestinationLabelValue(), d.ActualDestinationLabelValue(), stats.Count)
+		
 		ch <- counter(metrics.NetConnectionsSuccessful, float64(stats.Count), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
 		ch <- counter(metrics.NetConnectionsTotalTime, stats.TotalTime.Seconds(), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
 		if stats.Retransmissions > 0 {
@@ -670,38 +684,6 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 
 	c.lock.Lock()
 	defer c.lock.Unlock()
-
-	// --- START: New "Lazy Lookup" and "Fix-up" Logic ---
-
-	// Check if the resolved workload is incomplete (missing the node name).
-	// This indicates a potential race condition.
-	isIncomplete := actualDstWorkload.Instance == ""
-
-	if isIncomplete {
-		// Slow Path: The metadata is incomplete. Let's see if we already have a more complete
-		// entry for this destination from a previous connection.
-		for existingKey, stats := range c.connectionStats {
-			// Check if this existing entry is for the same logical destination
-			if existingKey.ActualDestination().IPPort() == actualDst &&
-				existingKey.GetActualDestinationWorkload().Instance != "" { // and is more complete
-
-				// We found a better, existing entry. Merge the stats into it.
-				if failed {
-					// For failed connections, we just increment a simple counter.
-					// We'll find the corresponding HostPort key.
-					hp := existingKey.Destination()
-					c.failedConnectionAttempts[hp]++
-				} else {
-					stats.Count++
-					stats.TotalTime += duration
-				}
-				// Mark the last attempt time and exit. Do not create a new polluted entry.
-				c.lastConnectionAttempts[existingKey.Destination()] = time.Now()
-				return
-			}
-		}
-	}
-	// --- END: New Logic ---
 
 	// Fast Path (or slow path that found no match):
 	// Proceed with creating the key and updating stats as usual.
