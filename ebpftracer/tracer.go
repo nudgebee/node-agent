@@ -177,6 +177,7 @@ type Connection struct {
 	BytesReceived uint64
 	Timestamp     uint64
 	Protocol      uint8
+	_             [7]byte // Explicit padding
 }
 
 type perfMap struct {
