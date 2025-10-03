@@ -71,9 +71,10 @@ struct {
 } connection_id_by_socket SEC(".maps");
 
 struct connection {
-    __u64 timestamp;
     __u64 bytes_sent;
     __u64 bytes_received;
+    __u64 timestamp;
+    __u8 protocol;
 };
 
 struct {

@@ -213,7 +213,7 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
     if (!req) {
         return 0;
     }
-    req->protocol = PROTOCOL_UNKNOWN;
+    req->protocol = conn->protocol; // Use the known protocol if it exists
     req->partial = 0;
     req->request_id = 0;
     req->ns = 0;
@@ -224,92 +224,84 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
     k.is_tls = is_tls;
     k.stream_id = -1;
 
-    if (is_http_request(payload)) {
-        req->protocol = PROTOCOL_HTTP;
-    } else if (is_postgres_query(payload, size, &req->request_type)) {
-        if (req->request_type == POSTGRES_FRAME_CLOSE) {
+    if (req->protocol == PROTOCOL_UNKNOWN) { // Only detect protocol if it's not already known
+        if (is_http_request(payload)) {
+            req->protocol = PROTOCOL_HTTP;
+        } else if (is_postgres_query(payload, size, &req->request_type)) {
+            req->protocol = PROTOCOL_POSTGRES;
+        } else if (is_redis_query(payload, size)) {
+            req->protocol = PROTOCOL_REDIS;
+        } else if (is_memcached_query(payload, size)) {
+            req->protocol = PROTOCOL_MEMCACHED;
+        } else if (is_mysql_query(payload, size, &req->request_type)) {
+            req->protocol = PROTOCOL_MYSQL;
+        } else if (is_mongo_query(payload, size)) {
+            req->protocol = PROTOCOL_MONGO;
+        } else if (is_rabbitmq_produce(payload, size)) {
             struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
-            if (!e) {
-                return 0;
-            }
-            e->protocol = PROTOCOL_POSTGRES;
-            e->method = METHOD_STATEMENT_CLOSE;
+            if (!e) { return 0; }
+            e->protocol = PROTOCOL_RABBITMQ;
+            e->method = METHOD_PRODUCE;
+            send_event(ctx, e, cid, conn);
+            return 0;
+        } else if (nats_method(payload, size) == METHOD_PRODUCE) {
+            struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
+            if (!e) { return 0; }
+            e->protocol = PROTOCOL_NATS;
+            e->method = METHOD_PRODUCE;
+            send_event(ctx, e, cid, conn);
+            return 0;
+        } else if (is_cassandra_request(payload, size, &k.stream_id)) {
+            req->protocol = PROTOCOL_CASSANDRA;
+        } else if (looks_like_http2_frame(payload, size, METHOD_HTTP2_CLIENT_FRAMES)) {
+            struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
+            if (!e) { return 0; }
+            e->protocol = PROTOCOL_HTTP2;
+            e->method = METHOD_HTTP2_CLIENT_FRAMES;
+            e->duration = bpf_ktime_get_ns();
             e->payload_size = size;
             COPY_PAYLOAD(e->payload, size, payload);
             send_event(ctx, e, cid, conn);
             return 0;
+        } else if (is_rabbitmq_connection(payload, size)) {
+            req->protocol = PROTOCOL_RABBITMQ;
+        } else if (is_clickhouse_query(payload, size)) {
+            req->protocol = PROTOCOL_CLICKHOUSE;
+        } else if (is_zk_request(payload, total_size)) {
+            req->protocol = PROTOCOL_ZOOKEEPER;
+        }  else if (is_kafka_request(payload, size, &req->request_id)) {
+            req->protocol = PROTOCOL_KAFKA;
+        } else if (is_dubbo2_request(payload, size)) {
+            req->protocol = PROTOCOL_DUBBO2;
+        } else if (is_dns_request(payload, size, &k.stream_id)) {
+            req->protocol = PROTOCOL_DNS;
+        } else if (is_foundationdb_request(payload, size)) {
+            req->protocol = PROTOCOL_FOUNDATIONDB;
         }
-        req->protocol = PROTOCOL_POSTGRES;
-    } else if (is_redis_query(payload, size)) {
-        req->protocol = PROTOCOL_REDIS;
-    } else if (is_memcached_query(payload, size)) {
-        req->protocol = PROTOCOL_MEMCACHED;
-    } else if (is_mysql_query(payload, size, &req->request_type)) {
-        if (req->request_type == MYSQL_COM_STMT_CLOSE) {
-            struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
-            if (!e) {
-                return 0;
-            }
-            e->protocol = PROTOCOL_MYSQL;
-            e->method = METHOD_STATEMENT_CLOSE;
-            e->payload_size = size;
-            COPY_PAYLOAD(e->payload, size, payload);
-            send_event(ctx, e, cid, conn);
-            return 0;
+        if (req->protocol != PROTOCOL_UNKNOWN) {
+            conn->protocol = req->protocol; // Save the detected protocol
         }
-        req->protocol = PROTOCOL_MYSQL;
-    } else if (is_mongo_query(payload, size)) {
-        req->protocol = PROTOCOL_MONGO;
-    } else if (is_rabbitmq_produce(payload, size)) {
+    }
+
+    if (req->protocol == PROTOCOL_POSTGRES && req->request_type == POSTGRES_FRAME_CLOSE) {
         struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
-        if (!e) {
-            return 0;
-        }
-        e->protocol = PROTOCOL_RABBITMQ;
-        e->method = METHOD_PRODUCE;
-        send_event(ctx, e, cid, conn);
-        return 0;
-    } else if (nats_method(payload, size) == METHOD_PRODUCE) {
-        struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
-        if (!e) {
-            return 0;
-        }
-        e->protocol = PROTOCOL_NATS;
-        e->method = METHOD_PRODUCE;
-        send_event(ctx, e, cid, conn);
-        return 0;
-    } else if (is_cassandra_request(payload, size, &k.stream_id)) {
-        req->protocol = PROTOCOL_CASSANDRA;
-    } else if (looks_like_http2_frame(payload, size, METHOD_HTTP2_CLIENT_FRAMES)) {
-        struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
-        if (!e) {
-            return 0;
-        }
-        e->protocol = PROTOCOL_HTTP2;
-        e->method = METHOD_HTTP2_CLIENT_FRAMES;
-        e->duration = bpf_ktime_get_ns();
+        if (!e) { return 0; }
+        e->protocol = PROTOCOL_POSTGRES;
+        e->method = METHOD_STATEMENT_CLOSE;
         e->payload_size = size;
         COPY_PAYLOAD(e->payload, size, payload);
         send_event(ctx, e, cid, conn);
         return 0;
-    } else if (is_rabbitmq_connection(payload, size)) {
-        req->protocol = PROTOCOL_RABBITMQ;
-    } else if (is_clickhouse_query(payload, size)) {
-        req->protocol = PROTOCOL_CLICKHOUSE;
-    } else if (is_zk_request(payload, total_size)) {
-        req->protocol = PROTOCOL_ZOOKEEPER;
-    }  else if (is_kafka_request(payload, size, &req->request_id)) {
-        req->protocol = PROTOCOL_KAFKA;
-        struct l7_request *prev_req = bpf_map_lookup_elem(&active_l7_requests, &k);
-        if (prev_req && prev_req->protocol == PROTOCOL_KAFKA) {
-            req->ns = prev_req->ns;
-        }
-    } else if (is_dubbo2_request(payload, size)) {
-        req->protocol = PROTOCOL_DUBBO2;
-    } else if (is_dns_request(payload, size, &k.stream_id)) {
-        req->protocol = PROTOCOL_DNS;
-    } else if (is_foundationdb_request(payload, size)) {
-        req->protocol = PROTOCOL_FOUNDATIONDB;
+    }
+    if (req->protocol == PROTOCOL_MYSQL && req->request_type == MYSQL_COM_STMT_CLOSE) {
+        struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
+        if (!e) { return 0; }
+        e->protocol = PROTOCOL_MYSQL;
+        e->method = METHOD_STATEMENT_CLOSE;
+        e->payload_size = size;
+        COPY_PAYLOAD(e->payload, size, payload);
+        send_event(ctx, e, cid, conn);
+        return 0;
     }
 
     if (req->protocol == PROTOCOL_UNKNOWN) {

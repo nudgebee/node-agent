@@ -3,7 +3,6 @@ package containers
 import (
 	"bytes"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"log"
 	"os"
@@ -11,7 +10,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/coroot/coroot-node-agent/cgroup"
 	"github.com/coroot/coroot-node-agent/common"
@@ -956,9 +954,6 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 			conn.postgresParser = l7.NewPostgresParser()
 		}
 		query := conn.postgresParser.Parse(r.Payload)
-		if !utf8.ValidString(query) {
-			klog.Warningf("Invalid UTF-8 detected in parsed query for protocol %s. Raw payload (hex): %s", r.Protocol.String(), hex.EncodeToString(r.Payload))
-		}
 		if trace != nil {
 			trace.PostgresQuery(query, r.Status.Error(), r.Duration)
 		}
@@ -971,9 +966,6 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 			conn.mysqlParser = l7.NewMysqlParser()
 		}
 		query := conn.mysqlParser.Parse(r.Payload, r.StatementId)
-		if !utf8.ValidString(query) {
-			klog.Warningf("Invalid UTF-8 detected in parsed query for protocol %s. Raw payload (hex): %s", r.Protocol.String(), hex.EncodeToString(r.Payload))
-		}
 		if trace != nil {
 			trace.MysqlQuery(query, r.Status.Error(), r.Duration)
 		}
@@ -981,9 +973,6 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		// Update stats for Memcached
 		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		cmd, items := l7.ParseMemcached(r.Payload)
-		if !utf8.ValidString(cmd) {
-			klog.Warningf("Invalid UTF-8 detected in parsed query for protocol %s. Raw payload (hex): %s", r.Protocol.String(), hex.EncodeToString(r.Payload))
-		}
 		if trace != nil {
 			trace.MemcachedQuery(cmd, items, r.Status.Error(), r.Duration)
 		}
@@ -991,9 +980,6 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		// Update stats for Redis
 		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		cmd, args := l7.ParseRedis(r.Payload)
-		if !utf8.ValidString(cmd) || !utf8.ValidString(args) {
-			klog.Warningf("Invalid UTF-8 detected in parsed query for protocol %s. Raw payload (hex): %s", r.Protocol.String(), hex.EncodeToString(r.Payload))
-		}
 		if trace != nil {
 			trace.RedisQuery(cmd, args, r.Status.Error(), r.Duration)
 		}
@@ -1001,9 +987,6 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		// Update stats for Mongo
 		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		query := l7.ParseMongo(r.Payload)
-		if !utf8.ValidString(query) {
-			klog.Warningf("Invalid UTF-8 detected in parsed query for protocol %s. Raw payload (hex): %s", r.Protocol.String(), hex.EncodeToString(r.Payload))
-		}
 		if trace != nil {
 			trace.MongoQuery(query, r.Status.Error(), r.Duration)
 		}
@@ -1020,9 +1003,6 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		// Update stats for Clickhouse
 		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		query := l7.ParseClickhouse(r.Payload)
-		if !utf8.ValidString(query) {
-			klog.Warningf("Invalid UTF-8 detected in parsed query for protocol %s. Raw payload (hex): %s", r.Protocol.String(), hex.EncodeToString(r.Payload))
-		}
 		if trace != nil {
 			trace.ClickhouseQuery(query, r.Status.Error(), r.Duration)
 		}
@@ -1030,9 +1010,6 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		// Update stats for Zookeeper
 		c.l7Stats.observe(r.Protocol, r.Status.Zookeeper(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		op, arg := l7.ParseZookeeper(r.Payload)
-		if !utf8.ValidString(op) || !utf8.ValidString(arg) {
-			klog.Warningf("Invalid UTF-8 detected in parsed query for protocol %s. Raw payload (hex): %s", r.Protocol.String(), hex.EncodeToString(r.Payload))
-		}
 		if trace != nil {
 			trace.ZookeeperRequest(op, arg, r.Status, r.Duration)
 		}
