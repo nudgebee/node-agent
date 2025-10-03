@@ -149,6 +149,11 @@ void send_event(void *ctx, struct l7_event *e, struct connection_id cid, struct 
 
 static inline __attribute__((__always_inline__))
 __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_size) {
+    // The verifier needs to know that iovlen is bounded, as it comes from a user pointer.
+    if (iovlen > MAX_IOVEC_SIZE) {
+        iovlen = MAX_IOVEC_SIZE;
+    }
+
     struct iovec iov = {};
     __u64 max = (ret) ? MIN(ret, MAX_PAYLOAD_SIZE) : MAX_PAYLOAD_SIZE;
     __u64 offset = 0;
