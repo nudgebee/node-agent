@@ -516,7 +516,12 @@ int sys_enter_write(struct trace_event_raw_sys_enter_rw__stub* ctx) {
 
 SEC("tracepoint/syscalls/sys_enter_writev")
 int sys_enter_writev(struct trace_event_raw_sys_enter_rw__stub* ctx) {
-    return trace_enter_write(ctx, ctx->fd, 0, ctx->buf, 0, ctx->size);
+    // Bound check iovlen to prevent verifier issues
+    __u64 iovlen = ctx->size;
+    if (iovlen > MAX_IOVEC_SIZE) {
+        iovlen = MAX_IOVEC_SIZE;
+    }
+    return trace_enter_write(ctx, ctx->fd, 0, ctx->buf, 0, iovlen);
 }
 
 SEC("tracepoint/syscalls/sys_enter_sendmsg")
@@ -525,7 +530,12 @@ int sys_enter_sendmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     if (bpf_probe_read(&msghdr, sizeof(msghdr), (void *)ctx->buf)) {
         return 0;
     }
-    return trace_enter_write(ctx, ctx->fd, 0, (char*)msghdr.msg_iov, 0, msghdr.msg_iovlen);
+    // Bound check iovlen to prevent verifier issues
+    __u64 iovlen = msghdr.msg_iovlen;
+    if (iovlen > MAX_IOVEC_SIZE) {
+        iovlen = MAX_IOVEC_SIZE;
+    }
+    return trace_enter_write(ctx, ctx->fd, 0, (char*)msghdr.msg_iov, 0, iovlen);
 }
 
 struct mmsghdr {
@@ -540,14 +550,24 @@ int sys_enter_sendmmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
         if (bpf_probe_read(&h , sizeof(h), (void *)ctx->buf)) {
             return 0;
         }
-        trace_enter_write(ctx, ctx->fd, 0, (char*)h.msg_hdr.msg_iov, 0, h.msg_hdr.msg_iovlen);
+        // Bound check iovlen to prevent verifier issues
+        __u64 iovlen = h.msg_hdr.msg_iovlen;
+        if (iovlen > MAX_IOVEC_SIZE) {
+            iovlen = MAX_IOVEC_SIZE;
+        }
+        trace_enter_write(ctx, ctx->fd, 0, (char*)h.msg_hdr.msg_iov, 0, iovlen);
     }
     if (ctx->size > 1) {
         struct mmsghdr h = {};
         if (bpf_probe_read(&h , sizeof(h), (void *)(ctx->buf + sizeof(h)))) {
             return 0;
         }
-        trace_enter_write(ctx, ctx->fd, 0, (char*)h.msg_hdr.msg_iov, 0, h.msg_hdr.msg_iovlen);
+        // Bound check iovlen to prevent verifier issues
+        __u64 iovlen = h.msg_hdr.msg_iovlen;
+        if (iovlen > MAX_IOVEC_SIZE) {
+            iovlen = MAX_IOVEC_SIZE;
+        }
+        trace_enter_write(ctx, ctx->fd, 0, (char*)h.msg_hdr.msg_iov, 0, iovlen);
     }
     return 0;
 }
@@ -579,7 +599,12 @@ int sys_enter_recvmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
         return 0;
     }
     __u32 pid = id >> 32;
-    return trace_enter_read(id, pid, ctx->fd, (char*)msghdr.msg_iov, 0, msghdr.msg_iovlen);
+    // Bound check iovlen to prevent verifier issues
+    __u64 iovlen = msghdr.msg_iovlen;
+    if (iovlen > MAX_IOVEC_SIZE) {
+        iovlen = MAX_IOVEC_SIZE;
+    }
+    return trace_enter_read(id, pid, ctx->fd, (char*)msghdr.msg_iov, 0, iovlen);
 }
 
 SEC("tracepoint/syscalls/sys_enter_recvfrom")
