@@ -27,12 +27,13 @@ const MAX_PODS_LIMIT = 30000   // arbitrary limit
 // MinimalPod holds only the essential fields from a v1.Pod object
 // to reduce the memory footprint of the cache by ~90%.
 type MinimalPod struct {
-	UID       types.UID
-	Name      string
-	Namespace string
-	Labels    map[string]string
-	NodeName  string
-	PodIPs    []v1.PodIP
+	UID             types.UID
+	Name            string
+	Namespace       string
+	Labels          map[string]string
+	NodeName        string
+	PodIPs          []v1.PodIP
+	OwnerReferences []metav1.OwnerReference
 }
 
 type clusterSnapshot struct {
@@ -333,12 +334,13 @@ func (resolver *K8sIPResolver) addPodHandlers(podInformer cache.SharedIndexInfor
 
 func (resolver *K8sIPResolver) handlePodAdd(pod *v1.Pod) bool {
 	minPod := MinimalPod{
-		UID:       pod.UID,
-		Name:      pod.Name,
-		Namespace: pod.Namespace,
-		Labels:    pod.Labels,
-		NodeName:  pod.Spec.NodeName,
-		PodIPs:    pod.Status.PodIPs,
+		UID:             pod.UID,
+		Name:            pod.Name,
+		Namespace:       pod.Namespace,
+		Labels:          pod.Labels,
+		NodeName:        pod.Spec.NodeName,
+		PodIPs:          pod.Status.PodIPs,
+		OwnerReferences: pod.ObjectMeta.OwnerReferences,
 	}
 	resolver.snapshot.Pods.Store(pod.UID, minPod)
 	entry := resolver.resolvePodDescriptor(&minPod)
@@ -437,12 +439,13 @@ func (resolver *K8sIPResolver) getFullClusterSnapshot() error {
 
 	for _, pod := range pods.Items {
 		minPod := MinimalPod{
-			UID:       pod.UID,
-			Name:      pod.Name,
-			Namespace: pod.Namespace,
-			Labels:    pod.Labels,
-			NodeName:  pod.Spec.NodeName,
-			PodIPs:    pod.Status.PodIPs,
+			UID:             pod.UID,
+			Name:            pod.Name,
+			Namespace:       pod.Namespace,
+			Labels:          pod.Labels,
+			NodeName:        pod.Spec.NodeName,
+			PodIPs:          pod.Status.PodIPs,
+			OwnerReferences: pod.ObjectMeta.OwnerReferences,
 		}
 		resolver.snapshot.Pods.Store(pod.UID, minPod)
 	}
@@ -802,9 +805,31 @@ func (resolver *K8sIPResolver) resolvePodDescriptor(pod *MinimalPod) Workload {
 	name := pod.Name
 	namespace := pod.Namespace
 	kind := "pod"
-	// For MinimalPod, we need to create a fake ObjectMeta to get owner refs
-	// Since we don't store OwnerReferences in MinimalPod, we'll need to handle this differently
-	// For now, let's just use the pod info directly
+
+	// Resolve owner hierarchy using OwnerReferences from MinimalPod
+	if len(pod.OwnerReferences) > 0 {
+		// Find the controller owner reference
+		for _, owner := range pod.OwnerReferences {
+			if owner.Controller != nil && *owner.Controller {
+				name = owner.Name
+				kind = owner.Kind
+				// Try to climb up the ownership hierarchy
+				if owner, err := resolver.getControllerOfOwner(&owner); err == nil && owner != nil {
+					for owner != nil {
+						name = owner.Name
+						kind = owner.Kind
+						owner, err = resolver.getControllerOfOwner(owner)
+						if err != nil {
+							klog.V(5).Infof("couldn't retrieve owner of %v - %v", name, err)
+							break
+						}
+					}
+				}
+				break
+			}
+		}
+	}
+
 	instanceMeta, ok := resolver.instanceMetaMap.Load(pod.NodeName)
 	region := ""
 	zone := ""
@@ -872,12 +897,13 @@ func (resolver *K8sIPResolver) ResolvePodOwner(podName string, podNamespace stri
 		}
 	}
 	minPod := &MinimalPod{
-		UID:       pods.UID,
-		Name:      pods.Name,
-		Namespace: pods.Namespace,
-		Labels:    pods.Labels,
-		NodeName:  pods.Spec.NodeName,
-		PodIPs:    pods.Status.PodIPs,
+		UID:             pods.UID,
+		Name:            pods.Name,
+		Namespace:       pods.Namespace,
+		Labels:          pods.Labels,
+		NodeName:        pods.Spec.NodeName,
+		PodIPs:          pods.Status.PodIPs,
+		OwnerReferences: pods.ObjectMeta.OwnerReferences,
 	}
 	return resolver.resolvePodDescriptor(minPod)
 }
