@@ -487,11 +487,29 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	}
 	if c := r.containersById[id]; c != nil {
 		klog.Warningln("id conflict:", id)
+		
+		// Unregister the existing container from Prometheus to prevent duplicate metrics
+		klog.Infof("DEBUG: Unregistering existing container due to ID conflict - id: %s, app_id: %s", c.id, c.appId)
+		if ok := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(c.id), "app_id": c.appId}, r.reg).Unregister(c); !ok {
+			klog.Warningf("DEBUG: failed to unregister existing container during ID conflict: %s", c.id)
+		} else {
+			klog.Infof("DEBUG: Successfully unregistered existing container during ID conflict - id: %s", c.id)
+		}
+		
 		if cg.CreatedAt().After(c.cgroup.CreatedAt()) {
 			c.cgroup = cg
 			c.metadata = md
 			c.runLogParser("")
 		}
+		
+		// Re-register the container with potentially updated metadata
+		klog.Infof("DEBUG: Re-registering container after ID conflict - id: %s, app_id: %s", c.id, c.appId)
+		if err := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(c.id), "app_id": c.appId}, r.reg).Register(c); err != nil {
+			klog.Warningf("DEBUG: failed to re-register container after ID conflict: %v", err)
+		} else {
+			klog.Infof("DEBUG: Successfully re-registered container after ID conflict - id: %s", c.id)
+		}
+		
 		r.containersByPid[pid] = c
 		r.containersByCgroupId[cg.Id] = c
 		return c
