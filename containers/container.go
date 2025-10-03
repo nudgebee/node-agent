@@ -179,10 +179,10 @@ type Container struct {
 	done        chan struct{}
 	ip_resolver IPResolver
 	srcWorkload common.Workload
-	
+
 	// Debug fields
-	collectCallCount    int
-	lastCollectTime     time.Time
+	collectCallCount int
+	lastCollectTime  time.Time
 }
 
 func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid uint32, registry *Registry) (*Container, error) {
@@ -280,14 +280,14 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	c.lock.Lock()
 	c.collectCallCount++
 	timeSinceLastCall := time.Since(c.lastCollectTime)
-	
+
 	// Prevent duplicate metric emissions by ensuring minimum 5 second interval between collections
 	if timeSinceLastCall < 5*time.Second && c.collectCallCount > 1 {
 		klog.Infof("DEBUG: Skipping collection for container %s - called too recently (call #%d, time since last: %v)", c.id, c.collectCallCount, timeSinceLastCall)
 		defer c.lock.Unlock()
 		return
 	}
-	
+
 	c.lastCollectTime = time.Now()
 	klog.Infof("DEBUG: Container.Collect() called for container %s (app_id: %s) - call #%d, time since last: %v", c.id, c.appId, c.collectCallCount, timeSinceLastCall)
 	defer c.lock.Unlock()
@@ -367,25 +367,25 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	klog.Infof("DEBUG: Container %s emitting TCP metrics for %d destinations", c.id, len(c.connectionStats))
-	
+
 	// Track emitted metrics to detect duplicates
 	emittedMetrics := make(map[string]int)
-	
+
 	for d, stats := range c.connectionStats {
 		workload_src := c.srcWorkload
 		workload_dest := d.GetDestinationWorkload()
 		actualDestWorkload := d.GetActualDestinationWorkload()
-		
+
 		// Create a key to track duplicate metrics
 		metricKey := fmt.Sprintf("%s->%s:%s->%s", workload_src.Name, workload_dest.Name, d.DestinationLabelValue(), d.ActualDestinationLabelValue())
 		emittedMetrics[metricKey]++
 		if emittedMetrics[metricKey] > 1 {
 			klog.Errorf("DEBUG: DUPLICATE METRIC DETECTED! Container %s already emitted metric for %s (occurrence #%d)", c.id, metricKey, emittedMetrics[metricKey])
 		}
-		
+
 		// Debug log each TCP metric emission
 		klog.Infof("DEBUG: Container %s emitting TCP metrics - dest: %s, actual: %s, count: %d, workload: %s->%s", c.id, d.DestinationLabelValue(), d.ActualDestinationLabelValue(), stats.Count, workload_src.Name, workload_dest.Name)
-		
+
 		ch <- counter(metrics.NetConnectionsSuccessful, float64(stats.Count), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
 		ch <- counter(metrics.NetConnectionsTotalTime, stats.TotalTime.Seconds(), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
 		if stats.Retransmissions > 0 {

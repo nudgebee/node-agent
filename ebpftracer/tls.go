@@ -270,7 +270,7 @@ func getSslLibPathAndVersion(pid uint32) (string, string) {
 		return "", ""
 	}
 	defer f.Close()
-	
+
 	// Regex to find libraries that look like libssl or libcrypto, even with version numbers.
 	// e.g., libssl.so.3, libcrypto-74fbf0e0.so.3
 	libSslRe := regexp.MustCompile(`libssl\.so(\.\d+)*`)

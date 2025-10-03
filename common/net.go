@@ -226,10 +226,10 @@ func NewDomain(fqdn string, ips []netaddr.IP) *Domain {
 func NewDestinationKey(dst, actualDst netaddr.IPPort, domain *Domain, dstWorkload Workload, actualDestWorkload Workload) DestinationKey {
 	// Debug logging for duplicate metrics investigation
 	if dst.IP().String() == "10.43.37.74" && dst.Port() == 8000 {
-		klog.Infof("DEBUG NewDestinationKey: dst=%s actualDst=%s domain=%v dstWorkload=%s actualDestWorkload=%s", 
+		klog.Infof("DEBUG NewDestinationKey: dst=%s actualDst=%s domain=%v dstWorkload=%s actualDestWorkload=%s",
 			dst, actualDst, domain, dstWorkload.Name, actualDestWorkload.Name)
 	}
-	
+
 	if IsIpExternal(actualDst.IP()) && domain != nil && !domain.SpecifyIP {
 		dstWorkload.Name = domain.FQDN
 		actualDestWorkload.Name = domain.FQDN
