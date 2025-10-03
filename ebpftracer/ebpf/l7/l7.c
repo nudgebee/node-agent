@@ -532,22 +532,18 @@ struct mmsghdr {
 
 SEC("tracepoint/syscalls/sys_enter_sendmmsg")
 int sys_enter_sendmmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
-    __u64 offset = 0;
-    __u64 size = ctx->size;
-    // The verifier needs to know that size is bounded.
-    if (size > 2) {
-        size = 2;
-    }
-    #pragma unroll
-    for (int i = 0; i <= 1; i++) {
-        if (i >= size) {
-            break;
-        }
+    if (ctx->size > 0) {
         struct mmsghdr h = {};
-        if (bpf_probe_read(&h , sizeof(h), (void *)(ctx->buf + offset))) {
+        if (bpf_probe_read(&h , sizeof(h), (void *)ctx->buf)) {
             return 0;
         }
-        offset += sizeof(h);
+        trace_enter_write(ctx, ctx->fd, 0, (char*)h.msg_hdr.msg_iov, 0, h.msg_hdr.msg_iovlen);
+    }
+    if (ctx->size > 1) {
+        struct mmsghdr h = {};
+        if (bpf_probe_read(&h , sizeof(h), (void *)(ctx->buf + sizeof(h)))) {
+            return 0;
+        }
         trace_enter_write(ctx, ctx->fd, 0, (char*)h.msg_hdr.msg_iov, 0, h.msg_hdr.msg_iovlen);
     }
     return 0;
