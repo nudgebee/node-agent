@@ -270,6 +270,14 @@ func getSslLibPathAndVersion(pid uint32) (string, string) {
 		return "", ""
 	}
 	defer f.Close()
+	
+	// Regex to find libraries that look like libssl or libcrypto, even with version numbers.
+	// e.g., libssl.so.3, libcrypto-74fbf0e0.so.3
+	libSslRe := regexp.MustCompile(`libssl\.so(\.\d+)*`)
+	libCryptoRe := regexp.MustCompile(`libcrypto\.so(\.\d+)*`)
+	// A more specific regex for psycopg2's bundled libs
+	psycopg2LibRe := regexp.MustCompile(`lib(ssl|crypto)-[a-f0-9]+\.so\.\d+`)
+
 	scanner := bufio.NewScanner(f)
 	scanner.Split(bufio.ScanLines)
 	var libsslPath, libcryptoPath string
@@ -280,8 +288,11 @@ func getSslLibPathAndVersion(pid uint32) (string, string) {
 			continue
 		}
 		libPath := parts[5]
-		switch {
-		case libsslPath == "" && strings.Contains(libPath, "libssl.so"):
+
+		isSsl := libSslRe.MatchString(libPath) || (strings.Contains(libPath, "psycopg2") && psycopg2LibRe.MatchString(libPath) && strings.Contains(libPath, "libssl"))
+		isCrypto := libCryptoRe.MatchString(libPath) || (strings.Contains(libPath, "psycopg2") && psycopg2LibRe.MatchString(libPath) && strings.Contains(libPath, "libcrypto"))
+
+		if libsslPath == "" && isSsl {
 			fullPath := proc.Path(pid, "root", libPath)
 			if _, err = os.Stat(fullPath); err == nil {
 				libsslPath = fullPath
@@ -289,7 +300,7 @@ func getSslLibPathAndVersion(pid uint32) (string, string) {
 			} else {
 				klog.V(4).Infof("pid=%d: libssl candidate %s not accessible: %v", pid, fullPath, err)
 			}
-		case libcryptoPath == "" && strings.Contains(libPath, "libcrypto.so"):
+		} else if libcryptoPath == "" && isCrypto {
 			fullPath := proc.Path(pid, "root", libPath)
 			if _, err = os.Stat(fullPath); err == nil {
 				libcryptoPath = fullPath
@@ -297,9 +308,8 @@ func getSslLibPathAndVersion(pid uint32) (string, string) {
 			} else {
 				klog.V(4).Infof("pid=%d: libcrypto candidate %s not accessible: %v", pid, fullPath, err)
 			}
-		default:
-			continue
 		}
+
 		if libsslPath != "" && libcryptoPath != "" {
 			break
 		}

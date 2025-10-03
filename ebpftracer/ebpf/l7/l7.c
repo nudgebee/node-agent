@@ -174,10 +174,13 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
             size = MIN(iov.size, max-offset);
             TRUNCATE_PAYLOAD_SIZE(size);
             TRUNCATE_PAYLOAD_SIZE(offset);
-            if (bpf_probe_read(buf + offset, size, (void *)iov.buf)) {
-                return 0;
+            // Additional bounds check to satisfy eBPF verifier
+            if (offset >= 0 && offset < 10240 && size > 0 && size <= 5119 && (offset + size) <= 10240) {
+                if (bpf_probe_read(buf + offset, size, (void *)iov.buf)) {
+                    return 0;
+                }
+                offset += size;
             }
-            offset += size;
         }
     }
     return offset;
