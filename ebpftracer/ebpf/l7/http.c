@@ -28,18 +28,18 @@ int is_http_request(char *buf) {
         return 0;
     }
 
-    // We scan for " HTTP/1." starting after the shortest possible method ("GET ").
-    // The loop must have a constant boundary to be unrolled by the compiler and accepted by the eBPF verifier.
-    #pragma unroll
-    for (int i = 4; i < 128 - 8; i++) {
-        char version_check[8];
-        if (bpf_probe_read_str(&version_check, sizeof(version_check), (void *)(buf + i)) < 0) {
-            break; // Stop if we can't read
-        }
-        if (version_check[0] == ' ' && version_check[1] == 'H' && version_check[2] == 'T' &&
-            version_check[3] == 'T' && version_check[4] == 'P' && version_check[5] == '/' &&
-            version_check[6] == '1' && version_check[7] == '.') {
-            return 1; // Found " HTTP/1." - this is a valid HTTP/1.x request
+    // Simplified HTTP detection - just check if " HTTP/1." appears in first 64 bytes
+    // Use a single read to avoid pointer arithmetic issues
+    char full_buf[64];
+    if (bpf_probe_read_str(&full_buf, sizeof(full_buf), (void *)buf) >= 8) {
+        // Look for " HTTP/1." pattern manually without pointer arithmetic
+        #pragma unroll
+        for (int i = 4; i < 56; i++) { // 64 - 8 = 56
+            if (full_buf[i] == ' ' && full_buf[i+1] == 'H' && full_buf[i+2] == 'T' &&
+                full_buf[i+3] == 'T' && full_buf[i+4] == 'P' && full_buf[i+5] == '/' &&
+                full_buf[i+6] == '1' && full_buf[i+7] == '.') {
+                return 1; // Found " HTTP/1." - this is a valid HTTP/1.x request
+            }
         }
     }
 
