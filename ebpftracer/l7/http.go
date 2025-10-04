@@ -68,19 +68,9 @@ func ParseHttp(payload []byte) (string, string) {
 func ParseHTTPRequest(data []byte) (*http.Request, error) {
 	method, rest, ok := bytes.Cut(data, space)
 	if !ok {
-		debugLen := 50
-		if len(data) < debugLen {
-			debugLen = len(data)
-		}
-		log.Printf("invalid method - no space found in payload: %q", safeString(data[:debugLen]))
 		return nil, errors.New("invalid payload")
 	}
 	if !isHttpMethod(safeString(method)) {
-		debugLen := 50
-		if len(data) < debugLen {
-			debugLen = len(data)
-		}
-		log.Printf("invalid method: %q (hex: %x) from payload start: %q", safeString(method), method, safeString(data[:debugLen]))
 		return nil, errors.New("invalid payload")
 	}
 	uri, rest, ok := bytes.Cut(rest, space)
@@ -214,20 +204,10 @@ func SanitizeString(value string) string {
 
 // ParseHTTPResponse parses HTTP response data and returns status code and headers
 func ParseHTTPResponse(data []byte) (*http.Response, error) {
-	// DEBUG: Log what data is being processed as HTTP response
-	debugLen := 50
-	if len(data) < debugLen {
-		debugLen = len(data)
-	}
-	log.Printf("DEBUG: Processing as HTTP response: %q (hex: %x)", safeString(data[:debugLen]), data[:debugLen])
+	// Skip debug logging for performance
 
 	// Check if it starts with HTTP/
 	if !bytes.HasPrefix(data, []byte("HTTP/")) {
-		debugLen := 20
-		if len(data) < debugLen {
-			debugLen = len(data)
-		}
-		log.Printf("invalid response - does not start with HTTP/: %q", safeString(data[:debugLen]))
 		return nil, errors.New("invalid response format")
 	}
 

@@ -165,7 +165,7 @@ func parseOpenAIRequest(jsonPayload string) (*LLMRequest, error) {
 	}
 
 	if err := json.Unmarshal([]byte(jsonPayload), &req); err != nil {
-		log.Printf("Failed to parse OpenAI request: %v", err)
+		// Skip logging expected parsing failures
 		return nil, err
 	}
 
@@ -189,7 +189,6 @@ func parseOpenAIResponse(jsonResponse string) (*LLMResponse, error) {
 	}
 
 	if err := json.Unmarshal([]byte(jsonResponse), &resp); err != nil {
-		log.Printf("Failed to parse OpenAI response: %v", err)
 		return nil, err
 	}
 
@@ -211,7 +210,6 @@ func parseAnthropicRequest(jsonPayload string) (*LLMRequest, error) {
 	}
 
 	if err := json.Unmarshal([]byte(jsonPayload), &req); err != nil {
-		log.Printf("Failed to parse Anthropic request: %v", err)
 		return nil, err
 	}
 
@@ -234,7 +232,7 @@ func parseAnthropicResponse(jsonResponse string) (*LLMResponse, error) {
 	}
 
 	if err := json.Unmarshal([]byte(jsonResponse), &resp); err != nil {
-		log.Printf("Failed to parse Anthropic response: %v", err)
+		// Skip logging expected parsing failures
 		return nil, err
 	}
 
@@ -257,7 +255,7 @@ func parseGoogleRequest(jsonPayload string) (*LLMRequest, error) {
 	}
 
 	if err := json.Unmarshal([]byte(jsonPayload), &req); err != nil {
-		log.Printf("Failed to parse Google request: %v", err)
+		// Skip logging expected parsing failures
 		return nil, err
 	}
 
@@ -283,7 +281,7 @@ func parseGoogleResponse(jsonResponse string) (*LLMResponse, error) {
 	}
 
 	if err := json.Unmarshal([]byte(jsonResponse), &resp); err != nil {
-		log.Printf("Failed to parse Google response: %v", err)
+		// Skip logging expected parsing failures
 		return nil, err
 	}
 
@@ -305,7 +303,7 @@ func parseCohereRequest(jsonPayload string) (*LLMRequest, error) {
 	}
 
 	if err := json.Unmarshal([]byte(jsonPayload), &req); err != nil {
-		log.Printf("Failed to parse Cohere request: %v", err)
+		// Skip logging expected parsing failures
 		return nil, err
 	}
 
@@ -329,7 +327,7 @@ func parseCohereResponse(jsonResponse string) (*LLMResponse, error) {
 	}
 
 	if err := json.Unmarshal([]byte(jsonResponse), &resp); err != nil {
-		log.Printf("Failed to parse Cohere response: %v", err)
+		// Skip logging expected parsing failures
 		return nil, err
 	}
 
