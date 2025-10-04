@@ -27,7 +27,7 @@ import (
 	"k8s.io/klog/v2"
 )
 
-const MaxPayloadSize = 1024 * 5
+const MaxPayloadSize = 1024
 
 type EventType uint32
 type EventReason uint32
@@ -258,7 +258,7 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	}
 
 	if !t.disableL7Tracing {
-		perfMaps = append(perfMaps, perfMap{name: "l7_events", typ: perfMapTypeL7Events, perCPUBufferSizePages: 128}) // Increased for high-volume LLM API tracing
+		perfMaps = append(perfMaps, perfMap{name: "l7_events", typ: perfMapTypeL7Events, perCPUBufferSizePages: 64}) // Increased for high-volume LLM API tracing
 	}
 
 	pageSize := os.Getpagesize()
@@ -394,8 +394,8 @@ type l7Event struct {
 	StatementId         uint32
 	PayloadSize         uint64
 	ResponseSize        uint64
-	Payload             [5120]byte // Must match MAX_PAYLOAD_SIZE in eBPF
-	Response            [5120]byte // Must match MAX_PAYLOAD_SIZE in eBPF
+	Payload             [1024]byte // Must match MAX_PAYLOAD_SIZE in eBPF
+	Response            [1024]byte // Must match MAX_PAYLOAD_SIZE in eBPF
 }
 
 // HTTP response fragment event (must match eBPF struct)

@@ -618,9 +618,11 @@ func (c *Container) onFileOpen(pid uint32, fd uint64, mnt uint64, log bool) {
 		}
 	}()
 	if logPath != "" {
-		c.lock.Lock()
-		c.runLogParser(logPath)
-		c.lock.Unlock()
+		if *flags.EnableDynamicLogTailing {
+			c.lock.Lock()
+			c.runLogParser(logPath)
+			c.lock.Unlock()
+		}
 	}
 }
 
