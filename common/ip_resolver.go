@@ -572,8 +572,12 @@ func (resolver *K8sIPResolver) updateIpMapping() {
 				}
 
 				if matches {
-					// Found matching pod, get its owner workload
-					workload = resolver.ResolvePodOwner(pod.Name, pod.Namespace)
+					// Found matching pod, get its owner workload and update the service's workload
+					owner := resolver.ResolvePodOwner(pod.Name, pod.Namespace)
+					workload.Name = owner.Name
+					workload.Kind = owner.Kind
+					workload.Region = owner.Region
+					workload.Zone = owner.Zone
 					return false // stop iteration
 				}
 
@@ -702,8 +706,12 @@ func (resolver *K8sIPResolver) handleServiceUpdate(service v1.Service) {
 			}
 
 			if matches {
-				// Found matching pod, get its owner workload
-				workload = resolver.ResolvePodOwner(pod.Name, pod.Namespace)
+				// Found matching pod, get its owner workload and update the service's workload
+				owner := resolver.ResolvePodOwner(pod.Name, pod.Namespace)
+				workload.Name = owner.Name
+				workload.Kind = owner.Kind
+				workload.Region = owner.Region
+				workload.Zone = owner.Zone
 				return false // stop iteration
 			}
 
