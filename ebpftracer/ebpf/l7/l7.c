@@ -191,8 +191,12 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
 
     char* payload = buf;
     if (iovlen) {
-        // Skip iovec processing to avoid eBPF verifier issues
-        return 0;
+        payload = bpf_map_lookup_elem(&iovec_buf_heap, &zero);
+        if (!payload) {
+            return 0;
+        }
+        total_size = 0;
+        size = read_iovec(buf, iovlen, 0, payload, &total_size);
     }
     if (!size) {
         return 0;
@@ -257,6 +261,8 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
             send_event(ctx, e, cid, conn);
             return 0;
         } else if (is_rabbitmq_connection(payload, size)) {
+            req->protocol = PROTOCOL_RABBITMQ;
+        } else if (is_amqp_frame(payload, size)) {
             req->protocol = PROTOCOL_RABBITMQ;
         } else if (is_clickhouse_query(payload, size)) {
             req->protocol = PROTOCOL_CLICKHOUSE;
@@ -513,20 +519,14 @@ struct mmsghdr {
 
 SEC("tracepoint/syscalls/sys_enter_sendmmsg")
 int sys_enter_sendmmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
-    __u64 offset = 0;
-    #pragma unroll
-    for (int i = 0; i <= 1; i++) {
-        if (i >= ctx->size) {
-            break;
-        }
-        struct mmsghdr h = {};
-        if (bpf_probe_read(&h , sizeof(h), (void *)(ctx->buf + offset))) {
-            return 0;
-        }
-        offset += sizeof(h);
-        trace_enter_write(ctx, ctx->fd, 0, (char*)h.msg_hdr.msg_iov, 0, h.msg_hdr.msg_iovlen);
+    if (ctx->size == 0) {
+        return 0;
     }
-    return 0;
+    struct mmsghdr h = {};
+    if (bpf_probe_read(&h , sizeof(h), (void *)ctx->buf)) {
+        return 0;
+    }
+    return trace_enter_write(ctx, ctx->fd, 0, (char*)h.msg_hdr.msg_iov, 0, h.msg_hdr.msg_iovlen);
 }
 
 SEC("tracepoint/syscalls/sys_enter_sendto")

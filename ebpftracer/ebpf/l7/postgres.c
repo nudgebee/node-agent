@@ -21,13 +21,9 @@ int is_postgres_query(char *buf, __u64 buf_size, __u8 *request_type) {
         bpf_read(buf + 1, f_length);
         f_length = bpf_htonl(f_length);
 
-        // Check if the length is plausible and if the query is null-terminated.
+        // Check if the length is plausible.
         if (f_length > 4 && f_length < buf_size) {
-            char last_char;
-            bpf_read(buf + f_length, last_char);
-            if (last_char == 0) {
-                return 1;
-            }
+            return 1;
         }
     }
 
