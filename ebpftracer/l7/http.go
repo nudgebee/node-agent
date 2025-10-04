@@ -84,9 +84,7 @@ func ParseHTTPRequest(data []byte) (*http.Request, error) {
 	if len(remaining) > 1 {
 		body = remaining[1]
 	}
-	if !ok {
-		return nil, errors.New("invalid headers")
-	}
+	// Headers parsing continues regardless of URI space parsing
 	parsedURL, err := url.ParseRequestURI(safeString(uri))
 
 	if err != nil {
