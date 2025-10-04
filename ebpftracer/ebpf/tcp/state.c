@@ -1,5 +1,5 @@
 #define MAX_CONNECTIONS 1000000
-#define MAX_PAYLOAD_SIZE 1024 * 5 // must be power of 2
+#define MAX_PAYLOAD_SIZE 1024 // must be power of 2
 
 struct tcp_event {
     __u64 fd;
@@ -105,7 +105,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(key_size, sizeof(struct l7_request_key));
     __uint(value_size, sizeof(struct l7_request));
-    __uint(max_entries, 32768);
+    __uint(max_entries, 8192);
 } active_l7_requests SEC(".maps");
 
 SEC("tracepoint/sock/inet_sock_set_state")

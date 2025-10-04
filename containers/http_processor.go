@@ -77,9 +77,9 @@ func (ctx *HTTPRequestContext) parseHTTPRequest() {
 	}
 }
 
-// encodePayloads converts raw payloads to base64 with UTF-8 validation, separating body from headers.
+// encodePayloads converts raw payloads to base64 with UTF-8 validation.
 func (ctx *HTTPRequestContext) encodePayloads() {
-	// Validate and encode request payload
+	// For requests, store only the body.
 	if len(ctx.RawPayload) > 0 {
 		body, _ := splitHTTPPayload(ctx.RawPayload)
 		ctx.HasValidUTF8Payload = utf8.Valid(body)
@@ -88,12 +88,17 @@ func (ctx *HTTPRequestContext) encodePayloads() {
 		}
 	}
 
-	// Validate and encode response payload
+	// For responses, handle binary bodies gracefully.
 	if len(ctx.RawResponse) > 0 {
-		body, _ := splitHTTPPayload(ctx.RawResponse)
-		ctx.HasValidUTF8Response = utf8.Valid(body)
-		if len(body) > 0 {
-			ctx.ResponseBase64 = base64.StdEncoding.EncodeToString(body)
+		responseBody, responseHeaders := splitHTTPPayload(ctx.RawResponse)
+		ctx.HasValidUTF8Response = utf8.Valid(responseBody)
+
+		// If the entire response is valid text, store it all.
+		if utf8.Valid(ctx.RawResponse) {
+			ctx.ResponseBase64 = base64.StdEncoding.EncodeToString(ctx.RawResponse)
+		} else {
+			// Otherwise, it's likely a binary body; store headers only.
+			ctx.ResponseBase64 = base64.StdEncoding.EncodeToString(responseHeaders)
 		}
 	}
 }
