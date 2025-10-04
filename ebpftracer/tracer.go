@@ -27,7 +27,7 @@ import (
 	"k8s.io/klog/v2"
 )
 
-const MaxPayloadSize = 1024
+const MaxPayloadSize = 4096
 
 type EventType uint32
 type EventReason uint32
@@ -394,8 +394,8 @@ type l7Event struct {
 	StatementId         uint32
 	PayloadSize         uint64
 	ResponseSize        uint64
-	Payload             [1024]byte // Must match MAX_PAYLOAD_SIZE in eBPF
-	Response            [1024]byte // Must match MAX_PAYLOAD_SIZE in eBPF
+	Payload             [4096]byte // Must match MAX_PAYLOAD_SIZE in eBPF
+	Response            [4096]byte // Must match MAX_PAYLOAD_SIZE in eBPF
 }
 
 // HTTP response fragment event (must match eBPF struct)
