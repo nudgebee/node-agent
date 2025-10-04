@@ -12,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/coroot/coroot-node-agent/cgroup"
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer"
@@ -23,6 +22,7 @@ import (
 	"github.com/coroot/coroot-node-agent/pinger"
 	"github.com/coroot/coroot-node-agent/proc"
 	"github.com/coroot/coroot-node-agent/tracing"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/nudgebee/logparser"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vishvananda/netns"
@@ -246,14 +246,14 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		registry:    registry,
 		srcWorkload: src_workload,
 	}
-	
+
 	// Initialize the LRU cache for connection stats
 	connStatsCache, err := lru.New[common.DestinationKey, *ConnectionStats](connectionStatsCacheSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create connection stats cache: %w", err)
 	}
 	c.connectionStats = connStatsCache
-	
+
 	c.runLogParser("")
 
 	go func() {

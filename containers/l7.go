@@ -28,22 +28,22 @@ func (si *stringInterner) intern(s string) string {
 	if s == "" {
 		return ""
 	}
-	
+
 	si.mu.RLock()
 	if interned, ok := si.cache[s]; ok {
 		si.mu.RUnlock()
 		return interned
 	}
 	si.mu.RUnlock()
-	
+
 	si.mu.Lock()
 	defer si.mu.Unlock()
-	
+
 	// Double-check after acquiring write lock
 	if interned, ok := si.cache[s]; ok {
 		return interned
 	}
-	
+
 	// Limit cache size to prevent unbounded growth
 	if len(si.cache) > 10000 {
 		// Clear half the cache when it gets too large
@@ -56,7 +56,7 @@ func (si *stringInterner) intern(s string) string {
 		}
 		si.cache = newCache
 	}
-	
+
 	si.cache[s] = s
 	return s
 }
@@ -75,24 +75,24 @@ var (
 func initializePathNormalizationRules() {
 	rulesMutex.Lock()
 	defer rulesMutex.Unlock()
-	
+
 	if rulesInitialized {
 		return
 	}
-	
+
 	// Default built-in rules
 	defaultRules := []pathNormalizationRule{
 		// Generic API resource IDs - matches common ID patterns in REST APIs
 		// e.g., /api/users/123, /api/products/ABC123, /v1/orders/uuid-123-abc
 		{regexp.MustCompile(`(/api/[^/]+/)[A-Za-z0-9\-_]{3,}`), "${1}{id}"},
 		{regexp.MustCompile(`(/v[0-9]+/[^/]+/)[A-Za-z0-9\-_]{3,}`), "${1}{id}"},
-		
+
 		// UUIDs in any path segment
 		{regexp.MustCompile(`/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`), "/{uuid}"},
-		
+
 		// Numeric IDs (3+ digits to avoid false positives like /v1, /api)
 		{regexp.MustCompile(`/\d{3,}`), "/{id}"},
-		
+
 		// ACME challenge paths
 		{regexp.MustCompile(`/\.well-known/acme-challenge/[A-Za-z0-9_-]+`), "/.well-known/acme-challenge/{token}"},
 		// Next.js specific pages, e.g., /_next/static/chunks/pages/cart-4042ca3ed7b203d7.js
@@ -108,9 +108,9 @@ func initializePathNormalizationRules() {
 		{regexp.MustCompile(`\b[a-fA-F0-9]{8,}\b`), ":hex"},
 		{regexp.MustCompile(`\b\d{4,}\b`), ":number"},
 	}
-	
+
 	httpPathNormalizationRules = defaultRules
-	
+
 	// Add custom rules from environment variable
 	if customRulesStr := flags.GetString(flags.HttpPathNormalizationRules); customRulesStr != "" {
 		for _, ruleStr := range strings.Split(customRulesStr, ",") {
@@ -130,7 +130,7 @@ func initializePathNormalizationRules() {
 			}
 		}
 	}
-	
+
 	rulesInitialized = true
 }
 
@@ -139,7 +139,7 @@ func normalizeHttpPath(path string) string {
 	if !rulesInitialized {
 		initializePathNormalizationRules()
 	}
-	
+
 	if i := strings.Index(path, "?"); i != -1 {
 		path = path[:i]
 	}
