@@ -58,6 +58,8 @@ var (
 	DisableKubeProbe           = kingpin.Flag("disable-kube-probe", "disable kube probe trace").Default("true").Envar("DISABLE_KUBE_PROBE").Bool()
 	DisableSensitiveLogParsing = kingpin.Flag("disable-sensitive-log-parsing", "disable sensitive log parsing").Default("false").Envar("DISABLE_SENSITIVE_LOG_PARSING").Bool()
 	TraceIdHeaders             = kingpin.Flag("trace-id-headers", "trace id headers").Default("Traceparent,X-Request-Id").Envar("TRACE_ID_HEADERS").String()
+	
+	HttpPathNormalizationRules = kingpin.Flag("http-path-normalization-rules", "Custom HTTP path normalization rules in format 'pattern1:replacement1,pattern2:replacement2'").Envar("HTTP_PATH_NORMALIZATION_RULES").String()
 
 	agentVersion = kingpin.Flag("version", "Print version and exit").Default("false").Bool()
 	Version      = "unknown"
