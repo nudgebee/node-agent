@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/coroot/coroot-node-agent/cgroup"
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer"
@@ -36,6 +37,10 @@ var (
 	multilineCollectorTimeout = time.Second
 	payloadThreshold          = 1024 * 1024
 	gpuStatsWindow            = 15 * time.Second
+)
+
+const (
+	connectionStatsCacheSize = 8192 // LRU cache size for connection stats
 )
 
 type ContainerID string
@@ -149,7 +154,7 @@ type Container struct {
 
 	listens map[netaddr.IPPort]map[uint32]*ListenDetails
 
-	connectionStats          map[common.DestinationKey]*ConnectionStats
+	connectionStats          *lru.Cache[common.DestinationKey, *ConnectionStats]
 	failedConnectionAttempts map[common.HostPort]int64
 	lastConnectionAttempts   map[common.HostPort]time.Time
 	activeConnections        map[ConnectionKey]*ActiveConnection
@@ -218,7 +223,7 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 
 		listens: map[netaddr.IPPort]map[uint32]*ListenDetails{},
 
-		connectionStats:          map[common.DestinationKey]*ConnectionStats{},
+		connectionStats:          nil, // Will be initialized below
 		failedConnectionAttempts: map[common.HostPort]int64{},
 		lastConnectionAttempts:   map[common.HostPort]time.Time{},
 		activeConnections:        map[ConnectionKey]*ActiveConnection{},
@@ -241,6 +246,14 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		registry:    registry,
 		srcWorkload: src_workload,
 	}
+	
+	// Initialize the LRU cache for connection stats
+	connStatsCache, err := lru.New[common.DestinationKey, *ConnectionStats](connectionStatsCacheSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create connection stats cache: %w", err)
+	}
+	c.connectionStats = connStatsCache
+	
 	c.runLogParser("")
 
 	go func() {
@@ -366,12 +379,16 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
-	klog.Infof("DEBUG: Container %s emitting TCP metrics for %d destinations", c.id, len(c.connectionStats))
+	klog.Infof("DEBUG: Container %s emitting TCP metrics for %d destinations", c.id, c.connectionStats.Len())
 
 	// Track emitted metrics to detect duplicates
 	emittedMetrics := make(map[string]int)
 
-	for d, stats := range c.connectionStats {
+	for _, d := range c.connectionStats.Keys() {
+		stats, ok := c.connectionStats.Peek(d)
+		if !ok {
+			continue
+		}
 		workload_src := c.srcWorkload
 		workload_dest := d.GetDestinationWorkload()
 		actualDestWorkload := d.GetActualDestinationWorkload()
@@ -712,10 +729,10 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 	if failed {
 		c.failedConnectionAttempts[key.Destination()]++
 	} else {
-		stats := c.connectionStats[key]
+		stats, _ := c.connectionStats.Get(key)
 		if stats == nil {
 			stats = &ConnectionStats{}
-			c.connectionStats[key] = stats
+			c.connectionStats.Add(key, stats)
 		}
 		stats.Count++
 		stats.TotalTime += duration
@@ -775,10 +792,10 @@ func (c *Container) updateConnectionTrafficStats(ac *ActiveConnection, sent, rec
 	if ac == nil {
 		return
 	}
-	stats := c.connectionStats[ac.DestinationKey]
+	stats, _ := c.connectionStats.Get(ac.DestinationKey)
 	if stats == nil {
 		stats = &ConnectionStats{}
-		c.connectionStats[ac.DestinationKey] = stats
+		c.connectionStats.Add(ac.DestinationKey, stats)
 	}
 	if sent > ac.BytesSent {
 		stats.BytesSent += sent - ac.BytesSent
@@ -1037,10 +1054,10 @@ func (c *Container) onRetransmission(src netaddr.IPPort, dst netaddr.IPPort) boo
 	if !ok {
 		return false
 	}
-	stats := c.connectionStats[conn.DestinationKey]
+	stats, _ := c.connectionStats.Get(conn.DestinationKey)
 	if stats == nil {
 		stats = &ConnectionStats{}
-		c.connectionStats[conn.DestinationKey] = stats
+		c.connectionStats.Add(conn.DestinationKey, stats)
 	}
 	stats.Retransmissions++
 	return true
@@ -1225,7 +1242,7 @@ func (c *Container) ping() map[netaddr.IP]float64 {
 	}
 
 	ips := map[netaddr.IP]struct{}{}
-	for d := range c.connectionStats {
+	for _, d := range c.connectionStats.Keys() {
 		if ip := d.ActualDestination().IP(); !ip.IsZero() {
 			ips[ip] = struct{}{}
 		}
@@ -1376,9 +1393,9 @@ func (c *Container) gc(now time.Time) {
 		if !active && !at.IsZero() && now.Sub(at) > gcInterval {
 			delete(c.lastConnectionAttempts, dst)
 			delete(c.failedConnectionAttempts, dst)
-			for d := range c.connectionStats {
+			for _, d := range c.connectionStats.Keys() {
 				if d.Destination() == dst {
-					delete(c.connectionStats, d)
+					c.connectionStats.Remove(d)
 				}
 			}
 			c.l7Stats.delete(dst)

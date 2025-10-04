@@ -8,6 +8,7 @@ import (
 
 	"github.com/cilium/ebpf/link"
 	"github.com/coroot/coroot-node-agent/ebpftracer"
+	"github.com/coroot/coroot-node-agent/flags"
 	"github.com/coroot/coroot-node-agent/gpu"
 	"github.com/coroot/coroot-node-agent/proc"
 	"github.com/jpillora/backoff"
@@ -88,9 +89,11 @@ func (p *Process) instrument(tracer *ebpftracer.Tracer) {
 			if dest != "/" && len(cmdline) > 0 {
 				p.instrumentPython(cmdline, tracer)
 				p.instrumentNodejs(dest, tracer)
-				if dotNetAppName, err := dotNetApp(cmdline, p.Pid); err == nil {
-					if dotNetAppName != "" {
-						p.dotNetMonitor = NewDotNetMonitor(p.ctx, p.Pid, dotNetAppName)
+				if *flags.EnableDotNetTracing {
+					if dotNetAppName, err := dotNetApp(cmdline, p.Pid); err == nil {
+						if dotNetAppName != "" {
+							p.dotNetMonitor = NewDotNetMonitor(p.ctx, p.Pid, dotNetAppName)
+						}
 					}
 				}
 				return

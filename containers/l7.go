@@ -3,6 +3,7 @@ package containers
 import (
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -12,12 +13,63 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// String interning to reduce memory usage for repeated label values
+type stringInterner struct {
+	mu    sync.RWMutex
+	cache map[string]string
+}
+
+var labelInterner = &stringInterner{
+	cache: make(map[string]string),
+}
+
+func (si *stringInterner) intern(s string) string {
+	if s == "" {
+		return ""
+	}
+	
+	si.mu.RLock()
+	if interned, ok := si.cache[s]; ok {
+		si.mu.RUnlock()
+		return interned
+	}
+	si.mu.RUnlock()
+	
+	si.mu.Lock()
+	defer si.mu.Unlock()
+	
+	// Double-check after acquiring write lock
+	if interned, ok := si.cache[s]; ok {
+		return interned
+	}
+	
+	// Limit cache size to prevent unbounded growth
+	if len(si.cache) > 10000 {
+		// Clear half the cache when it gets too large
+		newCache := make(map[string]string, 5000)
+		for k, v := range si.cache {
+			if len(newCache) >= 5000 {
+				break
+			}
+			newCache[k] = v
+		}
+		si.cache = newCache
+	}
+	
+	si.cache[s] = s
+	return s
+}
+
 var (
 	// path normalization rules are applied in order
 	httpPathNormalizationRules = []struct {
 		pattern     *regexp.Regexp
 		replacement string
 	}{
+		// API product IDs, e.g., /api/products/0PUK6V6EV0
+		{regexp.MustCompile(`/api/products/[A-Z0-9]{10}`), "/api/products/{id}"},
+		// ACME challenge paths, e.g., /.well-known/acme-challenge/O60cbA-6JXkKyeCWlvBSRT7IUFB0G-qdW9lNPyRlQV0
+		{regexp.MustCompile(`/\.well-known/acme-challenge/[A-Za-z0-9_-]+`), "/.well-known/acme-challenge/{token}"},
 		// Next.js specific pages, e.g., /_next/static/chunks/pages/cart-4042ca3ed7b203d7.js
 		{regexp.MustCompile(`/_next/static/chunks/pages/.*-[a-f0-9]{16,}\.js`), "/_next/static/chunks/pages/{page}.js"},
 		// Next.js specific chunks, e.g., /_next/static/chunks/framework-123abc.js
@@ -68,42 +120,42 @@ func (s L7Stats) observe(protocol l7.Protocol, status, method string, duration t
 		metricsProtocol = l7.ProtocolHTTP
 	}
 
-	// Base labels that all protocols use
+	// Base labels that all protocols use (with string interning for memory optimization)
 	labelValues := []string{
-		status,
-		key.DestinationLabelValue(),
-		key.ActualDestinationLabelValue(),
-		key.GetDestinationWorkload().Kind,
-		key.GetDestinationWorkload().Name,
-		key.GetDestinationWorkload().Namespace,
-		srcWorkload.Kind,
-		srcWorkload.Name,
-		srcWorkload.Namespace,
-		actualDestWorkload.Kind,
-		actualDestWorkload.Name,
-		actualDestWorkload.Namespace,
-		srcWorkload.Region,
-		srcWorkload.Zone,
-		actualDestWorkload.Region,
-		actualDestWorkload.Zone,
-		actualDestWorkload.Instance,
+		labelInterner.intern(status),
+		labelInterner.intern(key.DestinationLabelValue()),
+		labelInterner.intern(key.ActualDestinationLabelValue()),
+		labelInterner.intern(key.GetDestinationWorkload().Kind),
+		labelInterner.intern(key.GetDestinationWorkload().Name),
+		labelInterner.intern(key.GetDestinationWorkload().Namespace),
+		labelInterner.intern(srcWorkload.Kind),
+		labelInterner.intern(srcWorkload.Name),
+		labelInterner.intern(srcWorkload.Namespace),
+		labelInterner.intern(actualDestWorkload.Kind),
+		labelInterner.intern(actualDestWorkload.Name),
+		labelInterner.intern(actualDestWorkload.Namespace),
+		labelInterner.intern(srcWorkload.Region),
+		labelInterner.intern(srcWorkload.Zone),
+		labelInterner.intern(actualDestWorkload.Region),
+		labelInterner.intern(actualDestWorkload.Zone),
+		labelInterner.intern(actualDestWorkload.Instance),
 	}
 
 	// Protocol-specific labels (use metricsProtocol, not original protocol)
 	switch metricsProtocol {
 	case l7.ProtocolRabbitmq, l7.ProtocolNats:
-		labelValues = append(labelValues, method)
+		labelValues = append(labelValues, labelInterner.intern(method))
 	case l7.ProtocolHTTP:
 		parsedMethod, path := l7.ParseHttp(r.Payload)
 		if ValidUtf8([]byte(path)) {
-			labelValues = append(labelValues, normalizeHttpPath(path))
+			labelValues = append(labelValues, labelInterner.intern(normalizeHttpPath(path)))
 		} else {
 			labelValues = append(labelValues, "")
 		}
-		labelValues = append(labelValues, parsedMethod)
+		labelValues = append(labelValues, labelInterner.intern(parsedMethod))
 	case l7.ProtocolDNS:
 		requestType, domain, _ := l7.ParseDns(r.Payload)
-		labelValues = append(labelValues, requestType, common.NormalizeFQDN(domain, requestType))
+		labelValues = append(labelValues, labelInterner.intern(requestType), labelInterner.intern(common.NormalizeFQDN(domain, requestType)))
 	}
 
 	// Update counter
