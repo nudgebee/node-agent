@@ -298,13 +298,11 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 
 	// Prevent duplicate metric emissions by ensuring minimum 5 second interval between collections
 	if timeSinceLastCall < 5*time.Second && c.collectCallCount > 1 {
-		klog.Infof("DEBUG: Skipping collection for container %s - called too recently (call #%d, time since last: %v)", c.id, c.collectCallCount, timeSinceLastCall)
 		defer c.lock.Unlock()
 		return
 	}
 
 	c.lastCollectTime = time.Now()
-	klog.Infof("DEBUG: Container.Collect() called for container %s (app_id: %s) - call #%d, time since last: %v", c.id, c.appId, c.collectCallCount, timeSinceLastCall)
 	defer c.lock.Unlock()
 
 	if c.metadata.image != "" || c.metadata.systemdTriggeredBy != "" {
