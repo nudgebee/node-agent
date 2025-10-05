@@ -260,6 +260,12 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
             COPY_PAYLOAD(e->payload, size, payload);
             send_event(ctx, e, cid, conn);
             return 0;
+        } else if (conn->dport == 5672 && (is_rabbitmq_connection(payload, size) || is_amqp_frame(payload, size) || is_amqp_method_frame(payload, size))) {
+            // Port-based hint: RabbitMQ typically runs on port 5672
+            req->protocol = PROTOCOL_RABBITMQ;
+        } else if ((conn->dport == 9000 || conn->dport == 8123) && is_clickhouse_query(payload, size)) {
+            // Port-based hint: ClickHouse typically runs on ports 9000 (native) or 8123 (HTTP)
+            req->protocol = PROTOCOL_CLICKHOUSE;
         } else if (is_rabbitmq_connection(payload, size)) {
             req->protocol = PROTOCOL_RABBITMQ;
         } else if (is_amqp_frame(payload, size)) {

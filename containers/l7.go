@@ -2,6 +2,7 @@ package containers
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -9,7 +10,6 @@ import (
 
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
-	"github.com/coroot/coroot-node-agent/flags"
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/klog/v2"
 )
@@ -61,92 +61,43 @@ func (si *stringInterner) intern(s string) string {
 	return s
 }
 
-type pathNormalizationRule struct {
-	pattern     *regexp.Regexp
-	replacement string
-}
-
 var (
-	httpPathNormalizationRules []pathNormalizationRule
-	rulesInitialized           bool
-	rulesMutex                 sync.Mutex
+	uuidRegex       = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+	hexRegex        = regexp.MustCompile(`[a-fA-F0-9]{8,}`)
+	numericRegex    = regexp.MustCompile(`\d`)
+	alphaNumericMix = regexp.MustCompile(`[a-zA-Z].*\d|\d.*[a-zA-Z]`)
 )
 
-func initializePathNormalizationRules() {
-	rulesMutex.Lock()
-	defer rulesMutex.Unlock()
-
-	if rulesInitialized {
-		return
-	}
-
-	// Default built-in rules
-	defaultRules := []pathNormalizationRule{
-		// Generic API resource IDs - matches common ID patterns in REST APIs
-		// e.g., /api/users/123, /api/products/ABC123, /v1/orders/uuid-123-abc
-		{regexp.MustCompile(`(/api/[^/]+/)[A-Za-z0-9\-_]{3,}`), "${1}{id}"},
-		{regexp.MustCompile(`(/v[0-9]+/[^/]+/)[A-Za-z0-9\-_]{3,}`), "${1}{id}"},
-
-		// UUIDs in any path segment
-		{regexp.MustCompile(`/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`), "/{uuid}"},
-
-		// Numeric IDs (3+ digits to avoid false positives like /v1, /api)
-		{regexp.MustCompile(`/\d{3,}`), "/{id}"},
-
-		// ACME challenge paths
-		{regexp.MustCompile(`/\.well-known/acme-challenge/[A-Za-z0-9_-]+`), "/.well-known/acme-challenge/{token}"},
-		// Next.js specific pages, e.g., /_next/static/chunks/pages/cart-4042ca3ed7b203d7.js
-		{regexp.MustCompile(`/_next/static/chunks/pages/.*-[a-f0-9]{16,}\.js`), "/_next/static/chunks/pages/{page}.js"},
-		// Next.js specific chunks, e.g., /_next/static/chunks/framework-123abc.js
-		{regexp.MustCompile(`/_next/static/chunks/.*-[a-f0-9]{8,}\.js`), "/_next/static/chunks/{chunk}.js"},
-		// Next.js build manifests, e.g., /_next/static/aBcDeF/_buildManifest.js
-		{regexp.MustCompile(`/_next/static/[^/]+/_buildManifest\.js`), "/_next/static/{buildID}/_buildManifest.js"},
-		{regexp.MustCompile(`/_next/static/[^/]+/_ssgManifest\.js`), "/_next/static/{buildID}/_ssgManifest.js"},
-		// Next.js CSS chunks, e.g., /_next/static/css/a1b2c3d4.css
-		{regexp.MustCompile(`/_next/static/css/.*\.css`), "/_next/static/css/{stylesheet}.css"},
-		// Generic rules for other dynamic paths
-		{regexp.MustCompile(`\b[a-fA-F0-9]{8,}\b`), ":hex"},
-		{regexp.MustCompile(`\b\d{4,}\b`), ":number"},
-	}
-
-	httpPathNormalizationRules = defaultRules
-
-	// Add custom rules from environment variable
-	if customRulesStr := flags.GetString(flags.HttpPathNormalizationRules); customRulesStr != "" {
-		for _, ruleStr := range strings.Split(customRulesStr, ",") {
-			parts := strings.SplitN(strings.TrimSpace(ruleStr), ":", 2)
-			if len(parts) == 2 {
-				pattern := strings.TrimSpace(parts[0])
-				replacement := strings.TrimSpace(parts[1])
-				if compiled, err := regexp.Compile(pattern); err == nil {
-					httpPathNormalizationRules = append(httpPathNormalizationRules, pathNormalizationRule{
-						pattern:     compiled,
-						replacement: replacement,
-					})
-					klog.Infof("Added custom HTTP path normalization rule: %s -> %s", pattern, replacement)
-				} else {
-					klog.Warningf("Invalid regex pattern in HTTP path normalization rule: %s", pattern)
-				}
-			}
-		}
-	}
-
-	rulesInitialized = true
-}
-
 func normalizeHttpPath(path string) string {
-	// Initialize rules on first use
-	if !rulesInitialized {
-		initializePathNormalizationRules()
-	}
-
 	if i := strings.Index(path, "?"); i != -1 {
 		path = path[:i]
 	}
-	for _, rule := range httpPathNormalizationRules {
-		path = rule.pattern.ReplaceAllString(path, rule.replacement)
+	if path == "" {
+		return ""
 	}
-	return path
+	parts := strings.Split(path, "/")
+	for i, p := range parts {
+		if p == "" {
+			continue
+		}
+		if uuidRegex.MatchString(p) {
+			parts[i] = "{uuid}"
+			continue
+		}
+		if _, err := strconv.Atoi(p); err == nil {
+			parts[i] = "{id}"
+			continue
+		}
+		if hexRegex.MatchString(p) && len(p) >= 8 {
+			parts[i] = "{hex}"
+			continue
+		}
+		if alphaNumericMix.MatchString(p) && len(p) >= 10 {
+			parts[i] = "{id}"
+			continue
+		}
+	}
+	return strings.Join(parts, "/")
 }
 
 type L7Stats struct {

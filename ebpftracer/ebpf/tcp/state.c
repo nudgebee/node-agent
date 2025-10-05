@@ -75,6 +75,7 @@ struct connection {
     __u64 bytes_received;
     __u64 timestamp;
     __u8 protocol;
+    __u16 dport;  // Destination port for protocol detection
 };
 
 struct {
@@ -133,6 +134,7 @@ int inet_sock_set_state(void *ctx)
 
         struct connection conn = {};
         conn.timestamp = bpf_ktime_get_ns();
+        conn.dport = args.dport;  // Store destination port for protocol detection
 
         bpf_map_delete_elem(&fd_by_pid_tgid, &id);
         bpf_map_update_elem(&connection_id_by_socket, &args.skaddr, &cid, BPF_ANY);

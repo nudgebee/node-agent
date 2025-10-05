@@ -174,6 +174,7 @@ type Container struct {
 	seenMounts map[uint64]struct{}
 
 	logParsers map[string]*LogParser
+	logSamples map[string]string
 
 	tracer *tracing.Tracer
 
@@ -238,6 +239,7 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		seenMounts: map[uint64]struct{}{},
 
 		logParsers: map[string]*LogParser{},
+		logSamples: map[string]string{},
 
 		tracer: tracing.GetContainerTracer(string(id)),
 
@@ -415,9 +417,14 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	for source, p := range c.logParsers {
-		for _, c := range p.parser.GetCounters() {
-			if c.Level == logparser.LevelCritical || c.Level == logparser.LevelError {
-				ch <- counter(metrics.LogMessages, float64(c.Messages), source, c.Level.String(), c.Hash, common.TruncateUtf8(c.Sample, *flags.MaxLabelLength))
+		for _, ctr := range p.parser.GetCounters() {
+			if ctr.Level == logparser.LevelCritical || ctr.Level == logparser.LevelError {
+				sample, ok := c.logSamples[ctr.Hash]
+				if !ok {
+					sample = common.TruncateUtf8(ctr.Sample, *flags.MaxLabelLength)
+					c.logSamples[ctr.Hash] = sample
+				}
+				ch <- counter(metrics.LogMessages, float64(ctr.Messages), source, ctr.Level.String(), ctr.Hash, sample)
 			}
 		}
 		for _, c := range p.parser.GetSensitiveCounters() {
