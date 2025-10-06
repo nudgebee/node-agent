@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"k8s.io/klog/v2"
 )
 
@@ -94,7 +95,7 @@ func debugMetricsHandler(registry *prometheus.Registry) http.HandlerFunc {
 		// Estimate memory per metric (rough calculation)
 		avgMemoryPerSeries := int64(0)
 		if totalSeries > 0 {
-			avgMemoryPerSeries = (memAfter - memBefore) / int64(totalSeries)
+			avgMemoryPerSeries = int64(memAfter - memBefore) / int64(totalSeries)
 		}
 		
 		// Build response
@@ -112,7 +113,7 @@ func debugMetricsHandler(registry *prometheus.Registry) http.HandlerFunc {
 		
 		debug := DebugInfo{
 			TotalMetrics:  totalSeries,
-			TotalMemoryMB: (memAfter - memBefore) / (1024 * 1024),
+			TotalMemoryMB: int64(memAfter - memBefore) / (1024 * 1024),
 			TopMetrics:    topMetrics,
 			Timestamp:     time.Now(),
 		}
@@ -125,7 +126,7 @@ func debugMetricsHandler(registry *prometheus.Registry) http.HandlerFunc {
 	}
 }
 
-func formatLabels(labels []*prometheus.LabelPair) string {
+func formatLabels(labels []*dto.LabelPair) string {
 	var parts []string
 	for _, label := range labels {
 		parts = append(parts, fmt.Sprintf("%s=%s", label.GetName(), label.GetValue()))
