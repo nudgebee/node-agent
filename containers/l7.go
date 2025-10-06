@@ -146,26 +146,39 @@ func (s L7Stats) observe(protocol l7.Protocol, status, method string, duration t
 		labelInterner.intern(actualDestWorkload.Instance),
 	}
 
-	// Protocol-specific labels (use metricsProtocol, not original protocol)
+	// Protocol-specific labels for counters (keep all labels including path for HTTP)
+	counterLabelValues := make([]string, len(labelValues))
+	copy(counterLabelValues, labelValues)
+	
 	switch metricsProtocol {
 	case l7.ProtocolRabbitmq, l7.ProtocolNats:
-		labelValues = append(labelValues, labelInterner.intern(method))
+		counterLabelValues = append(counterLabelValues, labelInterner.intern(method))
 	case l7.ProtocolHTTP:
 		parsedMethod, path := l7.ParseHttp(r.Payload)
 		if ValidUtf8([]byte(path)) {
-			labelValues = append(labelValues, labelInterner.intern(normalizeHttpPath(path)))
+			counterLabelValues = append(counterLabelValues, labelInterner.intern(normalizeHttpPath(path)))
 		} else {
-			labelValues = append(labelValues, "")
+			counterLabelValues = append(counterLabelValues, "")
 		}
-		labelValues = append(labelValues, labelInterner.intern(parsedMethod))
+		counterLabelValues = append(counterLabelValues, labelInterner.intern(parsedMethod))
 	case l7.ProtocolDNS:
 		requestType, domain, _ := l7.ParseDns(r.Payload)
-		labelValues = append(labelValues, labelInterner.intern(requestType), labelInterner.intern(common.NormalizeFQDN(domain, requestType)))
+		counterLabelValues = append(counterLabelValues, labelInterner.intern(requestType), labelInterner.intern(common.NormalizeFQDN(domain, requestType)))
+	}
+
+	// Protocol-specific labels for histograms (exclude path and method for HTTP to reduce cardinality)
+	histogramLabelValues := make([]string, len(labelValues))
+	copy(histogramLabelValues, labelValues)
+	
+	switch metricsProtocol {
+	case l7.ProtocolDNS:
+		requestType, domain, _ := l7.ParseDns(r.Payload)
+		histogramLabelValues = append(histogramLabelValues, labelInterner.intern(requestType), labelInterner.intern(common.NormalizeFQDN(domain, requestType)))
 	}
 
 	// Update counter
 	if counter := s.requests[protocol]; counter != nil {
-		if c, err := counter.GetMetricWithLabelValues(labelValues...); err != nil {
+		if c, err := counter.GetMetricWithLabelValues(counterLabelValues...); err != nil {
 			klog.Warningln("Error getting counter metric:", err)
 		} else {
 			c.Inc()
@@ -174,7 +187,7 @@ func (s L7Stats) observe(protocol l7.Protocol, status, method string, duration t
 
 	// Update histogram
 	if histogram := s.latency[protocol]; histogram != nil && duration != 0 {
-		if h, err := histogram.GetMetricWithLabelValues(labelValues...); err != nil {
+		if h, err := histogram.GetMetricWithLabelValues(histogramLabelValues...); err != nil {
 			klog.Warningln("Error getting histogram metric:", err)
 		} else {
 			h.Observe(duration.Seconds())
@@ -239,10 +252,8 @@ func (s L7Stats) ensureInitialized(protocol l7.Protocol) {
 	histogramLabels := make([]string, len(baseLabels))
 	copy(histogramLabels, baseLabels)
 
-	// For HTTP and DNS, add extra labels to histogram
+	// For DNS only, add extra labels to histogram (exclude path and method for HTTP to reduce cardinality)
 	switch metricsProtocol {
-	case l7.ProtocolHTTP:
-		histogramLabels = append(histogramLabels, "path", "method")
 	case l7.ProtocolDNS:
 		histogramLabels = append(histogramLabels, "request_type", "domain")
 	}
