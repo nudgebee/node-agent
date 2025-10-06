@@ -149,7 +149,7 @@ func (s L7Stats) observe(protocol l7.Protocol, status, method string, duration t
 	// Protocol-specific labels for counters (keep all labels including path for HTTP)
 	counterLabelValues := make([]string, len(labelValues))
 	copy(counterLabelValues, labelValues)
-	
+
 	switch metricsProtocol {
 	case l7.ProtocolRabbitmq, l7.ProtocolNats:
 		counterLabelValues = append(counterLabelValues, labelInterner.intern(method))
@@ -166,10 +166,12 @@ func (s L7Stats) observe(protocol l7.Protocol, status, method string, duration t
 		counterLabelValues = append(counterLabelValues, labelInterner.intern(requestType), labelInterner.intern(common.NormalizeFQDN(domain, requestType)))
 	}
 
-	// Protocol-specific labels for histograms (exclude path and method for HTTP to reduce cardinality)
+	// Protocol-specific labels for histograms (exclude path and method for HTTP, use grouped status to reduce cardinality)
 	histogramLabelValues := make([]string, len(labelValues))
 	copy(histogramLabelValues, labelValues)
-	
+	// Use grouped status codes (2xx, 4xx, etc.) for histograms to reduce cardinality
+	histogramLabelValues[0] = labelInterner.intern(groupHttpStatus(labelValues[0]))
+
 	switch metricsProtocol {
 	case l7.ProtocolDNS:
 		requestType, domain, _ := l7.ParseDns(r.Payload)
@@ -285,6 +287,30 @@ func (s L7Stats) delete(dst common.HostPort) {
 	// With the new architecture, we don't need to delete per-destination metrics
 	// since all metrics are shared across destinations with different label values
 	// This method can be kept for interface compatibility but doesn't need to do anything
+}
+
+func groupHttpStatus(status string) string {
+	if len(status) == 0 {
+		return "unknown"
+	}
+
+	// Handle HTTP status codes
+	if len(status) >= 1 {
+		switch status[0] {
+		case '2':
+			return "2xx"
+		case '3':
+			return "3xx"
+		case '4':
+			return "4xx"
+		case '5':
+			return "5xx"
+		default:
+			return "other"
+		}
+	}
+
+	return "unknown"
 }
 
 func ValidUtf8(payload []byte) bool {
