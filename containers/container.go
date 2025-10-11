@@ -298,12 +298,12 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 
 	// Prevent duplicate metric emissions by ensuring minimum 5 second interval between collections
 	if timeSinceLastCall < 5*time.Second && c.collectCallCount > 1 {
-		defer c.lock.Unlock()
+		c.lock.Unlock()
 		return
 	}
 
 	c.lastCollectTime = time.Now()
-	defer c.lock.Unlock()
+	c.lock.Unlock() // Release lock early to prevent lock contention during metrics collection
 
 	if c.metadata.image != "" || c.metadata.systemdTriggeredBy != "" {
 		ch <- gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemdTriggeredBy)
