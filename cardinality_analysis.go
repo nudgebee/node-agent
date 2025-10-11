@@ -12,8 +12,8 @@ import (
 
 // MetricCardinality tracks cardinality for each metric type
 type MetricCardinality struct {
-	Name       string
-	SeriesCount int
+	Name              string
+	SeriesCount       int
 	EstimatedMemoryMB int64
 }
 
@@ -22,7 +22,7 @@ func AnalyzeCardinality(registry *prometheus.Registry) []MetricCardinality {
 	var memStatsBefore runtime.MemStats
 	runtime.ReadMemStats(&memStatsBefore)
 	memBefore := memStatsBefore.Alloc
-	
+
 	start := time.Now()
 	metricFamilies, err := registry.Gather()
 	if err != nil {
@@ -30,35 +30,35 @@ func AnalyzeCardinality(registry *prometheus.Registry) []MetricCardinality {
 		return nil
 	}
 	gatherTime := time.Since(start)
-	
+
 	var memStatsAfter runtime.MemStats
 	runtime.ReadMemStats(&memStatsAfter)
 	memAfter := memStatsAfter.Alloc
 	memDelta := memAfter - memBefore
-	
-	klog.Infof("CARDINALITY: Metric gather took %v, used %d MB memory", 
+
+	klog.Infof("CARDINALITY: Metric gather took %v, used %d MB memory",
 		gatherTime, memDelta/(1024*1024))
-	
+
 	// Count series per metric type
 	metricCounts := make(map[string]int)
 	totalSeries := 0
-	
+
 	for _, mf := range metricFamilies {
 		seriesCount := len(mf.GetMetric())
 		metricCounts[mf.GetName()] = seriesCount
 		totalSeries += seriesCount
-		
+
 		// Log high cardinality metrics immediately
 		if seriesCount > 100 {
-			klog.Warningf("CARDINALITY: High cardinality metric: %s = %d series", 
+			klog.Warningf("CARDINALITY: High cardinality metric: %s = %d series",
 				mf.GetName(), seriesCount)
 		}
-		
+
 		// Log extremely high cardinality with sample labels
 		if seriesCount > 1000 {
-			klog.Errorf("CARDINALITY: CRITICAL cardinality metric: %s = %d series", 
+			klog.Errorf("CARDINALITY: CRITICAL cardinality metric: %s = %d series",
 				mf.GetName(), seriesCount)
-			
+
 			// Log first few label combinations to see pattern
 			for i, metric := range mf.GetMetric() {
 				if i >= 3 { // Only show first 3 examples
@@ -75,13 +75,13 @@ func AnalyzeCardinality(registry *prometheus.Registry) []MetricCardinality {
 			}
 		}
 	}
-	
+
 	// Calculate estimated memory per series
 	avgMemoryPerSeries := int64(0)
 	if totalSeries > 0 {
 		avgMemoryPerSeries = int64(memDelta) / int64(totalSeries)
 	}
-	
+
 	// Sort by cardinality
 	var results []MetricCardinality
 	for name, count := range metricCounts {
@@ -92,24 +92,24 @@ func AnalyzeCardinality(registry *prometheus.Registry) []MetricCardinality {
 			EstimatedMemoryMB: estimatedMB,
 		})
 	}
-	
+
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].SeriesCount > results[j].SeriesCount
 	})
-	
+
 	// Log top 10 metrics by cardinality
 	klog.Infof("CARDINALITY: Top 10 metrics by series count:")
 	for i, metric := range results {
 		if i >= 10 {
 			break
 		}
-		klog.Infof("CARDINALITY: %d. %s: %d series (~%d MB)", 
+		klog.Infof("CARDINALITY: %d. %s: %d series (~%d MB)",
 			i+1, metric.Name, metric.SeriesCount, metric.EstimatedMemoryMB)
 	}
-	
-	klog.Infof("CARDINALITY: Total metrics: %d, Total series: %d, Memory delta: %d MB", 
+
+	klog.Infof("CARDINALITY: Total metrics: %d, Total series: %d, Memory delta: %d MB",
 		len(results), totalSeries, memDelta/(1024*1024))
-	
+
 	return results
 }
 
@@ -123,7 +123,7 @@ func LogCardinalityPeriodically(registry *prometheus.Registry) {
 				var memStats runtime.MemStats
 				runtime.ReadMemStats(&memStats)
 				currentMemMB := memStats.Alloc / (1024 * 1024)
-				
+
 				if currentMemMB > 300 { // Only analyze when memory is high
 					klog.Infof("CARDINALITY: Memory is %d MB, running analysis...", currentMemMB)
 					AnalyzeCardinality(registry)
