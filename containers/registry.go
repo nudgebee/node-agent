@@ -399,8 +399,18 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 
 func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	// Fast path: try to find existing container with read lock
+	lockStart := time.Now()
+	klog.V(6).Infof("LOCK_DEBUG: Registry attempting to acquire read lock for getOrCreateContainer (pid %d)", pid)
+	
 	r.containerLock.RLock()
+	lockAcquireTime := time.Since(lockStart)
+	if lockAcquireTime > 50*time.Millisecond {
+		klog.Warningf("LOCK_CONTENTION: Registry took %v to acquire read lock for getOrCreateContainer (pid %d)", lockAcquireTime, pid)
+	}
+	klog.V(6).Infof("LOCK_DEBUG: Registry acquired read lock for getOrCreateContainer in %v (pid %d)", lockAcquireTime, pid)
+	
 	if c := r.containersByPid[pid]; c != nil {
+		klog.V(6).Infof("LOCK_DEBUG: Registry found existing container, releasing read lock (pid %d)", pid)
 		r.containerLock.RUnlock()
 		return c
 	}
@@ -474,8 +484,23 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	}
 
 	// Acquire write lock for container creation to prevent race conditions
+	writeLockStart := time.Now()
+	klog.V(6).Infof("LOCK_DEBUG: Registry attempting to acquire write lock for container creation (pid %d)", pid)
+	
 	r.containerLock.Lock()
-	defer r.containerLock.Unlock()
+	writeLockAcquireTime := time.Since(writeLockStart)
+	if writeLockAcquireTime > 100*time.Millisecond {
+		klog.Warningf("LOCK_CONTENTION: Registry took %v to acquire write lock for container creation (pid %d)", writeLockAcquireTime, pid)
+	}
+	klog.V(6).Infof("LOCK_DEBUG: Registry acquired write lock for container creation in %v (pid %d)", writeLockAcquireTime, pid)
+	defer func() {
+		writeLockHeldTime := time.Since(writeLockStart)
+		if writeLockHeldTime > 500*time.Millisecond {
+			klog.Warningf("LOCK_CONTENTION: Registry held write lock for %v during container creation (pid %d)", writeLockHeldTime, pid)
+		}
+		klog.V(6).Infof("LOCK_DEBUG: Registry releasing write lock after container creation, held for %v (pid %d)", writeLockHeldTime, pid)
+		r.containerLock.Unlock()
+	}()
 
 	// Double-check pattern: verify container doesn't exist after acquiring write lock
 	if c := r.containersByPid[pid]; c != nil {

@@ -218,37 +218,12 @@ func main() {
 		klog.Exitln(err)
 	}
 
-	// Add memory protection middleware to metrics endpoint
-	metricsHandler := memoryMiddleware(promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: logger{}, Registry: registerer}))
-	http.Handle("/metrics", metricsHandler)
+	// Simple metrics endpoint without middleware overhead
+	http.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: logger{}, Registry: registerer}))
 
-	// Add debug endpoints for cardinality analysis
-	http.HandleFunc("/debug/metrics", debugMetricsHandler(registry))
-	http.HandleFunc("/debug/memory", func(w http.ResponseWriter, r *http.Request) {
-		var memStats runtime.MemStats
-		runtime.ReadMemStats(&memStats)
 
-		response := map[string]interface{}{
-			"alloc_mb":       memStats.Alloc / (1024 * 1024),
-			"total_alloc_mb": memStats.TotalAlloc / (1024 * 1024),
-			"sys_mb":         memStats.Sys / (1024 * 1024),
-			"heap_alloc_mb":  memStats.HeapAlloc / (1024 * 1024),
-			"heap_sys_mb":    memStats.HeapSys / (1024 * 1024),
-			"heap_objects":   memStats.HeapObjects,
-			"gc_runs":        memStats.NumGC,
-			"last_gc":        time.Unix(0, int64(memStats.LastGC)),
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-	})
-
-	// Start periodic cardinality monitoring
-	LogCardinalityPeriodically(registry)
 
 	klog.Infoln("listening on:", *flags.ListenAddress)
-	klog.Infoln("debug endpoints: /debug/metrics, /debug/memory")
-	klog.Infoln("cardinality monitoring: enabled (every 5min when memory > 300MB)")
 	klog.Errorln(http.ListenAndServe(*flags.ListenAddress, nil))
 }
 
