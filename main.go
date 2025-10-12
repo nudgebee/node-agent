@@ -218,8 +218,12 @@ func main() {
 		klog.Exitln(err)
 	}
 
-	// Simple metrics endpoint without middleware overhead
-	http.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: logger{}, Registry: registerer}))
+	// Metrics endpoint with timeout protection
+	http.Handle("/metrics", http.TimeoutHandler(
+		promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: logger{}, Registry: registerer}),
+		30*time.Second,
+		"Metrics collection timeout",
+	))
 
 
 

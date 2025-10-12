@@ -291,31 +291,26 @@ func (c *Container) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *Container) Collect(ch chan<- prometheus.Metric) {
-	// Add detailed lock contention logging
+	// Add lock contention monitoring
 	lockStart := time.Now()
-	klog.V(6).Infof("LOCK_DEBUG: Container %s attempting to acquire lock for Collect()", c.id)
 	
 	c.lock.Lock()
 	lockAcquireTime := time.Since(lockStart)
 	if lockAcquireTime > 100*time.Millisecond {
 		klog.Warningf("LOCK_CONTENTION: Container %s took %v to acquire lock for Collect()", c.id, lockAcquireTime)
 	}
-	klog.V(6).Infof("LOCK_DEBUG: Container %s acquired lock for Collect() in %v", c.id, lockAcquireTime)
 	
 	c.collectCallCount++
 	timeSinceLastCall := time.Since(c.lastCollectTime)
 
-	// Prevent duplicate metric emissions by ensuring minimum 5 second interval between collections
-	if timeSinceLastCall < 5*time.Second && c.collectCallCount > 1 {
-		klog.V(6).Infof("LOCK_DEBUG: Container %s skipping collection (too frequent), releasing lock", c.id)
+	// Prevent duplicate metric emissions by ensuring minimum 1 second interval between collections
+	if timeSinceLastCall < 1*time.Second && c.collectCallCount > 1 {
 		c.lock.Unlock()
 		return
 	}
 
 	c.lastCollectTime = time.Now()
-	lockHeldTime := time.Since(lockStart)
 	c.lock.Unlock() // Release lock early to prevent lock contention during metrics collection
-	klog.V(6).Infof("LOCK_DEBUG: Container %s released lock early, held for %v", c.id, lockHeldTime)
 
 	if c.metadata.image != "" || c.metadata.systemdTriggeredBy != "" {
 		ch <- gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemdTriggeredBy)
