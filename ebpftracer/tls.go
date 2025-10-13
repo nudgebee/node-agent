@@ -35,6 +35,7 @@ func (t *Tracer) AttachOpenSslUprobes(pid uint32) []link.Link {
 	}
 	libPath, version := getSslLibPathAndVersion(pid)
 	if libPath == "" || version == "" {
+		klog.V(3).Infof("pid=%d: no SSL libraries found (libPath='%s', version='%s')", pid, libPath, version)
 		return nil
 	}
 
@@ -265,37 +266,56 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 func getSslLibPathAndVersion(pid uint32) (string, string) {
 	f, err := os.Open(proc.Path(pid, "maps"))
 	if err != nil {
+		klog.V(4).Infof("pid=%d: failed to open maps file: %v", pid, err)
 		return "", ""
 	}
 	defer f.Close()
+
+	// Regex to find libraries that look like libssl or libcrypto, even with version numbers.
+	// e.g., libssl.so.3, libcrypto-74fbf0e0.so.3
+	libSslRe := regexp.MustCompile(`libssl\.so(\.\d+)*`)
+	libCryptoRe := regexp.MustCompile(`libcrypto\.so(\.\d+)*`)
+	// A more specific regex for psycopg2's bundled libs
+	psycopg2LibRe := regexp.MustCompile(`lib(ssl|crypto)-[a-f0-9]+\.so\.\d+`)
+
 	scanner := bufio.NewScanner(f)
 	scanner.Split(bufio.ScanLines)
 	var libsslPath, libcryptoPath string
+	klog.V(4).Infof("pid=%d: scanning process maps for SSL libraries...", pid)
 	for scanner.Scan() {
 		parts := strings.Fields(scanner.Text())
 		if len(parts) <= 5 {
 			continue
 		}
 		libPath := parts[5]
-		switch {
-		case libsslPath == "" && strings.Contains(libPath, "libssl.so"):
+
+		isSsl := libSslRe.MatchString(libPath) || (strings.Contains(libPath, "psycopg2") && psycopg2LibRe.MatchString(libPath) && strings.Contains(libPath, "libssl"))
+		isCrypto := libCryptoRe.MatchString(libPath) || (strings.Contains(libPath, "psycopg2") && psycopg2LibRe.MatchString(libPath) && strings.Contains(libPath, "libcrypto"))
+
+		if libsslPath == "" && isSsl {
 			fullPath := proc.Path(pid, "root", libPath)
 			if _, err = os.Stat(fullPath); err == nil {
 				libsslPath = fullPath
+				klog.V(3).Infof("pid=%d: found libssl at %s", pid, fullPath)
+			} else {
+				klog.V(4).Infof("pid=%d: libssl candidate %s not accessible: %v", pid, fullPath, err)
 			}
-		case libcryptoPath == "" && strings.Contains(libPath, "libcrypto.so"):
+		} else if libcryptoPath == "" && isCrypto {
 			fullPath := proc.Path(pid, "root", libPath)
 			if _, err = os.Stat(fullPath); err == nil {
 				libcryptoPath = fullPath
+				klog.V(3).Infof("pid=%d: found libcrypto at %s", pid, fullPath)
+			} else {
+				klog.V(4).Infof("pid=%d: libcrypto candidate %s not accessible: %v", pid, fullPath, err)
 			}
-		default:
-			continue
 		}
+
 		if libsslPath != "" && libcryptoPath != "" {
 			break
 		}
 	}
 	if libsslPath == "" || libcryptoPath == "" {
+		klog.V(3).Infof("pid=%d: SSL libraries incomplete (libssl='%s', libcrypto='%s')", pid, libsslPath, libcryptoPath)
 		return "", ""
 	}
 

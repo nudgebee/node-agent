@@ -197,11 +197,11 @@ func (m *DotNetMonitor) connect(ctx context.Context) error {
 	}
 
 	ctc := dotnetdiag.CollectTracingConfig{
-		CircularBufferSizeMB: 10,
+		CircularBufferSizeMB: 1,
 		Providers: []dotnetdiag.ProviderConfig{
 			{
-				Keywords:     math.MaxInt64,
-				LogLevel:     5,
+				Keywords:     1, // EventCounter
+				LogLevel:     4, // Informational
 				ProviderName: provider,
 				FilterData:   "EventCounterIntervalSec=" + strconv.Itoa(int(dotNetEventInterval.Seconds())),
 			},

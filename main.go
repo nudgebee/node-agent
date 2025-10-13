@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/containers"
@@ -212,11 +213,17 @@ func main() {
 	profiling.Start()
 	defer profiling.Stop()
 
-	if err := prom.StartAgent(registry, machineId); err != nil {
+	if err := prom.StartAgent(registry, machineId, systemUuid); err != nil {
 		klog.Exitln(err)
 	}
 
-	http.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: logger{}, Registry: registerer}))
+	// Metrics endpoint with timeout protection
+	http.Handle("/metrics", http.TimeoutHandler(
+		promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: logger{}, Registry: registerer}),
+		30*time.Second,
+		"Metrics collection timeout",
+	))
+
 	klog.Infoln("listening on:", *flags.ListenAddress)
 	klog.Errorln(http.ListenAndServe(*flags.ListenAddress, nil))
 }

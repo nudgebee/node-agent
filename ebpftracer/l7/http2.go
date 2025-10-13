@@ -24,13 +24,16 @@ type Http2FrameHeader struct {
 }
 
 type Http2Request struct {
-	Method   string
-	Path     string
-	Scheme   string
-	Status   Status
-	Duration time.Duration
+	Method     string
+	Path       string
+	Scheme     string
+	Status     Status
+	GrpcStatus Status
+	Duration   time.Duration
 
-	kernelTime uint64
+	RequestPayload  []byte
+	ResponsePayload []byte
+	kernelTime      uint64
 }
 
 type Http2Parser struct {
@@ -61,6 +64,8 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64) []
 
 	var decoder *hpack.Decoder
 	statuses := map[uint32]Status{}
+	grpcStatuses := map[uint32]Status{}
+
 	offset := 0
 
 	switch method {
@@ -84,7 +89,30 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64) []
 			StreamId: binary.BigEndian.Uint32(payload[offset+5:]) & (1<<31 - 1),
 		}
 		offset += http2FrameHeaderLength
-		if h.Type != http2.FrameHeaders {
+		if h.Type == http2.FrameData {
+			// Extract DATA frame payload
+			if len(payload)-offset < h.Length {
+				break
+			}
+			dataPayload := payload[offset : offset+h.Length]
+
+			switch method {
+			case MethodHttp2ClientFrames:
+				// Client DATA frame = request payload
+				req := p.activeRequests[h.StreamId]
+				if req != nil {
+					req.RequestPayload = append(req.RequestPayload, dataPayload...)
+				}
+			case MethodHttp2ServerFrames:
+				// Server DATA frame = response payload
+				req := p.activeRequests[h.StreamId]
+				if req != nil {
+					req.ResponsePayload = append(req.ResponsePayload, dataPayload...)
+				}
+			}
+			offset += h.Length
+			continue
+		} else if h.Type != http2.FrameHeaders {
 			if len(payload)-offset < h.Length {
 				break
 			}
@@ -119,9 +147,13 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64) []
 				statuses[h.StreamId] = 0
 			}
 			decoder.SetEmitFunc(func(hf hpack.HeaderField) {
-				if hf.Name == ":status" {
+				switch hf.Name {
+				case ":status":
 					s, _ := strconv.Atoi(hf.Value)
 					statuses[h.StreamId] = Status(s)
+				case "grpc-status":
+					s, _ := strconv.Atoi(hf.Value)
+					grpcStatuses[h.StreamId] = Status(s)
 				}
 			})
 		}
@@ -141,6 +173,12 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64) []
 			continue
 		}
 		r.Status = status
+		grpcStatus, ok := grpcStatuses[streamId]
+		if ok {
+			r.GrpcStatus = grpcStatus
+		} else {
+			r.GrpcStatus = -1
+		}
 		r.Duration = time.Duration(kernelTime - r.kernelTime)
 		res = append(res, *r)
 		delete(p.activeRequests, streamId)

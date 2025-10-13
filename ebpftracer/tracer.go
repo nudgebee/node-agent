@@ -27,7 +27,7 @@ import (
 	"k8s.io/klog/v2"
 )
 
-const MaxPayloadSize = 1024 * 5
+const MaxPayloadSize = 4096
 
 type EventType uint32
 type EventReason uint32
@@ -44,6 +44,7 @@ const (
 	EventTypeTCPRetransmit    EventType = 9
 	EventTypeL7Request        EventType = 10
 	EventTypePythonThreadLock EventType = 11
+	EventTypeHTTPFragment     EventType = 12
 
 	EventReasonNone    EventReason = 0
 	EventReasonOOMKill EventReason = 1
@@ -65,9 +66,23 @@ type Event struct {
 	Timestamp     uint64
 	Duration      time.Duration
 	L7Request     *l7.RequestData
+	HTTPFragment  *HTTPResponseFragment
 	TrafficStats  *TrafficStats
 	Mnt           uint64
 	Log           bool
+}
+
+// HTTP response fragment data
+type HTTPResponseFragment struct {
+	Fd                  uint64
+	ConnectionTimestamp uint64
+	Pid                 uint32
+	FragmentId          uint32
+	TotalExpected       uint32
+	FragmentSize        uint16
+	IsFinal             bool
+	HttpStatus          uint16
+	Data                []byte
 }
 
 type perfMapType uint8
@@ -135,6 +150,22 @@ func (t *Tracer) ActiveConnectionsIterator() *ebpf.MapIterator {
 	return t.collection.Maps["active_connections"].Iterate()
 }
 
+func (t *Tracer) NodejsStatsIterator() *ebpf.MapIterator {
+	return t.collection.Maps["nodejs_stats"].Iterate()
+}
+
+func (t *Tracer) PythonStatsIterator() *ebpf.MapIterator {
+	return t.collection.Maps["python_stats"].Iterate()
+}
+
+type NodejsStats struct {
+	EventLoopBlockedTime time.Duration
+}
+
+type PythonStats struct {
+	ThreadLockWaitTime time.Duration
+}
+
 type ConnectionId struct {
 	FD  uint64
 	PID uint32
@@ -142,9 +173,11 @@ type ConnectionId struct {
 }
 
 type Connection struct {
-	Timestamp     uint64
 	BytesSent     uint64
 	BytesReceived uint64
+	Timestamp     uint64
+	Protocol      uint8
+	_             [7]byte // Explicit padding
 }
 
 type perfMap struct {
@@ -222,16 +255,19 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		{name: "tcp_connect_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 8, readTimeout: 10 * time.Millisecond},
 		{name: "tcp_retransmit_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 4},
 		{name: "file_events", typ: perfMapTypeFileEvents, perCPUBufferSizePages: 4},
-		{name: "python_thread_events", typ: perfMapTypePythonThreadEvents, perCPUBufferSizePages: 4},
 	}
 
 	if !t.disableL7Tracing {
-		perfMaps = append(perfMaps, perfMap{name: "l7_events", typ: perfMapTypeL7Events, perCPUBufferSizePages: 32})
+		perfMaps = append(perfMaps, perfMap{name: "l7_events", typ: perfMapTypeL7Events, perCPUBufferSizePages: 64}) // Increased for high-volume LLM API tracing
 	}
 
 	pageSize := os.Getpagesize()
 	for _, pm := range perfMaps {
-		r, err := perf.NewReaderWithOptions(t.collection.Maps[pm.name], pm.perCPUBufferSizePages*pageSize, perf.ReaderOptions{WakeupEvents: 100})
+		wakeupEvents := 100
+		if pm.typ == perfMapTypeL7Events {
+			wakeupEvents = 50 // Process L7 events more frequently to reduce buffer pressure
+		}
+		r, err := perf.NewReaderWithOptions(t.collection.Maps[pm.name], pm.perCPUBufferSizePages*pageSize, perf.ReaderOptions{WakeupEvents: wakeupEvents})
 		if err != nil {
 			t.Close()
 			return fmt.Errorf("failed to create ebpf reader: %w", err)
@@ -258,7 +294,7 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 			parts := strings.SplitN(programSpec.AttachTo, "/", 2)
 			l, err = link.Tracepoint(parts[0], parts[1], program, nil)
 		case ebpf.Kprobe:
-			if strings.HasPrefix(programSpec.SectionName, "uprobe/") {
+			if strings.HasPrefix(programSpec.SectionName, "uprobe/") || strings.HasPrefix(programSpec.SectionName, "uretprobe/") {
 				t.uprobes[programSpec.Name] = program
 				continue
 			}
@@ -274,6 +310,8 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		}
 		t.links = append(t.links, l)
 	}
+
+	// SSL uprobes are handled per-process in tls.go via AttachOpenSslUprobes()
 
 	return nil
 }
@@ -356,12 +394,21 @@ type l7Event struct {
 	StatementId         uint32
 	PayloadSize         uint64
 	ResponseSize        uint64
+	Payload             [4096]byte // Must match MAX_PAYLOAD_SIZE in eBPF
+	Response            [4096]byte // Must match MAX_PAYLOAD_SIZE in eBPF
 }
 
-type pythonThreadEvent struct {
-	Type     EventType
-	Pid      uint32
-	Duration uint64
+// HTTP response fragment event (must match eBPF struct)
+type httpResponseFragment struct {
+	Fd                  uint64
+	ConnectionTimestamp uint64
+	Pid                 uint32
+	FragmentId          uint32
+	TotalExpected       uint32
+	FragmentSize        uint16
+	IsFinal             uint8
+	HttpStatus          uint8
+	Data                [2048]byte // Must match HTTP_FRAGMENT_SIZE in eBPF
 }
 
 func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapType, readTimeout time.Duration) {
@@ -387,32 +434,22 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 		case perfMapTypeL7Events:
 			v := &l7Event{}
 			data := rec.RawSample
-			reader := bytes.NewBuffer(data)
 
-			// Ensure binary.Read does not fail before proceeding
-			if err := binary.Read(reader, binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read msg:", err)
+			if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, v); err != nil {
+				klog.Warningln("failed to read l7 event:", err)
 				continue
 			}
 
-			payload := reader.Bytes()
-			expectedSize := int(v.PayloadSize) + int(v.ResponseSize)
+			// Extract payload data directly from the struct arrays
+			payloadSize := min(int(v.PayloadSize), len(v.Payload))
+			responseSize := min(int(v.ResponseSize), len(v.Response))
 
-			// If the actual payload is smaller than expected, we log a warning and adjust
-			if len(payload) < expectedSize {
-				klog.Warningf("Payload too small (got %d bytes, expected %d), adjusting sizes", len(payload), expectedSize)
-			}
+			// Copy the actual data (preventing garbage from unused buffer space)
+			payloadData := make([]byte, payloadSize)
+			copy(payloadData, v.Payload[:payloadSize])
 
-			// Compute safe slicing limits
-			payloadEnd := min(int(v.PayloadSize), len(payload))
-			responseEnd := min(payloadEnd+int(v.ResponseSize), len(payload))
-
-			// Always copy to prevent garbage data from reused buffers
-			payloadData := make([]byte, payloadEnd)
-			copy(payloadData, payload[:payloadEnd])
-
-			responseData := make([]byte, responseEnd-payloadEnd)
-			copy(responseData, payload[payloadEnd:responseEnd])
+			responseData := make([]byte, responseSize)
+			copy(responseData, v.Response[:responseSize])
 
 			req := &l7.RequestData{
 				Protocol:     l7.Protocol(v.Protocol),
@@ -436,21 +473,21 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 		case perfMapTypeFileEvents:
 			v := &fileEvent{}
 			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read msg:", err)
+				klog.Warningln("failed to read file event:", err)
 				continue
 			}
 			event = Event{Type: v.Type, Pid: v.Pid, Fd: v.Fd, Mnt: v.Mnt, Log: v.Log > 0}
 		case perfMapTypeProcEvents:
 			v := &procEvent{}
 			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read msg:", err)
+				klog.Warningln("failed to read proc event:", err)
 				continue
 			}
 			event = Event{Type: v.Type, Reason: EventReason(v.Reason), Pid: v.Pid}
 		case perfMapTypeTCPEvents:
 			v := &tcpEvent{}
 			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read msg:", err)
+				klog.Warningln("failed to read tcp event:", err)
 				continue
 			}
 			event = Event{
@@ -468,17 +505,6 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 					BytesSent:     v.BytesSent,
 					BytesReceived: v.BytesReceived,
 				}
-			}
-		case perfMapTypePythonThreadEvents:
-			v := &pythonThreadEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read msg:", err)
-				continue
-			}
-			event = Event{
-				Type:     v.Type,
-				Pid:      v.Pid,
-				Duration: time.Duration(v.Duration),
 			}
 		default:
 			continue
