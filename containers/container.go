@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coroot/coroot-node-agent/cgroup"
@@ -186,9 +187,9 @@ type Container struct {
 	ip_resolver IPResolver
 	srcWorkload common.Workload
 
-	// Debug fields
-	collectCallCount int
-	lastCollectTime  time.Time
+	// Atomic throttling fields for lock-free access
+	collectCallCount int64
+	lastCollectTime  int64 // Unix nanoseconds
 }
 
 func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid uint32, registry *Registry) (*Container, error) {
@@ -293,26 +294,24 @@ func (c *Container) Describe(ch chan<- *prometheus.Desc) {
 func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	// Add comprehensive performance monitoring
 	collectStart := time.Now()
-	lockStart := time.Now()
 	
-	c.lock.Lock()
-	lockAcquireTime := time.Since(lockStart)
-	if lockAcquireTime > 100*time.Millisecond {
-		klog.Warningf("LOCK_CONTENTION: Container %s took %v to acquire lock for Collect()", c.id, lockAcquireTime)
-	}
+	// Lock-free throttling using atomic operations
+	currentCount := atomic.AddInt64(&c.collectCallCount, 1)
+	now := time.Now()
+	nowNanos := now.UnixNano()
 	
-	c.collectCallCount++
-	timeSinceLastCall := time.Since(c.lastCollectTime)
+	// Get last collection time atomically
+	lastCollectNanos := atomic.LoadInt64(&c.lastCollectTime)
+	timeSinceLastCall := time.Duration(nowNanos - lastCollectNanos)
 
 	// Prevent duplicate metric emissions by ensuring minimum 1 second interval between collections
-	if timeSinceLastCall < 1*time.Second && c.collectCallCount > 1 {
-		c.lock.Unlock()
+	if timeSinceLastCall < 1*time.Second && currentCount > 1 {
 		klog.V(2).Infof("COLLECT_SKIP: Container %s skipped due to recent collection (%v ago)", c.id, timeSinceLastCall)
 		return
 	}
 
-	c.lastCollectTime = time.Now()
-	c.lock.Unlock() // Release lock early to prevent lock contention during metrics collection
+	// Update last collection time atomically
+	atomic.StoreInt64(&c.lastCollectTime, nowNanos)
 	
 	// Track timing of different collection phases
 	phaseStart := time.Now()
