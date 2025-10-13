@@ -291,7 +291,8 @@ func (c *Container) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *Container) Collect(ch chan<- prometheus.Metric) {
-	// Add lock contention monitoring
+	// Add comprehensive performance monitoring
+	collectStart := time.Now()
 	lockStart := time.Now()
 	
 	c.lock.Lock()
@@ -306,11 +307,15 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	// Prevent duplicate metric emissions by ensuring minimum 1 second interval between collections
 	if timeSinceLastCall < 1*time.Second && c.collectCallCount > 1 {
 		c.lock.Unlock()
+		klog.V(2).Infof("COLLECT_SKIP: Container %s skipped due to recent collection (%v ago)", c.id, timeSinceLastCall)
 		return
 	}
 
 	c.lastCollectTime = time.Now()
 	c.lock.Unlock() // Release lock early to prevent lock contention during metrics collection
+	
+	// Track timing of different collection phases
+	phaseStart := time.Now()
 
 	if c.metadata.image != "" || c.metadata.systemdTriggeredBy != "" {
 		ch <- gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemdTriggeredBy)
@@ -377,6 +382,13 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
+	// Log basic metrics phase timing
+	basicMetricsTime := time.Since(phaseStart)
+	if basicMetricsTime > 100*time.Millisecond {
+		klog.V(2).Infof("COLLECT_TIMING: Container %s basic metrics took %v", c.id, basicMetricsTime)
+	}
+	phaseStart = time.Now()
+
 	for addr, open := range c.getListens() {
 		ch <- gauge(metrics.NetListenInfo, float64(open), addr.String(), "")
 	}
@@ -385,6 +397,13 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 			ch <- gauge(metrics.NetListenInfo, 1, addr.String(), proxy)
 		}
 	}
+
+	// Log network listen metrics phase timing
+	listenTime := time.Since(phaseStart)
+	if listenTime > 100*time.Millisecond {
+		klog.V(2).Infof("COLLECT_TIMING: Container %s listen metrics took %v", c.id, listenTime)
+	}
+	phaseStart = time.Now()
 
 	for _, d := range c.connectionStats.Keys() {
 		stats, ok := c.connectionStats.Peek(d)
@@ -407,6 +426,15 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		workload := c.ip_resolver.ResolveIP(dst.IP().String())
 		ch <- counter(metrics.NetConnectionsFailed, float64(count), dst.String(), workload.Name, workload.Namespace, workload.Kind, workload.Name, workload.Namespace, workload.Kind, c.srcWorkload.Region, c.srcWorkload.Zone, workload.Region, workload.Zone, workload.Region, workload.Zone, workload.Instance)
 	}
+
+	// Log connection stats phase timing
+	connStatsTime := time.Since(phaseStart)
+	if connStatsTime > 500*time.Millisecond {
+		klog.Warningf("COLLECT_TIMING: Container %s connection stats took %v", c.id, connStatsTime)
+	} else if connStatsTime > 100*time.Millisecond {
+		klog.V(2).Infof("COLLECT_TIMING: Container %s connection stats took %v", c.id, connStatsTime)
+	}
+	phaseStart = time.Now()
 
 	connections := map[common.DestinationKey]int{}
 	for _, conn := range c.activeConnections {
@@ -523,13 +551,46 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
+	// Log process and application metrics phase timing
+	processTime := time.Since(phaseStart)
+	if processTime > 500*time.Millisecond {
+		klog.Warningf("COLLECT_TIMING: Container %s process metrics took %v", c.id, processTime)
+	} else if processTime > 100*time.Millisecond {
+		klog.V(2).Infof("COLLECT_TIMING: Container %s process metrics took %v", c.id, processTime)
+	}
+	phaseStart = time.Now()
+
 	c.l7Stats.collect(ch)
+
+	// Log L7 stats collection timing
+	l7Time := time.Since(phaseStart)
+	if l7Time > 1*time.Second {
+		klog.Warningf("COLLECT_TIMING: Container %s L7 stats took %v", c.id, l7Time)
+	} else if l7Time > 200*time.Millisecond {
+		klog.V(2).Infof("COLLECT_TIMING: Container %s L7 stats took %v", c.id, l7Time)
+	}
+	phaseStart = time.Now()
 
 	if !*flags.DisablePinger {
 		for ip, rtt := range c.ping() {
 			destination_workload := c.ip_resolver.ResolveIP(ip.String())
 			ch <- gauge(metrics.NetLatency, rtt, ip.String(), destination_workload.Name, destination_workload.Namespace, destination_workload.Kind, destination_workload.Instance)
 		}
+	}
+
+	// Log final phase and total timing
+	finalTime := time.Since(phaseStart)
+	if finalTime > 100*time.Millisecond {
+		klog.V(2).Infof("COLLECT_TIMING: Container %s final phase took %v", c.id, finalTime)
+	}
+	
+	totalTime := time.Since(collectStart)
+	if totalTime > 2*time.Second {
+		klog.Errorf("COLLECT_SLOW: Container %s total Collect() took %v", c.id, totalTime)
+	} else if totalTime > 1*time.Second {
+		klog.Warningf("COLLECT_SLOW: Container %s total Collect() took %v", c.id, totalTime)
+	} else if totalTime > 500*time.Millisecond {
+		klog.V(1).Infof("COLLECT_TIMING: Container %s total Collect() took %v", c.id, totalTime)
 	}
 }
 
