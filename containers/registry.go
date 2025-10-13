@@ -400,13 +400,13 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	// Fast path: try to find existing container with read lock
 	lockStart := time.Now()
-	
+
 	r.containerLock.RLock()
 	lockAcquireTime := time.Since(lockStart)
 	if lockAcquireTime > 50*time.Millisecond {
 		klog.Warningf("LOCK_CONTENTION: Registry read lock took %v (pid %d)", lockAcquireTime, pid)
 	}
-	
+
 	if c := r.containersByPid[pid]; c != nil {
 		r.containerLock.RUnlock()
 		return c
@@ -482,7 +482,7 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 
 	// Acquire write lock for container creation to prevent race conditions
 	writeLockStart := time.Now()
-	
+
 	r.containerLock.Lock()
 	writeLockAcquireTime := time.Since(writeLockStart)
 	if writeLockAcquireTime > 100*time.Millisecond {

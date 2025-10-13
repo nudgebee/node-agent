@@ -294,12 +294,12 @@ func (c *Container) Describe(ch chan<- *prometheus.Desc) {
 func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	// Add comprehensive performance monitoring
 	collectStart := time.Now()
-	
+
 	// Lock-free throttling using atomic operations
 	currentCount := atomic.AddInt64(&c.collectCallCount, 1)
 	now := time.Now()
 	nowNanos := now.UnixNano()
-	
+
 	// Get last collection time atomically
 	lastCollectNanos := atomic.LoadInt64(&c.lastCollectTime)
 	timeSinceLastCall := time.Duration(nowNanos - lastCollectNanos)
@@ -312,7 +312,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 
 	// Update last collection time atomically
 	atomic.StoreInt64(&c.lastCollectTime, nowNanos)
-	
+
 	// Track timing of different collection phases
 	phaseStart := time.Now()
 
@@ -582,7 +582,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	if finalTime > 100*time.Millisecond {
 		klog.V(2).Infof("COLLECT_TIMING: Container %s final phase took %v", c.id, finalTime)
 	}
-	
+
 	totalTime := time.Since(collectStart)
 	if totalTime > 2*time.Second {
 		klog.Errorf("COLLECT_SLOW: Container %s total Collect() took %v", c.id, totalTime)

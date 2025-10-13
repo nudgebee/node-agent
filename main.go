@@ -224,8 +224,6 @@ func main() {
 		"Metrics collection timeout",
 	))
 
-
-
 	klog.Infoln("listening on:", *flags.ListenAddress)
 	klog.Errorln(http.ListenAndServe(*flags.ListenAddress, nil))
 }
