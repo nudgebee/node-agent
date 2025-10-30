@@ -8,21 +8,22 @@ import (
 type Protocol uint8
 
 const (
-	ProtocolHTTP       Protocol = 1
-	ProtocolPostgres   Protocol = 2
-	ProtocolRedis      Protocol = 3
-	ProtocolMemcached  Protocol = 4
-	ProtocolMysql      Protocol = 5
-	ProtocolMongo      Protocol = 6
-	ProtocolKafka      Protocol = 7
-	ProtocolCassandra  Protocol = 8
-	ProtocolRabbitmq   Protocol = 9
-	ProtocolNats       Protocol = 10
-	ProtocolHTTP2      Protocol = 11
-	ProtocolDubbo2     Protocol = 12
-	ProtocolDNS        Protocol = 13
-	ProtocolClickhouse Protocol = 14
-	ProtocolZookeeper  Protocol = 15
+	ProtocolHTTP         Protocol = 1
+	ProtocolPostgres     Protocol = 2
+	ProtocolRedis        Protocol = 3
+	ProtocolMemcached    Protocol = 4
+	ProtocolMysql        Protocol = 5
+	ProtocolMongo        Protocol = 6
+	ProtocolKafka        Protocol = 7
+	ProtocolCassandra    Protocol = 8
+	ProtocolRabbitmq     Protocol = 9
+	ProtocolNats         Protocol = 10
+	ProtocolHTTP2        Protocol = 11
+	ProtocolDubbo2       Protocol = 12
+	ProtocolDNS          Protocol = 13
+	ProtocolClickhouse   Protocol = 14
+	ProtocolZookeeper    Protocol = 15
+	ProtocolFoundationDB Protocol = 16
 )
 
 func (p Protocol) String() string {
@@ -57,6 +58,8 @@ func (p Protocol) String() string {
 		return "ClickHouse"
 	case ProtocolZookeeper:
 		return "Zookeeper"
+	case ProtocolFoundationDB:
+		return "FoundationDB"
 	}
 	return "UNKNOWN:" + strconv.Itoa(int(p))
 }
@@ -143,6 +146,46 @@ func (s Status) Zookeeper() string {
 		return "failed"
 	}
 	return "ok"
+}
+
+func (s Status) GRPC() string {
+	switch s {
+	case 0:
+		return "grpc:OK"
+	case 1:
+		return "grpc:CANCELLED"
+	case 2:
+		return "grpc:UNKNOWN"
+	case 3:
+		return "grpc:INVALID_ARGUMENT"
+	case 4:
+		return "grpc:DEADLINE_EXCEEDED"
+	case 5:
+		return "grpc:NOT_FOUND"
+	case 6:
+		return "grpc:ALREADY_EXISTS"
+	case 7:
+		return "grpc:PERMISSION_DENIED"
+	case 8:
+		return "grpc:RESOURCE_EXHAUSTED"
+	case 9:
+		return "grpc:FAILED_PRECONDITION"
+	case 10:
+		return "grpc:ABORTED"
+	case 11:
+		return "grpc:OUT_OF_RANGE"
+	case 12:
+		return "grpc:UNIMPLEMENTED"
+	case 13:
+		return "grpc:INTERNAL"
+	case 14:
+		return "grpc:UNAVAILABLE"
+	case 15:
+		return "grpc:DATA_LOSS"
+	case 16:
+		return "grpc:UNAUTHENTICATED"
+	}
+	return ""
 }
 
 func (s Status) Error() bool {

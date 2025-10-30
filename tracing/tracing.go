@@ -4,10 +4,11 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"math/rand"
+	"net"
 	"net/http"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
@@ -28,11 +29,16 @@ const (
 	MemcacheDBItemKeyName attribute.Key = "db.memcached.item"
 )
 
+func sanitizeUTF8(s string) string {
+	return strings.ToValidUTF8(s, "�")
+}
+
 var (
 	batcher             sdktrace.TracerProviderOption
 	commonResourceAttrs []attribute.KeyValue
 	agentVersion        string
 	initialized         bool
+	samplingRate        float64
 )
 
 func Init(machineId, hostname, version string) {
@@ -41,6 +47,15 @@ func Init(machineId, hostname, version string) {
 	if endpointUrl == nil {
 		klog.Infoln("no OpenTelemetry traces collector endpoint configured")
 		return
+	}
+
+	samplingRate = *flags.TracesSampling
+	if samplingRate < 0.0 || samplingRate > 1.0 {
+		klog.Warningf("invalid traces-sampling value %f, must be between 0.0 and 1.0, using default 1.0", samplingRate)
+		samplingRate = 1.0
+	}
+	if samplingRate < 1.0 {
+		klog.Infof("trace sampling rate set to %f", samplingRate)
 	}
 	klog.Infoln("OpenTelemetry traces collector endpoint:", endpointUrl.String())
 	path := endpointUrl.Path
@@ -99,6 +114,17 @@ type Tracer struct {
 	otel trace.Tracer
 }
 
+func shouldSample() bool {
+	if samplingRate >= 1.0 {
+		return true
+	}
+	if samplingRate <= 0.0 {
+		return false
+	}
+
+	return rand.Float64() < samplingRate
+}
+
 func GetContainerTracer(containerId string) *Tracer {
 	if !initialized {
 		return &Tracer{otel: nil}
@@ -131,20 +157,20 @@ func (t *Tracer) NewTrace(destination common.HostPort, srcWorkload common.Worklo
 		node = actualDstWorkload.Instance
 	}
 	return &Trace{tracer: t, destination: destination, commonAttrs: []attribute.KeyValue{
-		semconv.NetPeerName(destination.Host()),
+		semconv.NetPeerName(sanitizeUTF8(destination.Host())),
 		semconv.NetPeerPort(int(destination.Port())),
-		attribute.Key("destination.workload_name").String(dstWorkload.Name),
-		attribute.Key("destination.workload_namespace").String(dstWorkload.Namespace),
-		attribute.Key("destination.workload_kind").String(dstWorkload.Kind),
-		attribute.Key("source.workload_name").String(srcWorkload.Name),
-		attribute.Key("source.workload_namespace").String(srcWorkload.Namespace),
-		attribute.Key("source.workload_kind").String(srcWorkload.Kind),
-		attribute.Key("destination.name").String(actualDstWorkload.Name),
-		attribute.Key("destination.namespace").String(actualDstWorkload.Namespace),
-		attribute.Key("destination.kind").String(actualDstWorkload.Kind),
-		attribute.Key("destination.cloud.availablity_zone").String(zone),
-		attribute.Key("destination.cloud.region").String(region),
-		attribute.Key("destination.node").String(node),
+		attribute.Key("destination.workload_name").String(sanitizeUTF8(dstWorkload.Name)),
+		attribute.Key("destination.workload_namespace").String(sanitizeUTF8(dstWorkload.Namespace)),
+		attribute.Key("destination.workload_kind").String(sanitizeUTF8(dstWorkload.Kind)),
+		attribute.Key("source.workload_name").String(sanitizeUTF8(srcWorkload.Name)),
+		attribute.Key("source.workload_namespace").String(sanitizeUTF8(srcWorkload.Namespace)),
+		attribute.Key("source.workload_kind").String(sanitizeUTF8(srcWorkload.Kind)),
+		attribute.Key("destination.name").String(sanitizeUTF8(actualDstWorkload.Name)),
+		attribute.Key("destination.namespace").String(sanitizeUTF8(actualDstWorkload.Namespace)),
+		attribute.Key("destination.kind").String(sanitizeUTF8(actualDstWorkload.Kind)),
+		attribute.Key("destination.cloud.availablity_zone").String(sanitizeUTF8(zone)),
+		attribute.Key("destination.cloud.region").String(sanitizeUTF8(region)),
+		attribute.Key("destination.node").String(sanitizeUTF8(node)),
 	}}
 }
 
@@ -159,6 +185,11 @@ func (t *Trace) createSpan(name string, duration time.Duration, error bool, trac
 		return
 	}
 	end := time.Now()
+
+	if !shouldSample() {
+		return
+	}
+
 	start := end.Add(-duration)
 	ctx := context.Background()
 	if traceId != "" {
@@ -215,46 +246,46 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 	if t == nil || method == "" {
 		return
 	}
-	if host == "" {
-		host = t.destination.String()
+
+	// Use destination hostname for external services, fallback to provided host
+	requestHost := sanitizeUTF8(host)
+	if host == "" || isIPAddress(host) {
+		// Use destination hostname if host is empty or an IP address
+		if t.destination.Port() != 0 {
+			requestHost = sanitizeUTF8(t.destination.String())
+		}
 	}
-	requestPayload := ""
-	if utf8.ValidString(payload) {
-		requestPayload = payload
-	}
+
+	requestPayload := sanitizeUTF8(payload)
 	requestHeaders := ""
-	responsePayload := ""
-	if utf8.ValidString(response) {
-		responsePayload = response
-	}
-	requestPath := ""
-	if utf8.ValidString(path) {
-		requestPath = path
-	}
-	requestHost := ""
-	if utf8.ValidString(host) {
-		requestHost = host
-	}
+	responsePayload := sanitizeUTF8(response)
+	requestPath := sanitizeUTF8(path)
 
 	if headers != nil {
-		requestHeaders = l7.ConvertHeadersToBase64String(headers)
+		requestHeaders = sanitizeUTF8(l7.ConvertHeadersToBase64String(headers))
 	}
 
-	traceId := t.ExtractTraceId(headers)
-	t.createSpan(method, duration, status >= 400,
+	// Determine protocol based on port or known LLM APIs
+	protocol := "http"
+	if isHTTPSService(requestHost) || t.destination.Port() == 443 {
+		protocol = "https"
+	}
+
+	traceId := sanitizeUTF8(t.ExtractTraceId(headers))
+	t.createSpan(sanitizeUTF8(method), duration, status >= 400,
 		traceId,
-		semconv.HTTPURL(fmt.Sprintf("http://%s%s", requestHost, requestPath)),
-		semconv.HTTPMethod(method),
+		semconv.HTTPURL(fmt.Sprintf("%s://%s%s", protocol, requestHost, requestPath)),
+		semconv.HTTPMethod(sanitizeUTF8(method)),
 		semconv.HTTPStatusCode(int(status)),
 		semconv.HTTPRequestContentLength(int(requestSize)),
-		attribute.Key("http.request_payload").String(requestPayload),
-		attribute.Key("http.headers").String(requestHeaders),
-		attribute.Key("http.response").String(responsePayload),
-		attribute.Key("http.path").String(requestPath),
+		attribute.Key("http.request_payload").String(sanitizeUTF8(requestPayload)),
+		attribute.Key("http.headers").String(sanitizeUTF8(requestHeaders)),
+		attribute.Key("http.response").String(sanitizeUTF8(responsePayload)),
+		attribute.Key("http.path").String(sanitizeUTF8(requestPath)),
 	)
 }
 
-func (t *Trace) Http2Request(method, path, scheme string, status l7.Status, duration time.Duration, payload string) {
+func (t *Trace) Http2Request(method, path, scheme string, status, grpcStatus l7.Status, duration time.Duration) {
 	if t == nil {
 		return
 	}
@@ -267,17 +298,16 @@ func (t *Trace) Http2Request(method, path, scheme string, status l7.Status, dura
 	if scheme == "" {
 		scheme = "unknown"
 	}
-	requestPayload := ""
-	if utf8.ValidString(payload) {
-		requestPayload = payload
-	}
 
-	t.createSpan(method, duration, status > 400, "",
+	attrs := []attribute.KeyValue{
 		semconv.HTTPURL(fmt.Sprintf("%s://%s%s", scheme, t.destination.String(), path)),
 		semconv.HTTPMethod(method),
 		semconv.HTTPStatusCode(int(status)),
-		attribute.Key("http.request_payload").String(requestPayload),
-	)
+	}
+	if grpcStatus >= 0 {
+		attrs = append(attrs, semconv.RPCGRPCStatusCodeKey.Int(int(grpcStatus)))
+	}
+	t.createSpan(method, duration, status > 400 || grpcStatus > 0, "", attrs...)
 }
 
 func (t *Trace) PostgresQuery(query string, error bool, duration time.Duration) {
@@ -286,7 +316,7 @@ func (t *Trace) PostgresQuery(query string, error bool, duration time.Duration) 
 	}
 	t.createSpan("query", duration, error, "",
 		semconv.DBSystemPostgreSQL,
-		semconv.DBStatement(query),
+		semconv.DBStatement(sanitizeUTF8(query)),
 	)
 }
 
@@ -296,7 +326,7 @@ func (t *Trace) MysqlQuery(query string, error bool, duration time.Duration) {
 	}
 	t.createSpan("query", duration, error, "",
 		semconv.DBSystemMySQL,
-		semconv.DBStatement(query),
+		semconv.DBStatement(sanitizeUTF8(query)),
 	)
 }
 
@@ -306,7 +336,7 @@ func (t *Trace) MongoQuery(query string, error bool, duration time.Duration) {
 	}
 	t.createSpan("query", duration, error, "",
 		semconv.DBSystemMongoDB,
-		semconv.DBStatement(query),
+		semconv.DBStatement(sanitizeUTF8(query)),
 	)
 }
 
@@ -319,9 +349,13 @@ func (t *Trace) MemcachedQuery(cmd string, items []string, error bool, duration 
 		semconv.DBOperation(cmd),
 	}
 	if len(items) == 1 {
-		attrs = append(attrs, MemcacheDBItemKeyName.String(items[0]))
+		attrs = append(attrs, MemcacheDBItemKeyName.String(sanitizeUTF8(items[0])))
 	} else if len(items) > 1 {
-		attrs = append(attrs, MemcacheDBItemKeyName.StringSlice(items))
+		sanitizedItems := make([]string, len(items))
+		for i, item := range items {
+			sanitizedItems[i] = sanitizeUTF8(item)
+		}
+		attrs = append(attrs, MemcacheDBItemKeyName.StringSlice(sanitizedItems))
 	}
 	t.createSpan(cmd, duration, error, "", attrs...)
 }
@@ -336,8 +370,8 @@ func (t *Trace) RedisQuery(cmd, args string, error bool, duration time.Duration)
 	}
 	t.createSpan(cmd, duration, error, "",
 		semconv.DBSystemRedis,
-		semconv.DBOperation(cmd),
-		semconv.DBStatement(statement),
+		semconv.DBOperation(sanitizeUTF8(cmd)),
+		semconv.DBStatement(sanitizeUTF8(statement)),
 	)
 }
 
@@ -347,7 +381,7 @@ func (t *Trace) ClickhouseQuery(query string, error bool, duration time.Duration
 	}
 	t.createSpan("query", duration, error, "",
 		semconv.DBSystemClickhouse,
-		semconv.DBStatement(query),
+		semconv.DBStatement(sanitizeUTF8(query)),
 	)
 }
 
@@ -365,7 +399,36 @@ func (t *Trace) ZookeeperRequest(op string, args string, status l7.Status, durat
 	t.createSpan(op, duration, status.Zookeeper() != "ok", "",
 		semconv.DBSystemKey.String("zookeeper"),
 		semconv.DBOperation(op),
-		semconv.DBStatementKey.String(statement),
+		semconv.DBStatementKey.String(sanitizeUTF8(statement)),
 		attribute.Key("zookeeper.status_code").Int(int(status)),
 	)
+}
+
+// isIPAddress checks if a string is an IP address
+func isIPAddress(host string) bool {
+	return net.ParseIP(host) != nil
+}
+
+// isHTTPSService checks if a hostname is known to use HTTPS
+func isHTTPSService(host string) bool {
+	// Common LLM API services that use HTTPS
+	httpsServices := []string{
+		"api.openai.com",
+		"api.anthropic.com",
+		"api.cohere.ai",
+		"api.cohere.com",
+		"generativelanguage.googleapis.com",
+		"ai.googleapis.com",
+		"aiplatform.googleapis.com",
+		"claude.ai",
+	}
+
+	hostLower := strings.ToLower(host)
+	for _, service := range httpsServices {
+		if strings.Contains(hostLower, service) {
+			return true
+		}
+	}
+
+	return false
 }

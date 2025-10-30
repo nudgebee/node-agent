@@ -1,0 +1,79 @@
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+  - location: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+mounts:
+  - location: "~"
+    writable: true
+  - location: "/tmp/lima"
+    writable: true
+
+provision:
+  - mode: system
+    script: |
+      apt-get update
+
+      # Core dev tools
+      apt-get install -y build-essential pkgconf bsdutils zlib1g-dev \
+                         apt-transport-https ca-certificates curl jq \
+                         python3-pip make conntrack git
+
+      # Clang + LLVM
+      apt-get install -y llvm-12 clang-12 clang-format-12 llvm-strip-12 llc-12 \
+                         libelf-dev libpcap-dev libbfd-dev binutils-dev
+
+      # Soft links
+      for tool in clang llc llvm-strip clang-format; do
+        if ! command -v $tool >/dev/null 2>&1; then
+          alt=$(which ${tool}-12)
+          [ -n \"$alt\" ] && ln -s $alt /usr/local/bin/$tool
+        fi
+      done
+
+      # Kernel + BPF tools
+      apt-get install -y linux-headers-$(uname -r) linux-tools-common linux-tools-$(uname -r) \
+                         bpfcc-tools libsystemd-dev
+
+      # Install bpftrace
+      snap install --devmode bpftrace
+
+      # Install Go (cross-arch)
+      ARCH=$(uname -m)
+      if [ \"$ARCH\" = \"x86_64\" ]; then
+        GO_ARCH=amd64
+      elif [ \"$ARCH\" = \"aarch64\" ]; then
+        GO_ARCH=arm64
+      else
+        echo \"Unsupported arch: $ARCH\"
+        exit 1
+      fi
+
+      GO_VERSION=1.24.1
+      curl -LO https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz
+      tar -C /usr/local -xzf go${GO_VERSION}.linux-${GO_ARCH}.tar.gz
+      echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
+      echo 'export GOPATH=$HOME/go' >> /etc/profile
+      echo 'export PATH=$PATH:$GOPATH/bin' >> /etc/profile
+      mkdir -p /root/go
+
+      # Install kubectl
+      curl -LO \"https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/${GO_ARCH}/kubectl\"
+      chmod +x ./kubectl
+      mv ./kubectl /usr/local/bin/kubectl
+
+      # Install Minikube
+      curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-${GO_ARCH}
+      install minikube-linux-${GO_ARCH} /usr/local/bin/minikube
+
+      # Optional: install Docker for Minikube
+      apt-get install -y docker.io
+      systemctl enable --now docker
+
+      # Add root to docker group (optional)
+      usermod -aG docker root
+
+      # Optional: pre-start Minikube (uncomment to auto-init)
+      # minikube start --driver=docker --container-runtime=containerd --kubernetes-version=stable
+      # echo 'export KUBECONFIG=/root/.kube/config' >> /etc/profile

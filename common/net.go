@@ -217,27 +217,31 @@ func (d *Domain) String() string {
 }
 
 func NewDomain(fqdn string, ips []netaddr.IP) *Domain {
-	d := &Domain{FQDN: fqdn, SpecifyIP: true}
-	if len(ips) > 1 {
-		containsPrivateIPs := false
-		for _, ip := range ips {
-			if !IsIpExternal(ip) {
-				containsPrivateIPs = true
-				break
-			}
-		}
-		if !containsPrivateIPs {
-			d.SpecifyIP = false
-		}
-	}
+	// For external domains, prefer showing domain names over IP addresses in traces
+	// This allows external API calls to show meaningful service names instead of IPs
+	d := &Domain{FQDN: fqdn, SpecifyIP: false}
 	return d
 }
 
 func NewDestinationKey(dst, actualDst netaddr.IPPort, domain *Domain, dstWorkload Workload, actualDestWorkload Workload) DestinationKey {
+	// Debug logging for duplicate metrics investigation
+	if dst.IP().String() == "10.43.37.74" && dst.Port() == 8000 {
+		klog.Infof("DEBUG NewDestinationKey: dst=%s actualDst=%s domain=%v dstWorkload=%s actualDestWorkload=%s",
+			dst, actualDst, domain, dstWorkload.Name, actualDestWorkload.Name)
+	}
+
 	if IsIpExternal(actualDst.IP()) && domain != nil && !domain.SpecifyIP {
+		dstWorkload.Name = domain.FQDN
+		actualDestWorkload.Name = domain.FQDN
 		return DestinationKey{
-			destination: HostPortWithEmptyIP(domain.FQDN, dst.Port()),
+			destination:               HostPortWithEmptyIP(domain.FQDN, dst.Port()),
+			actualDestination:         HostPortFromIPPort(actualDst),
+			destinationWorkload:       dstWorkload,
+			actualDestinationWorkload: actualDestWorkload,
 		}
+	} else if IsIpExternal(actualDst.IP()) && domain != nil && domain.SpecifyIP {
+		// Note: This case should rarely happen now that we default SpecifyIP to false
+		klog.V(5).Infof("ip %q is external, but domain %q specifies IP, using IP as destination", actualDst.IP(), domain.FQDN)
 	}
 	return DestinationKey{
 		destination:               HostPortFromIPPort(dst),
