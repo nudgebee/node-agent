@@ -1,6 +1,6 @@
 module github.com/coroot/coroot-node-agent
 
-go 1.23.8
+go 1.24.7
 
 require (
 	cloud.google.com/go/compute/metadata v0.6.0
@@ -8,11 +8,11 @@ require (
 	github.com/NVIDIA/go-nvml v0.12.4-1
 	github.com/agoda-com/opentelemetry-logs-go v0.4.1
 	github.com/cilium/cilium v1.17.3
-	github.com/cilium/ebpf v0.17.3
+	github.com/cilium/ebpf v0.19.0
 	github.com/containerd/cgroups v1.0.4
 	github.com/containerd/containerd v1.6.38
 	github.com/coreos/go-systemd/v22 v22.5.0
-	github.com/docker/docker v27.4.0+incompatible
+	github.com/docker/docker v28.0.0+incompatible
 	github.com/florianl/go-conntrack v0.3.0
 	github.com/go-kit/log v0.2.1
 	github.com/godbus/dbus/v5 v5.1.0
@@ -42,7 +42,7 @@ require (
 	golang.org/x/arch v0.4.0
 	golang.org/x/exp v0.0.0-20240808152545-0cdaa3abc0fa
 	golang.org/x/net v0.38.0
-	golang.org/x/sys v0.32.0
+	golang.org/x/sys v0.36.0
 	golang.org/x/time v0.8.0
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
 	gopkg.in/yaml.v2 v2.4.0
@@ -53,7 +53,10 @@ require (
 	k8s.io/klog/v2 v2.130.1
 )
 
-require github.com/gobwas/glob v0.2.3
+require (
+	github.com/gobwas/glob v0.2.3
+	gotest.tools v2.2.0+incompatible
+)
 
 require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
@@ -161,7 +164,7 @@ require (
 	github.com/spf13/pflag v1.0.6-0.20210604193023-d5e0c0615ace // indirect
 	github.com/spf13/viper v1.19.0 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
-	github.com/ulikunitz/xz v0.5.12 // indirect
+	github.com/ulikunitz/xz v0.5.14 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	go.etcd.io/etcd/api/v3 v3.5.17 // indirect
 	go.etcd.io/etcd/client/pkg/v3 v3.5.17 // indirect
@@ -190,7 +193,6 @@ require (
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	gotest.tools v2.2.0+incompatible
 	k8s.io/apiextensions-apiserver v0.32.0 // indirect
 	k8s.io/kube-openapi v0.0.0-20241105132330-32ad38e42d3f // indirect
 	k8s.io/utils v0.0.0-20241210054802-24370beab758 // indirect

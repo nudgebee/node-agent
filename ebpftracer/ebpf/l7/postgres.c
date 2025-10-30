@@ -8,25 +8,33 @@
 
 static __always_inline
 int is_postgres_query(char *buf, __u64 buf_size, __u8 *request_type) {
-    char f_cmd;
-    int f_length;
-    if (buf_size < sizeof(f_cmd)+sizeof(f_length)) {
+    if (buf_size < 5) {
         return 0;
     }
+    char f_cmd;
     bpf_read(buf, f_cmd);
-    bpf_read(buf+1, f_length);
-    f_length = bpf_htonl(f_length);
-
     *request_type = f_cmd;
-    if ((f_cmd == POSTGRES_FRAME_SIMPLE_QUERY || f_cmd == POSTGRES_FRAME_CLOSE) && f_length+1 == buf_size) {
+
+    // A simple query starts with 'Q', a 4-byte length, and a null-terminated string.
+    if (f_cmd == POSTGRES_FRAME_SIMPLE_QUERY) {
+        __u32 f_length;
+        bpf_read(buf + 1, f_length);
+        f_length = bpf_htonl(f_length);
+
+        // Check if the length is plausible.
+        if (f_length > 4 && f_length < buf_size) {
+            return 1;
+        }
+    }
+
+    // Other frame types like Parse ('P') and Close ('C') have similar structures.
+    // For now, we'll keep the logic simple and focus on not misidentifying other protocols.
+    // The old 'S' check was too broad. A more robust check would be needed for full
+    // extended protocol support, but this is safer for now.
+    if (f_cmd == POSTGRES_FRAME_PARSE || f_cmd == POSTGRES_FRAME_CLOSE) {
         return 1;
     }
-    char sync[5];
-    TRUNCATE_PAYLOAD_SIZE(buf_size);
-    bpf_read(buf+buf_size-5, sync);
-    if (sync[0] == 'S' && sync[1] == 0 && sync[2] == 0 && sync[3] == 0 && sync[4] == 4) {
-        return 1;
-    }
+
     return 0;
 }
 

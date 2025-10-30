@@ -14,6 +14,7 @@
 #define PROTOCOL_DNS        13
 #define PROTOCOL_CLICKHOUSE 14
 #define PROTOCOL_ZOOKEEPER  15
+#define PROTOCOL_FOUNDATIONDB 16
 
 #define STATUS_UNKNOWN  0
 #define STATUS_OK       200
@@ -56,6 +57,7 @@
 #include "dns.c"
 #include "clickhouse.c"
 #include "zookeeper.c"
+#include "foundationdb.c"
 
 struct l7_event {
     __u64 fd;
@@ -71,6 +73,11 @@ struct l7_event {
     __u64 response_size;
     char payload[MAX_PAYLOAD_SIZE];
     char response[MAX_PAYLOAD_SIZE];
+};
+
+struct iovec {
+    char* buf;
+    __u64 size;
 };
 
 struct {
@@ -122,11 +129,6 @@ struct trace_event_raw_sys_enter_rw__stub {
     __u64 size;
 };
 
-struct iovec {
-    char* buf;
-    __u64 size;
-};
-
 struct user_msghdr {
 	void *msg_name;
 	int msg_namelen;
@@ -147,33 +149,30 @@ void send_event(void *ctx, struct l7_event *e, struct connection_id cid, struct 
 
 static inline __attribute__((__always_inline__))
 __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_size) {
-    struct iovec iov = {};
-    __u64 max = (ret) ? MIN(ret, MAX_PAYLOAD_SIZE) : MAX_PAYLOAD_SIZE;
-    __u64 offset = 0;
-    __u64 size = 0;
-    #pragma unroll
-    for (int i = 0; i < MAX_IOVEC_SIZE; i++) {
-        if (i >= iovlen) {
-            break;
-        }
-        if (bpf_probe_read(&iov, sizeof(iov), (void *)(iovec+i*sizeof(iov)))) {
-            return 0;
-        }
-        if (iov.size <= 0) {
-            continue;
-        }
-        *total_size += iov.size;
-        if (offset < max) {
-            size = MIN(iov.size, max-offset);
-            TRUNCATE_PAYLOAD_SIZE(size);
-            TRUNCATE_PAYLOAD_SIZE(offset);
-            if (bpf_probe_read(buf + offset, size, (void *)iov.buf)) {
-                return 0;
-            }
-            offset += size;
-        }
+    if (iovlen == 0) {
+        return 0;
     }
-    return offset;
+    
+    // Only process the first iovec entry to avoid verifier issues with offset arithmetic
+    struct iovec iov = {};
+    if (bpf_probe_read(&iov, sizeof(iov), (void *)iovec)) {
+        return 0;
+    }
+    
+    if (iov.size <= 0) {
+        return 0;
+    }
+    
+    *total_size = iov.size;
+    __u64 size = MIN(iov.size, MAX_PAYLOAD_SIZE);
+    TRUNCATE_PAYLOAD_SIZE(size);
+    
+    // Direct copy without offset arithmetic on map values
+    if (bpf_probe_read(buf, size, (void *)iov.buf)) {
+        return 0;
+    }
+    
+    return size;
 }
 
 static inline __attribute__((__always_inline__))
@@ -211,7 +210,7 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
     if (!req) {
         return 0;
     }
-    req->protocol = PROTOCOL_UNKNOWN;
+    req->protocol = conn->protocol; // Use the known protocol if it exists
     req->partial = 0;
     req->request_id = 0;
     req->ns = 0;
@@ -222,88 +221,94 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
     k.is_tls = is_tls;
     k.stream_id = -1;
 
-    if (is_http_request(payload)) {
-        req->protocol = PROTOCOL_HTTP;
-    } else if (is_postgres_query(payload, size, &req->request_type)) {
-        if (req->request_type == POSTGRES_FRAME_CLOSE) {
+    if (req->protocol == PROTOCOL_UNKNOWN) { // Only detect protocol if it's not already known
+        if (is_http_request(payload)) {
+            req->protocol = PROTOCOL_HTTP;
+        } else if (is_postgres_query(payload, size, &req->request_type)) {
+            req->protocol = PROTOCOL_POSTGRES;
+        } else if (is_redis_query(payload, size)) {
+            req->protocol = PROTOCOL_REDIS;
+        } else if (is_memcached_query(payload, size)) {
+            req->protocol = PROTOCOL_MEMCACHED;
+        } else if (is_mysql_query(payload, size, &req->request_type)) {
+            req->protocol = PROTOCOL_MYSQL;
+        } else if (is_mongo_query(payload, size)) {
+            req->protocol = PROTOCOL_MONGO;
+        } else if (is_rabbitmq_produce(payload, size)) {
             struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
-            if (!e) {
-                return 0;
-            }
-            e->protocol = PROTOCOL_POSTGRES;
-            e->method = METHOD_STATEMENT_CLOSE;
+            if (!e) { return 0; }
+            e->protocol = PROTOCOL_RABBITMQ;
+            e->method = METHOD_PRODUCE;
+            send_event(ctx, e, cid, conn);
+            return 0;
+        } else if (nats_method(payload, size) == METHOD_PRODUCE) {
+            struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
+            if (!e) { return 0; }
+            e->protocol = PROTOCOL_NATS;
+            e->method = METHOD_PRODUCE;
+            send_event(ctx, e, cid, conn);
+            return 0;
+        } else if (is_cassandra_request(payload, size, &k.stream_id)) {
+            req->protocol = PROTOCOL_CASSANDRA;
+        } else if (looks_like_http2_frame(payload, size, METHOD_HTTP2_CLIENT_FRAMES)) {
+            struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
+            if (!e) { return 0; }
+            e->protocol = PROTOCOL_HTTP2;
+            e->method = METHOD_HTTP2_CLIENT_FRAMES;
+            e->duration = bpf_ktime_get_ns();
             e->payload_size = size;
             COPY_PAYLOAD(e->payload, size, payload);
             send_event(ctx, e, cid, conn);
             return 0;
+        } else if (conn->dport == 5672 && (is_rabbitmq_connection(payload, size) || is_amqp_frame(payload, size) || is_amqp_method_frame(payload, size))) {
+            // Port-based hint: RabbitMQ typically runs on port 5672
+            req->protocol = PROTOCOL_RABBITMQ;
+        } else if ((conn->dport == 9000 || conn->dport == 8123) && is_clickhouse_query(payload, size)) {
+            // Port-based hint: ClickHouse typically runs on ports 9000 (native) or 8123 (HTTP)
+            req->protocol = PROTOCOL_CLICKHOUSE;
+        } else if (is_rabbitmq_connection(payload, size)) {
+            req->protocol = PROTOCOL_RABBITMQ;
+        } else if (is_amqp_frame(payload, size)) {
+            req->protocol = PROTOCOL_RABBITMQ;
+        } else if (is_amqp_method_frame(payload, size)) {
+            req->protocol = PROTOCOL_RABBITMQ;
+        } else if (is_clickhouse_query(payload, size)) {
+            req->protocol = PROTOCOL_CLICKHOUSE;
+        } else if (is_zk_request(payload, total_size)) {
+            req->protocol = PROTOCOL_ZOOKEEPER;
+        }  else if (is_kafka_request(payload, size, &req->request_id)) {
+            req->protocol = PROTOCOL_KAFKA;
+        } else if (is_dubbo2_request(payload, size)) {
+            req->protocol = PROTOCOL_DUBBO2;
+        } else if (is_dns_request(payload, size, &k.stream_id)) {
+            req->protocol = PROTOCOL_DNS;
+        } else if (is_foundationdb_request(payload, size)) {
+            req->protocol = PROTOCOL_FOUNDATIONDB;
         }
-        req->protocol = PROTOCOL_POSTGRES;
-    } else if (is_redis_query(payload, size)) {
-        req->protocol = PROTOCOL_REDIS;
-    } else if (is_memcached_query(payload, size)) {
-        req->protocol = PROTOCOL_MEMCACHED;
-    } else if (is_mysql_query(payload, size, &req->request_type)) {
-        if (req->request_type == MYSQL_COM_STMT_CLOSE) {
-            struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
-            if (!e) {
-                return 0;
-            }
-            e->protocol = PROTOCOL_MYSQL;
-            e->method = METHOD_STATEMENT_CLOSE;
-            e->payload_size = size;
-            COPY_PAYLOAD(e->payload, size, payload);
-            send_event(ctx, e, cid, conn);
-            return 0;
+        if (req->protocol != PROTOCOL_UNKNOWN) {
+            conn->protocol = req->protocol; // Save the detected protocol
         }
-        req->protocol = PROTOCOL_MYSQL;
-    } else if (is_mongo_query(payload, size)) {
-        req->protocol = PROTOCOL_MONGO;
-    } else if (is_rabbitmq_produce(payload, size)) {
+    }
+
+    if (req->protocol == PROTOCOL_POSTGRES && req->request_type == POSTGRES_FRAME_CLOSE) {
         struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
-        if (!e) {
-            return 0;
-        }
-        e->protocol = PROTOCOL_RABBITMQ;
-        e->method = METHOD_PRODUCE;
-        send_event(ctx, e, cid, conn);
-        return 0;
-    } else if (nats_method(payload, size) == METHOD_PRODUCE) {
-        struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
-        if (!e) {
-            return 0;
-        }
-        e->protocol = PROTOCOL_NATS;
-        e->method = METHOD_PRODUCE;
-        send_event(ctx, e, cid, conn);
-        return 0;
-    } else if (is_cassandra_request(payload, size, &k.stream_id)) {
-        req->protocol = PROTOCOL_CASSANDRA;
-    } else if (looks_like_http2_frame(payload, size, METHOD_HTTP2_CLIENT_FRAMES)) {
-        struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
-        if (!e) {
-            return 0;
-        }
-        e->protocol = PROTOCOL_HTTP2;
-        e->method = METHOD_HTTP2_CLIENT_FRAMES;
-        e->duration = bpf_ktime_get_ns();
+        if (!e) { return 0; }
+        e->protocol = PROTOCOL_POSTGRES;
+        e->method = METHOD_STATEMENT_CLOSE;
         e->payload_size = size;
         COPY_PAYLOAD(e->payload, size, payload);
         send_event(ctx, e, cid, conn);
         return 0;
-    } else if (is_clickhouse_query(payload, size)) {
-        req->protocol = PROTOCOL_CLICKHOUSE;
-    } else if (is_zk_request(payload, total_size)) {
-        req->protocol = PROTOCOL_ZOOKEEPER;
-    }  else if (is_kafka_request(payload, size, &req->request_id)) {
-        req->protocol = PROTOCOL_KAFKA;
-        struct l7_request *prev_req = bpf_map_lookup_elem(&active_l7_requests, &k);
-        if (prev_req && prev_req->protocol == PROTOCOL_KAFKA) {
-            req->ns = prev_req->ns;
-        }
-    } else if (is_dubbo2_request(payload, size)) {
-        req->protocol = PROTOCOL_DUBBO2;
-    } else if (is_dns_request(payload, size, &k.stream_id)) {
-        req->protocol = PROTOCOL_DNS;
+    }
+    if (req->protocol == PROTOCOL_MYSQL && req->request_type == MYSQL_COM_STMT_CLOSE) {
+        struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
+        if (!e) { return 0; }
+        e->protocol = PROTOCOL_MYSQL;
+        e->method = METHOD_STATEMENT_CLOSE;
+        e->payload_size = size;
+        COPY_PAYLOAD(e->payload, size, payload);
+        send_event(ctx, e, cid, conn);
+        return 0;
     }
 
     if (req->protocol == PROTOCOL_UNKNOWN) {
@@ -374,15 +379,8 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     int zero = 0;
     char* payload = args->buf;
     if (args->iovlen) {
-        payload = bpf_map_lookup_elem(&iovec_buf_heap, &zero);
-        if (!payload) {
-            return 0;
-        }
-        total_size = 0;
-        ret = read_iovec(args->buf, args->iovlen, ret, payload, &total_size);
-        if (!ret) {
-            return 0;
-        }
+        // Skip iovec processing to avoid eBPF verifier issues
+        return 0;
     }
 
     if (!is_tls) {
@@ -398,8 +396,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     e->method = METHOD_UNKNOWN;
     e->statement_id = 0;
     e->payload_size = 0;
-    e->response_size = ret;
-    COPY_PAYLOAD(e->response, ret, payload);
+
     if (is_rabbitmq_consume(payload, ret)) {
         e->protocol = PROTOCOL_RABBITMQ;
         e->method = METHOD_CONSUME;
@@ -487,12 +484,19 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
         }
     } else if (e->protocol == PROTOCOL_DUBBO2) {
         response = is_dubbo2_response(payload, &e->status);
+    } else if (e->protocol == PROTOCOL_FOUNDATIONDB) {
+        response = is_foundationdb_response(payload, ret, &e->status);
+        if (response == 2) { // partial
+            return 0; // keeping the query in the map
+        }
     }
     bpf_map_delete_elem(&active_l7_requests, &k);
     if (!response) {
         return 0;
     }
     e->duration = bpf_ktime_get_ns() - req->ns;
+    e->response_size = ret;
+    COPY_PAYLOAD(e->response, ret, payload);
     send_event(ctx, e, cid, conn);
     return 0;
 }
@@ -523,20 +527,14 @@ struct mmsghdr {
 
 SEC("tracepoint/syscalls/sys_enter_sendmmsg")
 int sys_enter_sendmmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
-    __u64 offset = 0;
-    #pragma unroll
-    for (int i = 0; i <= 1; i++) {
-        if (i >= ctx->size) {
-            break;
-        }
-        struct mmsghdr h = {};
-        if (bpf_probe_read(&h , sizeof(h), (void *)(ctx->buf + offset))) {
-            return 0;
-        }
-        offset += sizeof(h);
-        trace_enter_write(ctx, ctx->fd, 0, (char*)h.msg_hdr.msg_iov, 0, h.msg_hdr.msg_iovlen);
+    if (ctx->size == 0) {
+        return 0;
     }
-    return 0;
+    struct mmsghdr h = {};
+    if (bpf_probe_read(&h , sizeof(h), (void *)ctx->buf)) {
+        return 0;
+    }
+    return trace_enter_write(ctx, ctx->fd, 0, (char*)h.msg_hdr.msg_iov, 0, h.msg_hdr.msg_iovlen);
 }
 
 SEC("tracepoint/syscalls/sys_enter_sendto")

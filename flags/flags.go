@@ -9,11 +9,12 @@ import (
 )
 
 var (
-	ListenAddress     = kingpin.Flag("listen", "Listen address - ip:port or :port").Default("0.0.0.0:80").Envar("LISTEN").String()
-	CgroupRoot        = kingpin.Flag("cgroupfs-root", "The mount point of the host cgroupfs root").Default("/sys/fs/cgroup").Envar("CGROUPFS_ROOT").String()
-	DisableLogParsing = kingpin.Flag("disable-log-parsing", "Disable container log parsing").Default("false").Envar("DISABLE_LOG_PARSING").Bool()
-	DisablePinger     = kingpin.Flag("disable-pinger", "Don't ping upstreams").Default("true").Envar("DISABLE_PINGER").Bool()
-	DisableL7Tracing  = kingpin.Flag("disable-l7-tracing", "Disable L7 tracing").Default("false").Envar("DISABLE_L7_TRACING").Bool()
+	ListenAddress       = kingpin.Flag("listen", "Listen address - ip:port or :port").Default("0.0.0.0:80").Envar("LISTEN").String()
+	CgroupRoot          = kingpin.Flag("cgroupfs-root", "The mount point of the host cgroupfs root").Default("/sys/fs/cgroup").Envar("CGROUPFS_ROOT").String()
+	DisableLogParsing   = kingpin.Flag("disable-log-parsing", "Disable container log parsing").Default("false").Envar("DISABLE_LOG_PARSING").Bool()
+	DisablePinger       = kingpin.Flag("disable-pinger", "Don't ping upstreams").Default("true").Envar("DISABLE_PINGER").Bool()
+	DisableL7Tracing    = kingpin.Flag("disable-l7-tracing", "Disable L7 tracing").Default("false").Envar("DISABLE_L7_TRACING").Bool()
+	EnableDotNetTracing = kingpin.Flag("enable-dotnet-tracing", "Enable .NET CLR tracing").Default("false").Envar("ENABLE_DOTNET_TRACING").Bool()
 
 	ContainerAllowlist = kingpin.Flag("container-allowlist", "List of allowed containers (regex patterns)").Envar("CONTAINER_ALLOWLIST").Strings()
 	ContainerDenylist  = kingpin.Flag("container-denylist", "List of denied containers (regex patterns)").Envar("CONTAINER_DENYLIST").Strings()
@@ -42,6 +43,7 @@ var (
 	ApiKey             = kingpin.Flag("api-key", "Coroot API key").Envar("API_KEY").String()
 	MetricsEndpoint    = kingpin.Flag("metrics-endpoint", "The URL of the endpoint to send metrics to").Envar("METRICS_ENDPOINT").URL()
 	TracesEndpoint     = kingpin.Flag("traces-endpoint", "The URL of the endpoint to send traces to").Envar("TRACES_ENDPOINT").URL()
+	TracesSampling     = kingpin.Flag("traces-sampling", "Trace sampling rate (0.0 to 1.0)").Default("1.0").Envar("TRACES_SAMPLING").Float64()
 	LogsEndpoint       = kingpin.Flag("logs-endpoint", "The URL of the endpoint to send logs to").Envar("LOGS_ENDPOINT").URL()
 	ProfilesEndpoint   = kingpin.Flag("profiles-endpoint", "The URL of the endpoint to send profiles to").Envar("PROFILES_ENDPOINT").URL()
 	InsecureSkipVerify = kingpin.Flag("insecure-skip-verify", "whether to skip verifying the certificate or not").Envar("INSECURE_SKIP_VERIFY").Default("false").Bool()
@@ -54,8 +56,11 @@ var (
 	SanitizeHeaders            = kingpin.Flag("sanitize-headers", "should sanitize headers").Default("true").Envar("SANITIZE_HEADERS").Bool()
 	SensitiveHeader            = kingpin.Flag("sensitive-headers", "sanitize headers using patterns").Default("Authorization, Cookie, X-Action-Token").Envar("SENSITIVE_HEADERS").String()
 	DisableKubeProbe           = kingpin.Flag("disable-kube-probe", "disable kube probe trace").Default("true").Envar("DISABLE_KUBE_PROBE").Bool()
+	EnableDynamicLogTailing    = kingpin.Flag("enable-dynamic-log-tailing", "Enable automatic tailing of log files opened by container processes.").Default("false").Envar("ENABLE_DYNAMIC_LOG_TAILING").Bool()
 	DisableSensitiveLogParsing = kingpin.Flag("disable-sensitive-log-parsing", "disable sensitive log parsing").Default("true").Envar("DISABLE_SENSITIVE_LOG_PARSING").Bool()
 	TraceIdHeaders             = kingpin.Flag("trace-id-headers", "trace id headers").Default("Traceparent,X-Request-Id").Envar("TRACE_ID_HEADERS").String()
+
+	HttpPathNormalizationRules = kingpin.Flag("http-path-normalization-rules", "Custom HTTP path normalization rules in format 'pattern1:replacement1,pattern2:replacement2'").Envar("HTTP_PATH_NORMALIZATION_RULES").String()
 
 	agentVersion = kingpin.Flag("version", "Print version and exit").Default("false").Bool()
 	Version      = "unknown"

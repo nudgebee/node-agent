@@ -1,5 +1,5 @@
 #define MAX_CONNECTIONS 1000000
-#define MAX_PAYLOAD_SIZE 1024 * 5 // must be power of 2
+#define MAX_PAYLOAD_SIZE 4096 // must be power of 2
 
 struct tcp_event {
     __u64 fd;
@@ -71,9 +71,11 @@ struct {
 } connection_id_by_socket SEC(".maps");
 
 struct connection {
-    __u64 timestamp;
     __u64 bytes_sent;
     __u64 bytes_received;
+    __u64 timestamp;
+    __u8 protocol;
+    __u16 dport;  // Destination port for protocol detection
 };
 
 struct {
@@ -104,7 +106,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(key_size, sizeof(struct l7_request_key));
     __uint(value_size, sizeof(struct l7_request));
-    __uint(max_entries, 32768);
+    __uint(max_entries, 8192);
 } active_l7_requests SEC(".maps");
 
 SEC("tracepoint/sock/inet_sock_set_state")
@@ -132,6 +134,7 @@ int inet_sock_set_state(void *ctx)
 
         struct connection conn = {};
         conn.timestamp = bpf_ktime_get_ns();
+        conn.dport = args.dport;  // Store destination port for protocol detection
 
         bpf_map_delete_elem(&fd_by_pid_tgid, &id);
         bpf_map_update_elem(&connection_id_by_socket, &args.skaddr, &cid, BPF_ANY);
