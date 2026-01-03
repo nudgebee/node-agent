@@ -168,6 +168,7 @@ func (r *Registry) Close() {
 func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 	gcTicker := time.NewTicker(gcInterval)
 	defer gcTicker.Stop()
+	var containerCache []*Container
 	for {
 		select {
 		case now := <-gcTicker.C:
@@ -357,15 +358,30 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 					c.onConnectionClose(e)
 				}
 			case ebpftracer.EventTypeTCPRetransmit:
-				r.containerLock.RLock()
-				containers := make([]*Container, 0, len(r.containersById))
-				for _, c := range r.containersById {
-					containers = append(containers, c)
+				handled := false
+				if e.Pid != 0 {
+					r.containerLock.RLock()
+					c := r.containersByPid[e.Pid]
+					r.containerLock.RUnlock()
+					if c != nil && c.onRetransmission(e.SrcAddr, e.DstAddr) {
+						handled = true
+					}
 				}
-				r.containerLock.RUnlock()
-				for _, c := range containers {
-					if c.onRetransmission(e.SrcAddr, e.DstAddr) {
-						break
+				if !handled {
+					r.containerLock.RLock()
+					if cap(containerCache) < len(r.containersById) {
+						containerCache = make([]*Container, 0, len(r.containersById))
+					} else {
+						containerCache = containerCache[:0]
+					}
+					for _, c := range r.containersById {
+						containerCache = append(containerCache, c)
+					}
+					r.containerLock.RUnlock()
+					for _, c := range containerCache {
+						if c.onRetransmission(e.SrcAddr, e.DstAddr) {
+							break
+						}
 					}
 				}
 			case ebpftracer.EventTypeL7Request:
