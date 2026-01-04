@@ -9,10 +9,49 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/coroot/coroot-node-agent/flags"
 )
+
+var (
+	sensitiveHeadersCache map[string]bool
+	sensitiveHeadersMu    sync.RWMutex
+	lastSensitiveHeader   string
+)
+
+func getSensitiveHeaders() map[string]bool {
+	currentHeader := ""
+	if flags.SensitiveHeader != nil {
+		currentHeader = *flags.SensitiveHeader
+	}
+
+	sensitiveHeadersMu.RLock()
+	if sensitiveHeadersCache != nil && lastSensitiveHeader == currentHeader {
+		m := sensitiveHeadersCache
+		sensitiveHeadersMu.RUnlock()
+		return m
+	}
+	sensitiveHeadersMu.RUnlock()
+
+	sensitiveHeadersMu.Lock()
+	defer sensitiveHeadersMu.Unlock()
+
+	// Double check
+	if sensitiveHeadersCache != nil && lastSensitiveHeader == currentHeader {
+		return sensitiveHeadersCache
+	}
+
+	m := make(map[string]bool)
+	sensitiveKeysList := strings.Split(currentHeader, ",")
+	for _, key := range sensitiveKeysList {
+		m[strings.ToLower(strings.TrimSpace(key))] = true
+	}
+	sensitiveHeadersCache = m
+	lastSensitiveHeader = currentHeader
+	return m
+}
 
 // safeString converts bytes to string with UTF-8 validation
 // If bytes contain invalid UTF-8, returns base64 encoded version as fallback
@@ -100,11 +139,7 @@ func ParseHTTPRequest(data []byte) (*http.Request, error) {
 	var header = http.Header{}
 	var host = ""
 	headerLines := bytes.Split(headers, []byte("\n"))
-	sensitiveHeaders := make(map[string]bool)
-	sensitiveKeysList := strings.Split(*flags.SensitiveHeader, ",")
-	for _, key := range sensitiveKeysList {
-		sensitiveHeaders[strings.ToLower(strings.TrimSpace(key))] = true
-	}
+	sensitiveHeaders := getSensitiveHeaders()
 	for _, line := range headerLines {
 		// Skip empty lines
 		if len(line) == 0 {
@@ -252,11 +287,7 @@ func ParseHTTPResponse(data []byte) (*http.Response, error) {
 
 	// Parse headers
 	var header = http.Header{}
-	sensitiveHeaders := make(map[string]bool)
-	sensitiveKeysList := strings.Split(*flags.SensitiveHeader, ",")
-	for _, key := range sensitiveKeysList {
-		sensitiveHeaders[strings.ToLower(strings.TrimSpace(key))] = true
-	}
+	sensitiveHeaders := getSensitiveHeaders()
 
 	headerLines := bytes.Split(headerData, []byte("\r\n"))
 	if len(headerLines) == 1 {
