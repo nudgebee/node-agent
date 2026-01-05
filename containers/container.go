@@ -421,10 +421,12 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		ch <- counter(metrics.NetBytesSent, float64(stats.BytesSent), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, workload_dest.Region, workload_dest.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
 		ch <- counter(metrics.NetBytesReceived, float64(stats.BytesReceived), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, workload_dest.Region, workload_dest.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
 	}
+	c.lock.RLock()
 	for dst, count := range c.failedConnectionAttempts {
 		workload := c.ip_resolver.ResolveIP(dst.IP().String())
 		ch <- counter(metrics.NetConnectionsFailed, float64(count), dst.String(), workload.Name, workload.Namespace, workload.Kind, workload.Name, workload.Namespace, workload.Kind, c.srcWorkload.Region, c.srcWorkload.Zone, workload.Region, workload.Zone, workload.Region, workload.Zone, workload.Instance)
 	}
+	c.lock.RUnlock()
 
 	// Log connection stats phase timing
 	connStatsTime := time.Since(phaseStart)
@@ -436,25 +438,38 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	phaseStart = time.Now()
 
 	connections := map[common.DestinationKey]int{}
+	c.lock.RLock()
 	for _, conn := range c.activeConnections {
 		if !conn.Closed.IsZero() {
 			continue
 		}
 		connections[conn.DestinationKey]++
 	}
+	c.lock.RUnlock()
 	for d, count := range connections {
 		actualDestWorkload := d.GetActualDestinationWorkload()
 		destWorkload := d.GetDestinationWorkload()
 		ch <- gauge(metrics.NetConnectionsActive, float64(count), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), c.srcWorkload.Name, c.srcWorkload.Namespace, c.srcWorkload.Kind, destWorkload.Name, destWorkload.Namespace, destWorkload.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, c.srcWorkload.Region, c.srcWorkload.Zone, destWorkload.Region, destWorkload.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
 	}
 
+	c.lock.RLock()
+	logParsersSnapshot := make(map[string]*LogParser)
 	for source, p := range c.logParsers {
+		logParsersSnapshot[source] = p
+	}
+	c.lock.RUnlock()
+
+	for source, p := range logParsersSnapshot {
 		for _, ctr := range p.parser.GetCounters() {
 			if ctr.Level == logparser.LevelCritical || ctr.Level == logparser.LevelError {
+				c.lock.RLock()
 				sample, ok := c.logSamples[ctr.Hash]
+				c.lock.RUnlock()
 				if !ok {
 					sample = common.TruncateUtf8(ctr.Sample, *flags.MaxLabelLength)
+					c.lock.Lock()
 					c.logSamples[ctr.Hash] = sample
+					c.lock.Unlock()
 				}
 				ch <- counter(metrics.LogMessages, float64(ctr.Messages), source, ctr.Level.String(), ctr.Hash, sample)
 			}
