@@ -11,6 +11,10 @@ import (
 	"k8s.io/klog/v2"
 )
 
+const (
+	journaldPollTimeout = 100 * time.Millisecond
+)
+
 type JournaldReader struct {
 	journal     *sdjournal.Journal
 	subscribers map[string]chan<- logparser.LogEntry
@@ -26,13 +30,16 @@ func NewJournaldReader(journalPaths ...string) (*JournaldReader, error) {
 	var err error
 	for _, journalPath := range journalPaths {
 		if r.journal, err = sdjournal.NewJournalFromDir(journalPath); err != nil {
+			klog.Errorf("failed to get journal at %s: %s", journalPath, err)
 			continue
 		}
 		usage, err := r.journal.GetUsage()
 		if err != nil {
+			klog.Errorf("failed to read journal disk space usage at %s: %s", journalPath, err)
 			continue
 		}
 		if usage == 0 {
+			klog.Errorf("journal at %s is empty", journalPath)
 			r.journal = nil
 			continue
 		}
@@ -57,7 +64,11 @@ func (r *JournaldReader) follow() {
 			return
 		}
 		if c <= 0 {
-			r.journal.Wait(time.Millisecond * 100)
+			t := time.Now()
+			ret := r.journal.Wait(journaldPollTimeout)
+			if ret <= 0 && time.Since(t) < journaldPollTimeout { // inotify can't work due to system limits
+				time.Sleep(journaldPollTimeout)
+			}
 			continue
 		}
 		e, err := r.journal.GetEntry()
