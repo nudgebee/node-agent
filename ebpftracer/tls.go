@@ -27,6 +27,12 @@ const (
 
 var (
 	opensslVersionRe = regexp.MustCompile(`OpenSSL\s(\d\.\d+\.\d+)`)
+	// Regex to find libraries that look like libssl or libcrypto, even with version numbers.
+	// e.g., libssl.so.3, libcrypto-74fbf0e0.so.3
+	libSslRe    = regexp.MustCompile(`libssl\.so(\.\d+)*`)
+	libCryptoRe = regexp.MustCompile(`libcrypto\.so(\.\d+)*`)
+	// A more specific regex for psycopg2's bundled libs
+	psycopg2LibRe = regexp.MustCompile(`lib(ssl|crypto)-[a-f0-9]+\.so\.\d+`)
 )
 
 func (t *Tracer) AttachOpenSslUprobes(pid uint32) []link.Link {
@@ -270,13 +276,6 @@ func getSslLibPathAndVersion(pid uint32) (string, string) {
 		return "", ""
 	}
 	defer f.Close()
-
-	// Regex to find libraries that look like libssl or libcrypto, even with version numbers.
-	// e.g., libssl.so.3, libcrypto-74fbf0e0.so.3
-	libSslRe := regexp.MustCompile(`libssl\.so(\.\d+)*`)
-	libCryptoRe := regexp.MustCompile(`libcrypto\.so(\.\d+)*`)
-	// A more specific regex for psycopg2's bundled libs
-	psycopg2LibRe := regexp.MustCompile(`lib(ssl|crypto)-[a-f0-9]+\.so\.\d+`)
 
 	scanner := bufio.NewScanner(f)
 	scanner.Split(bufio.ScanLines)
