@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"unsafe"
 	"path"
 	"runtime"
 	"strconv"
@@ -432,13 +433,15 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 
 		switch typ {
 		case perfMapTypeL7Events:
-			v := &l7Event{}
-			data := rec.RawSample
-
-			if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read l7 event:", err)
+			// OPTIMIZATION: Use unsafe pointer cast instead of binary.Read to avoid
+			// expensive reflection and memory allocation.
+			// The l7Event struct matches the C-struct layout (including padding).
+			// We verify the size to ensure memory safety.
+			if len(rec.RawSample) < int(unsafe.Sizeof(l7Event{})) {
+				klog.Warningln("l7 event too small:", len(rec.RawSample))
 				continue
 			}
+			v := (*l7Event)(unsafe.Pointer(&rec.RawSample[0]))
 
 			// Extract payload data directly from the struct arrays
 			payloadSize := min(int(v.PayloadSize), len(v.Payload))
