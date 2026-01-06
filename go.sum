@@ -278,8 +278,6 @@ github.com/coreos/pkg v0.0.0-20160727233714-3ac0863d7acf/go.mod h1:E3G3o1h8I7cfc
 github.com/coreos/pkg v0.0.0-20180928190104-399ea9e2e55f/go.mod h1:E3G3o1h8I7cfcXa63jLwjI0eiQQMgzzUDFVpN/nH/eA=
 github.com/coroot/dotnetdiag v1.2.2 h1:PVP/By8o+xhPjfVolJYcjHLbFQInM7pkaD6/otPLc8Q=
 github.com/coroot/dotnetdiag v1.2.2/go.mod h1:veXCMlFzm1yNl7wwJb/ZLxO4WbzhDBoy1VG1XtkH2ls=
-github.com/coroot/logparser v1.2.1 h1:NLU4VAgGwqMTtKyRHDpTtE9BtPQJLOhDIuB5yiQdelQ=
-github.com/coroot/logparser v1.2.1/go.mod h1:/7qHU4/I4zWRYIzRchQPehlTzbcMv5HV6cwBqg2zl6I=
 github.com/coroot/pyroscope/ebpf v0.0.0-20250418092207-a70610b6df72 h1:NFEMXMOdUzQFG+OwRVecv/yc75/s8MmLkNquMm6hk3I=
 github.com/coroot/pyroscope/ebpf v0.0.0-20250418092207-a70610b6df72/go.mod h1:IepHM9FJ0n3n3k+ZV23Y7vNAfvWI7LDuLqWPO4rB6sQ=
 github.com/cpuguy83/go-md2man/v2 v2.0.0-20190314233015-f79a8a8ca69d/go.mod h1:maD7wRr/U5Z6m/iR4s+kqSMx2CaBsrgA7czyZG/E6dU=
@@ -706,6 +704,8 @@ github.com/mwitkow/go-conntrack v0.0.0-20161129095857-cc309e4a2223/go.mod h1:qRW
 github.com/mxk/go-flowrate v0.0.0-20140419014527-cca7078d478f/go.mod h1:ZdcZmHo+o7JKHSa8/e818NopupXU1YMK5fe1lsApnBw=
 github.com/ncw/swift v1.0.47/go.mod h1:23YIA4yWVnGwv2dQlN4bB7egfYX6YLn0Yo/S6zZO/ZM=
 github.com/niemeyer/pretty v0.0.0-20200227124842-a10e7caefd8e/go.mod h1:zD1mROLANZcx1PVRCS0qkT7pwLkGfwJo4zjcN/Tysno=
+github.com/nudgebee/logparser v0.0.0-20250610175416-3edee28c2059 h1:uBl8oxU66pg5348GTrIvRiNz1er9Wc7Ild+Kg0Qq+fA=
+github.com/nudgebee/logparser v0.0.0-20250610175416-3edee28c2059/go.mod h1:ddmUa8en2sToRL+bBvFkuS1AHvA6Msn56v3BpLMbKoc=
 github.com/nxadm/tail v1.4.4/go.mod h1:kenIhsEOeOJmVchQTgglprH7qJGnHDVpk1VPCcaMI8A=
 github.com/oklog/ulid v1.3.1 h1:EGfNDEx6MqHz8B3uNV6QAib1UR2Lm97sHi3ocA6ESJ4=
 github.com/oklog/ulid v1.3.1/go.mod h1:CirwcVhetQ6Lv90oh/F+FBtV6XMibvdAFo93nm5qn4U=
