@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/base64"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -432,13 +432,11 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 
 		switch typ {
 		case perfMapTypeL7Events:
-			v := &l7Event{}
-			data := rec.RawSample
-
-			if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read l7 event:", err)
+			if len(rec.RawSample) < int(unsafe.Sizeof(l7Event{})) {
+				klog.Warningln("l7 event too small:", len(rec.RawSample))
 				continue
 			}
+			v := (*l7Event)(unsafe.Pointer(&rec.RawSample[0]))
 
 			// Extract payload data directly from the struct arrays
 			payloadSize := min(int(v.PayloadSize), len(v.Payload))
@@ -471,25 +469,25 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 				L7Request: req,
 			}
 		case perfMapTypeFileEvents:
-			v := &fileEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read file event:", err)
+			if len(rec.RawSample) < int(unsafe.Sizeof(fileEvent{})) {
+				klog.Warningln("file event too small:", len(rec.RawSample))
 				continue
 			}
+			v := (*fileEvent)(unsafe.Pointer(&rec.RawSample[0]))
 			event = Event{Type: v.Type, Pid: v.Pid, Fd: v.Fd, Mnt: v.Mnt, Log: v.Log > 0}
 		case perfMapTypeProcEvents:
-			v := &procEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read proc event:", err)
+			if len(rec.RawSample) < int(unsafe.Sizeof(procEvent{})) {
+				klog.Warningln("proc event too small:", len(rec.RawSample))
 				continue
 			}
+			v := (*procEvent)(unsafe.Pointer(&rec.RawSample[0]))
 			event = Event{Type: v.Type, Reason: EventReason(v.Reason), Pid: v.Pid}
 		case perfMapTypeTCPEvents:
-			v := &tcpEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read tcp event:", err)
+			if len(rec.RawSample) < int(unsafe.Sizeof(tcpEvent{})) {
+				klog.Warningln("tcp event too small:", len(rec.RawSample))
 				continue
 			}
+			v := (*tcpEvent)(unsafe.Pointer(&rec.RawSample[0]))
 			event = Event{
 				Type:          v.Type,
 				Pid:           v.Pid,
