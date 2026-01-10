@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path"
 	"runtime"
@@ -438,8 +439,8 @@ func (t *lostSamplesTracker) recordLostSamples(name string, count uint64, cpu in
 		if t.lastLog.CompareAndSwap(lastLog, now) {
 			total := t.count.Swap(0)
 			if total > 0 {
-				// Use ErrorS for structured logging that only logs once at ERROR level
-				klog.ErrorS(nil, "lost samples", "map", name, "total", total, "cpu", cpu, "interval_seconds", t.interval)
+				// Use standard log package to avoid klog's multi-severity output
+				log.Printf("ERROR: %s lost %d samples total (last on CPU %d) in the last %d seconds", name, total, cpu, t.interval)
 			}
 		}
 	}
