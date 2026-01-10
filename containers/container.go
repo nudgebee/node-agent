@@ -1139,18 +1139,44 @@ func (c *Container) onRetransmission(src netaddr.IPPort, dst netaddr.IPPort) boo
 }
 
 func (c *Container) updateDelays() {
+	// Get a snapshot of PIDs under read lock to avoid concurrent map access
+	c.lock.RLock()
+	pids := make([]uint32, 0, len(c.processes))
 	for pid := range c.processes {
+		pids = append(pids, pid)
+	}
+	c.lock.RUnlock()
+
+	// Make syscalls without holding the lock to avoid contention
+	type pidDelayStats struct {
+		pid       uint32
+		cpuDelay  time.Duration
+		diskDelay time.Duration
+	}
+	pidStats := make([]pidDelayStats, 0, len(pids))
+	for _, pid := range pids {
 		stats, err := TaskstatsTGID(pid)
 		if err != nil {
 			continue
 		}
-		d := c.delaysByPid[pid]
-		c.delays.cpu += stats.CPUDelay - d.cpu
-		c.delays.disk += stats.BlockIODelay - d.disk
-		d.cpu = stats.CPUDelay
-		d.disk = stats.BlockIODelay
-		c.delaysByPid[pid] = d
+		pidStats = append(pidStats, pidDelayStats{
+			pid:       pid,
+			cpuDelay:  stats.CPUDelay,
+			diskDelay: stats.BlockIODelay,
+		})
 	}
+
+	// Update delays under write lock
+	c.lock.Lock()
+	for _, ps := range pidStats {
+		d := c.delaysByPid[ps.pid]
+		c.delays.cpu += ps.cpuDelay - d.cpu
+		c.delays.disk += ps.diskDelay - d.disk
+		d.cpu = ps.cpuDelay
+		d.disk = ps.diskDelay
+		c.delaysByPid[ps.pid] = d
+	}
+	c.lock.Unlock()
 }
 
 func (c *Container) updateNodejsStats(s NodejsStatsUpdate) {
