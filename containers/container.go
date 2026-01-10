@@ -198,15 +198,31 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		return nil, err
 	}
 	defer netNs.Close()
-	split := strings.Split(string(id), "/")
-	if len(split) < 4 {
-		klog.Errorf("unexpected container id %s", id)
-		return nil, errors.New("unexpected container id")
+
+	// Resolve workload based on container type
+	var src_workload common.Workload
+	idStr := string(id)
+	split := strings.Split(idStr, "/")
+
+	if strings.HasPrefix(idStr, "/k8s/") || strings.HasPrefix(idStr, "/k8s-cronjob/") {
+		// Kubernetes container: /k8s/namespace/pod/container or /k8s-cronjob/namespace/job/container
+		if len(split) < 4 {
+			klog.Errorf("unexpected k8s container id %s", id)
+			return nil, errors.New("unexpected container id")
+		}
+		namespace := split[2]
+		podName := split[3]
+		src_workload = registry.ip_resolver.ResolvePodOwner(podName, namespace)
+		klog.Infof("Pod %s/%s is owned by %s/%s/%s", namespace, podName, src_workload.Name, src_workload.Namespace, src_workload.Kind)
+	} else {
+		// Non-k8s containers (docker, systemd, swarm, nomad): use container name as workload
+		name := ""
+		if len(split) > 0 {
+			name = split[len(split)-1]
+		}
+		src_workload = common.Workload{Name: name, Kind: "container"}
+		klog.V(2).Infof("Non-k8s container %s using workload name: %s", id, name)
 	}
-	namespace := split[2]
-	podName := split[3]
-	src_workload := registry.ip_resolver.ResolvePodOwner(podName, namespace)
-	klog.Infof("Pod %s/%s is owned by %s/%s/%s", namespace, podName, src_workload.Name, src_workload.Namespace, src_workload.Kind)
 
 	cid := string(id)
 	appId := common.ContainerIdToOtelServiceName(cid)

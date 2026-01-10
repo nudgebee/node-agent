@@ -650,6 +650,10 @@ func calcId(cg *cgroup.Cgroup, md *ContainerMetadata) ContainerID {
 		if strings.HasPrefix(cg.ContainerId, "/system.slice/crio-conmon-") {
 			return ""
 		}
+		// Skip systemd services that match the ignore control plane list
+		if ignoreControlPlane(cg.ContainerId) {
+			return ""
+		}
 		return ContainerID(cg.ContainerId)
 	case cgroup.ContainerTypeTalosRuntime:
 		return ContainerID(cg.ContainerId)
