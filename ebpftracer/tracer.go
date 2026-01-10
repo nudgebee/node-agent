@@ -13,6 +13,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -258,7 +260,7 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	}
 
 	if !t.disableL7Tracing {
-		perfMaps = append(perfMaps, perfMap{name: "l7_events", typ: perfMapTypeL7Events, perCPUBufferSizePages: 64}) // Increased for high-volume LLM API tracing
+		perfMaps = append(perfMaps, perfMap{name: "l7_events", typ: perfMapTypeL7Events, perCPUBufferSizePages: 128}) // Increased for high-volume LLM API tracing
 	}
 
 	pageSize := os.Getpagesize()
@@ -411,7 +413,39 @@ type httpResponseFragment struct {
 	Data                [2048]byte // Must match HTTP_FRAGMENT_SIZE in eBPF
 }
 
+// lostSamplesTracker tracks lost samples per perf map and logs them periodically
+type lostSamplesTracker struct {
+	count    atomic.Uint64
+	lastLog  atomic.Int64 // Unix timestamp in seconds
+	interval int64        // Log interval in seconds
+}
+
+var lostSamplesTrackers = sync.Map{} // map[string]*lostSamplesTracker
+
+func getLostSamplesTracker(name string) *lostSamplesTracker {
+	tracker, ok := lostSamplesTrackers.Load(name)
+	if !ok {
+		tracker, _ = lostSamplesTrackers.LoadOrStore(name, &lostSamplesTracker{interval: 10})
+	}
+	return tracker.(*lostSamplesTracker)
+}
+
+func (t *lostSamplesTracker) recordLostSamples(name string, count uint64, cpu int) {
+	t.count.Add(count)
+	now := time.Now().Unix()
+	lastLog := t.lastLog.Load()
+	if now-lastLog >= t.interval {
+		if t.lastLog.CompareAndSwap(lastLog, now) {
+			total := t.count.Swap(0)
+			if total > 0 {
+				klog.Errorf("%s lost %d samples total (last on CPU %d) in the last %d seconds", name, total, cpu, t.interval)
+			}
+		}
+	}
+}
+
 func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapType, readTimeout time.Duration) {
+	tracker := getLostSamplesTracker(name)
 	if readTimeout == 0 {
 		readTimeout = 100 * time.Millisecond
 	}
@@ -425,7 +459,7 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 			continue
 		}
 		if rec.LostSamples > 0 {
-			klog.Errorln(name, "lost samples:", rec.LostSamples)
+			tracker.recordLostSamples(name, rec.LostSamples, rec.CPU)
 			continue
 		}
 		var event Event
