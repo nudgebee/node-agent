@@ -452,12 +452,14 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	phaseStart = time.Now()
 
 	connections := map[common.DestinationKey]int{}
+	c.lock.RLock()
 	for _, conn := range c.activeConnections {
 		if !conn.Closed.IsZero() {
 			continue
 		}
 		connections[conn.DestinationKey]++
 	}
+	c.lock.RUnlock()
 	for d, count := range connections {
 		actualDestWorkload := d.GetActualDestinationWorkload()
 		destWorkload := d.GetDestinationWorkload()
