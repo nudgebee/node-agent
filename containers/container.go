@@ -198,15 +198,31 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		return nil, err
 	}
 	defer netNs.Close()
-	split := strings.Split(string(id), "/")
-	if len(split) < 4 {
-		klog.Errorf("unexpected container id %s", id)
-		return nil, errors.New("unexpected container id")
+
+	// Resolve workload based on container type
+	var src_workload common.Workload
+	idStr := string(id)
+	split := strings.Split(idStr, "/")
+
+	if strings.HasPrefix(idStr, "/k8s/") || strings.HasPrefix(idStr, "/k8s-cronjob/") {
+		// Kubernetes container: /k8s/namespace/pod/container or /k8s-cronjob/namespace/job/container
+		if len(split) < 4 {
+			klog.Errorf("unexpected k8s container id %s", id)
+			return nil, errors.New("unexpected container id")
+		}
+		namespace := split[2]
+		podName := split[3]
+		src_workload = registry.ip_resolver.ResolvePodOwner(podName, namespace)
+		klog.Infof("Pod %s/%s is owned by %s/%s/%s", namespace, podName, src_workload.Name, src_workload.Namespace, src_workload.Kind)
+	} else {
+		// Non-k8s containers (docker, systemd, swarm, nomad): use container name as workload
+		name := ""
+		if len(split) > 0 {
+			name = split[len(split)-1]
+		}
+		src_workload = common.Workload{Name: name, Kind: "container"}
+		klog.V(2).Infof("Non-k8s container %s using workload name: %s", id, name)
 	}
-	namespace := split[2]
-	podName := split[3]
-	src_workload := registry.ip_resolver.ResolvePodOwner(podName, namespace)
-	klog.Infof("Pod %s/%s is owned by %s/%s/%s", namespace, podName, src_workload.Name, src_workload.Namespace, src_workload.Kind)
 
 	cid := string(id)
 	appId := common.ContainerIdToOtelServiceName(cid)
@@ -436,12 +452,14 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	phaseStart = time.Now()
 
 	connections := map[common.DestinationKey]int{}
+	c.lock.RLock()
 	for _, conn := range c.activeConnections {
 		if !conn.Closed.IsZero() {
 			continue
 		}
 		connections[conn.DestinationKey]++
 	}
+	c.lock.RUnlock()
 	for d, count := range connections {
 		actualDestWorkload := d.GetActualDestinationWorkload()
 		destWorkload := d.GetDestinationWorkload()
@@ -1123,18 +1141,44 @@ func (c *Container) onRetransmission(src netaddr.IPPort, dst netaddr.IPPort) boo
 }
 
 func (c *Container) updateDelays() {
+	// Get a snapshot of PIDs under read lock to avoid concurrent map access
+	c.lock.RLock()
+	pids := make([]uint32, 0, len(c.processes))
 	for pid := range c.processes {
+		pids = append(pids, pid)
+	}
+	c.lock.RUnlock()
+
+	// Make syscalls without holding the lock to avoid contention
+	type pidDelayStats struct {
+		pid       uint32
+		cpuDelay  time.Duration
+		diskDelay time.Duration
+	}
+	pidStats := make([]pidDelayStats, 0, len(pids))
+	for _, pid := range pids {
 		stats, err := TaskstatsTGID(pid)
 		if err != nil {
 			continue
 		}
-		d := c.delaysByPid[pid]
-		c.delays.cpu += stats.CPUDelay - d.cpu
-		c.delays.disk += stats.BlockIODelay - d.disk
-		d.cpu = stats.CPUDelay
-		d.disk = stats.BlockIODelay
-		c.delaysByPid[pid] = d
+		pidStats = append(pidStats, pidDelayStats{
+			pid:       pid,
+			cpuDelay:  stats.CPUDelay,
+			diskDelay: stats.BlockIODelay,
+		})
 	}
+
+	// Update delays under write lock
+	c.lock.Lock()
+	for _, ps := range pidStats {
+		d := c.delaysByPid[ps.pid]
+		c.delays.cpu += ps.cpuDelay - d.cpu
+		c.delays.disk += ps.diskDelay - d.disk
+		d.cpu = ps.cpuDelay
+		d.disk = ps.diskDelay
+		c.delaysByPid[ps.pid] = d
+	}
+	c.lock.Unlock()
 }
 
 func (c *Container) updateNodejsStats(s NodejsStatsUpdate) {
