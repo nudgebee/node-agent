@@ -1,0 +1,3 @@
+## 2024-03-24 - Zero-copy eBPF Event Parsing
+**Learning:** `binary.Read` is extremely expensive for parsing high-frequency eBPF events because it involves reflection and memory allocation. Switching to `unsafe.Pointer` casting (zero-copy) for struct parsing offers massive performance gains (e.g., 100,000 ns/op -> 0.5 ns/op for large structs).
+**Action:** When working with eBPF raw samples in Go, always prefer `unsafe.Pointer` casting over `binary.Read` if the Go struct memory layout matches the C struct (alignment/padding). Always verify alignment and use explicit bounds checks `len(data) < int(unsafe.Sizeof(struct))` to ensure safety. Note that `binary.Read` might still be needed if alignment doesn't match (e.g., `tcpEvent` with 102 vs 104 bytes).
