@@ -58,8 +58,7 @@ func readSockets(src string) ([]Sock, error) {
 		local, b := nextField(b)
 		remote, b := nextField(b)
 		st, b := nextField(b)
-		state := string(st)
-		if state != stateEstablished && state != stateListen {
+		if !isStateEstablished(st) && !isStateListen(st) {
 			continue
 		}
 		_, b = nextField(b)
@@ -68,9 +67,17 @@ func readSockets(src string) ([]Sock, error) {
 		_, b = nextField(b)
 		_, b = nextField(b)
 		inode, _ := nextField(b)
-		res = append(res, Sock{SAddr: decodeAddr(local), DAddr: decodeAddr(remote), Listen: state == stateListen, Inode: string(inode)})
+		res = append(res, Sock{SAddr: decodeAddr(local), DAddr: decodeAddr(remote), Listen: isStateListen(st), Inode: string(inode)})
 	}
 	return res, nil
+}
+
+func isStateEstablished(s []byte) bool {
+	return len(s) == 2 && s[0] == '0' && s[1] == '1'
+}
+
+func isStateListen(s []byte) bool {
+	return len(s) == 2 && s[0] == '0' && s[1] == 'A'
 }
 
 func nextField(s []byte) ([]byte, []byte) {
