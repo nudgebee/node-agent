@@ -17,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -468,13 +469,11 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 
 		switch typ {
 		case perfMapTypeL7Events:
-			v := &l7Event{}
-			data := rec.RawSample
-
-			if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read l7 event:", err)
+			if len(rec.RawSample) < int(unsafe.Sizeof(l7Event{})) {
+				klog.Warningln("l7 event too small")
 				continue
 			}
+			v := (*l7Event)(unsafe.Pointer(&rec.RawSample[0]))
 
 			// Extract payload data directly from the struct arrays
 			payloadSize := min(int(v.PayloadSize), len(v.Payload))
@@ -507,39 +506,54 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 				L7Request: req,
 			}
 		case perfMapTypeFileEvents:
-			v := &fileEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read file event:", err)
+			if len(rec.RawSample) < int(unsafe.Sizeof(fileEvent{})) {
+				klog.Warningln("file event too small")
 				continue
 			}
+			v := (*fileEvent)(unsafe.Pointer(&rec.RawSample[0]))
 			event = Event{Type: v.Type, Pid: v.Pid, Fd: v.Fd, Mnt: v.Mnt, Log: v.Log > 0}
 		case perfMapTypeProcEvents:
-			v := &procEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read proc event:", err)
+			if len(rec.RawSample) < int(unsafe.Sizeof(procEvent{})) {
+				klog.Warningln("proc event too small")
 				continue
 			}
+			v := (*procEvent)(unsafe.Pointer(&rec.RawSample[0]))
 			event = Event{Type: v.Type, Reason: EventReason(v.Reason), Pid: v.Pid}
 		case perfMapTypeTCPEvents:
-			v := &tcpEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read tcp event:", err)
+			// tcpEvent is 104 bytes in Go (due to padding), but 102 bytes in eBPF.
+			// unsafe.Pointer is not safe here due to size mismatch.
+			// binary.Read is too slow.
+			// Manual parsing is fast and safe.
+			if len(rec.RawSample) < 102 {
+				klog.Warningln("tcp event too small")
 				continue
 			}
+			data := rec.RawSample
+			typ := EventType(binary.LittleEndian.Uint32(data[24:28]))
+			pid := binary.LittleEndian.Uint32(data[28:32])
+			fd := binary.LittleEndian.Uint64(data[0:8])
+			timestamp := binary.LittleEndian.Uint64(data[8:16])
+			duration := binary.LittleEndian.Uint64(data[16:24])
+
+			var sAddr, dAddr, aAddr [16]byte
+			copy(sAddr[:], data[54:70])
+			copy(dAddr[:], data[70:86])
+			copy(aAddr[:], data[86:102])
+
 			event = Event{
-				Type:          v.Type,
-				Pid:           v.Pid,
-				SrcAddr:       ipPort(v.SAddr, v.SPort),
-				DstAddr:       ipPort(v.DAddr, v.DPort),
-				ActualDstAddr: ipPort(v.AAddr, v.Aport),
-				Fd:            v.Fd,
-				Timestamp:     v.Timestamp,
-				Duration:      time.Duration(v.Duration),
+				Type:          typ,
+				Pid:           pid,
+				SrcAddr:       ipPort(sAddr, binary.LittleEndian.Uint16(data[48:50])),
+				DstAddr:       ipPort(dAddr, binary.LittleEndian.Uint16(data[50:52])),
+				ActualDstAddr: ipPort(aAddr, binary.LittleEndian.Uint16(data[52:54])),
+				Fd:            fd,
+				Timestamp:     timestamp,
+				Duration:      time.Duration(duration),
 			}
-			if v.Type == EventTypeConnectionClose {
+			if typ == EventTypeConnectionClose {
 				event.TrafficStats = &TrafficStats{
-					BytesSent:     v.BytesSent,
-					BytesReceived: v.BytesReceived,
+					BytesSent:     binary.LittleEndian.Uint64(data[32:40]),
+					BytesReceived: binary.LittleEndian.Uint64(data[40:48]),
 				}
 			}
 		default:
