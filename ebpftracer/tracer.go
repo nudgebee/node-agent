@@ -355,52 +355,6 @@ func (t EventReason) String() string {
 	return "unknown: " + strconv.Itoa(int(t))
 }
 
-type procEvent struct {
-	Type   EventType
-	Pid    uint32
-	Reason uint32
-}
-
-type tcpEvent struct {
-	Fd            uint64
-	Timestamp     uint64
-	Duration      uint64
-	Type          EventType
-	Pid           uint32
-	BytesSent     uint64
-	BytesReceived uint64
-	SPort         uint16
-	DPort         uint16
-	Aport         uint16
-	SAddr         [16]byte
-	DAddr         [16]byte
-	AAddr         [16]byte
-}
-
-type fileEvent struct {
-	Type EventType
-	Pid  uint32
-	Fd   uint64
-	Mnt  uint64
-	Log  uint64
-}
-
-type l7Event struct {
-	Fd                  uint64
-	ConnectionTimestamp uint64
-	Pid                 uint32
-	Status              int32
-	Duration            uint64
-	Protocol            uint8
-	Method              uint8
-	Padding             uint16
-	StatementId         uint32
-	PayloadSize         uint64
-	ResponseSize        uint64
-	Payload             [4096]byte // Must match MAX_PAYLOAD_SIZE in eBPF
-	Response            [4096]byte // Must match MAX_PAYLOAD_SIZE in eBPF
-}
-
 // HTTP response fragment event (must match eBPF struct)
 type httpResponseFragment struct {
 	Fd                  uint64
@@ -468,78 +422,130 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 
 		switch typ {
 		case perfMapTypeL7Events:
-			v := &l7Event{}
 			data := rec.RawSample
-
-			if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read l7 event:", err)
+			if len(data) < 56 {
+				klog.Warningln("l7 event too short:", len(data))
 				continue
 			}
+			fd := binary.LittleEndian.Uint64(data[0:8])
+			connectionTimestamp := binary.LittleEndian.Uint64(data[8:16])
+			pid := binary.LittleEndian.Uint32(data[16:20])
+			status := int32(binary.LittleEndian.Uint32(data[20:24]))
+			duration := binary.LittleEndian.Uint64(data[24:32])
+			protocol := data[32]
+			method := data[33]
+			// padding 2 bytes at 34
+			statementId := binary.LittleEndian.Uint32(data[36:40])
+			payloadSize := binary.LittleEndian.Uint64(data[40:48])
+			responseSize := binary.LittleEndian.Uint64(data[48:56])
 
 			// Extract payload data directly from the struct arrays
-			payloadSize := min(int(v.PayloadSize), len(v.Payload))
-			responseSize := min(int(v.ResponseSize), len(v.Response))
+			pSize := min(int(payloadSize), len(data)-56)
+			if pSize < 0 {
+				pSize = 0
+			}
 
 			// Copy the actual data (preventing garbage from unused buffer space)
-			payloadData := make([]byte, payloadSize)
-			copy(payloadData, v.Payload[:payloadSize])
+			payloadData := make([]byte, pSize)
+			copy(payloadData, data[56:56+pSize])
 
-			responseData := make([]byte, responseSize)
-			copy(responseData, v.Response[:responseSize])
+			// Response starts at 56 + 4096 = 4152
+			rOffset := 56 + 4096
+			rSize := min(int(responseSize), len(data)-rOffset)
+			if rSize < 0 {
+				rSize = 0
+			}
+
+			responseData := make([]byte, rSize)
+			if rSize > 0 && len(data) >= rOffset+rSize {
+				copy(responseData, data[rOffset:rOffset+rSize])
+			}
 
 			req := &l7.RequestData{
-				Protocol:     l7.Protocol(v.Protocol),
-				Status:       l7.Status(v.Status),
-				Duration:     time.Duration(v.Duration),
-				Method:       l7.Method(v.Method),
-				StatementId:  v.StatementId,
-				PayloadSize:  v.PayloadSize,
-				ResponseSize: v.ResponseSize,
+				Protocol:     l7.Protocol(protocol),
+				Status:       l7.Status(status),
+				Duration:     time.Duration(duration),
+				Method:       l7.Method(method),
+				StatementId:  statementId,
+				PayloadSize:  payloadSize,
+				ResponseSize: responseSize,
 				Payload:      payloadData,
 				Response:     responseData,
 			}
 
 			event = Event{
 				Type:      EventTypeL7Request,
-				Pid:       v.Pid,
-				Fd:        v.Fd,
-				Timestamp: v.ConnectionTimestamp,
+				Pid:       pid,
+				Fd:        fd,
+				Timestamp: connectionTimestamp,
 				L7Request: req,
 			}
 		case perfMapTypeFileEvents:
-			v := &fileEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read file event:", err)
+			data := rec.RawSample
+			if len(data) < 32 {
+				klog.Warningln("file event too short:", len(data))
 				continue
 			}
-			event = Event{Type: v.Type, Pid: v.Pid, Fd: v.Fd, Mnt: v.Mnt, Log: v.Log > 0}
+			typ := EventType(binary.LittleEndian.Uint32(data[0:4]))
+			pid := binary.LittleEndian.Uint32(data[4:8])
+			fd := binary.LittleEndian.Uint64(data[8:16])
+			mnt := binary.LittleEndian.Uint64(data[16:24])
+			logVal := binary.LittleEndian.Uint64(data[24:32])
+
+			event = Event{Type: typ, Pid: pid, Fd: fd, Mnt: mnt, Log: logVal > 0}
 		case perfMapTypeProcEvents:
-			v := &procEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read proc event:", err)
+			data := rec.RawSample
+			if len(data) < 12 {
+				klog.Warningln("proc event too short:", len(data))
 				continue
 			}
-			event = Event{Type: v.Type, Reason: EventReason(v.Reason), Pid: v.Pid}
+			typ := EventType(binary.LittleEndian.Uint32(data[0:4]))
+			pid := binary.LittleEndian.Uint32(data[4:8])
+			reason := binary.LittleEndian.Uint32(data[8:12])
+
+			event = Event{Type: typ, Reason: EventReason(reason), Pid: pid}
 		case perfMapTypeTCPEvents:
-			v := &tcpEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read tcp event:", err)
+			data := rec.RawSample
+			if len(data) < 54 { // Minimum size before addrs
+				klog.Warningln("tcp event too short:", len(data))
 				continue
 			}
-			event = Event{
-				Type:          v.Type,
-				Pid:           v.Pid,
-				SrcAddr:       ipPort(v.SAddr, v.SPort),
-				DstAddr:       ipPort(v.DAddr, v.DPort),
-				ActualDstAddr: ipPort(v.AAddr, v.Aport),
-				Fd:            v.Fd,
-				Timestamp:     v.Timestamp,
-				Duration:      time.Duration(v.Duration),
+			// SAddr (16) + DAddr (16) + AAddr (16) = 48 bytes at offset 54
+			if len(data) < 54+48 {
+				klog.Warningln("tcp event too short for addrs:", len(data))
+				continue
 			}
-			if v.Type == EventTypeConnectionClose {
+
+			fd := binary.LittleEndian.Uint64(data[0:8])
+			timestamp := binary.LittleEndian.Uint64(data[8:16])
+			duration := binary.LittleEndian.Uint64(data[16:24])
+			typ := EventType(binary.LittleEndian.Uint32(data[24:28]))
+			pid := binary.LittleEndian.Uint32(data[28:32])
+			bytesSent := binary.LittleEndian.Uint64(data[32:40])
+			bytesReceived := binary.LittleEndian.Uint64(data[40:48])
+			sPort := binary.LittleEndian.Uint16(data[48:50])
+			dPort := binary.LittleEndian.Uint16(data[50:52])
+			aPort := binary.LittleEndian.Uint16(data[52:54])
+
+			var sAddr, dAddr, aAddr [16]byte
+			copy(sAddr[:], data[54:70])
+			copy(dAddr[:], data[70:86])
+			copy(aAddr[:], data[86:102])
+
+			event = Event{
+				Type:          typ,
+				Pid:           pid,
+				SrcAddr:       ipPort(sAddr, sPort),
+				DstAddr:       ipPort(dAddr, dPort),
+				ActualDstAddr: ipPort(aAddr, aPort),
+				Fd:            fd,
+				Timestamp:     timestamp,
+				Duration:      time.Duration(duration),
+			}
+			if typ == EventTypeConnectionClose {
 				event.TrafficStats = &TrafficStats{
-					BytesSent:     v.BytesSent,
-					BytesReceived: v.BytesReceived,
+					BytesSent:     bytesSent,
+					BytesReceived: bytesReceived,
 				}
 			}
 		default:
