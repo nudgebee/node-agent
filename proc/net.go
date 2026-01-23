@@ -58,8 +58,7 @@ func readSockets(src string) ([]Sock, error) {
 		local, b := nextField(b)
 		remote, b := nextField(b)
 		st, b := nextField(b)
-		state := string(st)
-		if state != stateEstablished && state != stateListen {
+		if string(st) != stateEstablished && string(st) != stateListen {
 			continue
 		}
 		_, b = nextField(b)
@@ -68,7 +67,7 @@ func readSockets(src string) ([]Sock, error) {
 		_, b = nextField(b)
 		_, b = nextField(b)
 		inode, _ := nextField(b)
-		res = append(res, Sock{SAddr: decodeAddr(local), DAddr: decodeAddr(remote), Listen: state == stateListen, Inode: string(inode)})
+		res = append(res, Sock{SAddr: decodeAddr(local), DAddr: decodeAddr(remote), Listen: string(st) == stateListen, Inode: string(inode)})
 	}
 	return res, nil
 }
@@ -93,11 +92,13 @@ func decodeAddr(src []byte) netaddr.IPPort {
 	if col == -1 || (col != 8 && col != 32) {
 		return netaddr.IPPort{}
 	}
-	ip := make([]byte, col/2)
+	var ipBuf [16]byte
+	ip := ipBuf[:col/2]
 	if _, err := hex.Decode(ip, src[:col]); err != nil {
 		return netaddr.IPPort{}
 	}
-	port := make([]byte, 2)
+	var portBuf [2]byte
+	port := portBuf[:]
 	if _, err := hex.Decode(port, src[col+1:]); err != nil {
 		return netaddr.IPPort{}
 	}
