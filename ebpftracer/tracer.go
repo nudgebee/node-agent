@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/base64"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -471,21 +470,30 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 			v := &l7Event{}
 			data := rec.RawSample
 
-			if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read l7 event:", err)
+			if !parseL7Event(data, v) {
+				klog.Warningln("failed to read l7 event: invalid size")
 				continue
 			}
 
-			// Extract payload data directly from the struct arrays
-			payloadSize := min(int(v.PayloadSize), len(v.Payload))
-			responseSize := min(int(v.ResponseSize), len(v.Response))
+			// Extract payload data directly from the raw data (v.Payload/v.Response are empty)
+			payloadSize := int(v.PayloadSize)
+			if payloadSize > 4096 {
+				payloadSize = 4096
+			}
+			responseSize := int(v.ResponseSize)
+			if responseSize > 4096 {
+				responseSize = 4096
+			}
 
-			// Copy the actual data (preventing garbage from unused buffer space)
 			payloadData := make([]byte, payloadSize)
-			copy(payloadData, v.Payload[:payloadSize])
+			if payloadSize > 0 && len(data) >= 56+payloadSize {
+				copy(payloadData, data[56:56+payloadSize])
+			}
 
 			responseData := make([]byte, responseSize)
-			copy(responseData, v.Response[:responseSize])
+			if responseSize > 0 && len(data) >= 4152+responseSize {
+				copy(responseData, data[4152:4152+responseSize])
+			}
 
 			req := &l7.RequestData{
 				Protocol:     l7.Protocol(v.Protocol),
@@ -508,22 +516,22 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 			}
 		case perfMapTypeFileEvents:
 			v := &fileEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read file event:", err)
+			if !parseFileEvent(rec.RawSample, v) {
+				klog.Warningln("failed to read file event: invalid size")
 				continue
 			}
 			event = Event{Type: v.Type, Pid: v.Pid, Fd: v.Fd, Mnt: v.Mnt, Log: v.Log > 0}
 		case perfMapTypeProcEvents:
 			v := &procEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read proc event:", err)
+			if !parseProcEvent(rec.RawSample, v) {
+				klog.Warningln("failed to read proc event: invalid size")
 				continue
 			}
 			event = Event{Type: v.Type, Reason: EventReason(v.Reason), Pid: v.Pid}
 		case perfMapTypeTCPEvents:
 			v := &tcpEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read tcp event:", err)
+			if !parseTCPEvent(rec.RawSample, v) {
+				klog.Warningln("failed to read tcp event: invalid size")
 				continue
 			}
 			event = Event{
