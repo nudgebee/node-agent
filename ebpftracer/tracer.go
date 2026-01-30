@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/base64"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -355,52 +354,6 @@ func (t EventReason) String() string {
 	return "unknown: " + strconv.Itoa(int(t))
 }
 
-type procEvent struct {
-	Type   EventType
-	Pid    uint32
-	Reason uint32
-}
-
-type tcpEvent struct {
-	Fd            uint64
-	Timestamp     uint64
-	Duration      uint64
-	Type          EventType
-	Pid           uint32
-	BytesSent     uint64
-	BytesReceived uint64
-	SPort         uint16
-	DPort         uint16
-	Aport         uint16
-	SAddr         [16]byte
-	DAddr         [16]byte
-	AAddr         [16]byte
-}
-
-type fileEvent struct {
-	Type EventType
-	Pid  uint32
-	Fd   uint64
-	Mnt  uint64
-	Log  uint64
-}
-
-type l7Event struct {
-	Fd                  uint64
-	ConnectionTimestamp uint64
-	Pid                 uint32
-	Status              int32
-	Duration            uint64
-	Protocol            uint8
-	Method              uint8
-	Padding             uint16
-	StatementId         uint32
-	PayloadSize         uint64
-	ResponseSize        uint64
-	Payload             [4096]byte // Must match MAX_PAYLOAD_SIZE in eBPF
-	Response            [4096]byte // Must match MAX_PAYLOAD_SIZE in eBPF
-}
-
 // HTTP response fragment event (must match eBPF struct)
 type httpResponseFragment struct {
 	Fd                  uint64
@@ -468,79 +421,32 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 
 		switch typ {
 		case perfMapTypeL7Events:
-			v := &l7Event{}
-			data := rec.RawSample
-
-			if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, v); err != nil {
+			var err error
+			event, err = parseL7Event(rec.RawSample)
+			if err != nil {
 				klog.Warningln("failed to read l7 event:", err)
 				continue
 			}
-
-			// Extract payload data directly from the struct arrays
-			payloadSize := min(int(v.PayloadSize), len(v.Payload))
-			responseSize := min(int(v.ResponseSize), len(v.Response))
-
-			// Copy the actual data (preventing garbage from unused buffer space)
-			payloadData := make([]byte, payloadSize)
-			copy(payloadData, v.Payload[:payloadSize])
-
-			responseData := make([]byte, responseSize)
-			copy(responseData, v.Response[:responseSize])
-
-			req := &l7.RequestData{
-				Protocol:     l7.Protocol(v.Protocol),
-				Status:       l7.Status(v.Status),
-				Duration:     time.Duration(v.Duration),
-				Method:       l7.Method(v.Method),
-				StatementId:  v.StatementId,
-				PayloadSize:  v.PayloadSize,
-				ResponseSize: v.ResponseSize,
-				Payload:      payloadData,
-				Response:     responseData,
-			}
-
-			event = Event{
-				Type:      EventTypeL7Request,
-				Pid:       v.Pid,
-				Fd:        v.Fd,
-				Timestamp: v.ConnectionTimestamp,
-				L7Request: req,
-			}
 		case perfMapTypeFileEvents:
-			v := &fileEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
+			var err error
+			event, err = parseFileEvent(rec.RawSample)
+			if err != nil {
 				klog.Warningln("failed to read file event:", err)
 				continue
 			}
-			event = Event{Type: v.Type, Pid: v.Pid, Fd: v.Fd, Mnt: v.Mnt, Log: v.Log > 0}
 		case perfMapTypeProcEvents:
-			v := &procEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
+			var err error
+			event, err = parseProcEvent(rec.RawSample)
+			if err != nil {
 				klog.Warningln("failed to read proc event:", err)
 				continue
 			}
-			event = Event{Type: v.Type, Reason: EventReason(v.Reason), Pid: v.Pid}
 		case perfMapTypeTCPEvents:
-			v := &tcpEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
+			var err error
+			event, err = parseTCPEvent(rec.RawSample)
+			if err != nil {
 				klog.Warningln("failed to read tcp event:", err)
 				continue
-			}
-			event = Event{
-				Type:          v.Type,
-				Pid:           v.Pid,
-				SrcAddr:       ipPort(v.SAddr, v.SPort),
-				DstAddr:       ipPort(v.DAddr, v.DPort),
-				ActualDstAddr: ipPort(v.AAddr, v.Aport),
-				Fd:            v.Fd,
-				Timestamp:     v.Timestamp,
-				Duration:      time.Duration(v.Duration),
-			}
-			if v.Type == EventTypeConnectionClose {
-				event.TrafficStats = &TrafficStats{
-					BytesSent:     v.BytesSent,
-					BytesReceived: v.BytesReceived,
-				}
 			}
 		default:
 			continue
@@ -550,10 +456,6 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 	}
 }
 
-func ipPort(ip [16]byte, port uint16) netaddr.IPPort {
-	i, _ := netaddr.FromStdIP(ip[:])
-	return netaddr.IPPortFrom(i, port)
-}
 
 func isCtxExtraPaddingRequired(traceFsPath string) bool {
 	f, err := os.Open(path.Join(traceFsPath, "events/task/task_newtask/format"))
