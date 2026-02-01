@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
-	"net"
 	"os"
 
 	"inet.af/netaddr"
@@ -93,24 +92,28 @@ func decodeAddr(src []byte) netaddr.IPPort {
 	if col == -1 || (col != 8 && col != 32) {
 		return netaddr.IPPort{}
 	}
-	ip := make([]byte, col/2)
-	if _, err := hex.Decode(ip, src[:col]); err != nil {
+
+	// Parsing to stack-allocated buffers to avoid heap allocations
+	var ip [16]byte
+	if _, err := hex.Decode(ip[:col/2], src[:col]); err != nil {
 		return netaddr.IPPort{}
 	}
-	port := make([]byte, 2)
-	if _, err := hex.Decode(port, src[col+1:]); err != nil {
+	var portBuf [2]byte
+	if _, err := hex.Decode(portBuf[:], src[col+1:]); err != nil {
 		return netaddr.IPPort{}
 	}
 
 	var v uint32
-	for i := 0; i < len(ip); i += 4 {
+	for i := 0; i < col/2; i += 4 {
 		v = binary.BigEndian.Uint32(ip[i : i+4])
 		binary.LittleEndian.PutUint32(ip[i:i+4], v)
 	}
 
-	ipp, ok := netaddr.FromStdIP(net.IP(ip))
-	if !ok {
-		return netaddr.IPPort{}
+	var ipp netaddr.IP
+	if col == 8 {
+		ipp = netaddr.IPv4(ip[0], ip[1], ip[2], ip[3])
+	} else {
+		ipp = netaddr.IPFrom16(ip)
 	}
-	return netaddr.IPPortFrom(ipp, binary.BigEndian.Uint16(port))
+	return netaddr.IPPortFrom(ipp, binary.BigEndian.Uint16(portBuf[:]))
 }
