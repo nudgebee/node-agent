@@ -1,5 +1,5 @@
 #define MAX_CONNECTIONS 1000000
-#define MAX_PAYLOAD_SIZE 4096 // must be power of 2
+#define MAX_PAYLOAD_SIZE 8192 // must be power of 2, increased for LLM HTTP/2 payloads
 
 struct tcp_event {
     __u64 fd;

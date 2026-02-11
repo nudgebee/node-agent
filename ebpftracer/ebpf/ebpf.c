@@ -27,11 +27,19 @@
     }                                                 \
 })
 
+// Debug logging disabled - uncomment below to enable
+// #define BPF_DEBUG 1
+
+#undef bpf_printk
+#ifdef BPF_DEBUG
 #define bpf_printk(fmt, ...)                                   \
 ({                                                             \
     char ____fmt[] = fmt;                                      \
     bpf_trace_printk(____fmt, sizeof(____fmt), ##__VA_ARGS__); \
 })
+#else
+#define bpf_printk(fmt, ...) ({})
+#endif
 
 struct trace_event_raw_sys_exit__stub {
 	__u64 unused;

@@ -64,6 +64,9 @@ struct ssl_st {
 #define WRITE_ENTER(ctx, bio_t)                                 \
 ({                                                              \
     __u32 fd = GET_FD(ctx, bio_t, wbio);                        \
+    __u64 pid_tgid = bpf_get_current_pid_tgid();                \
+    __u32 pid = pid_tgid >> 32;                                 \
+    ensure_connection_tracked(pid, fd);                         \
     char* buf_ptr = (char*)PT_REGS_PARM2(ctx);                  \
     __u64 buf_size = PT_REGS_PARM3(ctx);                        \
     return trace_enter_write(ctx, fd, 1, buf_ptr, buf_size, 0); \
@@ -75,6 +78,7 @@ struct ssl_st {
     char* buf_ptr = (char*)PT_REGS_PARM2(ctx);           \
     __u64 pid_tgid = bpf_get_current_pid_tgid();         \
     __u32 pid = pid_tgid >> 32;                          \
+    ensure_connection_tracked(pid, fd);                  \
     __u64 id = pid_tgid | IS_TLS_READ_ID;                \
     return trace_enter_read(id, pid, fd, buf_ptr, 0, 0); \
 })
@@ -84,8 +88,9 @@ struct ssl_st {
     __u32 fd = GET_FD(ctx, bio_t, rbio);                       \
     char* buf_ptr = (char*)PT_REGS_PARM2(ctx);                 \
     __u64 pid_tgid = bpf_get_current_pid_tgid();               \
-    __u64 id = pid_tgid | IS_TLS_READ_ID;                      \
     __u32 pid = pid_tgid >> 32;                                \
+    ensure_connection_tracked(pid, fd);                        \
+    __u64 id = pid_tgid | IS_TLS_READ_ID;                      \
     __u64* ret_ptr = (__u64*)PT_REGS_PARM4(ctx);               \
     return trace_enter_read(id, pid, fd, buf_ptr, ret_ptr, 0); \
 })

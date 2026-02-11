@@ -77,6 +77,18 @@ type Registry struct {
 	pythonStatsUpdateCh  chan *PythonStatsUpdate
 
 	gpuProcessUsageSampleChan chan gpu.ProcessUsageSample
+
+	// pendingL7Events stores L7 events that arrived before their connection was established
+	// This handles the race condition between ring buffer (L7 events) and perf buffer (TCP events)
+	pendingL7Events     []pendingL7Event
+	pendingL7EventsLock sync.Mutex
+}
+
+// pendingL7Event stores an L7 event that's waiting for its connection to be established
+type pendingL7Event struct {
+	event      ebpftracer.Event
+	addedAt    time.Time
+	retryCount int
 }
 
 func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, ip_resolver *common.K8sIPResolver, gpuProcessUsageSampleChan chan gpu.ProcessUsageSample) (*Registry, error) {
@@ -135,6 +147,8 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, ip
 
 		gpuProcessUsageSampleChan: gpuProcessUsageSampleChan,
 	}
+	// Register LLM metrics with the same registerer used for other container metrics
+	RegisterLLMMetrics(reg)
 	if err = reg.Register(r); err != nil {
 		return nil, err
 	}
@@ -225,11 +239,8 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 					delete(r.containersById, c.id)
 
 					// Unregister from Prometheus (do this after removing from maps)
-					klog.Infof("DEBUG: Unregistering container from Prometheus - id: %s, app_id: %s", c.id, c.appId)
 					if ok := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(c.id), "app_id": c.appId}, r.reg).Unregister(c); !ok {
-						klog.Warningf("DEBUG: failed to unregister container: %s", c.id)
-					} else {
-						klog.Infof("DEBUG: Successfully unregistered container from Prometheus - id: %s", c.id)
+						klog.Warningf("failed to unregister container: %s", c.id)
 					}
 					c.Close()
 				}
@@ -372,28 +383,131 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				if e.L7Request == nil {
 					continue
 				}
-				if c := r.containersByPid[e.Pid]; c != nil {
-					ip2fqdn := c.onL7Request(e.Pid, e.Fd, e.Timestamp, e.L7Request)
-					r.ip2fqdnLock.Lock()
-					for ip, domain := range ip2fqdn {
-						r.ip2fqdn[ip] = domain
-						// Also update IP resolver cache for trace hostname display
-						r.ip_resolver.CacheDNS(ip.String(), domain.FQDN)
-					}
-					r.ip2fqdnLock.Unlock()
-				} else if e.L7Request.Protocol == l7.ProtocolDNS {
-					// Handle DNS queries from non-monitored processes for global ip2fqdn mapping
-					ip2fqdn := r.handleHostDNSRequest(e.L7Request)
-					r.ip2fqdnLock.Lock()
-					for ip, domain := range ip2fqdn {
-						r.ip2fqdn[ip] = domain
-						// Also update IP resolver cache for trace hostname display
-						r.ip_resolver.CacheDNS(ip.String(), domain.FQDN)
-					}
-					r.ip2fqdnLock.Unlock()
-				}
+				klog.V(2).Infof("L7_EVENT_REGISTRY: pid=%d fd=%d protocol=%d timestamp=%d",
+					e.Pid, e.Fd, e.L7Request.Protocol, e.Timestamp)
+				r.processL7Event(e)
 			}
+			// Process any pending L7 events after handling new events
+			r.processPendingL7Events()
 		}
+	}
+}
+
+// processL7Event handles an L7 event, queueing it for retry if the connection isn't found yet
+func (r *Registry) processL7Event(e ebpftracer.Event) {
+	if c := r.containersByPid[e.Pid]; c != nil {
+		klog.V(2).Infof("L7_EVENT_CONTAINER_FOUND: pid=%d container=%s", e.Pid, c.id)
+		ip2fqdn, result := c.onL7RequestWithResult(e.Pid, e.Fd, e.Timestamp, e.L7Request, e.SocketInfo)
+		if result == L7RequestConnNotFound {
+			// Connection not found - queue for retry
+			// This handles the race condition where L7 events (via ring buffer)
+			// arrive before TCP connect events (via perf buffer)
+			r.queueL7EventForRetry(e)
+			return
+		}
+		r.ip2fqdnLock.Lock()
+		for ip, domain := range ip2fqdn {
+			r.ip2fqdn[ip] = domain
+			// Also update IP resolver cache for trace hostname display
+			r.ip_resolver.CacheDNS(ip.String(), domain.FQDN)
+		}
+		r.ip2fqdnLock.Unlock()
+	} else if e.L7Request.Protocol == l7.ProtocolDNS {
+		// Handle DNS queries from non-monitored processes for global ip2fqdn mapping
+		ip2fqdn := r.handleHostDNSRequest(e.L7Request)
+		r.ip2fqdnLock.Lock()
+		for ip, domain := range ip2fqdn {
+			r.ip2fqdn[ip] = domain
+			// Also update IP resolver cache for trace hostname display
+			r.ip_resolver.CacheDNS(ip.String(), domain.FQDN)
+		}
+		r.ip2fqdnLock.Unlock()
+	}
+}
+
+// queueL7EventForRetry adds an L7 event to the pending queue for later retry
+func (r *Registry) queueL7EventForRetry(e ebpftracer.Event) {
+	r.pendingL7EventsLock.Lock()
+	defer r.pendingL7EventsLock.Unlock()
+
+	// Limit queue size to prevent memory issues
+	const maxPendingEvents = 1000
+	if len(r.pendingL7Events) >= maxPendingEvents {
+		klog.V(2).Infof("L7_EVENT_QUEUE_FULL: dropping event pid=%d fd=%d", e.Pid, e.Fd)
+		return
+	}
+
+	klog.V(2).Infof("L7_EVENT_QUEUED: pid=%d fd=%d protocol=%d", e.Pid, e.Fd, e.L7Request.Protocol)
+	r.pendingL7Events = append(r.pendingL7Events, pendingL7Event{
+		event:      e,
+		addedAt:    time.Now(),
+		retryCount: 0,
+	})
+}
+
+// processPendingL7Events retries pending L7 events
+func (r *Registry) processPendingL7Events() {
+	r.pendingL7EventsLock.Lock()
+	if len(r.pendingL7Events) == 0 {
+		r.pendingL7EventsLock.Unlock()
+		return
+	}
+
+	// Process pending events (copy and clear to avoid holding lock during processing)
+	pending := r.pendingL7Events
+	r.pendingL7Events = nil
+	r.pendingL7EventsLock.Unlock()
+
+	const maxRetries = 3
+	const maxAge = 5 * time.Second
+	now := time.Now()
+
+	var stillPending []pendingL7Event
+
+	for _, p := range pending {
+		// Expire old events
+		if now.Sub(p.addedAt) > maxAge {
+			klog.V(2).Infof("L7_EVENT_EXPIRED: pid=%d fd=%d age=%v", p.event.Pid, p.event.Fd, now.Sub(p.addedAt))
+			continue
+		}
+
+		// Try to process the event
+		c := r.containersByPid[p.event.Pid]
+		if c == nil {
+			if p.retryCount < maxRetries {
+				p.retryCount++
+				stillPending = append(stillPending, p)
+			}
+			continue
+		}
+
+		ip2fqdn, result := c.onL7RequestWithResult(p.event.Pid, p.event.Fd, p.event.Timestamp, p.event.L7Request, p.event.SocketInfo)
+		if result == L7RequestConnNotFound {
+			// Still not found - keep in queue if not exceeded max retries
+			if p.retryCount < maxRetries {
+				p.retryCount++
+				stillPending = append(stillPending, p)
+			} else {
+				klog.V(2).Infof("L7_EVENT_MAX_RETRIES: pid=%d fd=%d", p.event.Pid, p.event.Fd)
+			}
+			continue
+		}
+
+		// Successfully processed
+		klog.V(2).Infof("L7_EVENT_RETRY_SUCCESS: pid=%d fd=%d retries=%d", p.event.Pid, p.event.Fd, p.retryCount)
+		r.ip2fqdnLock.Lock()
+		for ip, domain := range ip2fqdn {
+			r.ip2fqdn[ip] = domain
+			r.ip_resolver.CacheDNS(ip.String(), domain.FQDN)
+		}
+		r.ip2fqdnLock.Unlock()
+	}
+
+	// Re-queue still pending events
+	if len(stillPending) > 0 {
+		r.pendingL7EventsLock.Lock()
+		r.pendingL7Events = append(r.pendingL7Events, stillPending...)
+		r.pendingL7EventsLock.Unlock()
 	}
 }
 
@@ -528,12 +642,10 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		return nil
 	}
 	klog.InfoS("detected a new container", "pid", pid, "cg", cg.Id, "id", id, "app", c.appId)
-	klog.Infof("DEBUG: Registering container with Prometheus - id: %s, app_id: %s", id, c.appId)
 	if err := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(id), "app_id": c.appId}, r.reg).Register(c); err != nil {
-		klog.Warningf("DEBUG: failed to register container: %v", err)
+		klog.Warningf("failed to register container %s: %v", id, err)
 		return nil
 	}
-	klog.Infof("DEBUG: Successfully registered container with Prometheus - id: %s", id)
 
 	// Update all maps atomically while holding the lock
 	r.containersByPid[pid] = c
