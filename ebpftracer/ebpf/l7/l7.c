@@ -32,11 +32,23 @@
     size = MIN(size, MAX_PAYLOAD_SIZE-1);                               \
     asm volatile ("%0 &= %1" : "+r"(size) : "i"(MAX_PAYLOAD_SIZE-1));   \
 })
+
+// COPY_PAYLOAD for use with non-ringbuf allocations (l7_request heap)
 #define COPY_PAYLOAD(dst, size, src) ({     \
     TRUNCATE_PAYLOAD_SIZE(size);            \
     if (bpf_probe_read(dst, size, src)) {   \
         return 0;                           \
     }                                       \
+})
+
+// COPY_PAYLOAD_RINGBUF for use with ring buffer allocations
+// Discards the event and returns 0 on failure to satisfy eBPF verifier
+#define COPY_PAYLOAD_RINGBUF(e, dst, size, src) ({  \
+    TRUNCATE_PAYLOAD_SIZE(size);                    \
+    if (bpf_probe_read(dst, size, src)) {           \
+        bpf_ringbuf_discard(e, 0);                  \
+        return 0;                                   \
+    }                                               \
 })
 
 #define IOVEC_BUF_SIZE MAX_PAYLOAD_SIZE * 2  // must be double of MAX_PAYLOAD_SIZE
@@ -59,6 +71,9 @@
 #include "zookeeper.c"
 #include "foundationdb.c"
 
+// Include socket info extraction (must be before l7_event uses socket_tuple)
+#include "../socket_info.c"
+
 struct l7_event {
     __u64 fd;
     __u64 connection_timestamp;
@@ -71,6 +86,14 @@ struct l7_event {
     __u32 statement_id;
     __u64 payload_size;
     __u64 response_size;
+    // Socket tuple - extracted directly from fd, no TCP event dependency
+    __u8 saddr[16];      // Source address (IPv4 in first 4 bytes, or full IPv6)
+    __u8 daddr[16];      // Destination address
+    __u16 sport;         // Source port
+    __u16 dport;         // Destination port
+    __u16 addr_family;   // AF_INET (2) or AF_INET6 (10)
+    __u8 socket_info_valid;  // 1 if socket info was extracted
+    __u8 padding2;
     char payload[MAX_PAYLOAD_SIZE];
     char response[MAX_PAYLOAD_SIZE];
 };
@@ -80,17 +103,16 @@ struct iovec {
     __u64 size;
 };
 
+// Ring buffer for L7 events - provides global ordering across CPUs
+// Size: 16MB shared buffer (1 << 24 = 16777216 bytes)
+// Benefits over perf buffer:
+//   - Global event ordering (important for SSE streaming)
+//   - More efficient memory usage (shared vs per-CPU)
+//   - Backpressure via reserve/submit pattern
+// Requires kernel 5.8+
 struct {
-     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-     __type(key, int);
-     __type(value, struct l7_event);
-     __uint(max_entries, 1);
-} l7_event_heap SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    __uint(key_size, sizeof(int));
-    __uint(value_size, sizeof(int));
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 24);  // 16MB
 } l7_events SEC(".maps");
 
 struct read_args {
@@ -139,12 +161,54 @@ struct user_msghdr {
     __u32 msg_flags;
 };
 
+// send_event submits an L7 event to the ring buffer
+// The event must have been allocated via bpf_ringbuf_reserve(&l7_events, ...)
 static inline __attribute__((__always_inline__))
 void send_event(void *ctx, struct l7_event *e, struct connection_id cid, struct connection *conn) {
     e->connection_timestamp = conn->timestamp;
     e->fd = cid.fd;
     e->pid = cid.pid;
-    bpf_perf_event_output(ctx, &l7_events, BPF_F_CURRENT_CPU, e, sizeof(*e));
+
+    // Extract socket info directly from fd - no dependency on TCP events
+    // This fixes Go goroutine thread-switching issues where TCP connection
+    // tracking fails due to fd_by_pid_tgid lookup using different thread ID
+    struct socket_tuple tuple = {};
+    if (get_socket_tuple_from_fd((__u32)cid.fd, &tuple)) {
+        __builtin_memcpy(e->saddr, tuple.saddr, sizeof(e->saddr));
+        __builtin_memcpy(e->daddr, tuple.daddr, sizeof(e->daddr));
+        e->sport = tuple.sport;
+        e->dport = tuple.dport;
+        e->addr_family = tuple.family;
+        e->socket_info_valid = 1;
+    } else {
+        e->socket_info_valid = 0;
+    }
+
+    bpf_ringbuf_submit(e, 0);
+}
+
+// reserve_l7_event allocates an l7_event from the ring buffer
+// Returns NULL if the ring buffer is full (backpressure)
+static inline __attribute__((__always_inline__))
+struct l7_event *reserve_l7_event(void) {
+    struct l7_event *e = bpf_ringbuf_reserve(&l7_events, sizeof(struct l7_event), 0);
+    if (e) {
+        // Initialize event to zero state
+        e->protocol = PROTOCOL_UNKNOWN;
+        e->status = STATUS_UNKNOWN;
+        e->method = METHOD_UNKNOWN;
+        e->statement_id = 0;
+        e->payload_size = 0;
+        e->response_size = 0;
+    }
+    return e;
+}
+
+// discard_l7_event discards a reserved event without sending
+// Use when an error occurs after reserve but before send
+static inline __attribute__((__always_inline__))
+void discard_l7_event(struct l7_event *e) {
+    bpf_ringbuf_discard(e, 0);
 }
 
 static inline __attribute__((__always_inline__))
@@ -178,14 +242,44 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
 static inline __attribute__((__always_inline__))
 int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, __u64 iovlen) {
     __u64 id = bpf_get_current_pid_tgid();
+    __u32 pid = id >> 32;
+
+    // Debug: Log at entry to trace_enter_write for TLS
+    if (is_tls) {
+        bpf_printk("l7_ENTRY: pid=%u fd=%llu size=%llu", pid, fd, size);
+    }
+
     __u32 zero = 0;
     struct connection_id cid = {};
-    cid.pid = id >> 32;
+    cid.pid = pid;
     cid.fd = fd;
     __u64 total_size = size;
 
     struct connection *conn = bpf_map_lookup_elem(&active_connections, &cid);
+    struct connection conn_on_stack = {};
+
     if (!conn) {
+        struct socket_tuple tuple = {};
+        if (is_tls) {
+            // For Go TLS, TCP tracking can fail. As a fallback, extract socket info directly.
+            if (get_socket_tuple_from_fd((__u32)fd, &tuple)) {
+                conn_on_stack.dport = tuple.dport;
+                conn = &conn_on_stack;
+                bpf_printk("l7_CONN_FALLBACK: pid=%u fd=%llu dport=%u", cid.pid, fd, conn->dport);
+            }
+        } else if (get_socket_tuple_from_fd((__u32)fd, &tuple) && tuple.dport == 53) {
+            // UDP DNS: inet_sock_set_state only tracks TCP, so UDP sockets
+            // are never in active_connections. Allow DNS through for ip2fqdn resolution.
+            conn_on_stack.dport = 53;
+            conn = &conn_on_stack;
+        }
+    }
+
+    if (!conn) {
+        // Log ALL TLS connection lookup failures (not just large payloads)
+        if (is_tls) {
+            bpf_printk("l7_NOT_FOUND: pid=%u fd=%llu size=%llu", cid.pid, fd, size);
+        }
         return 0;
     }
 
@@ -211,6 +305,11 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
         return 0;
     }
     req->protocol = conn->protocol; // Use the known protocol if it exists
+
+    // Debug: Log TLS write with protocol info
+    if (is_tls) {
+        bpf_printk("l7_FOUND: pid=%u fd=%llu proto=%d", cid.pid, fd, conn->protocol);
+    }
     req->partial = 0;
     req->request_id = 0;
     req->ns = 0;
@@ -221,7 +320,40 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
     k.is_tls = is_tls;
     k.stream_id = -1;
 
+    // Fast path: If connection is already known to be HTTP/2, handle immediately
+    if (req->protocol == PROTOCOL_HTTP2) {
+        struct l7_event *e = reserve_l7_event();
+        if (!e) {
+            if (is_tls) { bpf_printk("l7_H2_RESERVE_FAIL: pid=%u fd=%llu", cid.pid, fd); }
+            return 0;
+        }
+        e->protocol = PROTOCOL_HTTP2;
+        e->method = METHOD_HTTP2_CLIENT_FRAMES;
+        e->duration = bpf_ktime_get_ns();
+        e->payload_size = size;
+        COPY_PAYLOAD_RINGBUF(e, e->payload, size, payload);
+        send_event(ctx, e, cid, conn);
+        if (is_tls) { bpf_printk("l7_H2_SENT: pid=%u fd=%llu size=%llu", cid.pid, fd, size); }
+        return 0;
+    }
+
     if (req->protocol == PROTOCOL_UNKNOWN) { // Only detect protocol if it's not already known
+        // Port-based HTTP/2 hint: Try HTTP/2 detection first for HTTPS traffic (port 443/8443)
+        // Most modern HTTPS traffic uses HTTP/2, and this helps detect gRPC DATA frames
+        // that don't have the connection preface
+        if (conn->dport != 53 && is_likely_http2_port(conn->dport) && looks_like_http2_frame(payload, size, METHOD_HTTP2_CLIENT_FRAMES)) {
+            conn->protocol = PROTOCOL_HTTP2; // Cache for subsequent frames
+            struct l7_event *e = reserve_l7_event();
+            if (!e) { return 0; }
+            e->protocol = PROTOCOL_HTTP2;
+            e->method = METHOD_HTTP2_CLIENT_FRAMES;
+            e->duration = bpf_ktime_get_ns();
+            e->payload_size = size;
+            COPY_PAYLOAD_RINGBUF(e, e->payload, size, payload);
+            send_event(ctx, e, cid, conn);
+            return 0;
+        }
+
         if (is_http_request(payload)) {
             req->protocol = PROTOCOL_HTTP;
         } else if (is_postgres_query(payload, size, &req->request_type)) {
@@ -235,14 +367,14 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
         } else if (is_mongo_query(payload, size)) {
             req->protocol = PROTOCOL_MONGO;
         } else if (is_rabbitmq_produce(payload, size)) {
-            struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
+            struct l7_event *e = reserve_l7_event();
             if (!e) { return 0; }
             e->protocol = PROTOCOL_RABBITMQ;
             e->method = METHOD_PRODUCE;
             send_event(ctx, e, cid, conn);
             return 0;
         } else if (nats_method(payload, size) == METHOD_PRODUCE) {
-            struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
+            struct l7_event *e = reserve_l7_event();
             if (!e) { return 0; }
             e->protocol = PROTOCOL_NATS;
             e->method = METHOD_PRODUCE;
@@ -250,14 +382,18 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
             return 0;
         } else if (is_cassandra_request(payload, size, &k.stream_id)) {
             req->protocol = PROTOCOL_CASSANDRA;
+        } else if (is_dns_request(payload, size, &k.stream_id)) {
+            req->protocol = PROTOCOL_DNS;
         } else if (looks_like_http2_frame(payload, size, METHOD_HTTP2_CLIENT_FRAMES)) {
-            struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
+            // HTTP/2 detected on non-standard port
+            conn->protocol = PROTOCOL_HTTP2; // Cache for subsequent frames
+            struct l7_event *e = reserve_l7_event();
             if (!e) { return 0; }
             e->protocol = PROTOCOL_HTTP2;
             e->method = METHOD_HTTP2_CLIENT_FRAMES;
             e->duration = bpf_ktime_get_ns();
             e->payload_size = size;
-            COPY_PAYLOAD(e->payload, size, payload);
+            COPY_PAYLOAD_RINGBUF(e, e->payload, size, payload);
             send_event(ctx, e, cid, conn);
             return 0;
         } else if (conn->dport == 5672 && (is_rabbitmq_connection(payload, size) || is_amqp_frame(payload, size) || is_amqp_method_frame(payload, size))) {
@@ -280,8 +416,6 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
             req->protocol = PROTOCOL_KAFKA;
         } else if (is_dubbo2_request(payload, size)) {
             req->protocol = PROTOCOL_DUBBO2;
-        } else if (is_dns_request(payload, size, &k.stream_id)) {
-            req->protocol = PROTOCOL_DNS;
         } else if (is_foundationdb_request(payload, size)) {
             req->protocol = PROTOCOL_FOUNDATIONDB;
         }
@@ -291,22 +425,22 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
     }
 
     if (req->protocol == PROTOCOL_POSTGRES && req->request_type == POSTGRES_FRAME_CLOSE) {
-        struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
+        struct l7_event *e = reserve_l7_event();
         if (!e) { return 0; }
         e->protocol = PROTOCOL_POSTGRES;
         e->method = METHOD_STATEMENT_CLOSE;
         e->payload_size = size;
-        COPY_PAYLOAD(e->payload, size, payload);
+        COPY_PAYLOAD_RINGBUF(e, e->payload, size, payload);
         send_event(ctx, e, cid, conn);
         return 0;
     }
     if (req->protocol == PROTOCOL_MYSQL && req->request_type == MYSQL_COM_STMT_CLOSE) {
-        struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
+        struct l7_event *e = reserve_l7_event();
         if (!e) { return 0; }
         e->protocol = PROTOCOL_MYSQL;
         e->method = METHOD_STATEMENT_CLOSE;
         e->payload_size = size;
-        COPY_PAYLOAD(e->payload, size, payload);
+        COPY_PAYLOAD_RINGBUF(e, e->payload, size, payload);
         send_event(ctx, e, cid, conn);
         return 0;
     }
@@ -330,7 +464,12 @@ int trace_enter_read(__u64 id, __u32 pid, __u64 fd, char *buf, __u64 *ret, __u64
 
     struct connection *conn = bpf_map_lookup_elem(&active_connections, &cid);
     if (!conn) {
-        return 0;
+        // UDP DNS: inet_sock_set_state only tracks TCP, so UDP sockets
+        // are never in active_connections. Allow DNS reads through.
+        struct socket_tuple tuple = {};
+        if (!get_socket_tuple_from_fd((__u32)fd, &tuple) || tuple.dport != 53) {
+            return 0;
+        }
     }
 
     struct read_args args = {};
@@ -352,9 +491,18 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     cid.pid = pid;
     cid.fd = args->fd;
     struct connection *conn = bpf_map_lookup_elem(&active_connections, &cid);
+    struct connection conn_on_stack = {};
     if (!conn) {
-        bpf_map_delete_elem(&active_reads, &id);
-        return 0;
+        // UDP DNS: inet_sock_set_state only tracks TCP, so UDP sockets
+        // are never in active_connections. Allow DNS responses through.
+        struct socket_tuple tuple = {};
+        if (get_socket_tuple_from_fd((__u32)cid.fd, &tuple) && tuple.dport == 53) {
+            conn_on_stack.dport = 53;
+            conn = &conn_on_stack;
+        } else {
+            bpf_map_delete_elem(&active_reads, &id);
+            return 0;
+        }
     }
     struct l7_request_key k = {};
     k.pid = cid.pid;
@@ -387,7 +535,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
         __sync_fetch_and_add(&conn->bytes_received, total_size);
     }
 
-    struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
+    struct l7_event *e = reserve_l7_event();
     if (!e) {
         return 0;
     }
@@ -410,43 +558,59 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
         return 0;
     }
 
+    // Fast path: If connection is already known to be HTTP/2, handle immediately
+    if (conn->protocol == PROTOCOL_HTTP2) {
+        e->protocol = PROTOCOL_HTTP2;
+        e->method = METHOD_HTTP2_SERVER_FRAMES;
+        e->duration = bpf_ktime_get_ns();
+        e->payload_size = ret;
+        COPY_PAYLOAD_RINGBUF(e, e->payload, ret, payload);
+        send_event(ctx, e, cid, conn);
+        return 0;
+    }
+
     struct l7_request *req = bpf_map_lookup_elem(&active_l7_requests, &k);
     int response = 0;
     if (!req) {
         if (is_dns_response(payload, ret, &k.stream_id, &e->status)) {
             req = bpf_map_lookup_elem(&active_l7_requests, &k);
             if (!req) {
+                discard_l7_event(e);
                 return 0;
             }
             e->protocol = PROTOCOL_DNS;
             e->duration = bpf_ktime_get_ns() - req->ns;
             e->payload_size = ret;
-            COPY_PAYLOAD(e->payload, ret, payload);
+            COPY_PAYLOAD_RINGBUF(e, e->payload, ret, payload);
             send_event(ctx, e, cid, conn);
             bpf_map_delete_elem(&active_l7_requests, &k);
             return 0;
         } else if (is_cassandra_response(payload, ret, &k.stream_id, &e->status)) {
             req = bpf_map_lookup_elem(&active_l7_requests, &k);
             if (!req) {
+                discard_l7_event(e);
                 return 0;
             }
             response = 1;
         } else if (looks_like_http2_frame(payload, ret, METHOD_HTTP2_SERVER_FRAMES)) {
+            // HTTP/2 detected - cache protocol for subsequent frames
+            conn->protocol = PROTOCOL_HTTP2;
             e->protocol = PROTOCOL_HTTP2;
             e->method = METHOD_HTTP2_SERVER_FRAMES;
             e->duration = bpf_ktime_get_ns();
             e->payload_size = ret;
-            COPY_PAYLOAD(e->payload, ret, payload);
+            COPY_PAYLOAD_RINGBUF(e, e->payload, ret, payload);
             send_event(ctx, e, cid, conn);
             return 0;
         } else {
+            discard_l7_event(e);
             return 0;
         }
     }
 
     e->protocol = req->protocol;
     e->payload_size = req->payload_size;
-    COPY_PAYLOAD(e->payload, req->payload_size, req->payload);
+    COPY_PAYLOAD_RINGBUF(e, e->payload, req->payload_size, req->payload);
     if (e->protocol == PROTOCOL_HTTP) {
         response = is_http_response(payload, &e->status);
     } else if (e->protocol == PROTOCOL_POSTGRES) {
@@ -467,6 +631,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
         response = is_mongo_response(payload, ret, req->partial);
         if (response == 2) { // partial
             req->partial = 1;
+            discard_l7_event(e);
             return 0; // keeping the query in the map
         }
     } else if (e->protocol == PROTOCOL_KAFKA) {
@@ -474,12 +639,14 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     } else if (e->protocol == PROTOCOL_CLICKHOUSE) {
         response = is_clickhouse_response(payload, &e->status);
         if (!response) {
+            discard_l7_event(e);
             return 0; // keeping the query in the map
         }
     } else if (e->protocol == PROTOCOL_ZOOKEEPER) {
         response = is_zk_response(payload, total_size, &e->status, req->partial);
         if (response == 2) { // partial
             req->partial = 1;
+            discard_l7_event(e);
             return 0; // keeping the query in the map
         }
     } else if (e->protocol == PROTOCOL_DUBBO2) {
@@ -487,16 +654,18 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     } else if (e->protocol == PROTOCOL_FOUNDATIONDB) {
         response = is_foundationdb_response(payload, ret, &e->status);
         if (response == 2) { // partial
+            discard_l7_event(e);
             return 0; // keeping the query in the map
         }
     }
     bpf_map_delete_elem(&active_l7_requests, &k);
     if (!response) {
+        discard_l7_event(e);
         return 0;
     }
     e->duration = bpf_ktime_get_ns() - req->ns;
     e->response_size = ret;
-    COPY_PAYLOAD(e->response, ret, payload);
+    COPY_PAYLOAD_RINGBUF(e, e->response, ret, payload);
     send_event(ctx, e, cid, conn);
     return 0;
 }

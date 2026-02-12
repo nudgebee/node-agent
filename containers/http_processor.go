@@ -1,6 +1,7 @@
 package containers
 
 import (
+	"bytes"
 	"encoding/base64"
 	"net"
 	"net/http"
@@ -9,15 +10,20 @@ import (
 	"unicode/utf8"
 
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
+	"inet.af/netaddr"
 )
 
-// HTTPRequestContext is a rich data object that encapsulates all HTTP request processing
-// Parse once, use everywhere to eliminate duplication
+// DNSResolver is a function type for looking up hostnames from IP addresses.
+// This allows dependency injection of the registry's DNS cache.
+type DNSResolver func(ip netaddr.IP) string
+
+// HTTPRequestContext encapsulates all HTTP request processing.
+// Parse once, use everywhere to eliminate duplication.
 type HTTPRequestContext struct {
 	// Parsed HTTP data
 	Method  string
 	Path    string
-	Host    string
+	Host    string // Resolved hostname (never an IP if resolvable)
 	Headers http.Header
 	TraceID string
 
@@ -30,17 +36,24 @@ type HTTPRequestContext struct {
 	Duration   time.Duration
 	Status     l7.Status
 
-	// Raw data (for specialized processing)
+	// Raw data (for specialized processing like LLM detection)
 	RawPayload  []byte
 	RawResponse []byte
 
-	// Processing flags
+	// Content type flags
 	HasValidUTF8Payload  bool
 	HasValidUTF8Response bool
+	IsSSE                bool // Server-Sent Events (streaming response)
+
+	// LLM detection cache (computed once)
+	llmProvider     LLMProvider
+	llmProviderDone bool
 }
 
-// NewHTTPRequestProcessor creates and processes HTTP request data once
-func NewHTTPRequestProcessor(r *l7.RequestData, conn *ActiveConnection) *HTTPRequestContext {
+// NewHTTPRequestContext creates and processes HTTP request data.
+// The dnsResolver parameter allows looking up hostnames from IPs at request time,
+// fixing the race condition where DNS cache wasn't populated at connection time.
+func NewHTTPRequestContext(r *l7.RequestData, conn *ActiveConnection, dnsResolver DNSResolver) *HTTPRequestContext {
 	ctx := &HTTPRequestContext{
 		Connection:  conn,
 		Duration:    r.Duration,
@@ -49,27 +62,35 @@ func NewHTTPRequestProcessor(r *l7.RequestData, conn *ActiveConnection) *HTTPReq
 		RawResponse: r.Response,
 	}
 
-	// Parse HTTP request once
-	ctx.parseHTTPRequest()
+	// Step 1: Parse HTTP request (method, path, headers)
+	ctx.parseRequest()
 
-	// Encode payloads once
+	// Step 2: Resolve host with proper priority
+	ctx.resolveHost(dnsResolver)
+
+	// Step 3: Encode payloads for consumers
 	ctx.encodePayloads()
 
-	// Extract host information
-	ctx.resolveHost()
-
-	// Extract trace ID if available
+	// Step 4: Extract distributed tracing context
 	ctx.extractTraceID()
+
+	// Step 5: Detect streaming response
+	ctx.detectSSE()
 
 	return ctx
 }
 
-// parseHTTPRequest parses the HTTP request and extracts method, path, headers
-func (ctx *HTTPRequestContext) parseHTTPRequest() {
-	// Parse method and path from raw payload
+// parseRequest extracts method, path, and headers from raw payload.
+func (ctx *HTTPRequestContext) parseRequest() {
+	if len(ctx.RawPayload) == 0 {
+		ctx.Headers = http.Header{}
+		return
+	}
+
+	// Parse method and path
 	ctx.Method, ctx.Path = l7.ParseHttp(ctx.RawPayload)
 
-	// Parse headers if available
+	// Parse full HTTP request for headers
 	if req, err := l7.ParseHTTPRequest(ctx.RawPayload); err == nil && req != nil && req.Header != nil {
 		ctx.Headers = req.Header
 	} else {
@@ -77,119 +98,217 @@ func (ctx *HTTPRequestContext) parseHTTPRequest() {
 	}
 }
 
+// resolveHost determines the hostname using a priority-based approach.
+// Priority order (highest to lowest):
+//  1. Host header (HTTP/1.1) - most reliable for external services
+//  2. :authority pseudo-header (HTTP/2)
+//  3. DNS cache lookup - fixes race condition with connection creation
+//  4. Destination workload name - fallback for internal services
+func (ctx *HTTPRequestContext) resolveHost(dnsResolver DNSResolver) {
+	// Priority 1: Host header (HTTP/1.1)
+	// This is the most reliable source for external services like LLM APIs,
+	// especially when using Google Private Access or similar proxy setups.
+	if host := ctx.Headers.Get("Host"); host != "" {
+		ctx.Host = stripPort(host)
+		return
+	}
+
+	// Priority 2: :authority pseudo-header (HTTP/2)
+	// Used in HTTP/2 and gRPC requests instead of Host header.
+	if authority := ctx.Headers.Get(":authority"); authority != "" {
+		ctx.Host = stripPort(authority)
+		return
+	}
+
+	// Priority 3: DNS cache lookup
+	// This fixes the race condition where DNS response arrives after TCP connect.
+	// At L7 request time, DNS should be cached from the earlier lookup.
+	if dnsResolver != nil {
+		destIP := ctx.Connection.DestinationKey.ActualDestinationIfKnown().IP()
+		if hostname := dnsResolver(destIP); hostname != "" {
+			ctx.Host = hostname
+			return
+		}
+	}
+
+	// Priority 4: Destination workload name (fallback)
+	// For internal services, this may be the service name.
+	// For external services, this may be an IP address if DNS wasn't cached.
+	ctx.Host = ctx.Connection.DestinationKey.GetDestinationWorkload().Name
+}
+
 // encodePayloads converts raw payloads to base64 with UTF-8 validation.
 func (ctx *HTTPRequestContext) encodePayloads() {
-	// For requests, store only the body.
+	// Process request payload - extract body only
 	if len(ctx.RawPayload) > 0 {
-		body, _ := splitHTTPPayload(ctx.RawPayload)
+		body := extractHTTPBody(ctx.RawPayload)
 		ctx.HasValidUTF8Payload = utf8.Valid(body)
 		if len(body) > 0 {
 			ctx.PayloadBase64 = base64.StdEncoding.EncodeToString(body)
 		}
 	}
 
-	// For responses, handle binary bodies gracefully.
+	// Process response payload
 	if len(ctx.RawResponse) > 0 {
-		responseBody, responseHeaders := splitHTTPPayload(ctx.RawResponse)
-		ctx.HasValidUTF8Response = utf8.Valid(responseBody)
+		body := extractHTTPBody(ctx.RawResponse)
+		ctx.HasValidUTF8Response = utf8.Valid(body)
 
-		// If the entire response is valid text, store it all.
+		// For valid UTF-8, encode entire response (headers + body)
+		// For binary, encode headers only
 		if utf8.Valid(ctx.RawResponse) {
 			ctx.ResponseBase64 = base64.StdEncoding.EncodeToString(ctx.RawResponse)
 		} else {
-			// Otherwise, it's likely a binary body; store headers only.
-			ctx.ResponseBase64 = base64.StdEncoding.EncodeToString(responseHeaders)
-		}
-	}
-}
-
-// splitHTTPPayload separates the headers from the body of an HTTP message.
-func splitHTTPPayload(payload []byte) (body []byte, headers []byte) {
-	separator := []byte("\r\n\r\n")
-	if i := strings.Index(string(payload), string(separator)); i != -1 {
-		return payload[i+len(separator):], payload[:i]
-	}
-	// If no separator is found, assume the whole payload is the body (e.g., for gRPC-like traffic)
-	return payload, nil
-}
-
-// resolveHost determines the host from connection or headers
-func (ctx *HTTPRequestContext) resolveHost() {
-	// Primary: Get host from destination workload
-	ctx.Host = ctx.Connection.DestinationKey.GetDestinationWorkload().Name
-
-	// Fallback: Extract from headers if primary is empty or IP
-	if ctx.Host == "" || isIPAddress(ctx.Host) {
-		if hostHeader := ctx.Headers.Get("Host"); hostHeader != "" {
-			ctx.Host = hostHeader
-		}
-	}
-}
-
-// extractTraceID extracts OpenTelemetry trace ID from headers
-func (ctx *HTTPRequestContext) extractTraceID() {
-	// Extract common trace headers
-	if traceParent := ctx.Headers.Get("traceparent"); traceParent != "" {
-		ctx.TraceID = extractTraceIDFromTraceParent(traceParent)
-	} else if xTraceID := ctx.Headers.Get("x-trace-id"); xTraceID != "" {
-		ctx.TraceID = xTraceID
-	} else if xB3TraceID := ctx.Headers.Get("x-b3-traceid"); xB3TraceID != "" {
-		ctx.TraceID = xB3TraceID
-	}
-}
-
-// extractTraceIDFromTraceParent parses W3C traceparent header
-func extractTraceIDFromTraceParent(traceParent string) string {
-	// W3C traceparent format: version-trace_id-parent_id-flags
-	// Example: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
-	if len(traceParent) >= 35 { // Minimum length for valid traceparent
-		parts := []rune(traceParent)
-		if len(parts) > 3 && parts[2] == '-' {
-			// Extract trace_id (32 hex chars starting at position 3)
-			if len(parts) >= 35 {
-				return string(parts[3:35])
+			headers := extractHTTPHeaders(ctx.RawResponse)
+			if len(headers) > 0 {
+				ctx.ResponseBase64 = base64.StdEncoding.EncodeToString(headers)
 			}
 		}
 	}
-	return traceParent // Return as-is if parsing fails
 }
 
-// IsLLMRequest determines if this is an LLM API request
-func (ctx *HTTPRequestContext) IsLLMRequest() bool {
-	provider := DetectLLMProvider(ctx.Host)
-	if provider != ProviderUnknown {
-		return true
+// extractTraceID extracts distributed tracing context from headers.
+// Supports W3C Trace Context, B3, and custom trace ID headers.
+func (ctx *HTTPRequestContext) extractTraceID() {
+	// W3C Trace Context (preferred)
+	if tp := ctx.Headers.Get("traceparent"); tp != "" {
+		ctx.TraceID = parseW3CTraceID(tp)
+		return
 	}
 
-	// Fallback detection from request content
-	if ctx.HasValidUTF8Payload {
-		provider = detectLLMFromHTTPRequest(ctx.RawPayload, ctx.ResponseBase64)
-		return provider != ProviderUnknown
+	// B3 propagation (Zipkin)
+	if b3 := ctx.Headers.Get("x-b3-traceid"); b3 != "" {
+		ctx.TraceID = b3
+		return
 	}
 
-	return false
+	// Custom trace ID header
+	if xTrace := ctx.Headers.Get("x-trace-id"); xTrace != "" {
+		ctx.TraceID = xTrace
+		return
+	}
+
+	// X-Request-ID (common in nginx/envoy)
+	if reqID := ctx.Headers.Get("x-request-id"); reqID != "" {
+		ctx.TraceID = reqID
+	}
 }
 
-// GetLLMProvider returns the detected LLM provider
+// detectSSE checks if this is a Server-Sent Events (streaming) response.
+func (ctx *HTTPRequestContext) detectSSE() {
+	// Check response Content-Type for SSE
+	if len(ctx.RawResponse) > 0 {
+		headers := extractHTTPHeaders(ctx.RawResponse)
+		headerStr := strings.ToLower(string(headers))
+		ctx.IsSSE = strings.Contains(headerStr, "text/event-stream")
+	}
+}
+
+// GetLLMProvider returns the detected LLM provider with caching.
 func (ctx *HTTPRequestContext) GetLLMProvider() LLMProvider {
-	provider := DetectLLMProvider(ctx.Host)
-	if provider != ProviderUnknown {
-		return provider
+	if ctx.llmProviderDone {
+		return ctx.llmProvider
+	}
+	ctx.llmProviderDone = true
+
+	// Primary: hostname-based detection
+	ctx.llmProvider = DetectLLMProvider(ctx.Host)
+	if ctx.llmProvider != ProviderUnknown {
+		return ctx.llmProvider
 	}
 
-	// Fallback detection
+	// Fallback: content-based detection for unknown hosts
 	if ctx.HasValidUTF8Payload {
-		return detectLLMFromHTTPRequest(ctx.RawPayload, ctx.ResponseBase64)
+		ctx.llmProvider = detectLLMFromHTTPRequest(ctx.RawPayload, ctx.ResponseBase64)
 	}
 
-	return ProviderUnknown
+	return ctx.llmProvider
 }
 
-// isIPAddress checks if a string represents an IP address
-func isIPAddress(host string) bool {
-	// Remove port if present
-	if strings.Contains(host, ":") {
-		host, _, _ = net.SplitHostPort(host)
+// IsLLMRequest returns true if this is an LLM API request.
+func (ctx *HTTPRequestContext) IsLLMRequest() bool {
+	return ctx.GetLLMProvider() != ProviderUnknown
+}
+
+// --- Helper functions ---
+
+// stripPort removes the port from a host:port string.
+func stripPort(hostPort string) string {
+	// IPv6 addresses are wrapped in brackets: [::1]:8080
+	if strings.HasPrefix(hostPort, "[") {
+		if idx := strings.LastIndex(hostPort, "]:"); idx != -1 {
+			return hostPort[1:idx]
+		}
+		// No port, just brackets
+		return strings.Trim(hostPort, "[]")
 	}
+
+	// IPv4 or hostname
+	if idx := strings.LastIndex(hostPort, ":"); idx != -1 {
+		// Verify it's actually a port (contains only digits after colon)
+		port := hostPort[idx+1:]
+		if len(port) > 0 && len(port) <= 5 {
+			isPort := true
+			for _, c := range port {
+				if c < '0' || c > '9' {
+					isPort = false
+					break
+				}
+			}
+			if isPort {
+				return hostPort[:idx]
+			}
+		}
+	}
+	return hostPort
+}
+
+// isIPAddress checks if a string represents an IP address.
+func isIPAddress(host string) bool {
+	host = stripPort(host)
 	return net.ParseIP(host) != nil
+}
+
+// extractHTTPBody extracts the body from an HTTP message (after \r\n\r\n).
+func extractHTTPBody(payload []byte) []byte {
+	separator := []byte("\r\n\r\n")
+	if idx := bytes.Index(payload, separator); idx != -1 {
+		return payload[idx+4:]
+	}
+	// No separator found - might be body-only (e.g., continued chunk)
+	return payload
+}
+
+// extractHTTPHeaders extracts headers from an HTTP message (before \r\n\r\n).
+func extractHTTPHeaders(payload []byte) []byte {
+	separator := []byte("\r\n\r\n")
+	if idx := bytes.Index(payload, separator); idx != -1 {
+		return payload[:idx]
+	}
+	return nil
+}
+
+// parseW3CTraceID extracts trace ID from W3C traceparent header.
+// Format: version-traceid-parentid-flags (e.g., 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01)
+func parseW3CTraceID(traceparent string) string {
+	// Minimum valid length: 2 (version) + 1 (-) + 32 (trace_id) + 1 (-) = 36
+	if len(traceparent) < 36 {
+		return traceparent
+	}
+
+	// Version should be 2 hex chars followed by dash
+	if traceparent[2] != '-' {
+		return traceparent
+	}
+
+	// Extract 32-char trace ID (positions 3-34)
+	traceID := traceparent[3:35]
+
+	// Validate it's hex
+	for _, c := range traceID {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return traceparent
+		}
+	}
+
+	return traceID
 }

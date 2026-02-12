@@ -126,6 +126,9 @@ func getClientSet() (*kubernetes.Clientset, error) {
 func main() {
 	// Initialize klog flags to prevent duplicate output
 	klog.InitFlags(nil)
+	if v := os.Getenv("KLOG_V"); v != "" {
+		flag.Set("v", v)
+	}
 	flag.Set("logtostderr", "false")
 	flag.Set("alsologtostderr", "false")
 	flag.Set("stderrthreshold", "FATAL")

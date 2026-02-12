@@ -21,6 +21,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
+	"github.com/cilium/ebpf/ringbuf"
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/coroot/coroot-node-agent/proc"
@@ -30,7 +31,7 @@ import (
 	"k8s.io/klog/v2"
 )
 
-const MaxPayloadSize = 4096
+const MaxPayloadSize = 8192 // Must match MAX_PAYLOAD_SIZE in eBPF
 
 type EventType uint32
 type EventReason uint32
@@ -47,7 +48,6 @@ const (
 	EventTypeTCPRetransmit    EventType = 9
 	EventTypeL7Request        EventType = 10
 	EventTypePythonThreadLock EventType = 11
-	EventTypeHTTPFragment     EventType = 12
 
 	EventReasonNone    EventReason = 0
 	EventReasonOOMKill EventReason = 1
@@ -69,23 +69,12 @@ type Event struct {
 	Timestamp     uint64
 	Duration      time.Duration
 	L7Request     *l7.RequestData
-	HTTPFragment  *HTTPResponseFragment
 	TrafficStats  *TrafficStats
 	Mnt           uint64
 	Log           bool
-}
-
-// HTTP response fragment data
-type HTTPResponseFragment struct {
-	Fd                  uint64
-	ConnectionTimestamp uint64
-	Pid                 uint32
-	FragmentId          uint32
-	TotalExpected       uint32
-	FragmentSize        uint16
-	IsFinal             bool
-	HttpStatus          uint16
-	Data                []byte
+	// Socket info extracted directly from fd in eBPF (for L7 events)
+	// This enables processing L7 events even when TCP connection tracking failed
+	SocketInfo *SocketInfo
 }
 
 type perfMapType uint8
@@ -103,10 +92,11 @@ type Tracer struct {
 	hostNetNs        netns.NsHandle
 	selfNetNs        netns.NsHandle
 
-	collection *ebpf.Collection
-	readers    map[string]*perf.Reader
-	links      []link.Link
-	uprobes    map[string]*ebpf.Program
+	collection    *ebpf.Collection
+	readers       map[string]*perf.Reader
+	ringbufReader *ringbuf.Reader // Ring buffer reader for l7_events
+	links         []link.Link
+	uprobes       map[string]*ebpf.Program
 }
 
 func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool) *Tracer {
@@ -145,6 +135,10 @@ func (t *Tracer) Close() {
 	}
 	for _, r := range t.readers {
 		_ = r.Close()
+	}
+	// Close ring buffer reader for l7_events
+	if t.ringbufReader != nil {
+		_ = t.ringbufReader.Close()
 	}
 	t.collection.Close()
 }
@@ -252,6 +246,13 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	}
 	t.collection = c
 
+	// Initialize socket info offsets for direct fd->socket tuple extraction
+	// This enables L7 event processing without dependency on TCP connection tracking
+	if err := t.initSocketInfoOffsets(); err != nil {
+		klog.Warningf("Failed to initialize socket info offsets: %v", err)
+		// Not fatal - socket info extraction just won't work
+	}
+
 	perfMaps := []perfMap{
 		{name: "proc_events", typ: perfMapTypeProcEvents, perCPUBufferSizePages: 4},
 		{name: "tcp_listen_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 4},
@@ -260,23 +261,27 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		{name: "file_events", typ: perfMapTypeFileEvents, perCPUBufferSizePages: 4},
 	}
 
-	if !t.disableL7Tracing {
-		perfMaps = append(perfMaps, perfMap{name: "l7_events", typ: perfMapTypeL7Events, perCPUBufferSizePages: 128}) // Increased for high-volume LLM API tracing
-	}
-
+	// Create perf buffer readers for non-L7 events
 	pageSize := os.Getpagesize()
 	for _, pm := range perfMaps {
-		wakeupEvents := 100
-		if pm.typ == perfMapTypeL7Events {
-			wakeupEvents = 50 // Process L7 events more frequently to reduce buffer pressure
-		}
-		r, err := perf.NewReaderWithOptions(t.collection.Maps[pm.name], pm.perCPUBufferSizePages*pageSize, perf.ReaderOptions{WakeupEvents: wakeupEvents})
+		r, err := perf.NewReaderWithOptions(t.collection.Maps[pm.name], pm.perCPUBufferSizePages*pageSize, perf.ReaderOptions{WakeupEvents: 100})
 		if err != nil {
 			t.Close()
 			return fmt.Errorf("failed to create ebpf reader: %w", err)
 		}
 		t.readers[pm.name] = r
 		go runEventsReader(pm.name, r, ch, pm.typ, pm.readTimeout)
+	}
+
+	// Create ring buffer reader for l7_events (provides global ordering for SSE streaming)
+	if !t.disableL7Tracing {
+		ringbufReader, err := ringbuf.NewReader(t.collection.Maps["l7_events"])
+		if err != nil {
+			t.Close()
+			return fmt.Errorf("failed to create ring buffer reader for l7_events: %w", err)
+		}
+		t.ringbufReader = ringbufReader
+		go runRingbufEventsReader("l7_events", ringbufReader, ch)
 	}
 
 	for _, programSpec := range collectionSpec.Programs {
@@ -397,21 +402,16 @@ type l7Event struct {
 	StatementId         uint32
 	PayloadSize         uint64
 	ResponseSize        uint64
-	Payload             [4096]byte // Must match MAX_PAYLOAD_SIZE in eBPF
-	Response            [4096]byte // Must match MAX_PAYLOAD_SIZE in eBPF
-}
-
-// HTTP response fragment event (must match eBPF struct)
-type httpResponseFragment struct {
-	Fd                  uint64
-	ConnectionTimestamp uint64
-	Pid                 uint32
-	FragmentId          uint32
-	TotalExpected       uint32
-	FragmentSize        uint16
-	IsFinal             uint8
-	HttpStatus          uint8
-	Data                [2048]byte // Must match HTTP_FRAGMENT_SIZE in eBPF
+	// Socket tuple - extracted directly from fd in eBPF, no TCP event dependency
+	Saddr           [16]byte // Source address (IPv4 in first 4 bytes, or full IPv6)
+	Daddr           [16]byte // Destination address
+	Sport           uint16   // Source port
+	Dport           uint16   // Destination port
+	AddrFamily      uint16   // AF_INET (2) or AF_INET6 (10)
+	SocketInfoValid uint8    // 1 if socket info was extracted
+	Padding2        uint8
+	Payload         [8192]byte // Must match MAX_PAYLOAD_SIZE in eBPF
+	Response        [8192]byte // Must match MAX_PAYLOAD_SIZE in eBPF
 }
 
 // lostSamplesTracker tracks lost samples per perf map and logs them periodically
@@ -544,6 +544,66 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 			}
 		default:
 			continue
+		}
+
+		ch <- event
+	}
+}
+
+// runRingbufEventsReader reads L7 events from ring buffer
+// Ring buffer provides global event ordering across CPUs, which is important
+// for streaming responses (SSE) where chunk order matters
+func runRingbufEventsReader(name string, r *ringbuf.Reader, ch chan<- Event) {
+	for {
+		rec, err := r.Read()
+		if err != nil {
+			if errors.Is(err, ringbuf.ErrClosed) {
+				klog.V(2).Infof("ring buffer reader %s closed", name)
+				break
+			}
+			klog.Warningf("failed to read from ring buffer %s: %v", name, err)
+			continue
+		}
+
+		v := &l7Event{}
+		if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
+			klog.Warningln("failed to read l7 event from ring buffer:", err)
+			continue
+		}
+
+		// Extract payload data directly from the struct arrays
+		payloadSize := min(int(v.PayloadSize), len(v.Payload))
+		responseSize := min(int(v.ResponseSize), len(v.Response))
+
+		// Copy the actual data (preventing garbage from unused buffer space)
+		payloadData := make([]byte, payloadSize)
+		copy(payloadData, v.Payload[:payloadSize])
+
+		responseData := make([]byte, responseSize)
+		copy(responseData, v.Response[:responseSize])
+
+		req := &l7.RequestData{
+			Protocol:     l7.Protocol(v.Protocol),
+			Status:       l7.Status(v.Status),
+			Duration:     time.Duration(v.Duration),
+			Method:       l7.Method(v.Method),
+			StatementId:  v.StatementId,
+			PayloadSize:  v.PayloadSize,
+			ResponseSize: v.ResponseSize,
+			Payload:      payloadData,
+			Response:     responseData,
+		}
+
+		// Extract socket info from L7 event (enables processing without TCP connection tracking)
+		socketInfo := GetSocketInfoFromL7Event(v)
+
+		event := Event{
+			Type:       EventTypeL7Request,
+			Pid:        v.Pid,
+			Fd:         v.Fd,
+			Timestamp:  v.ConnectionTimestamp,
+			L7Request:  req,
+			SocketInfo: socketInfo,
 		}
 
 		ch <- event
