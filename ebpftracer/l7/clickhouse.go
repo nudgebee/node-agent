@@ -6,7 +6,14 @@ import (
 	"github.com/ClickHouse/ch-go/proto"
 )
 
-func ParseClickhouse(payload []byte) string {
+func ParseClickhouse(payload []byte) (result string) {
+	// Recover from panics caused by malformed/incomplete packets
+	defer func() {
+		if r := recover(); r != nil {
+			result = ""
+		}
+	}()
+
 	r := proto.NewReader(bytes.NewReader(payload))
 	var err error
 	if _, err = r.Byte(); err != nil {

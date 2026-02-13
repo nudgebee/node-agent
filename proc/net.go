@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
-	"net"
 	"os"
 
 	"inet.af/netaddr"
@@ -93,24 +92,38 @@ func decodeAddr(src []byte) netaddr.IPPort {
 	if col == -1 || (col != 8 && col != 32) {
 		return netaddr.IPPort{}
 	}
-	ip := make([]byte, col/2)
-	if _, err := hex.Decode(ip, src[:col]); err != nil {
+
+	if len(src) < col+5 {
 		return netaddr.IPPort{}
 	}
-	port := make([]byte, 2)
-	if _, err := hex.Decode(port, src[col+1:]); err != nil {
+	// Use stack-allocated buffer for port to avoid heap allocation.
+	var portBuf [2]byte
+	// Port is 4 hex characters.
+	if _, err := hex.Decode(portBuf[:], src[col+1:col+5]); err != nil {
 		return netaddr.IPPort{}
+	}
+	port := binary.BigEndian.Uint16(portBuf[:])
+
+	// IPv4 address in /proc/net/tcp is stored as a little-endian 32-bit hex number.
+	// For example, 127.0.0.1 is 0100007F.
+	// We decode the hex directly into a stack-allocated array and then reverse the bytes
+	// to reconstruct the IP address in standard network order.
+	if col == 8 {
+		var ip [4]byte
+		if _, err := hex.Decode(ip[:], src[:col]); err != nil {
+			return netaddr.IPPort{}
+		}
+		ip[0], ip[1], ip[2], ip[3] = ip[3], ip[2], ip[1], ip[0]
+		return netaddr.IPPortFrom(netaddr.IPv4(ip[0], ip[1], ip[2], ip[3]), port)
 	}
 
-	var v uint32
-	for i := 0; i < len(ip); i += 4 {
-		v = binary.BigEndian.Uint32(ip[i : i+4])
-		binary.LittleEndian.PutUint32(ip[i:i+4], v)
-	}
-
-	ipp, ok := netaddr.FromStdIP(net.IP(ip))
-	if !ok {
+	// IPv6 address is stored as 4 32-bit integers, each in little-endian hex format.
+	var ip [16]byte
+	if _, err := hex.Decode(ip[:], src[:col]); err != nil {
 		return netaddr.IPPort{}
 	}
-	return netaddr.IPPortFrom(ipp, binary.BigEndian.Uint16(port))
+	for i := 0; i < 16; i += 4 {
+		ip[i], ip[i+1], ip[i+2], ip[i+3] = ip[i+3], ip[i+2], ip[i+1], ip[i]
+	}
+	return netaddr.IPPortFrom(netaddr.IPFrom16(ip), port)
 }
