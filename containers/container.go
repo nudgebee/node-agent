@@ -411,17 +411,18 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		if !ok {
 			continue
 		}
+		enrichedKey := c.enrichDestinationKey(d)
 		workload_src := c.srcWorkload
-		workload_dest := d.GetDestinationWorkload()
-		actualDestWorkload := d.GetActualDestinationWorkload()
+		workload_dest := enrichedKey.GetDestinationWorkload()
+		actualDestWorkload := enrichedKey.GetActualDestinationWorkload()
 
-		ch <- counter(metrics.NetConnectionsSuccessful, float64(stats.Count), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, workload_dest.Region, workload_dest.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
-		ch <- counter(metrics.NetConnectionsTotalTime, stats.TotalTime.Seconds(), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, workload_dest.Region, workload_dest.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
+		ch <- counter(metrics.NetConnectionsSuccessful, float64(stats.Count), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, workload_dest.Region, workload_dest.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
+		ch <- counter(metrics.NetConnectionsTotalTime, stats.TotalTime.Seconds(), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, workload_dest.Region, workload_dest.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
 		if stats.Retransmissions > 0 {
-			ch <- counter(metrics.NetRetransmits, float64(stats.Retransmissions), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, workload_dest.Region, workload_dest.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
+			ch <- counter(metrics.NetRetransmits, float64(stats.Retransmissions), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, workload_dest.Region, workload_dest.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
 		}
-		ch <- counter(metrics.NetBytesSent, float64(stats.BytesSent), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, workload_dest.Region, workload_dest.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
-		ch <- counter(metrics.NetBytesReceived, float64(stats.BytesReceived), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, workload_dest.Region, workload_dest.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
+		ch <- counter(metrics.NetBytesSent, float64(stats.BytesSent), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, workload_dest.Region, workload_dest.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
+		ch <- counter(metrics.NetBytesReceived, float64(stats.BytesReceived), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, workload_dest.Region, workload_dest.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
 	}
 	// Copy failedConnectionAttempts under read lock to avoid concurrent map access
 	c.lock.RLock()
@@ -446,9 +447,10 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	}
 	c.lock.RUnlock()
 	for d, count := range connections {
-		actualDestWorkload := d.GetActualDestinationWorkload()
-		destWorkload := d.GetDestinationWorkload()
-		ch <- gauge(metrics.NetConnectionsActive, float64(count), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), c.srcWorkload.Name, c.srcWorkload.Namespace, c.srcWorkload.Kind, destWorkload.Name, destWorkload.Namespace, destWorkload.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, c.srcWorkload.Region, c.srcWorkload.Zone, destWorkload.Region, destWorkload.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
+		enrichedKey := c.enrichDestinationKey(d)
+		actualDestWorkload := enrichedKey.GetActualDestinationWorkload()
+		destWorkload := enrichedKey.GetDestinationWorkload()
+		ch <- gauge(metrics.NetConnectionsActive, float64(count), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), c.srcWorkload.Name, c.srcWorkload.Namespace, c.srcWorkload.Kind, destWorkload.Name, destWorkload.Namespace, destWorkload.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, c.srcWorkload.Region, c.srcWorkload.Zone, destWorkload.Region, destWorkload.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
 	}
 
 	// Copy logParsers under read lock to avoid concurrent map access
@@ -1075,6 +1077,22 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	return ip2fqdn
 }
 
+// enrichDestinationKey checks if the DestinationKey has an IP-based workload name
+// and attempts to resolve it to an FQDN using the DNS cache. Returns the original
+// key if no resolution is needed or available.
+func (c *Container) enrichDestinationKey(key common.DestinationKey) common.DestinationKey {
+	ip := key.ActualDestinationIfKnown().IP()
+	if !common.IsIpExternal(ip) {
+		return key
+	}
+	if isIPAddress(key.GetDestinationWorkload().Name) {
+		if domain := c.registry.getDomain(ip); domain != nil {
+			return key.WithResolvedDomain(domain.FQDN)
+		}
+	}
+	return key
+}
+
 // onL7RequestWithResult processes an L7 request and returns the result along with whether it should be retried
 // socketInfo contains connection tuple extracted directly from fd in eBPF (nil if extraction failed)
 func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData, socketInfo *ebpftracer.SocketInfo) (map[netaddr.IP]*common.Domain, L7RequestResult) {
@@ -1117,6 +1135,10 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		return nil, L7RequestTimestampMismatch
 	}
 
+	// Enrich the destination key with FQDN from DNS cache (fixes race condition
+	// where DNS wasn't cached at connection open time but is available now)
+	enrichedKey := c.enrichDestinationKey(conn.DestinationKey)
+
 	// Check if eBPF traces are disabled (upstream feature)
 	ebpfTracesDisabled := false
 	for _, p := range c.processes {
@@ -1154,7 +1176,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		if t == "TypeAAAA" && r.Status == 0 && len(ips) == 0 {
 			return nil, L7RequestProcessed
 		}
-		c.l7Stats.observe(r.Protocol, status, t, r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, status, t, r.Duration, enrichedKey, conn.srcWorkload, r, "")
 
 		ip2fqdn := map[netaddr.IP]*common.Domain{}
 		if fqdn != "" {
@@ -1178,7 +1200,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		httpCtx := NewHTTPRequestContext(r, conn, dnsResolver)
 
 		// Update stats with extracted trace ID
-		c.l7Stats.observe(r.Protocol, r.Status.Http(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, httpCtx.TraceID)
+		c.l7Stats.observe(r.Protocol, r.Status.Http(), "", r.Duration, enrichedKey, conn.srcWorkload, r, httpCtx.TraceID)
 
 		// LLM tracking with improved detection
 		if httpCtx.IsLLMRequest() {
@@ -1278,7 +1300,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 				if req.GrpcStatus >= 0 {
 					status = req.GrpcStatus.GRPC()
 				}
-				c.l7Stats.observe(r.Protocol, status, "", req.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+				c.l7Stats.observe(r.Protocol, status, "", req.Duration, enrichedKey, conn.srcWorkload, r, "")
 				if trace != nil {
 					trace.Http2Request(req.Method, req.Path, req.Scheme, req.Status, req.GrpcStatus, req.Duration)
 				}
@@ -1345,7 +1367,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	case l7.ProtocolPostgres:
 		// Update stats for Postgres
 		if r.Method != l7.MethodStatementClose {
-			c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+			c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, enrichedKey, conn.srcWorkload, r, "")
 		}
 		if conn.postgresParser == nil {
 			conn.postgresParser = l7.NewPostgresParser()
@@ -1357,7 +1379,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	case l7.ProtocolMysql:
 		// Update stats for MySQL
 		if r.Method != l7.MethodStatementClose {
-			c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+			c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, enrichedKey, conn.srcWorkload, r, "")
 		}
 		if conn.mysqlParser == nil {
 			conn.mysqlParser = l7.NewMysqlParser()
@@ -1368,54 +1390,54 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		}
 	case l7.ProtocolMemcached:
 		// Update stats for Memcached
-		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, enrichedKey, conn.srcWorkload, r, "")
 		cmd, items := l7.ParseMemcached(r.Payload)
 		if trace != nil {
 			trace.MemcachedQuery(cmd, items, r.Status.Error(), r.Duration)
 		}
 	case l7.ProtocolRedis:
 		// Update stats for Redis
-		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, enrichedKey, conn.srcWorkload, r, "")
 		cmd, args := l7.ParseRedis(r.Payload)
 		if trace != nil {
 			trace.RedisQuery(cmd, args, r.Status.Error(), r.Duration)
 		}
 	case l7.ProtocolMongo:
 		// Update stats for Mongo
-		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, enrichedKey, conn.srcWorkload, r, "")
 		query := l7.ParseMongo(r.Payload)
 		if trace != nil {
 			trace.MongoQuery(query, r.Status.Error(), r.Duration)
 		}
 	case l7.ProtocolKafka, l7.ProtocolCassandra:
 		// Update stats for Kafka/Cassandra
-		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, enrichedKey, conn.srcWorkload, r, "")
 	case l7.ProtocolRabbitmq, l7.ProtocolNats:
 		// Update stats for RabbitMQ/Nats
-		c.l7Stats.observe(r.Protocol, r.Status.String(), r.Method.String(), 0, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), r.Method.String(), 0, enrichedKey, conn.srcWorkload, r, "")
 	case l7.ProtocolDubbo2:
 		// Update stats for Dubbo2
-		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, enrichedKey, conn.srcWorkload, r, "")
 	case l7.ProtocolClickhouse:
 		// Update stats for Clickhouse
-		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, enrichedKey, conn.srcWorkload, r, "")
 		query := l7.ParseClickhouse(r.Payload)
 		if trace != nil {
 			trace.ClickhouseQuery(query, r.Status.Error(), r.Duration)
 		}
 	case l7.ProtocolZookeeper:
 		// Update stats for Zookeeper
-		c.l7Stats.observe(r.Protocol, r.Status.Zookeeper(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.Zookeeper(), "", r.Duration, enrichedKey, conn.srcWorkload, r, "")
 		op, arg := l7.ParseZookeeper(r.Payload)
 		if trace != nil {
 			trace.ZookeeperRequest(op, arg, r.Status, r.Duration)
 		}
 	case l7.ProtocolFoundationDB:
 		// Update stats for FoundationDB
-		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, enrichedKey, conn.srcWorkload, r, "")
 	default:
 		// For all other protocols, update stats
-		c.l7Stats.observe(r.Protocol, "unknown", "", 0, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, "unknown", "", 0, enrichedKey, conn.srcWorkload, r, "")
 	}
 	return nil, L7RequestProcessed
 }

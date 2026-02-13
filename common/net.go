@@ -279,6 +279,13 @@ func NormalizeFQDN(fqdn string, requestType string) string {
 	return fqdn
 }
 
+func (dk DestinationKey) WithResolvedDomain(fqdn string) DestinationKey {
+	dk.destination = HostPortWithEmptyIP(fqdn, dk.destination.Port())
+	dk.destinationWorkload.Name = fqdn
+	dk.actualDestinationWorkload.Name = fqdn
+	return dk
+}
+
 func (dk DestinationKey) GetDestinationWorkload() Workload {
 	return dk.destinationWorkload
 }
