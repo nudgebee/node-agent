@@ -911,6 +911,7 @@ func (c *Container) updateConnectionTrafficStats(ac *ActiveConnection, sent, rec
 	if ac == nil {
 		return
 	}
+	c.migrateConnectionKeyIfNeeded(ac)
 	stats, _ := c.connectionStats.Get(ac.DestinationKey)
 	if stats == nil {
 		stats = &ConnectionStats{}
@@ -1112,6 +1113,50 @@ func (c *Container) enrichDestinationKey(key common.DestinationKey) common.Desti
 	return key
 }
 
+// migrateConnectionKeyIfNeeded updates conn.DestinationKey from IP to FQDN when
+// DNS becomes available, and migrates the corresponding connectionStats entry.
+// This fixes the root cause of duplicate metrics: connections opened before DNS
+// was cached get an IP-based key, while later connections get an FQDN-based key.
+// By migrating the key in-place, both converge to the same key.
+// Must be called under c.lock.
+func (c *Container) migrateConnectionKeyIfNeeded(conn *ActiveConnection) {
+	if conn == nil {
+		return
+	}
+	if !isIPAddress(conn.DestinationKey.GetDestinationWorkload().Name) {
+		return
+	}
+	ip := conn.DestinationKey.ActualDestinationIfKnown().IP()
+	if !common.IsIpExternal(ip) {
+		return
+	}
+	domain := c.registry.getDomain(ip)
+	if domain == nil {
+		return
+	}
+
+	oldKey := conn.DestinationKey
+	newKey := oldKey.WithResolvedDomain(domain.FQDN)
+
+	// Migrate connectionStats from old key to new key
+	oldStats, _ := c.connectionStats.Get(oldKey)
+	if oldStats != nil {
+		c.connectionStats.Remove(oldKey)
+		newStats, _ := c.connectionStats.Get(newKey)
+		if newStats != nil {
+			newStats.Count += oldStats.Count
+			newStats.TotalTime += oldStats.TotalTime
+			newStats.Retransmissions += oldStats.Retransmissions
+			newStats.BytesSent += oldStats.BytesSent
+			newStats.BytesReceived += oldStats.BytesReceived
+		} else {
+			c.connectionStats.Add(newKey, oldStats)
+		}
+	}
+
+	conn.DestinationKey = newKey
+}
+
 // onL7RequestWithResult processes an L7 request and returns the result along with whether it should be retried
 // socketInfo contains connection tuple extracted directly from fd in eBPF (nil if extraction failed)
 func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData, socketInfo *ebpftracer.SocketInfo) (map[netaddr.IP]*common.Domain, L7RequestResult) {
@@ -1154,9 +1199,9 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		return nil, L7RequestTimestampMismatch
 	}
 
-	// Enrich the destination key with FQDN from DNS cache (fixes race condition
-	// where DNS wasn't cached at connection open time but is available now)
-	enrichedKey := c.enrichDestinationKey(conn.DestinationKey)
+	// Migrate connection key from IP to FQDN if DNS is now available
+	// (fixes race condition where DNS wasn't cached at connection open time)
+	c.migrateConnectionKeyIfNeeded(conn)
 
 	// Check if eBPF traces are disabled (upstream feature)
 	ebpfTracesDisabled := false
@@ -1195,7 +1240,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		if t == "TypeAAAA" && r.Status == 0 && len(ips) == 0 {
 			return nil, L7RequestProcessed
 		}
-		c.l7Stats.observe(r.Protocol, status, t, r.Duration, enrichedKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, status, t, r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 
 		ip2fqdn := map[netaddr.IP]*common.Domain{}
 		if fqdn != "" {
@@ -1219,7 +1264,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		httpCtx := NewHTTPRequestContext(r, conn, dnsResolver)
 
 		// Update stats with extracted trace ID
-		c.l7Stats.observe(r.Protocol, r.Status.Http(), "", r.Duration, enrichedKey, conn.srcWorkload, r, httpCtx.TraceID)
+		c.l7Stats.observe(r.Protocol, r.Status.Http(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, httpCtx.TraceID)
 
 		// LLM tracking with improved detection
 		if httpCtx.IsLLMRequest() {
@@ -1319,7 +1364,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 				if req.GrpcStatus >= 0 {
 					status = req.GrpcStatus.GRPC()
 				}
-				c.l7Stats.observe(r.Protocol, status, "", req.Duration, enrichedKey, conn.srcWorkload, r, "")
+				c.l7Stats.observe(r.Protocol, status, "", req.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 				if trace != nil {
 					trace.Http2Request(req.Method, req.Path, req.Scheme, req.Status, req.GrpcStatus, req.Duration)
 				}
@@ -1386,7 +1431,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	case l7.ProtocolPostgres:
 		// Update stats for Postgres
 		if r.Method != l7.MethodStatementClose {
-			c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, enrichedKey, conn.srcWorkload, r, "")
+			c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		}
 		if conn.postgresParser == nil {
 			conn.postgresParser = l7.NewPostgresParser()
@@ -1398,7 +1443,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	case l7.ProtocolMysql:
 		// Update stats for MySQL
 		if r.Method != l7.MethodStatementClose {
-			c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, enrichedKey, conn.srcWorkload, r, "")
+			c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		}
 		if conn.mysqlParser == nil {
 			conn.mysqlParser = l7.NewMysqlParser()
@@ -1409,54 +1454,54 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		}
 	case l7.ProtocolMemcached:
 		// Update stats for Memcached
-		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, enrichedKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		cmd, items := l7.ParseMemcached(r.Payload)
 		if trace != nil {
 			trace.MemcachedQuery(cmd, items, r.Status.Error(), r.Duration)
 		}
 	case l7.ProtocolRedis:
 		// Update stats for Redis
-		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, enrichedKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		cmd, args := l7.ParseRedis(r.Payload)
 		if trace != nil {
 			trace.RedisQuery(cmd, args, r.Status.Error(), r.Duration)
 		}
 	case l7.ProtocolMongo:
 		// Update stats for Mongo
-		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, enrichedKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		query := l7.ParseMongo(r.Payload)
 		if trace != nil {
 			trace.MongoQuery(query, r.Status.Error(), r.Duration)
 		}
 	case l7.ProtocolKafka, l7.ProtocolCassandra:
 		// Update stats for Kafka/Cassandra
-		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, enrichedKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 	case l7.ProtocolRabbitmq, l7.ProtocolNats:
 		// Update stats for RabbitMQ/Nats
-		c.l7Stats.observe(r.Protocol, r.Status.String(), r.Method.String(), 0, enrichedKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), r.Method.String(), 0, conn.DestinationKey, conn.srcWorkload, r, "")
 	case l7.ProtocolDubbo2:
 		// Update stats for Dubbo2
-		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, enrichedKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 	case l7.ProtocolClickhouse:
 		// Update stats for Clickhouse
-		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, enrichedKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		query := l7.ParseClickhouse(r.Payload)
 		if trace != nil {
 			trace.ClickhouseQuery(query, r.Status.Error(), r.Duration)
 		}
 	case l7.ProtocolZookeeper:
 		// Update stats for Zookeeper
-		c.l7Stats.observe(r.Protocol, r.Status.Zookeeper(), "", r.Duration, enrichedKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.Zookeeper(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		op, arg := l7.ParseZookeeper(r.Payload)
 		if trace != nil {
 			trace.ZookeeperRequest(op, arg, r.Status, r.Duration)
 		}
 	case l7.ProtocolFoundationDB:
 		// Update stats for FoundationDB
-		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, enrichedKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 	default:
 		// For all other protocols, update stats
-		c.l7Stats.observe(r.Protocol, "unknown", "", 0, enrichedKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, "unknown", "", 0, conn.DestinationKey, conn.srcWorkload, r, "")
 	}
 	return nil, L7RequestProcessed
 }
