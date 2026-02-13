@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"flag"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
@@ -123,7 +124,14 @@ func getClientSet() (*kubernetes.Clientset, error) {
 }
 
 func main() {
-	klog.LogToStderr(false)
+	// Initialize klog flags to prevent duplicate output
+	klog.InitFlags(nil)
+	if v := os.Getenv("KLOG_V"); v != "" {
+		flag.Set("v", v)
+	}
+	flag.Set("logtostderr", "false")
+	flag.Set("alsologtostderr", "false")
+	flag.Set("stderrthreshold", "FATAL")
 	klog.SetOutput(&RateLimitedLogOutput{limiter: rate.NewLimiter(rate.Limit(*flags.LogPerSecond), *flags.LogBurst)})
 
 	klog.Infoln("agent version:", version)

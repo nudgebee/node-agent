@@ -432,3 +432,147 @@ func isHTTPSService(host string) bool {
 
 	return false
 }
+
+// LLMStreamInfo contains information about a completed LLM stream for tracing
+type LLMStreamInfo struct {
+	Provider         string
+	Model            string
+	Operation        string
+	ServerAddress    string
+	TraceID          string
+	ParentSpanID     string
+	RequestTime      time.Time
+	FirstTokenTime   time.Time
+	CompletionTime   time.Time
+	InputTokens      int
+	OutputTokens     int
+	StatusCode       int
+	IsError          bool
+	CompletionReason string
+}
+
+// LLMRequest creates a trace span for an LLM API request
+func (t *Trace) LLMRequest(info LLMStreamInfo) {
+	if t == nil || t.tracer.otel == nil {
+		return
+	}
+
+	if !shouldSample() {
+		return
+	}
+
+	ctx := context.Background()
+
+	// Set up parent context from traceparent if available
+	if info.TraceID != "" {
+		traceID, err := trace.TraceIDFromHex(info.TraceID)
+		if err == nil {
+			spanCtxConfig := trace.SpanContextConfig{
+				TraceID:    traceID,
+				TraceFlags: trace.FlagsSampled,
+				Remote:     true,
+			}
+			if info.ParentSpanID != "" {
+				spanID, err := trace.SpanIDFromHex(info.ParentSpanID)
+				if err == nil {
+					spanCtxConfig.SpanID = spanID
+				}
+			}
+			spanCtx := trace.NewSpanContext(spanCtxConfig)
+			ctx = trace.ContextWithRemoteSpanContext(ctx, spanCtx)
+		}
+	}
+
+	// Span name follows OTel GenAI conventions: "{provider} {operation}"
+	spanName := fmt.Sprintf("%s %s", sanitizeUTF8(info.Provider), sanitizeUTF8(info.Operation))
+
+	// Create span with explicit start time
+	_, span := t.tracer.otel.Start(ctx, spanName,
+		trace.WithTimestamp(info.RequestTime),
+		trace.WithSpanKind(trace.SpanKindClient),
+	)
+
+	// OTel GenAI semantic conventions attributes
+	attrs := []attribute.KeyValue{
+		attribute.String("gen_ai.system", sanitizeUTF8(info.Provider)),
+		attribute.String("gen_ai.operation.name", sanitizeUTF8(info.Operation)),
+		attribute.String("gen_ai.request.model", sanitizeUTF8(info.Model)),
+		attribute.String("server.address", sanitizeUTF8(info.ServerAddress)),
+		attribute.Int("server.port", 443),
+		attribute.String("network.protocol.name", "http"),
+		attribute.String("network.protocol.version", "2"),
+		attribute.Bool("gen_ai.response.is_streaming", true),
+	}
+
+	// Token usage
+	if info.InputTokens > 0 {
+		attrs = append(attrs, attribute.Int("gen_ai.usage.input_tokens", info.InputTokens))
+	}
+	if info.OutputTokens > 0 {
+		attrs = append(attrs, attribute.Int("gen_ai.usage.output_tokens", info.OutputTokens))
+	}
+	if info.InputTokens > 0 || info.OutputTokens > 0 {
+		attrs = append(attrs, attribute.Int("gen_ai.usage.total_tokens", info.InputTokens+info.OutputTokens))
+	}
+
+	// TTFT (Time to First Token)
+	if !info.FirstTokenTime.IsZero() {
+		ttftMs := info.FirstTokenTime.Sub(info.RequestTime).Milliseconds()
+		attrs = append(attrs, attribute.Int64("gen_ai.response.time_to_first_token_ms", ttftMs))
+
+		// Add first token event
+		span.AddEvent("gen_ai.first_token",
+			trace.WithTimestamp(info.FirstTokenTime),
+			trace.WithAttributes(
+				attribute.Int64("gen_ai.response.time_to_first_token_ms", ttftMs),
+			),
+		)
+	}
+
+	// Tokens per second
+	if info.OutputTokens > 0 && !info.FirstTokenTime.IsZero() && !info.CompletionTime.IsZero() {
+		genDuration := info.CompletionTime.Sub(info.FirstTokenTime).Seconds()
+		if genDuration > 0 {
+			tps := float64(info.OutputTokens) / genDuration
+			attrs = append(attrs, attribute.Float64("gen_ai.response.tokens_per_second", tps))
+		}
+	}
+
+	// HTTP status code
+	if info.StatusCode > 0 {
+		attrs = append(attrs, attribute.Int("http.response.status_code", info.StatusCode))
+	}
+
+	// Set all attributes
+	span.SetAttributes(attrs...)
+	span.SetAttributes(t.commonAttrs...)
+
+	// Stream completion event
+	span.AddEvent("gen_ai.stream_complete",
+		trace.WithTimestamp(info.CompletionTime),
+		trace.WithAttributes(
+			attribute.Int("gen_ai.usage.output_tokens", info.OutputTokens),
+			attribute.String("gen_ai.completion_reason", sanitizeUTF8(info.CompletionReason)),
+		),
+	)
+
+	// Set error status if applicable
+	if info.IsError {
+		errorType := "unknown"
+		switch info.StatusCode {
+		case 429:
+			errorType = "rate_limit"
+		case 400, 422:
+			errorType = "invalid_request"
+		case 401, 403:
+			errorType = "auth_error"
+		case 500, 502, 503, 504:
+			errorType = "server_error"
+		}
+		span.SetStatus(codes.Error, errorType)
+		span.SetAttributes(attribute.String("error.type", errorType))
+	}
+
+	// End span with completion time
+	span.End(trace.WithTimestamp(info.CompletionTime))
+}

@@ -8,16 +8,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
+	"github.com/cilium/ebpf/ringbuf"
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/coroot/coroot-node-agent/proc"
@@ -27,7 +31,14 @@ import (
 	"k8s.io/klog/v2"
 )
 
-const MaxPayloadSize = 4096
+const (
+	MaxPayloadSize = 8192 // Must match MAX_PAYLOAD_SIZE in eBPF
+
+	l7EventHeaderSize = 96 // 56 bytes base + 40 bytes socket tuple fields
+	tcpEventSize      = 104
+	fileEventSize     = 32
+	procEventSize     = 12
+)
 
 type EventType uint32
 type EventReason uint32
@@ -44,7 +55,6 @@ const (
 	EventTypeTCPRetransmit    EventType = 9
 	EventTypeL7Request        EventType = 10
 	EventTypePythonThreadLock EventType = 11
-	EventTypeHTTPFragment     EventType = 12
 
 	EventReasonNone    EventReason = 0
 	EventReasonOOMKill EventReason = 1
@@ -66,23 +76,12 @@ type Event struct {
 	Timestamp     uint64
 	Duration      time.Duration
 	L7Request     *l7.RequestData
-	HTTPFragment  *HTTPResponseFragment
 	TrafficStats  *TrafficStats
 	Mnt           uint64
 	Log           bool
-}
-
-// HTTP response fragment data
-type HTTPResponseFragment struct {
-	Fd                  uint64
-	ConnectionTimestamp uint64
-	Pid                 uint32
-	FragmentId          uint32
-	TotalExpected       uint32
-	FragmentSize        uint16
-	IsFinal             bool
-	HttpStatus          uint16
-	Data                []byte
+	// Socket info extracted directly from fd in eBPF (for L7 events)
+	// This enables processing L7 events even when TCP connection tracking failed
+	SocketInfo *SocketInfo
 }
 
 type perfMapType uint8
@@ -100,10 +99,11 @@ type Tracer struct {
 	hostNetNs        netns.NsHandle
 	selfNetNs        netns.NsHandle
 
-	collection *ebpf.Collection
-	readers    map[string]*perf.Reader
-	links      []link.Link
-	uprobes    map[string]*ebpf.Program
+	collection    *ebpf.Collection
+	readers       map[string]*perf.Reader
+	ringbufReader *ringbuf.Reader // Ring buffer reader for l7_events
+	links         []link.Link
+	uprobes       map[string]*ebpf.Program
 }
 
 func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool) *Tracer {
@@ -142,6 +142,10 @@ func (t *Tracer) Close() {
 	}
 	for _, r := range t.readers {
 		_ = r.Close()
+	}
+	// Close ring buffer reader for l7_events
+	if t.ringbufReader != nil {
+		_ = t.ringbufReader.Close()
 	}
 	t.collection.Close()
 }
@@ -249,6 +253,13 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	}
 	t.collection = c
 
+	// Initialize socket info offsets for direct fd->socket tuple extraction
+	// This enables L7 event processing without dependency on TCP connection tracking
+	if err := t.initSocketInfoOffsets(); err != nil {
+		klog.Warningf("Failed to initialize socket info offsets: %v", err)
+		// Not fatal - socket info extraction just won't work
+	}
+
 	perfMaps := []perfMap{
 		{name: "proc_events", typ: perfMapTypeProcEvents, perCPUBufferSizePages: 4},
 		{name: "tcp_listen_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 4},
@@ -257,23 +268,27 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		{name: "file_events", typ: perfMapTypeFileEvents, perCPUBufferSizePages: 4},
 	}
 
-	if !t.disableL7Tracing {
-		perfMaps = append(perfMaps, perfMap{name: "l7_events", typ: perfMapTypeL7Events, perCPUBufferSizePages: 64}) // Increased for high-volume LLM API tracing
-	}
-
+	// Create perf buffer readers for non-L7 events
 	pageSize := os.Getpagesize()
 	for _, pm := range perfMaps {
-		wakeupEvents := 100
-		if pm.typ == perfMapTypeL7Events {
-			wakeupEvents = 50 // Process L7 events more frequently to reduce buffer pressure
-		}
-		r, err := perf.NewReaderWithOptions(t.collection.Maps[pm.name], pm.perCPUBufferSizePages*pageSize, perf.ReaderOptions{WakeupEvents: wakeupEvents})
+		r, err := perf.NewReaderWithOptions(t.collection.Maps[pm.name], pm.perCPUBufferSizePages*pageSize, perf.ReaderOptions{WakeupEvents: 100})
 		if err != nil {
 			t.Close()
 			return fmt.Errorf("failed to create ebpf reader: %w", err)
 		}
 		t.readers[pm.name] = r
 		go runEventsReader(pm.name, r, ch, pm.typ, pm.readTimeout)
+	}
+
+	// Create ring buffer reader for l7_events (provides global ordering for SSE streaming)
+	if !t.disableL7Tracing {
+		ringbufReader, err := ringbuf.NewReader(t.collection.Maps["l7_events"])
+		if err != nil {
+			t.Close()
+			return fmt.Errorf("failed to create ring buffer reader for l7_events: %w", err)
+		}
+		t.ringbufReader = ringbufReader
+		go runRingbufEventsReader("l7_events", ringbufReader, ch)
 	}
 
 	for _, programSpec := range collectionSpec.Programs {
@@ -394,24 +409,52 @@ type l7Event struct {
 	StatementId         uint32
 	PayloadSize         uint64
 	ResponseSize        uint64
-	Payload             [4096]byte // Must match MAX_PAYLOAD_SIZE in eBPF
-	Response            [4096]byte // Must match MAX_PAYLOAD_SIZE in eBPF
+	// Socket tuple - extracted directly from fd in eBPF, no TCP event dependency
+	Saddr           [16]byte // Source address (IPv4 in first 4 bytes, or full IPv6)
+	Daddr           [16]byte // Destination address
+	Sport           uint16   // Source port
+	Dport           uint16   // Destination port
+	AddrFamily      uint16   // AF_INET (2) or AF_INET6 (10)
+	SocketInfoValid uint8    // 1 if socket info was extracted
+	Padding2        uint8
+	Payload         [8192]byte // Must match MAX_PAYLOAD_SIZE in eBPF
+	Response        [8192]byte // Must match MAX_PAYLOAD_SIZE in eBPF
 }
 
-// HTTP response fragment event (must match eBPF struct)
-type httpResponseFragment struct {
-	Fd                  uint64
-	ConnectionTimestamp uint64
-	Pid                 uint32
-	FragmentId          uint32
-	TotalExpected       uint32
-	FragmentSize        uint16
-	IsFinal             uint8
-	HttpStatus          uint8
-	Data                [2048]byte // Must match HTTP_FRAGMENT_SIZE in eBPF
+// lostSamplesTracker tracks lost samples per perf map and logs them periodically
+type lostSamplesTracker struct {
+	count    atomic.Uint64
+	lastLog  atomic.Int64 // Unix timestamp in seconds
+	interval int64        // Log interval in seconds
+}
+
+var lostSamplesTrackers = sync.Map{} // map[string]*lostSamplesTracker
+
+func getLostSamplesTracker(name string) *lostSamplesTracker {
+	tracker, ok := lostSamplesTrackers.Load(name)
+	if !ok {
+		tracker, _ = lostSamplesTrackers.LoadOrStore(name, &lostSamplesTracker{interval: 10})
+	}
+	return tracker.(*lostSamplesTracker)
+}
+
+func (t *lostSamplesTracker) recordLostSamples(name string, count uint64, cpu int) {
+	t.count.Add(count)
+	now := time.Now().Unix()
+	lastLog := t.lastLog.Load()
+	if now-lastLog >= t.interval {
+		if t.lastLog.CompareAndSwap(lastLog, now) {
+			total := t.count.Swap(0)
+			if total > 0 {
+				// Use standard log package to avoid klog's multi-severity output
+				log.Printf("ERROR: %s lost %d samples total (last on CPU %d) in the last %d seconds", name, total, cpu, t.interval)
+			}
+		}
+	}
 }
 
 func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapType, readTimeout time.Duration) {
+	tracker := getLostSamplesTracker(name)
 	if readTimeout == 0 {
 		readTimeout = 100 * time.Millisecond
 	}
@@ -425,85 +468,102 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 			continue
 		}
 		if rec.LostSamples > 0 {
-			klog.Errorln(name, "lost samples:", rec.LostSamples)
+			tracker.recordLostSamples(name, rec.LostSamples, rec.CPU)
 			continue
 		}
 		var event Event
 
 		switch typ {
 		case perfMapTypeL7Events:
-			v := &l7Event{}
 			data := rec.RawSample
-
-			if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read l7 event:", err)
+			if len(data) < l7EventHeaderSize {
+				klog.Warningln("invalid l7 event size:", len(data))
 				continue
 			}
+			payloadSize := binary.LittleEndian.Uint64(data[40:48])
+			responseSize := binary.LittleEndian.Uint64(data[48:56])
+			payloadLen := int(payloadSize)
+			if payloadLen > MaxPayloadSize {
+				payloadLen = MaxPayloadSize
+			}
+			responseLen := int(responseSize)
+			if responseLen > MaxPayloadSize {
+				responseLen = MaxPayloadSize
+			}
 
-			// Extract payload data directly from the struct arrays
-			payloadSize := min(int(v.PayloadSize), len(v.Payload))
-			responseSize := min(int(v.ResponseSize), len(v.Response))
+			payloadData := make([]byte, payloadLen)
+			if l7EventHeaderSize+payloadLen <= len(data) {
+				copy(payloadData, data[l7EventHeaderSize:l7EventHeaderSize+payloadLen])
+			}
 
-			// Copy the actual data (preventing garbage from unused buffer space)
-			payloadData := make([]byte, payloadSize)
-			copy(payloadData, v.Payload[:payloadSize])
-
-			responseData := make([]byte, responseSize)
-			copy(responseData, v.Response[:responseSize])
+			responseData := make([]byte, responseLen)
+			respOffset := l7EventHeaderSize + MaxPayloadSize
+			if respOffset+responseLen <= len(data) {
+				copy(responseData, data[respOffset:respOffset+responseLen])
+			}
 
 			req := &l7.RequestData{
-				Protocol:     l7.Protocol(v.Protocol),
-				Status:       l7.Status(v.Status),
-				Duration:     time.Duration(v.Duration),
-				Method:       l7.Method(v.Method),
-				StatementId:  v.StatementId,
-				PayloadSize:  v.PayloadSize,
-				ResponseSize: v.ResponseSize,
+				Protocol:     l7.Protocol(data[32]),
+				Method:       l7.Method(data[33]),
+				Status:       l7.Status(int32(binary.LittleEndian.Uint32(data[20:24]))),
+				Duration:     time.Duration(binary.LittleEndian.Uint64(data[24:32])),
+				StatementId:  binary.LittleEndian.Uint32(data[36:40]),
+				PayloadSize:  payloadSize,
+				ResponseSize: responseSize,
 				Payload:      payloadData,
 				Response:     responseData,
 			}
 
 			event = Event{
 				Type:      EventTypeL7Request,
-				Pid:       v.Pid,
-				Fd:        v.Fd,
-				Timestamp: v.ConnectionTimestamp,
+				Pid:       binary.LittleEndian.Uint32(data[16:20]),
+				Fd:        binary.LittleEndian.Uint64(data[0:8]),
+				Timestamp: binary.LittleEndian.Uint64(data[8:16]),
 				L7Request: req,
 			}
 		case perfMapTypeFileEvents:
-			v := &fileEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read file event:", err)
-				continue
-			}
-			event = Event{Type: v.Type, Pid: v.Pid, Fd: v.Fd, Mnt: v.Mnt, Log: v.Log > 0}
-		case perfMapTypeProcEvents:
-			v := &procEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read proc event:", err)
-				continue
-			}
-			event = Event{Type: v.Type, Reason: EventReason(v.Reason), Pid: v.Pid}
-		case perfMapTypeTCPEvents:
-			v := &tcpEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read tcp event:", err)
+			if len(rec.RawSample) < fileEventSize {
+				klog.Warningln("invalid file event size:", len(rec.RawSample))
 				continue
 			}
 			event = Event{
-				Type:          v.Type,
-				Pid:           v.Pid,
-				SrcAddr:       ipPort(v.SAddr, v.SPort),
-				DstAddr:       ipPort(v.DAddr, v.DPort),
-				ActualDstAddr: ipPort(v.AAddr, v.Aport),
-				Fd:            v.Fd,
-				Timestamp:     v.Timestamp,
-				Duration:      time.Duration(v.Duration),
+				Type: EventType(binary.LittleEndian.Uint32(rec.RawSample[0:4])),
+				Pid:  binary.LittleEndian.Uint32(rec.RawSample[4:8]),
+				Fd:   binary.LittleEndian.Uint64(rec.RawSample[8:16]),
+				Mnt:  binary.LittleEndian.Uint64(rec.RawSample[16:24]),
+				Log:  binary.LittleEndian.Uint64(rec.RawSample[24:32]) > 0,
 			}
-			if v.Type == EventTypeConnectionClose {
+		case perfMapTypeProcEvents:
+			if len(rec.RawSample) < procEventSize {
+				klog.Warningln("invalid proc event size:", len(rec.RawSample))
+				continue
+			}
+			event = Event{
+				Type:   EventType(binary.LittleEndian.Uint32(rec.RawSample[0:4])),
+				Pid:    binary.LittleEndian.Uint32(rec.RawSample[4:8]),
+				Reason: EventReason(binary.LittleEndian.Uint32(rec.RawSample[8:12])),
+			}
+		case perfMapTypeTCPEvents:
+			if len(rec.RawSample) < tcpEventSize {
+				klog.Warningln("invalid tcp event size:", len(rec.RawSample))
+				continue
+			}
+			data := rec.RawSample
+			typ := EventType(binary.LittleEndian.Uint32(data[24:28]))
+			event = Event{
+				Type:          typ,
+				Pid:           binary.LittleEndian.Uint32(data[28:32]),
+				SrcAddr:       ipPort(data[54:70], binary.LittleEndian.Uint16(data[48:50])),
+				DstAddr:       ipPort(data[70:86], binary.LittleEndian.Uint16(data[50:52])),
+				ActualDstAddr: ipPort(data[86:102], binary.LittleEndian.Uint16(data[52:54])),
+				Fd:            binary.LittleEndian.Uint64(data[0:8]),
+				Timestamp:     binary.LittleEndian.Uint64(data[8:16]),
+				Duration:      time.Duration(binary.LittleEndian.Uint64(data[16:24])),
+			}
+			if typ == EventTypeConnectionClose {
 				event.TrafficStats = &TrafficStats{
-					BytesSent:     v.BytesSent,
-					BytesReceived: v.BytesReceived,
+					BytesSent:     binary.LittleEndian.Uint64(data[32:40]),
+					BytesReceived: binary.LittleEndian.Uint64(data[40:48]),
 				}
 			}
 		default:
@@ -514,8 +574,94 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 	}
 }
 
-func ipPort(ip [16]byte, port uint16) netaddr.IPPort {
-	i, _ := netaddr.FromStdIP(ip[:])
+// runRingbufEventsReader reads L7 events from ring buffer
+// Ring buffer provides global event ordering across CPUs, which is important
+// for streaming responses (SSE) where chunk order matters
+func runRingbufEventsReader(name string, r *ringbuf.Reader, ch chan<- Event) {
+	for {
+		rec, err := r.Read()
+		if err != nil {
+			if errors.Is(err, ringbuf.ErrClosed) {
+				klog.V(2).Infof("ring buffer reader %s closed", name)
+				break
+			}
+			klog.Warningf("failed to read from ring buffer %s: %v", name, err)
+			continue
+		}
+
+		data := rec.RawSample
+		if len(data) < l7EventHeaderSize {
+			klog.Warningln("invalid l7 event from ring buffer, size:", len(data))
+			continue
+		}
+
+		payloadSize := binary.LittleEndian.Uint64(data[40:48])
+		responseSize := binary.LittleEndian.Uint64(data[48:56])
+
+		payloadLen := int(payloadSize)
+		if payloadLen > MaxPayloadSize {
+			payloadLen = MaxPayloadSize
+		}
+		responseLen := int(responseSize)
+		if responseLen > MaxPayloadSize {
+			responseLen = MaxPayloadSize
+		}
+
+		payloadData := make([]byte, payloadLen)
+		if l7EventHeaderSize+payloadLen <= len(data) {
+			copy(payloadData, data[l7EventHeaderSize:l7EventHeaderSize+payloadLen])
+		}
+
+		responseData := make([]byte, responseLen)
+		respOffset := l7EventHeaderSize + MaxPayloadSize
+		if respOffset+responseLen <= len(data) {
+			copy(responseData, data[respOffset:respOffset+responseLen])
+		}
+
+		req := &l7.RequestData{
+			Protocol:     l7.Protocol(data[32]),
+			Method:       l7.Method(data[33]),
+			Status:       l7.Status(int32(binary.LittleEndian.Uint32(data[20:24]))),
+			Duration:     time.Duration(binary.LittleEndian.Uint64(data[24:32])),
+			StatementId:  binary.LittleEndian.Uint32(data[36:40]),
+			PayloadSize:  payloadSize,
+			ResponseSize: responseSize,
+			Payload:      payloadData,
+			Response:     responseData,
+		}
+
+		// Extract socket info from raw bytes
+		var socketInfo *SocketInfo
+		if data[94] != 0 { // SocketInfoValid at offset 94
+			var saddr, daddr [16]byte
+			copy(saddr[:], data[56:72])
+			copy(daddr[:], data[72:88])
+			addrFamily := binary.LittleEndian.Uint16(data[92:94])
+			socketInfo = &SocketInfo{
+				SrcIP:   extractIPFromSocketInfo(saddr, addrFamily),
+				DstIP:   extractIPFromSocketInfo(daddr, addrFamily),
+				SrcPort: binary.LittleEndian.Uint16(data[88:90]),
+				DstPort: binary.LittleEndian.Uint16(data[90:92]),
+				Family:  addrFamily,
+				Valid:   true,
+			}
+		}
+
+		event := Event{
+			Type:       EventTypeL7Request,
+			Pid:        binary.LittleEndian.Uint32(data[16:20]),
+			Fd:         binary.LittleEndian.Uint64(data[0:8]),
+			Timestamp:  binary.LittleEndian.Uint64(data[8:16]),
+			L7Request:  req,
+			SocketInfo: socketInfo,
+		}
+
+		ch <- event
+	}
+}
+
+func ipPort(ip []byte, port uint16) netaddr.IPPort {
+	i, _ := netaddr.FromStdIP(ip)
 	return netaddr.IPPortFrom(i, port)
 }
 

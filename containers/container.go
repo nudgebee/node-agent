@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"sort"
 	"strings"
@@ -72,6 +71,7 @@ type LLMStats struct {
 	Provider         LLMProvider
 	Model            string
 	Host             string
+	Operation        string // OTel GenAI operation name (chat, text_completion, embeddings, generate_content)
 	RequestCount     int64
 	PromptTokens     int64
 	CompletionTokens int64
@@ -160,10 +160,14 @@ type Container struct {
 	lastConnectionAttempts   map[common.HostPort]time.Time
 	activeConnections        map[ConnectionKey]*ActiveConnection
 	connectionsByPidFd       map[PidFd]*ActiveConnection
+	googleHTTP2Parsers       map[PidFd]*l7.Http2Parser // Per-connection HTTP/2 parsers (keyed by pid:fd for correct HPACK state)
 
 	l7Stats L7Stats
 
 	llmStats map[string]*LLMStats
+
+	// LLM stream tracker for SSE-based completion detection
+	llmStreamTracker *LLMStreamTracker
 
 	gpuStats map[string]*GpuUsage
 
@@ -198,15 +202,31 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		return nil, err
 	}
 	defer netNs.Close()
-	split := strings.Split(string(id), "/")
-	if len(split) < 4 {
-		klog.Errorf("unexpected container id %s", id)
-		return nil, errors.New("unexpected container id")
+
+	// Resolve workload based on container type
+	var src_workload common.Workload
+	idStr := string(id)
+	split := strings.Split(idStr, "/")
+
+	if strings.HasPrefix(idStr, "/k8s/") || strings.HasPrefix(idStr, "/k8s-cronjob/") {
+		// Kubernetes container: /k8s/namespace/pod/container or /k8s-cronjob/namespace/job/container
+		if len(split) < 4 {
+			klog.Errorf("unexpected k8s container id %s", id)
+			return nil, errors.New("unexpected container id")
+		}
+		namespace := split[2]
+		podName := split[3]
+		src_workload = registry.ip_resolver.ResolvePodOwner(podName, namespace)
+		klog.Infof("Pod %s/%s is owned by %s/%s/%s", namespace, podName, src_workload.Name, src_workload.Namespace, src_workload.Kind)
+	} else {
+		// Non-k8s containers (docker, systemd, swarm, nomad): use container name as workload
+		name := ""
+		if len(split) > 0 {
+			name = split[len(split)-1]
+		}
+		src_workload = common.Workload{Name: name, Kind: "container"}
+		klog.V(2).Infof("Non-k8s container %s using workload name: %s", id, name)
 	}
-	namespace := split[2]
-	podName := split[3]
-	src_workload := registry.ip_resolver.ResolvePodOwner(podName, namespace)
-	klog.Infof("Pod %s/%s is owned by %s/%s/%s", namespace, podName, src_workload.Name, src_workload.Namespace, src_workload.Kind)
 
 	cid := string(id)
 	appId := common.ContainerIdToOtelServiceName(cid)
@@ -257,6 +277,11 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 	}
 	c.connectionStats = connStatsCache
 
+	// Initialize LLM stream tracker with completion callback
+	c.llmStreamTracker = NewLLMStreamTracker(func(stream *LLMStream) {
+		c.onLLMStreamComplete(stream)
+	})
+
 	c.runLogParser("")
 
 	go func() {
@@ -279,6 +304,10 @@ func (c *Container) Close() {
 	for _, p := range c.logParsers {
 		p.Stop()
 	}
+	// Stop the LLM stream tracker
+	if c.llmStreamTracker != nil {
+		c.llmStreamTracker.Stop()
+	}
 	close(c.done)
 }
 
@@ -292,29 +321,16 @@ func (c *Container) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *Container) Collect(ch chan<- prometheus.Metric) {
-	// Add comprehensive performance monitoring
 	collectStart := time.Now()
 
-	// Lock-free throttling using atomic operations
+	// Throttle: prevent duplicate metric emissions within 1 second
 	currentCount := atomic.AddInt64(&c.collectCallCount, 1)
-	now := time.Now()
-	nowNanos := now.UnixNano()
-
-	// Get last collection time atomically
+	nowNanos := time.Now().UnixNano()
 	lastCollectNanos := atomic.LoadInt64(&c.lastCollectTime)
-	timeSinceLastCall := time.Duration(nowNanos - lastCollectNanos)
-
-	// Prevent duplicate metric emissions by ensuring minimum 1 second interval between collections
-	if timeSinceLastCall < 1*time.Second && currentCount > 1 {
-		klog.V(2).Infof("COLLECT_SKIP: Container %s skipped due to recent collection (%v ago)", c.id, timeSinceLastCall)
+	if time.Duration(nowNanos-lastCollectNanos) < 1*time.Second && currentCount > 1 {
 		return
 	}
-
-	// Update last collection time atomically
 	atomic.StoreInt64(&c.lastCollectTime, nowNanos)
-
-	// Track timing of different collection phases
-	phaseStart := time.Now()
 
 	if c.metadata.image != "" || c.metadata.systemdTriggeredBy != "" {
 		ch <- gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemdTriggeredBy)
@@ -381,13 +397,6 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
-	// Log basic metrics phase timing
-	basicMetricsTime := time.Since(phaseStart)
-	if basicMetricsTime > 100*time.Millisecond {
-		klog.V(2).Infof("COLLECT_TIMING: Container %s basic metrics took %v", c.id, basicMetricsTime)
-	}
-	phaseStart = time.Now()
-
 	for addr, open := range c.getListens() {
 		ch <- gauge(metrics.NetListenInfo, float64(open), addr.String(), "")
 	}
@@ -396,13 +405,6 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 			ch <- gauge(metrics.NetListenInfo, 1, addr.String(), proxy)
 		}
 	}
-
-	// Log network listen metrics phase timing
-	listenTime := time.Since(phaseStart)
-	if listenTime > 100*time.Millisecond {
-		klog.V(2).Infof("COLLECT_TIMING: Container %s listen metrics took %v", c.id, listenTime)
-	}
-	phaseStart = time.Now()
 
 	for _, d := range c.connectionStats.Keys() {
 		stats, ok := c.connectionStats.Peek(d)
@@ -421,34 +423,43 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		ch <- counter(metrics.NetBytesSent, float64(stats.BytesSent), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, workload_dest.Region, workload_dest.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
 		ch <- counter(metrics.NetBytesReceived, float64(stats.BytesReceived), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, workload_dest.Region, workload_dest.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
 	}
-	for dst, count := range c.failedConnectionAttempts {
+	// Copy failedConnectionAttempts under read lock to avoid concurrent map access
+	c.lock.RLock()
+	failedConnCopy := make(map[common.HostPort]int64, len(c.failedConnectionAttempts))
+	for k, v := range c.failedConnectionAttempts {
+		failedConnCopy[k] = v
+	}
+	c.lock.RUnlock()
+
+	for dst, count := range failedConnCopy {
 		workload := c.ip_resolver.ResolveIP(dst.IP().String())
 		ch <- counter(metrics.NetConnectionsFailed, float64(count), dst.String(), workload.Name, workload.Namespace, workload.Kind, workload.Name, workload.Namespace, workload.Kind, c.srcWorkload.Region, c.srcWorkload.Zone, workload.Region, workload.Zone, workload.Region, workload.Zone, workload.Instance)
 	}
 
-	// Log connection stats phase timing
-	connStatsTime := time.Since(phaseStart)
-	if connStatsTime > 500*time.Millisecond {
-		klog.Warningf("COLLECT_TIMING: Container %s connection stats took %v", c.id, connStatsTime)
-	} else if connStatsTime > 100*time.Millisecond {
-		klog.V(2).Infof("COLLECT_TIMING: Container %s connection stats took %v", c.id, connStatsTime)
-	}
-	phaseStart = time.Now()
-
 	connections := map[common.DestinationKey]int{}
+	c.lock.RLock()
 	for _, conn := range c.activeConnections {
 		if !conn.Closed.IsZero() {
 			continue
 		}
 		connections[conn.DestinationKey]++
 	}
+	c.lock.RUnlock()
 	for d, count := range connections {
 		actualDestWorkload := d.GetActualDestinationWorkload()
 		destWorkload := d.GetDestinationWorkload()
 		ch <- gauge(metrics.NetConnectionsActive, float64(count), d.DestinationLabelValue(), d.ActualDestinationLabelValue(), c.srcWorkload.Name, c.srcWorkload.Namespace, c.srcWorkload.Kind, destWorkload.Name, destWorkload.Namespace, destWorkload.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, c.srcWorkload.Region, c.srcWorkload.Zone, destWorkload.Region, destWorkload.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
 	}
 
-	for source, p := range c.logParsers {
+	// Copy logParsers under read lock to avoid concurrent map access
+	c.lock.RLock()
+	logParsersCopy := make(map[string]*LogParser, len(c.logParsers))
+	for k, v := range c.logParsers {
+		logParsersCopy[k] = v
+	}
+	c.lock.RUnlock()
+
+	for source, p := range logParsersCopy {
 		for _, ctr := range p.parser.GetCounters() {
 			if ctr.Level == logparser.LevelCritical || ctr.Level == logparser.LevelError {
 				sample, ok := c.logSamples[ctr.Hash]
@@ -467,13 +478,22 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	appTypes := map[string]struct{}{}
 	seenJvms := map[string]bool{}
 	seenDotNetApps := map[string]bool{}
-	pids := maps.Keys(c.processes)
+
+	// Copy processes map under read lock to avoid concurrent map access
+	c.lock.RLock()
+	processesCopy := make(map[uint32]*Process, len(c.processes))
+	for pid, p := range c.processes {
+		processesCopy[pid] = p
+	}
+	c.lock.RUnlock()
+
+	pids := maps.Keys(processesCopy)
 	sort.Slice(pids, func(i, j int) bool {
 		return pids[i] < pids[j]
 	})
 
 	for _, pid := range pids {
-		process := c.processes[pid]
+		process := processesCopy[pid]
 		cmdline := proc.GetCmdline(pid)
 		if len(cmdline) == 0 {
 			continue
@@ -538,37 +558,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		ch <- counter(metrics.NodejsEventLoopBlockedTime, c.nodejsStats.EventLoopBlockedTime.Seconds())
 	}
 
-	// LLM metrics collection
-	for _, stats := range c.llmStats {
-		ch <- counter(metrics.LLMRequests, float64(stats.RequestCount), string(stats.Provider), stats.Model, stats.Host)
-		ch <- counter(metrics.LLMTokensUsed, float64(stats.PromptTokens), string(stats.Provider), stats.Model, "prompt", stats.Host)
-		ch <- counter(metrics.LLMTokensUsed, float64(stats.CompletionTokens), string(stats.Provider), stats.Model, "completion", stats.Host)
-		ch <- counter(metrics.LLMTokensUsed, float64(stats.TotalTokens), string(stats.Provider), stats.Model, "total", stats.Host)
-		if stats.RequestCount > 0 {
-			avgLatency := float64(stats.TotalLatency) / float64(stats.RequestCount) / float64(time.Second)
-			ch <- gauge(metrics.LLMLatency, avgLatency, string(stats.Provider), stats.Model, stats.Host)
-		}
-	}
-
-	// Log process and application metrics phase timing
-	processTime := time.Since(phaseStart)
-	if processTime > 500*time.Millisecond {
-		klog.Warningf("COLLECT_TIMING: Container %s process metrics took %v", c.id, processTime)
-	} else if processTime > 100*time.Millisecond {
-		klog.V(2).Infof("COLLECT_TIMING: Container %s process metrics took %v", c.id, processTime)
-	}
-	phaseStart = time.Now()
-
 	c.l7Stats.collect(ch)
-
-	// Log L7 stats collection timing
-	l7Time := time.Since(phaseStart)
-	if l7Time > 1*time.Second {
-		klog.Warningf("COLLECT_TIMING: Container %s L7 stats took %v", c.id, l7Time)
-	} else if l7Time > 200*time.Millisecond {
-		klog.V(2).Infof("COLLECT_TIMING: Container %s L7 stats took %v", c.id, l7Time)
-	}
-	phaseStart = time.Now()
 
 	if !*flags.DisablePinger {
 		for ip, rtt := range c.ping() {
@@ -577,19 +567,11 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
-	// Log final phase and total timing
-	finalTime := time.Since(phaseStart)
-	if finalTime > 100*time.Millisecond {
-		klog.V(2).Infof("COLLECT_TIMING: Container %s final phase took %v", c.id, finalTime)
-	}
-
 	totalTime := time.Since(collectStart)
 	if totalTime > 2*time.Second {
 		klog.Errorf("COLLECT_SLOW: Container %s total Collect() took %v", c.id, totalTime)
 	} else if totalTime > 1*time.Second {
 		klog.Warningf("COLLECT_SLOW: Container %s total Collect() took %v", c.id, totalTime)
-	} else if totalTime > 500*time.Millisecond {
-		klog.V(1).Infof("COLLECT_TIMING: Container %s total Collect() took %v", c.id, totalTime)
 	}
 }
 
@@ -815,6 +797,63 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 	c.lastConnectionAttempts[key.Destination()] = time.Now()
 }
 
+// createConnectionFromSocketInfo creates an ActiveConnection from socket info extracted in eBPF
+// This is used when TCP connection tracking fails (common for Go TLS due to goroutine thread switching)
+// but we have socket tuple info extracted directly from the fd
+func (c *Container) createConnectionFromSocketInfo(pid uint32, fd uint64, socketInfo *ebpftracer.SocketInfo) *ActiveConnection {
+	if socketInfo == nil || !socketInfo.Valid {
+		return nil
+	}
+
+	// Parse destination IP
+	dstIP, err := netaddr.ParseIP(socketInfo.DstIP)
+	if err != nil {
+		klog.V(2).Infof("createConnectionFromSocketInfo: failed to parse dst IP %s: %v", socketInfo.DstIP, err)
+		return nil
+	}
+
+	// Parse source IP
+	srcIP, err := netaddr.ParseIP(socketInfo.SrcIP)
+	if err != nil {
+		klog.V(2).Infof("createConnectionFromSocketInfo: failed to parse src IP %s: %v", socketInfo.SrcIP, err)
+		return nil
+	}
+
+	dst := netaddr.IPPortFrom(dstIP, socketInfo.DstPort)
+	src := netaddr.IPPortFrom(srcIP, socketInfo.SrcPort)
+
+	// Resolve workloads
+	srcWorkload := c.ip_resolver.ResolveIP(src.IP().String())
+	dstWorkload := c.ip_resolver.ResolveIP(dst.IP().String())
+	actualDstWorkload := c.ip_resolver.ResolveActualIP(dst.IP().String())
+
+	// Try to get DNS domain for destination
+	domain := c.registry.getDomain(dst.IP())
+
+	// Create destination key
+	key := common.NewDestinationKey(dst, dst, domain, dstWorkload, actualDstWorkload)
+
+	// Create connection
+	connection := &ActiveConnection{
+		DestinationKey:     key,
+		Pid:                pid,
+		Fd:                 fd,
+		Timestamp:          0, // We don't have timestamp from socket info
+		srcWorkload:        srcWorkload,
+		dstWorkload:        dstWorkload,
+		actualDestWorkload: actualDstWorkload,
+	}
+
+	// Store in connectionsByPidFd for future L7 events on same connection
+	k := PidFd{Pid: pid, Fd: fd}
+	c.connectionsByPidFd[k] = connection
+
+	klog.V(2).Infof("L7_CONN_CREATED_FROM_SOCKET: pid=%d fd=%d src=%s dst=%s domain=%v",
+		pid, fd, src, dst, domain)
+
+	return connection
+}
+
 func (c *Container) onConnectionClose(e ebpftracer.Event) {
 	c.lock.Lock()
 	conn := c.connectionsByPidFd[PidFd{Pid: e.Pid, Fd: e.Fd}]
@@ -866,27 +905,37 @@ func (c *Container) updateConnectionTrafficStats(ac *ActiveConnection, sent, rec
 	ac.BytesReceived = received
 }
 
-func (c *Container) trackLLMRequest(provider LLMProvider, host, payloadBase64, responseBase64 string, duration time.Duration) {
+func (c *Container) trackLLMRequest(provider LLMProvider, host, path, payloadBase64, responseBase64 string, duration time.Duration) {
+	klog.V(2).Infof("LLM_TRACK_START: provider=%s host=%s path=%s reqBase64Len=%d respBase64Len=%d",
+		provider, host, path, len(payloadBase64), len(responseBase64))
 	// Parse request data
-	llmReq, err := ParseLLMRequest(provider, payloadBase64)
+	llmReq, err := ParseLLMRequest(provider, payloadBase64, path)
 	if err != nil || llmReq == nil {
+		klog.Infof("LLM_TRACK_PARSE_REQ_FAIL: provider=%s err=%v req=%v", provider, err, llmReq)
 		return // Skip tracking if we can't parse the request
 	}
+	klog.V(2).Infof("LLM_TRACK_REQ_PARSED: model=%s operation=%s", llmReq.Model, llmReq.Operation)
 
 	// Parse response data for token usage
-	llmResp, _ := ParseLLMResponse(provider, responseBase64)
+	llmResp, respErr := ParseLLMResponse(provider, responseBase64, path)
+	klog.V(2).Infof("LLM_TRACK_RESP_PARSED: resp=%+v err=%v", llmResp, respErr)
 
-	// Store LLM metrics for collection during next Collect() call
-	c.lock.Lock()
-	defer c.lock.Unlock()
+	// Determine operation from path (for OTel GenAI conventions)
+	operation := GetOperation(path)
 
-	key := string(provider) + ":" + llmReq.Model + ":" + host
+	// NOTE: No lock needed here - this function is ONLY called from onL7RequestWithResult
+	// which already holds c.lock. Adding a lock here would cause deadlock since Go's
+	// sync.Mutex is not reentrant.
+
+	// Key includes operation for proper OTel metric grouping
+	key := string(provider) + ":" + llmReq.Model + ":" + operation + ":" + host
 	stats := c.llmStats[key]
 	if stats == nil {
 		stats = &LLMStats{
-			Provider: provider,
-			Model:    llmReq.Model,
-			Host:     host,
+			Provider:  provider,
+			Model:     llmReq.Model,
+			Host:      host,
+			Operation: operation,
 		}
 		c.llmStats[key] = stats
 	}
@@ -900,18 +949,172 @@ func (c *Container) trackLLMRequest(provider LLMProvider, host, payloadBase64, r
 		stats.CompletionTokens += int64(llmResp.CompletionTokens)
 		stats.TotalTokens += int64(llmResp.TotalTokens)
 	}
+
+	// Emit Prometheus metrics (same as RecordLLMStreamMetrics for streaming path)
+	model := llmReq.Model
+	if model == "" {
+		model = "unknown"
+	}
+	if operation == "" {
+		operation = "unknown"
+	}
+	containerID := string(c.id)
+
+	ContainerLLMRequestsTotal.With(prometheus.Labels{
+		"container_id":              containerID,
+		"gen_ai_operation_name":     operation,
+		"gen_ai_request_model":      model,
+		"gen_ai_system":             string(provider),
+		"server_address":            host,
+		"http_response_status_code": "200",
+	}).Inc()
+
+	if llmResp != nil {
+		if llmResp.PromptTokens > 0 {
+			ContainerLLMTokenUsageTotal.With(prometheus.Labels{
+				"container_id":          containerID,
+				"gen_ai_operation_name": operation,
+				"gen_ai_request_model":  model,
+				"gen_ai_system":         string(provider),
+				"server_address":        host,
+				"gen_ai_token_type":     "input",
+			}).Add(float64(llmResp.PromptTokens))
+		}
+		if llmResp.CompletionTokens > 0 {
+			ContainerLLMTokenUsageTotal.With(prometheus.Labels{
+				"container_id":          containerID,
+				"gen_ai_operation_name": operation,
+				"gen_ai_request_model":  model,
+				"gen_ai_system":         string(provider),
+				"server_address":        host,
+				"gen_ai_token_type":     "output",
+			}).Add(float64(llmResp.CompletionTokens))
+		}
+	}
+
+	ContainerLLMRequestDuration.With(prometheus.Labels{
+		"container_id":          containerID,
+		"gen_ai_operation_name": operation,
+		"gen_ai_request_model":  model,
+		"gen_ai_system":         string(provider),
+		"server_address":        host,
+	}).Observe(duration.Seconds())
 }
 
+// onLLMStreamComplete is called when an LLM stream completes (detected via SSE markers)
+// This handles emitting metrics and traces for streaming LLM responses
+func (c *Container) onLLMStreamComplete(stream *LLMStream) {
+	klog.V(2).Infof("LLM_CALLBACK_CALLED: container=%s stream=%+v", c.id, stream != nil)
+	if stream == nil {
+		return
+	}
+
+	// Fill in container context if not set
+	if stream.ContainerID == "" {
+		stream.ContainerID = string(c.id)
+	}
+	if stream.PodName == "" {
+		stream.PodName = c.srcWorkload.Name
+	}
+	if stream.Namespace == "" {
+		stream.Namespace = c.srcWorkload.Namespace
+	}
+
+	// Record Prometheus metrics
+	RecordLLMStreamMetrics(stream)
+
+	// Emit OTel trace if tracer is available
+	if c.tracer != nil {
+		// Create a trace for the LLM request
+		dstWorkload := common.Workload{Name: stream.ServerAddress}
+		trace := c.tracer.NewTrace(
+			common.HostPortWithEmptyIP(stream.ServerAddress, 443),
+			c.srcWorkload,
+			dstWorkload,
+			dstWorkload,
+		)
+		if trace != nil {
+			trace.LLMRequest(tracing.LLMStreamInfo{
+				Provider:         string(stream.Provider),
+				Model:            stream.Model,
+				Operation:        stream.Operation,
+				ServerAddress:    stream.ServerAddress,
+				TraceID:          stream.TraceID,
+				ParentSpanID:     stream.ParentSpanID,
+				RequestTime:      stream.RequestTime,
+				FirstTokenTime:   stream.FirstTokenTime,
+				CompletionTime:   stream.CompletionTime,
+				InputTokens:      stream.InputTokens,
+				OutputTokens:     stream.OutputTokens,
+				StatusCode:       stream.StatusCode,
+				IsError:          stream.State == StreamStateError || stream.StatusCode >= 400,
+				CompletionReason: stream.CompletionReason,
+			})
+		}
+	}
+
+	klog.V(1).Infof("LLM_STREAM_METRICS_EMITTED: container=%s provider=%s model=%s "+
+		"input_tokens=%d output_tokens=%d duration_ms=%d ttft_ms=%d",
+		c.id, stream.Provider, stream.Model,
+		stream.InputTokens, stream.OutputTokens,
+		stream.CompletionTime.Sub(stream.RequestTime).Milliseconds(),
+		stream.FirstTokenTime.Sub(stream.RequestTime).Milliseconds())
+}
+
+// L7RequestResult indicates the result of processing an L7 request
+type L7RequestResult int
+
+const (
+	L7RequestProcessed         L7RequestResult = iota // Event was processed successfully
+	L7RequestConnNotFound                             // Connection not found - should retry
+	L7RequestTimestampMismatch                        // Timestamp mismatch - don't retry
+)
+
 func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData) map[netaddr.IP]*common.Domain {
+	ip2fqdn, _ := c.onL7RequestWithResult(pid, fd, timestamp, r, nil)
+	return ip2fqdn
+}
+
+// onL7RequestWithResult processes an L7 request and returns the result along with whether it should be retried
+// socketInfo contains connection tuple extracted directly from fd in eBPF (nil if extraction failed)
+func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData, socketInfo *ebpftracer.SocketInfo) (map[netaddr.IP]*common.Domain, L7RequestResult) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
 	conn := c.connectionsByPidFd[PidFd{Pid: pid, Fd: fd}]
 	if conn == nil {
-		return nil
+		// TCP connection tracking failed - common for Go TLS due to goroutine thread switching
+		// Try to create connection from socket info extracted directly from fd in eBPF
+		if socketInfo != nil && socketInfo.Valid {
+			klog.V(2).Infof("L7_CREATING_CONN_FROM_SOCKET_INFO: pid=%d fd=%d dst=%s:%d container=%s",
+				pid, fd, socketInfo.DstIP, socketInfo.DstPort, c.id)
+			conn = c.createConnectionFromSocketInfo(pid, fd, socketInfo)
+		}
+
+		if conn == nil {
+			// For HTTP/2 TLS connections, we can still process LLM detection using
+			// the :authority header from HTTP/2 frames (fallback path)
+			if r.Protocol == l7.ProtocolHTTP2 {
+				klog.V(2).Infof("HTTP2_CONN_NOT_FOUND: pid=%d fd=%d container=%s - attempting connectionless processing",
+					pid, fd, c.id)
+				return c.processHTTP2WithoutConnection(pid, fd, r)
+			}
+			klog.V(2).Infof("L7_EVENT_CONN_NOT_FOUND: pid=%d fd=%d container=%s num_connections=%d",
+				pid, fd, c.id, len(c.connectionsByPidFd))
+			return nil, L7RequestConnNotFound
+		}
 	}
 	if timestamp != 0 && conn.Timestamp != timestamp {
-		return nil
+		klog.V(2).Infof("L7_EVENT_TIMESTAMP_MISMATCH: pid=%d fd=%d event_ts=%d conn_ts=%d protocol=%d",
+			pid, fd, timestamp, conn.Timestamp, r.Protocol)
+		// For HTTP/2, fall through to connectionless processing instead of dropping.
+		// This handles Go TLS connections (S2A, gRPC) where ensure_connection_tracked()
+		// in eBPF creates entries with different timestamps than TCP tracepoints.
+		// Pass the destination IP so DNS cache can resolve :authority when HPACK fails.
+		if r.Protocol == l7.ProtocolHTTP2 {
+			return c.processHTTP2WithoutConnection(pid, fd, r, conn.DestinationKey.ActualDestinationIfKnown().IP())
+		}
+		return nil, L7RequestTimestampMismatch
 	}
 
 	// Check if eBPF traces are disabled (upstream feature)
@@ -941,15 +1144,15 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	case l7.ProtocolDNS:
 		status := r.Status.DNS()
 		if status == "" {
-			return nil
+			return nil, L7RequestProcessed
 		}
 		t, fqdn, ips := l7.ParseDns(r.Payload)
 		if t == "" {
-			return nil
+			return nil, L7RequestProcessed
 		}
 		// To reduce the number of metrics, we ignore AAAA requests with empty results
 		if t == "TypeAAAA" && r.Status == 0 && len(ips) == 0 {
-			return nil
+			return nil, L7RequestProcessed
 		}
 		c.l7Stats.observe(r.Protocol, status, t, r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 
@@ -960,24 +1163,27 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 				ip2fqdn[ip] = d
 			}
 		}
-		return ip2fqdn
+		return ip2fqdn, L7RequestProcessed
 	case l7.ProtocolHTTP:
+		// DNS resolver function - allows HTTP processor to lookup hostnames at request time
+		// This fixes the race condition where DNS cache wasn't populated at connection time
+		dnsResolver := func(ip netaddr.IP) string {
+			if domain := c.registry.getDomain(ip); domain != nil {
+				return domain.FQDN
+			}
+			return ""
+		}
+
 		// Use new HTTP processor - parse once, use everywhere
-		httpCtx := NewHTTPRequestProcessor(r, conn)
+		httpCtx := NewHTTPRequestContext(r, conn, dnsResolver)
 
 		// Update stats with extracted trace ID
 		c.l7Stats.observe(r.Protocol, r.Status.Http(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, httpCtx.TraceID)
 
-		// Debug logging for SSL payload capture (enable via environment variable)
-		if os.Getenv("DEBUG_SSL_PAYLOAD") == "true" {
-			log.Printf("SSL Payload Debug: %s -> %s: payload_len=%d, response_len=%d",
-				conn.srcWorkload.Name, httpCtx.Host, len(r.Payload), len(r.Response))
-		}
-
 		// LLM tracking with improved detection
 		if httpCtx.IsLLMRequest() {
 			provider := httpCtx.GetLLMProvider()
-			c.trackLLMRequest(provider, httpCtx.Host, httpCtx.PayloadBase64, httpCtx.ResponseBase64, r.Duration)
+			c.trackLLMRequest(provider, httpCtx.Host, httpCtx.Path, httpCtx.PayloadBase64, httpCtx.ResponseBase64, r.Duration)
 		}
 
 		// Create trace with processed context
@@ -987,12 +1193,86 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		}
 	case l7.ProtocolHTTP2:
 		// HTTP/2 stats will be updated in the loop below
-
-		if conn.http2Parser == nil {
-			conn.http2Parser = l7.NewHttp2Parser()
+		// Each HTTP/2 connection has its own HPACK dynamic table, so we use per-fd
+		// parsers to avoid header decoding corruption across connections.
+		if c.googleHTTP2Parsers == nil {
+			c.googleHTTP2Parsers = make(map[PidFd]*l7.Http2Parser)
 		}
-		requests := conn.http2Parser.Parse(r.Method, r.Payload, uint64(r.Duration))
+		pidFd := PidFd{Pid: pid, Fd: fd}
+		if c.googleHTTP2Parsers[pidFd] == nil {
+			c.googleHTTP2Parsers[pidFd] = l7.NewHttp2Parser()
+		}
+		// Use per-connection parser (each HTTP/2 connection has its own HPACK dynamic table)
+		parser := c.googleHTTP2Parsers[pidFd]
+		conn.http2Parser = parser // Keep reference on connection for compatibility
+		requests := parser.Parse(r.Method, r.Payload, uint64(r.Duration))
+		activeCount := parser.ActiveRequestCount()
+		if activeCount > 0 {
+			klog.V(3).Infof("HTTP2_PARSE_RESULT: pid=%d fd=%d completed=%d active=%d",
+				pid, fd, len(requests), activeCount)
+		}
+
+		// Feed active streams to LLM stream tracker for SSE-based completion detection
+		// This handles streaming LLM responses that don't send END_STREAM until complete
+		if c.llmStreamTracker != nil {
+			// Resolve host for LLM detection
+			host := conn.DestinationKey.GetDestinationWorkload().Name
+			if isIPAddress(host) {
+				if domain := c.registry.getDomain(conn.DestinationKey.ActualDestinationIfKnown().IP()); domain != nil {
+					host = domain.FQDN
+				}
+			}
+			// Also try :authority header if host is still an IP
+			if host == "" || isIPAddress(host) {
+				for _, update := range parser.GetActiveStreamsForLLM() {
+					if update.Authority != "" && !isIPAddress(update.Authority) {
+						host = update.Authority
+						break
+					}
+				}
+			}
+
+			// Process active streams for LLM tracking
+			activeStreams := parser.GetActiveStreamsForLLM()
+			for _, update := range activeStreams {
+				streamHost := host
+				if streamHost == "" && update.Authority != "" {
+					streamHost = update.Authority
+				}
+
+				klog.V(3).Infof("LLM_STREAM_UPDATE: pid=%d fd=%d stream=%d host=%s path=%s hasStatus=%v respPayloadLen=%d",
+					pid, fd, update.StreamId, streamHost, update.Path, update.HasResponseStatus, len(update.ResponsePayload))
+
+				// Notify stream tracker of request headers (for new streams)
+				c.llmStreamTracker.OnRequestHeaders(
+					pid, uint32(fd), update.StreamId,
+					streamHost, update.Path,
+					update.RequestHeaders,
+					string(c.id), c.srcWorkload.Name, c.srcWorkload.Namespace,
+				)
+
+				// Notify stream tracker of response status
+				if update.HasResponseStatus {
+					c.llmStreamTracker.OnResponseHeaders(
+						pid, uint32(fd), update.StreamId,
+						int(update.Status), nil,
+					)
+				}
+
+				// Feed response data for SSE completion detection
+				if len(update.ResponsePayload) > 0 {
+					klog.V(3).Infof("LLM_STREAM_DATA: pid=%d fd=%d stream=%d dataLen=%d",
+						pid, fd, update.StreamId, len(update.ResponsePayload))
+					c.llmStreamTracker.OnDataFrame(
+						pid, uint32(fd), update.StreamId,
+						update.ResponsePayload, true,
+					)
+				}
+			}
+		}
 		for _, req := range requests {
+			klog.V(2).Infof("HTTP2_COMPLETED_REQUEST: pid=%d fd=%d method=%s path=%s status=%d req_payload_len=%d resp_payload_len=%d",
+				pid, fd, req.Method, req.Path, req.Status, len(req.RequestPayload), len(req.ResponsePayload))
 			if !common.HttpFilter.ShouldBeSkipped(req.Path) {
 				status := req.Status.Http()
 				if req.GrpcStatus >= 0 {
@@ -1005,7 +1285,19 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 			}
 
 			// Enhanced LLM API tracking for HTTP/2 (including gRPC-based LLM services)
+			// Resolve host with DNS cache lookup at request time (fixes race condition)
 			host := conn.DestinationKey.GetDestinationWorkload().Name
+			if isIPAddress(host) {
+				if domain := c.registry.getDomain(conn.DestinationKey.ActualDestinationIfKnown().IP()); domain != nil {
+					host = domain.FQDN
+				}
+			}
+			// Fallback to :authority pseudo-header from HTTP/2 request
+			if host == "" || isIPAddress(host) {
+				if req.Authority != "" {
+					host = req.Authority
+				}
+			}
 
 			// Use extracted HTTP/2 DATA frame payloads for LLM tracking
 			requestPayloadBase64 := ""
@@ -1019,13 +1311,35 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 			}
 
 			provider := DetectLLMProvider(host)
-			if provider == ProviderUnknown && len(req.RequestPayload) > 0 {
-				// Fallback: Try to detect from HTTP/2 request and response payload
-				provider = detectLLMFromHTTPRequest(req.RequestPayload, responsePayloadBase64)
+			isGRPC := strings.HasPrefix(req.ContentType, "application/grpc")
+			klog.V(3).Infof("HTTP2_LLM_DETECTION: host=%s path=%s provider=%s contentType=%s isGRPC=%v reqPayloadLen=%d respPayloadLen=%d",
+				host, req.Path, provider, req.ContentType, isGRPC, len(req.RequestPayload), len(req.ResponsePayload))
+			if provider == ProviderUnknown {
+				// Fallback: Try to detect from HTTP/2 request path
+				provider, _ = DetectLLMProviderFromPath(req.Path)
+				// For gRPC, also check if it's a Gemini service
+				if provider == ProviderUnknown && isGRPC {
+					service, _ := ExtractGRPCServiceMethod(req.Path)
+					if IsGeminiGRPCService(service) {
+						provider = ProviderGoogle
+					}
+				}
+				// Last resort: analyze request/response structure (don't use detectLLMFromHTTPRequest
+				// which parses HTTP/1 text format - HTTP/2 DATA payloads are already JSON)
+				if provider == ProviderUnknown && !isGRPC && len(req.RequestPayload) > 0 {
+					provider = detectProviderFromRequestStructure(req.RequestPayload)
+				}
+				if provider == ProviderUnknown && !isGRPC && responsePayloadBase64 != "" {
+					if respBytes, err := base64.StdEncoding.DecodeString(responsePayloadBase64); err == nil {
+						provider = detectProviderFromResponseStructure(respBytes)
+					}
+				}
+				klog.V(3).Infof("HTTP2_LLM_DETECTION_FALLBACK: host=%s path=%s provider=%s isGRPC=%v", host, req.Path, provider, isGRPC)
 			}
 
 			if provider != ProviderUnknown && len(req.RequestPayload) > 0 {
-				c.trackLLMRequest(provider, host, requestPayloadBase64, responsePayloadBase64, req.Duration)
+				klog.V(2).Infof("HTTP2_LLM_TRACKING: provider=%s host=%s path=%s", provider, host, req.Path)
+				c.trackLLMRequest(provider, host, req.Path, requestPayloadBase64, responsePayloadBase64, req.Duration)
 			}
 		}
 	case l7.ProtocolPostgres:
@@ -1103,7 +1417,98 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		// For all other protocols, update stats
 		c.l7Stats.observe(r.Protocol, "unknown", "", 0, conn.DestinationKey, conn.srcWorkload, r, "")
 	}
-	return nil
+	return nil, L7RequestProcessed
+}
+
+// processHTTP2WithoutConnection handles HTTP/2 events when TCP connection tracking failed.
+// This is common for Go TLS connections where goroutines switch threads between
+// TCP connect and TLS write, causing fd_by_pid_tgid lookup to fail in eBPF.
+//
+// We can still extract useful info from HTTP/2 frames:
+// - :authority pseudo-header for host resolution (LLM detection)
+// - :path for request path matching
+// - Request/response payloads for LLM token extraction
+//
+// Each HTTP/2 connection has its own HPACK dynamic table, so we use per-fd parsers
+// to avoid header decoding corruption when a process has multiple connections.
+//
+// Note: Metrics that require destination IP will be skipped since we don't have it.
+func (c *Container) processHTTP2WithoutConnection(pid uint32, fd uint64, r *l7.RequestData, dstIP ...netaddr.IP) (map[netaddr.IP]*common.Domain, L7RequestResult) {
+	// Use per-connection parser: each HTTP/2 connection has its own HPACK dynamic table,
+	// so sharing a parser across connections corrupts header decoding.
+	if c.googleHTTP2Parsers == nil {
+		c.googleHTTP2Parsers = make(map[PidFd]*l7.Http2Parser)
+	}
+
+	pidFd := PidFd{Pid: pid, Fd: fd}
+	parser := c.googleHTTP2Parsers[pidFd]
+	if parser == nil {
+		parser = l7.NewHttp2Parser()
+		c.googleHTTP2Parsers[pidFd] = parser
+	}
+
+	requests := parser.Parse(r.Method, r.Payload, uint64(r.Duration))
+
+	if len(requests) == 0 {
+		klog.V(3).Infof("HTTP2_CONNECTIONLESS_PARSE: pid=%d fd=%d method=%d payloadLen=%d completed=0 active=%d",
+			pid, fd, r.Method, len(r.Payload), parser.ActiveRequestCount())
+	}
+
+	for _, req := range requests {
+		// Extract host from :authority header (set by HTTP/2 parser)
+		host := req.Authority
+		if host == "" && len(dstIP) > 0 && !dstIP[0].IsZero() {
+			// Fallback: resolve destination IP via DNS cache.
+			// This handles mid-stream HPACK join where :authority is in the
+			// dynamic table and can't be decoded.
+			if domain := c.registry.getDomain(dstIP[0]); domain != nil {
+				host = domain.FQDN
+				klog.V(2).Infof("HTTP2_CONNECTIONLESS: resolved host from DNS cache: ip=%s host=%s path=%s", dstIP[0], host, req.Path)
+			}
+		}
+		// Detect LLM provider: try host first, then path, then response structure
+		provider := ProviderUnknown
+		if host != "" {
+			provider = DetectLLMProvider(host)
+		}
+		if provider == ProviderUnknown && req.Path != "" {
+			provider, _ = DetectLLMProviderFromPath(req.Path)
+		}
+		// Last resort: analyze request/response structure for LLM patterns.
+		// Skip for gRPC (protobuf data can contain strings that match JSON patterns).
+		isGRPC := strings.HasPrefix(req.ContentType, "application/grpc")
+		if provider == ProviderUnknown && !isGRPC && len(req.ResponsePayload) > 0 {
+			provider = detectProviderFromResponseStructure(req.ResponsePayload)
+		}
+		if provider == ProviderUnknown && !isGRPC && len(req.RequestPayload) > 0 {
+			provider = detectProviderFromRequestStructure(req.RequestPayload)
+		}
+
+		if host == "" && provider == ProviderUnknown {
+			klog.V(3).Infof("HTTP2_CONNECTIONLESS: no authority/path and no LLM detected for pid=%d fd=%d", pid, fd)
+			continue
+		}
+
+		if provider != ProviderUnknown {
+			// Set a default server address if host is unknown (detected from payload structure)
+			if host == "" {
+				host = providerDefaultHost(provider)
+			}
+
+			klog.V(2).Infof("HTTP2_CONNECTIONLESS_LLM_DETECTED: pid=%d fd=%d provider=%s host=%s path=%s reqLen=%d respLen=%d",
+				pid, fd, provider, host, req.Path, len(req.RequestPayload), len(req.ResponsePayload))
+
+			requestPayloadBase64 := base64.StdEncoding.EncodeToString(req.RequestPayload)
+			responsePayloadBase64 := ""
+			if len(req.ResponsePayload) > 0 {
+				responsePayloadBase64 = base64.StdEncoding.EncodeToString(req.ResponsePayload)
+			}
+
+			c.trackLLMRequest(provider, host, req.Path, requestPayloadBase64, responsePayloadBase64, req.Duration)
+		}
+	}
+
+	return nil, L7RequestProcessed
 }
 
 func (c *Container) onRetransmission(src netaddr.IPPort, dst netaddr.IPPort) bool {
@@ -1123,18 +1528,44 @@ func (c *Container) onRetransmission(src netaddr.IPPort, dst netaddr.IPPort) boo
 }
 
 func (c *Container) updateDelays() {
+	// Get a snapshot of PIDs under read lock to avoid concurrent map access
+	c.lock.RLock()
+	pids := make([]uint32, 0, len(c.processes))
 	for pid := range c.processes {
+		pids = append(pids, pid)
+	}
+	c.lock.RUnlock()
+
+	// Make syscalls without holding the lock to avoid contention
+	type pidDelayStats struct {
+		pid       uint32
+		cpuDelay  time.Duration
+		diskDelay time.Duration
+	}
+	pidStats := make([]pidDelayStats, 0, len(pids))
+	for _, pid := range pids {
 		stats, err := TaskstatsTGID(pid)
 		if err != nil {
 			continue
 		}
-		d := c.delaysByPid[pid]
-		c.delays.cpu += stats.CPUDelay - d.cpu
-		c.delays.disk += stats.BlockIODelay - d.disk
-		d.cpu = stats.CPUDelay
-		d.disk = stats.BlockIODelay
-		c.delaysByPid[pid] = d
+		pidStats = append(pidStats, pidDelayStats{
+			pid:       pid,
+			cpuDelay:  stats.CPUDelay,
+			diskDelay: stats.BlockIODelay,
+		})
 	}
+
+	// Update delays under write lock
+	c.lock.Lock()
+	for _, ps := range pidStats {
+		d := c.delaysByPid[ps.pid]
+		c.delays.cpu += ps.cpuDelay - d.cpu
+		c.delays.disk += ps.diskDelay - d.disk
+		d.cpu = ps.cpuDelay
+		d.disk = ps.diskDelay
+		c.delaysByPid[ps.pid] = d
+	}
+	c.lock.Unlock()
 }
 
 func (c *Container) updateNodejsStats(s NodejsStatsUpdate) {
@@ -1539,22 +1970,12 @@ func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32) {
 		openSslUprobes := tracer.AttachOpenSslUprobes(pid)
 		p.uprobes = append(p.uprobes, openSslUprobes...)
 		p.openSslUprobesChecked = true
-
-		// Debug logging for SSL uprobes (enable via environment variable)
-		if os.Getenv("DEBUG_SSL_UPROBES") == "true" && len(openSslUprobes) > 0 {
-			log.Printf("SSL Debug: %s PID %d - OpenSSL uprobes attached: %d", c.srcWorkload.Name, pid, len(openSslUprobes))
-		}
 	}
 	if !p.goTlsUprobesChecked {
 		uprobes, isGolangApp := tracer.AttachGoTlsUprobes(pid)
 		p.isGolangApp = isGolangApp
 		p.uprobes = append(p.uprobes, uprobes...)
 		p.goTlsUprobesChecked = true
-
-		// Debug logging for Go TLS uprobes (enable via environment variable)
-		if os.Getenv("DEBUG_SSL_UPROBES") == "true" && len(uprobes) > 0 {
-			log.Printf("SSL Debug: %s PID %d - Go TLS uprobes attached: %d, isGolangApp: %v", c.srcWorkload.Name, pid, len(uprobes), isGolangApp)
-		}
 	}
 }
 
@@ -1589,36 +2010,11 @@ func detectLLMFromHTTPRequest(requestPayload []byte, responseBase64 string) LLMP
 	// Parse HTTP request to extract URL path
 	requestStr := string(requestPayload)
 
-	// Look for URL patterns in the HTTP request
+	// Use centralized path-based detection from llm.go
 	if path := extractHTTPPath(requestStr); path != "" {
-		// Google Gemini API patterns
-		if strings.Contains(path, "/v1beta/models/gemini") ||
-			strings.Contains(path, "generativelanguage.googleapis.com") ||
-			strings.Contains(path, ":streamGenerateContent") ||
-			strings.Contains(path, ":generateContent") {
-			return ProviderGoogle
-		}
-
-		// OpenAI API patterns
-		if strings.Contains(path, "/v1/chat/completions") ||
-			strings.Contains(path, "/v1/completions") ||
-			strings.Contains(path, "api.openai.com") {
-			return ProviderOpenAI
-		}
-
-		// Anthropic API patterns
-		if strings.Contains(path, "/v1/messages") ||
-			strings.Contains(path, "api.anthropic.com") ||
-			strings.Contains(path, "claude") {
-			return ProviderAnthropic
-		}
-
-		// Cohere API patterns
-		if strings.Contains(path, "/v1/generate") ||
-			strings.Contains(path, "/v1/chat") ||
-			strings.Contains(path, "api.cohere.ai") ||
-			strings.Contains(path, "api.cohere.com") {
-			return ProviderCohere
+		provider, _ := DetectLLMProviderFromPath(path)
+		if provider != ProviderUnknown {
+			return provider
 		}
 	}
 
@@ -1690,6 +2086,34 @@ func detectProviderFromResponseStructure(responseData []byte) LLMProvider {
 	if strings.Contains(jsonStr, `"generations"`) ||
 		(strings.Contains(jsonStr, `"meta"`) && strings.Contains(jsonStr, `"tokens"`)) {
 		return ProviderCohere
+	}
+
+	return ProviderUnknown
+}
+
+// detectProviderFromRequestStructure detects LLM provider from request payload.
+// This is used as a last resort when :authority and :path are both unavailable
+// (e.g., mid-stream HPACK join for HTTP/2 TLS connections).
+func detectProviderFromRequestStructure(requestData []byte) LLMProvider {
+	jsonStart := bytes.Index(requestData, []byte("{"))
+	if jsonStart == -1 {
+		return ProviderUnknown
+	}
+	jsonStr := string(requestData[jsonStart:])
+
+	// Google Gemini: request body has "contents" array with "parts" objects
+	// and optionally "generationConfig"
+	if strings.Contains(jsonStr, `"contents"`) && strings.Contains(jsonStr, `"parts"`) {
+		return ProviderGoogle
+	}
+
+	// OpenAI: request body has "messages" array with "role" and "content"
+	if strings.Contains(jsonStr, `"messages"`) && strings.Contains(jsonStr, `"role"`) {
+		// Could be OpenAI or Anthropic - check for Anthropic-specific fields
+		if strings.Contains(jsonStr, `"max_tokens"`) && !strings.Contains(jsonStr, `"model"`) {
+			return ProviderAnthropic
+		}
+		return ProviderOpenAI
 	}
 
 	return ProviderUnknown
