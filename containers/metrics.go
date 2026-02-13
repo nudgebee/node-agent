@@ -61,10 +61,6 @@ var metrics = struct {
 	GpuMemoryUsagePercent *prometheus.Desc
 
 	Ip2Fqdn *prometheus.Desc
-
-	LLMRequests   *prometheus.Desc
-	LLMTokensUsed *prometheus.Desc
-	LLMLatency    *prometheus.Desc
 }{
 	ContainerInfo: metric("container_info", "Meta information about the container", "image", "systemd_triggered_by"),
 
@@ -122,10 +118,6 @@ var metrics = struct {
 
 	GpuUsagePercent:       metric("container_resources_gpu_usage_percent", "Percent of GPU compute resources used by the container", "gpu_uuid"),
 	GpuMemoryUsagePercent: metric("container_resources_gpu_memory_usage_percent", "Percent of GPU memory used by the container", "gpu_uuid"),
-
-	LLMRequests:   metric("container_llm_requests_total", "Total number of LLM API requests", "provider", "model", "host"),
-	LLMTokensUsed: metric("container_llm_tokens_total", "Total number of LLM tokens used", "provider", "model", "type", "host"),
-	LLMLatency:    metric("container_llm_requests_duration_seconds", "Average LLM API request duration", "provider", "model", "host"),
 }
 
 var (

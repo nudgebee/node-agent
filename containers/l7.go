@@ -101,6 +101,7 @@ func normalizeHttpPath(path string) string {
 }
 
 type L7Stats struct {
+	mu          sync.RWMutex
 	requests    map[l7.Protocol]*prometheus.CounterVec
 	latency     map[l7.Protocol]*prometheus.HistogramVec
 	initialized map[l7.Protocol]bool
@@ -114,7 +115,7 @@ func NewL7Stats() L7Stats {
 	}
 }
 
-func (s L7Stats) observe(protocol l7.Protocol, status, method string, duration time.Duration, key common.DestinationKey, srcWorkload common.Workload, r *l7.RequestData, traceId string) {
+func (s *L7Stats) observe(protocol l7.Protocol, status, method, path string, duration time.Duration, key common.DestinationKey, srcWorkload common.Workload, r *l7.RequestData, traceId string) {
 	s.ensureInitialized(protocol)
 
 	actualDestWorkload := key.GetActualDestinationWorkload()
@@ -154,13 +155,12 @@ func (s L7Stats) observe(protocol l7.Protocol, status, method string, duration t
 	case l7.ProtocolRabbitmq, l7.ProtocolNats:
 		counterLabelValues = append(counterLabelValues, labelInterner.intern(method))
 	case l7.ProtocolHTTP:
-		parsedMethod, path := l7.ParseHttp(r.Payload)
 		if ValidUtf8([]byte(path)) {
 			counterLabelValues = append(counterLabelValues, labelInterner.intern(normalizeHttpPath(path)))
 		} else {
 			counterLabelValues = append(counterLabelValues, "")
 		}
-		counterLabelValues = append(counterLabelValues, labelInterner.intern(parsedMethod))
+		counterLabelValues = append(counterLabelValues, labelInterner.intern(method))
 	case l7.ProtocolDNS:
 		requestType, domain, _ := l7.ParseDns(r.Payload)
 		counterLabelValues = append(counterLabelValues, labelInterner.intern(requestType), labelInterner.intern(common.NormalizeFQDN(domain, requestType)))
@@ -178,8 +178,14 @@ func (s L7Stats) observe(protocol l7.Protocol, status, method string, duration t
 		histogramLabelValues = append(histogramLabelValues, labelInterner.intern(requestType), labelInterner.intern(common.NormalizeFQDN(domain, requestType)))
 	}
 
-	// Update counter
-	if counter := s.requests[protocol]; counter != nil {
+	// Map reads are safe after ensureInitialized — the protocol entry exists.
+	// Prometheus CounterVec/HistogramVec are internally thread-safe.
+	s.mu.RLock()
+	counter := s.requests[protocol]
+	histogram := s.latency[protocol]
+	s.mu.RUnlock()
+
+	if counter != nil {
 		if c, err := counter.GetMetricWithLabelValues(counterLabelValues...); err != nil {
 			klog.Warningln("Error getting counter metric:", err)
 		} else {
@@ -187,8 +193,7 @@ func (s L7Stats) observe(protocol l7.Protocol, status, method string, duration t
 		}
 	}
 
-	// Update histogram
-	if histogram := s.latency[protocol]; histogram != nil && duration != 0 {
+	if histogram != nil && duration != 0 {
 		if h, err := histogram.GetMetricWithLabelValues(histogramLabelValues...); err != nil {
 			klog.Warningln("Error getting histogram metric:", err)
 		} else {
@@ -197,7 +202,18 @@ func (s L7Stats) observe(protocol l7.Protocol, status, method string, duration t
 	}
 }
 
-func (s L7Stats) ensureInitialized(protocol l7.Protocol) {
+func (s *L7Stats) ensureInitialized(protocol l7.Protocol) {
+	s.mu.RLock()
+	if s.initialized[protocol] {
+		s.mu.RUnlock()
+		return
+	}
+	s.mu.RUnlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Double-check after acquiring write lock
 	if s.initialized[protocol] {
 		return
 	}
@@ -270,7 +286,9 @@ func (s L7Stats) ensureInitialized(protocol l7.Protocol) {
 	s.initialized[protocol] = true
 }
 
-func (s L7Stats) collect(ch chan<- prometheus.Metric) {
+func (s *L7Stats) collect(ch chan<- prometheus.Metric) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, counterVec := range s.requests {
 		if counterVec != nil {
 			counterVec.Collect(ch)
@@ -283,7 +301,7 @@ func (s L7Stats) collect(ch chan<- prometheus.Metric) {
 	}
 }
 
-func (s L7Stats) delete(dst common.HostPort) {
+func (s *L7Stats) delete(dst common.HostPort) {
 	// With the new architecture, we don't need to delete per-destination metrics
 	// since all metrics are shared across destinations with different label values
 	// This method can be kept for interface compatibility but doesn't need to do anything

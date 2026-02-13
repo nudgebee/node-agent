@@ -87,13 +87,20 @@ func (ctx *HTTPRequestContext) parseRequest() {
 		return
 	}
 
-	// Parse method and path
-	ctx.Method, ctx.Path = l7.ParseHttp(ctx.RawPayload)
-
-	// Parse full HTTP request for headers
-	if req, err := l7.ParseHTTPRequest(ctx.RawPayload); err == nil && req != nil && req.Header != nil {
-		ctx.Headers = req.Header
+	req, err := l7.ParseHTTPRequest(ctx.RawPayload)
+	if err == nil && req != nil {
+		ctx.Method = req.Method
+		if req.URL != nil {
+			ctx.Path = req.URL.RequestURI()
+		}
+		if req.Header != nil {
+			ctx.Headers = req.Header
+		} else {
+			ctx.Headers = http.Header{}
+		}
 	} else {
+		// Fallback for malformed URIs: still extract method/path
+		ctx.Method, ctx.Path = l7.ParseHttp(ctx.RawPayload)
 		ctx.Headers = http.Header{}
 	}
 }

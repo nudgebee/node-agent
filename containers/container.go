@@ -67,18 +67,6 @@ type Delays struct {
 	disk time.Duration
 }
 
-type LLMStats struct {
-	Provider         LLMProvider
-	Model            string
-	Host             string
-	Operation        string // OTel GenAI operation name (chat, text_completion, embeddings, generate_content)
-	RequestCount     int64
-	PromptTokens     int64
-	CompletionTokens int64
-	TotalTokens      int64
-	TotalLatency     time.Duration
-}
-
 // Removed complex HTTP fragment reassembly - using simple 5KB L7 events instead
 
 type LogParser struct {
@@ -163,8 +151,6 @@ type Container struct {
 	googleHTTP2Parsers       map[PidFd]*l7.Http2Parser // Per-connection HTTP/2 parsers (keyed by pid:fd for correct HPACK state)
 
 	l7Stats L7Stats
-
-	llmStats map[string]*LLMStats
 
 	// LLM stream tracker for SSE-based completion detection
 	llmStreamTracker *LLMStreamTracker
@@ -251,8 +237,6 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		activeConnections:        map[ConnectionKey]*ActiveConnection{},
 		connectionsByPidFd:       map[PidFd]*ActiveConnection{},
 		l7Stats:                  NewL7Stats(),
-
-		llmStats: map[string]*LLMStats{},
 
 		gpuStats: map[string]*GpuUsage{},
 
@@ -945,34 +929,7 @@ func (c *Container) trackLLMRequest(provider LLMProvider, host, path, payloadBas
 	// Determine operation from path (for OTel GenAI conventions)
 	operation := GetOperation(path)
 
-	// NOTE: No lock needed here - this function is ONLY called from onL7RequestWithResult
-	// which already holds c.lock. Adding a lock here would cause deadlock since Go's
-	// sync.Mutex is not reentrant.
-
-	// Key includes operation for proper OTel metric grouping
-	key := string(provider) + ":" + llmReq.Model + ":" + operation + ":" + host
-	stats := c.llmStats[key]
-	if stats == nil {
-		stats = &LLMStats{
-			Provider:  provider,
-			Model:     llmReq.Model,
-			Host:      host,
-			Operation: operation,
-		}
-		c.llmStats[key] = stats
-	}
-
-	// Update counters
-	stats.RequestCount++
-	stats.TotalLatency += duration
-
-	if llmResp != nil {
-		stats.PromptTokens += int64(llmResp.PromptTokens)
-		stats.CompletionTokens += int64(llmResp.CompletionTokens)
-		stats.TotalTokens += int64(llmResp.TotalTokens)
-	}
-
-	// Emit Prometheus metrics (same as RecordLLMStreamMetrics for streaming path)
+	// Emit Prometheus metrics
 	model := llmReq.Model
 	if model == "" {
 		model = "unknown"
@@ -1240,7 +1197,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		if t == "TypeAAAA" && r.Status == 0 && len(ips) == 0 {
 			return nil, L7RequestProcessed
 		}
-		c.l7Stats.observe(r.Protocol, status, t, r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, status, t, "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 
 		ip2fqdn := map[netaddr.IP]*common.Domain{}
 		if fqdn != "" {
@@ -1264,7 +1221,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		httpCtx := NewHTTPRequestContext(r, conn, dnsResolver)
 
 		// Update stats with extracted trace ID
-		c.l7Stats.observe(r.Protocol, r.Status.Http(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, httpCtx.TraceID)
+		c.l7Stats.observe(r.Protocol, r.Status.Http(), httpCtx.Method, httpCtx.Path, r.Duration, conn.DestinationKey, conn.srcWorkload, r, httpCtx.TraceID)
 
 		// LLM tracking with improved detection
 		if httpCtx.IsLLMRequest() {
@@ -1364,74 +1321,21 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 				if req.GrpcStatus >= 0 {
 					status = req.GrpcStatus.GRPC()
 				}
-				c.l7Stats.observe(r.Protocol, status, "", req.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+				c.l7Stats.observe(r.Protocol, status, "", "", req.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 				if trace != nil {
 					trace.Http2Request(req.Method, req.Path, req.Scheme, req.Status, req.GrpcStatus, req.Duration)
 				}
 			}
 
-			// Enhanced LLM API tracking for HTTP/2 (including gRPC-based LLM services)
-			// Resolve host with DNS cache lookup at request time (fixes race condition)
-			host := conn.DestinationKey.GetDestinationWorkload().Name
-			if isIPAddress(host) {
-				if domain := c.registry.getDomain(conn.DestinationKey.ActualDestinationIfKnown().IP()); domain != nil {
-					host = domain.FQDN
-				}
-			}
-			// Fallback to :authority pseudo-header from HTTP/2 request
-			if host == "" || isIPAddress(host) {
-				if req.Authority != "" {
-					host = req.Authority
-				}
-			}
-
-			// Use extracted HTTP/2 DATA frame payloads for LLM tracking
-			requestPayloadBase64 := ""
-			if len(req.RequestPayload) > 0 {
-				requestPayloadBase64 = base64.StdEncoding.EncodeToString(req.RequestPayload)
-			}
-
-			responsePayloadBase64 := ""
-			if len(req.ResponsePayload) > 0 {
-				responsePayloadBase64 = base64.StdEncoding.EncodeToString(req.ResponsePayload)
-			}
-
-			provider := DetectLLMProvider(host)
-			isGRPC := strings.HasPrefix(req.ContentType, "application/grpc")
-			klog.V(3).Infof("HTTP2_LLM_DETECTION: host=%s path=%s provider=%s contentType=%s isGRPC=%v reqPayloadLen=%d respPayloadLen=%d",
-				host, req.Path, provider, req.ContentType, isGRPC, len(req.RequestPayload), len(req.ResponsePayload))
-			if provider == ProviderUnknown {
-				// Fallback: Try to detect from HTTP/2 request path
-				provider, _ = DetectLLMProviderFromPath(req.Path)
-				// For gRPC, also check if it's a Gemini service
-				if provider == ProviderUnknown && isGRPC {
-					service, _ := ExtractGRPCServiceMethod(req.Path)
-					if IsGeminiGRPCService(service) {
-						provider = ProviderGoogle
-					}
-				}
-				// Last resort: analyze request/response structure (don't use detectLLMFromHTTPRequest
-				// which parses HTTP/1 text format - HTTP/2 DATA payloads are already JSON)
-				if provider == ProviderUnknown && !isGRPC && len(req.RequestPayload) > 0 {
-					provider = detectProviderFromRequestStructure(req.RequestPayload)
-				}
-				if provider == ProviderUnknown && !isGRPC && responsePayloadBase64 != "" {
-					if respBytes, err := base64.StdEncoding.DecodeString(responsePayloadBase64); err == nil {
-						provider = detectProviderFromResponseStructure(respBytes)
-					}
-				}
-				klog.V(3).Infof("HTTP2_LLM_DETECTION_FALLBACK: host=%s path=%s provider=%s isGRPC=%v", host, req.Path, provider, isGRPC)
-			}
-
-			if provider != ProviderUnknown && len(req.RequestPayload) > 0 {
-				klog.V(2).Infof("HTTP2_LLM_TRACKING: provider=%s host=%s path=%s", provider, host, req.Path)
-				c.trackLLMRequest(provider, host, req.Path, requestPayloadBase64, responsePayloadBase64, req.Duration)
-			}
+			// HTTP/2 LLM tracking is handled by the stream tracker (lines above)
+			// which feeds OnRequestHeaders/OnDataFrame/OnResponseHeaders for all
+			// active streams. This avoids double-counting since trackLLMRequest()
+			// and RecordLLMStreamMetrics() both emit to the same global counters.
 		}
 	case l7.ProtocolPostgres:
 		// Update stats for Postgres
 		if r.Method != l7.MethodStatementClose {
-			c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+			c.l7Stats.observe(r.Protocol, r.Status.String(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		}
 		if conn.postgresParser == nil {
 			conn.postgresParser = l7.NewPostgresParser()
@@ -1443,7 +1347,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	case l7.ProtocolMysql:
 		// Update stats for MySQL
 		if r.Method != l7.MethodStatementClose {
-			c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+			c.l7Stats.observe(r.Protocol, r.Status.String(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		}
 		if conn.mysqlParser == nil {
 			conn.mysqlParser = l7.NewMysqlParser()
@@ -1454,54 +1358,54 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		}
 	case l7.ProtocolMemcached:
 		// Update stats for Memcached
-		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		cmd, items := l7.ParseMemcached(r.Payload)
 		if trace != nil {
 			trace.MemcachedQuery(cmd, items, r.Status.Error(), r.Duration)
 		}
 	case l7.ProtocolRedis:
 		// Update stats for Redis
-		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		cmd, args := l7.ParseRedis(r.Payload)
 		if trace != nil {
 			trace.RedisQuery(cmd, args, r.Status.Error(), r.Duration)
 		}
 	case l7.ProtocolMongo:
 		// Update stats for Mongo
-		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		query := l7.ParseMongo(r.Payload)
 		if trace != nil {
 			trace.MongoQuery(query, r.Status.Error(), r.Duration)
 		}
 	case l7.ProtocolKafka, l7.ProtocolCassandra:
 		// Update stats for Kafka/Cassandra
-		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 	case l7.ProtocolRabbitmq, l7.ProtocolNats:
 		// Update stats for RabbitMQ/Nats
-		c.l7Stats.observe(r.Protocol, r.Status.String(), r.Method.String(), 0, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), r.Method.String(), "", 0, conn.DestinationKey, conn.srcWorkload, r, "")
 	case l7.ProtocolDubbo2:
 		// Update stats for Dubbo2
-		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 	case l7.ProtocolClickhouse:
 		// Update stats for Clickhouse
-		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		query := l7.ParseClickhouse(r.Payload)
 		if trace != nil {
 			trace.ClickhouseQuery(query, r.Status.Error(), r.Duration)
 		}
 	case l7.ProtocolZookeeper:
 		// Update stats for Zookeeper
-		c.l7Stats.observe(r.Protocol, r.Status.Zookeeper(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.Zookeeper(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		op, arg := l7.ParseZookeeper(r.Payload)
 		if trace != nil {
 			trace.ZookeeperRequest(op, arg, r.Status, r.Duration)
 		}
 	case l7.ProtocolFoundationDB:
 		// Update stats for FoundationDB
-		c.l7Stats.observe(r.Protocol, r.Status.String(), "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, r.Status.String(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 	default:
 		// For all other protocols, update stats
-		c.l7Stats.observe(r.Protocol, "unknown", "", 0, conn.DestinationKey, conn.srcWorkload, r, "")
+		c.l7Stats.observe(r.Protocol, "unknown", "", "", 0, conn.DestinationKey, conn.srcWorkload, r, "")
 	}
 	return nil, L7RequestProcessed
 }
