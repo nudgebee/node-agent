@@ -406,12 +406,32 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
+	// Aggregate connection stats by enriched key to avoid duplicate metrics
+	// when multiple IPs resolve to the same FQDN (e.g., Google's shared IPs)
+	aggregatedStats := map[common.DestinationKey]*ConnectionStats{}
 	for _, d := range c.connectionStats.Keys() {
 		stats, ok := c.connectionStats.Peek(d)
 		if !ok {
 			continue
 		}
 		enrichedKey := c.enrichDestinationKey(d)
+		if existing, ok := aggregatedStats[enrichedKey]; ok {
+			existing.Count += stats.Count
+			existing.TotalTime += stats.TotalTime
+			existing.Retransmissions += stats.Retransmissions
+			existing.BytesSent += stats.BytesSent
+			existing.BytesReceived += stats.BytesReceived
+		} else {
+			aggregatedStats[enrichedKey] = &ConnectionStats{
+				Count:           stats.Count,
+				TotalTime:       stats.TotalTime,
+				Retransmissions: stats.Retransmissions,
+				BytesSent:       stats.BytesSent,
+				BytesReceived:   stats.BytesReceived,
+			}
+		}
+	}
+	for enrichedKey, stats := range aggregatedStats {
 		workload_src := c.srcWorkload
 		workload_dest := enrichedKey.GetDestinationWorkload()
 		actualDestWorkload := enrichedKey.GetActualDestinationWorkload()
@@ -443,11 +463,10 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		if !conn.Closed.IsZero() {
 			continue
 		}
-		connections[conn.DestinationKey]++
+		connections[c.enrichDestinationKey(conn.DestinationKey)]++
 	}
 	c.lock.RUnlock()
-	for d, count := range connections {
-		enrichedKey := c.enrichDestinationKey(d)
+	for enrichedKey, count := range connections {
 		actualDestWorkload := enrichedKey.GetActualDestinationWorkload()
 		destWorkload := enrichedKey.GetDestinationWorkload()
 		ch <- gauge(metrics.NetConnectionsActive, float64(count), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), c.srcWorkload.Name, c.srcWorkload.Namespace, c.srcWorkload.Kind, destWorkload.Name, destWorkload.Namespace, destWorkload.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, c.srcWorkload.Region, c.srcWorkload.Zone, destWorkload.Region, destWorkload.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
