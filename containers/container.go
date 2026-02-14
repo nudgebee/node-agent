@@ -862,20 +862,21 @@ func (c *Container) createConnectionFromSocketInfo(pid uint32, fd uint64, socket
 func (c *Container) onConnectionClose(e ebpftracer.Event) {
 	c.lock.Lock()
 	conn := c.connectionsByPidFd[PidFd{Pid: e.Pid, Fd: e.Fd}]
-	c.lock.Unlock()
-	if conn != nil {
-		if conn.Timestamp != 0 && conn.Timestamp != e.Timestamp {
-			return
-		}
-		if conn.Closed.IsZero() {
-			if e.TrafficStats != nil {
-				c.lock.Lock()
-				c.updateConnectionTrafficStats(conn, e.TrafficStats.BytesSent, e.TrafficStats.BytesReceived)
-				c.lock.Unlock()
-			}
-			conn.Closed = time.Now()
-		}
+	if conn == nil {
+		c.lock.Unlock()
+		return
 	}
+	if conn.Timestamp != 0 && conn.Timestamp != e.Timestamp {
+		c.lock.Unlock()
+		return
+	}
+	if conn.Closed.IsZero() {
+		if e.TrafficStats != nil {
+			c.updateConnectionTrafficStats(conn, e.TrafficStats.BytesSent, e.TrafficStats.BytesReceived)
+		}
+		conn.Closed = time.Now()
+	}
+	c.lock.Unlock()
 }
 
 func (c *Container) updateTrafficStats(u *TrafficStatsUpdate) {
@@ -1596,10 +1597,18 @@ func (c *Container) getMounts() map[string]map[string]*proc.FSStat {
 	if len(c.mounts) == 0 {
 		return nil
 	}
+	// Copy pids under read lock — c.processes is mutated by handleEvents goroutine
+	c.lock.RLock()
+	pids := make([]uint32, 0, len(c.processes))
+	for pid := range c.processes {
+		pids = append(pids, pid)
+	}
+	c.lock.RUnlock()
+
 	res := map[string]map[string]*proc.FSStat{}
 	for _, mi := range c.mounts {
 		var stat *proc.FSStat
-		for pid := range c.processes {
+		for _, pid := range pids {
 			s, err := proc.StatFS(proc.Path(pid, "root", mi.MountPoint))
 			if err == nil {
 				stat = &s
@@ -1618,13 +1627,21 @@ func (c *Container) getMounts() map[string]map[string]*proc.FSStat {
 }
 
 func (c *Container) getListens() map[netaddr.IPPort]int {
+	// Copy processes under read lock — c.processes is mutated by handleEvents goroutine
+	c.lock.RLock()
+	processesCopy := make(map[uint32]*Process, len(c.processes))
+	for pid, p := range c.processes {
+		processesCopy[pid] = p
+	}
+	c.lock.RUnlock()
+
 	res := map[netaddr.IPPort]int{}
 	for addr, byPid := range c.listens {
 		open := 0
 		isHostNs := false
 		ips := map[netaddr.IP]bool{}
 		for pid, details := range byPid {
-			p := c.processes[pid]
+			p := processesCopy[pid]
 			if p == nil {
 				continue
 			}
@@ -1700,8 +1717,16 @@ func (c *Container) getProxiedListens() map[string]map[netaddr.IPPort]struct{} {
 }
 
 func (c *Container) ping() map[netaddr.IP]float64 {
-	netNs := netns.None()
+	// Copy pids under read lock — c.processes is mutated by handleEvents goroutine
+	c.lock.RLock()
+	pids := make([]uint32, 0, len(c.processes))
 	for pid := range c.processes {
+		pids = append(pids, pid)
+	}
+	c.lock.RUnlock()
+
+	netNs := netns.None()
+	for _, pid := range pids {
 		if pid == agentPid {
 			netNs = selfNetNs
 			break

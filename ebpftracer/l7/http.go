@@ -148,10 +148,8 @@ func ParseHTTPRequest(data []byte) (*http.Request, error) {
 		Host:       host,
 		Header:     header,
 	}
-	if len(body) > 0 || body != nil {
-		p := body
-		req.Body = io.NopCloser(bytes.NewReader(p))
-		defer req.Body.Close()
+	if len(body) > 0 {
+		req.Body = io.NopCloser(bytes.NewReader(body))
 	}
 	return req, nil
 }

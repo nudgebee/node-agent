@@ -72,6 +72,7 @@ type K8sIPResolver struct {
 	clientset        kubernetes.Interface
 	snapshot         clusterSnapshot
 	ipsMap           sync.Map
+	ipsMapMu         sync.Mutex // protects check-then-act on ipsMap
 	stopSignal       chan struct{}
 	shouldResolveDns bool
 	dnsResolvedIps   *lrucache.Cache[string, string]
@@ -199,6 +200,7 @@ func (resolver *K8sIPResolver) StartWatching() error {
 	daemonSetInformer := factory.Apps().V1().DaemonSets().Informer()
 	statefulSetInformer := factory.Apps().V1().StatefulSets().Informer()
 	jobInformer := factory.Batch().V1().Jobs().Informer()
+	cronJobInformer := factory.Batch().V1().CronJobs().Informer()
 	serviceInformer := factory.Core().V1().Services().Informer()
 	deploymentInformer := factory.Apps().V1().Deployments().Informer()
 
@@ -208,6 +210,7 @@ func (resolver *K8sIPResolver) StartWatching() error {
 	resolver.addDaemonSetHandlers(daemonSetInformer)
 	resolver.addStatefulSetHandlers(statefulSetInformer)
 	resolver.addJobHandlers(jobInformer)
+	resolver.addCronJobHandlers(cronJobInformer)
 	resolver.addServiceHandlers(serviceInformer)
 	resolver.addDeploymentHandlers(deploymentInformer)
 
@@ -304,6 +307,27 @@ func (resolve *K8sIPResolver) addJobHandlers(jobInformer cache.SharedIndexInform
 	})
 }
 
+func (resolve *K8sIPResolver) addCronJobHandlers(cronJobInformer cache.SharedIndexInformer) {
+	cronJobInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			cronJob := obj.(*batchv1.CronJob)
+			resolve.snapshot.CronJobs.Store(cronJob.UID, MinimalOwnerInfo{
+				OwnerReferences: cronJob.OwnerReferences,
+			})
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			cronJob := newObj.(*batchv1.CronJob)
+			resolve.snapshot.CronJobs.Store(cronJob.UID, MinimalOwnerInfo{
+				OwnerReferences: cronJob.OwnerReferences,
+			})
+		},
+		DeleteFunc: func(obj interface{}) {
+			cronJob := obj.(*batchv1.CronJob)
+			resolve.snapshot.CronJobs.Delete(cronJob.UID)
+		},
+	})
+}
+
 func (resolve *K8sIPResolver) addServiceHandlers(serviceInformer cache.SharedIndexInformer) {
 	serviceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
@@ -323,6 +347,7 @@ func (resolve *K8sIPResolver) addServiceHandlers(serviceInformer cache.SharedInd
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
+			oldService := oldObj.(*v1.Service)
 			service := newObj.(*v1.Service)
 			minSvc := MinimalService{
 				Name:       service.Name,
@@ -331,6 +356,16 @@ func (resolve *K8sIPResolver) addServiceHandlers(serviceInformer cache.SharedInd
 				ClusterIPs: service.Spec.ClusterIPs,
 			}
 			resolve.snapshot.Services.Store(service.UID, minSvc)
+			// Delete old ClusterIPs that are no longer present
+			newIPs := make(map[string]bool, len(service.Spec.ClusterIPs))
+			for _, ip := range service.Spec.ClusterIPs {
+				newIPs[ip] = true
+			}
+			for _, oldIP := range oldService.Spec.ClusterIPs {
+				if oldIP != "None" && !newIPs[oldIP] {
+					resolve.ipsMap.Delete(oldIP)
+				}
+			}
 			workload := resolve.resolveServiceWorkload(&minSvc)
 			for _, clusterIp := range minSvc.ClusterIPs {
 				if clusterIp != "None" {
@@ -378,7 +413,18 @@ func (resolver *K8sIPResolver) addPodHandlers(podInformer cache.SharedIndexInfor
 			resolver.handlePodAdd(pod)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
+			oldPod := oldObj.(*v1.Pod)
 			newPod := newObj.(*v1.Pod)
+			// Clean old IPs that are no longer present
+			newIPs := make(map[string]bool, len(newPod.Status.PodIPs))
+			for _, ip := range newPod.Status.PodIPs {
+				newIPs[ip.IP] = true
+			}
+			for _, oldIP := range oldPod.Status.PodIPs {
+				if !newIPs[oldIP.IP] {
+					resolver.podIpsMap.Remove(oldIP.IP)
+				}
+			}
 			resolver.handlePodAdd(newPod)
 		},
 		DeleteFunc: func(obj interface{}) {
@@ -526,8 +572,9 @@ func (resolver *K8sIPResolver) getFullClusterSnapshot() error {
 		region := node.Labels["topology.kubernetes.io/region"]
 		zone := node.Labels["topology.kubernetes.io/zone"]
 		meta := InstanceMeta{
-			Region: region,
-			Zone:   zone,
+			Region:   region,
+			Zone:     zone,
+			Instance: node.Name,
 		}
 		resolver.instanceMetaMap.Store(node.Name, meta)
 		resolver.snapshot.Nodes.Store(node.UID, MinimalNode{
@@ -712,16 +759,19 @@ func (resolver *K8sIPResolver) updateIpMapping() {
 
 func (resolver *K8sIPResolver) storeWorkloadsIP(ip string, newWorkload *Workload) {
 	// we want to override existing workload, unless the existing workload is a node and the new one isn't
+	resolver.ipsMapMu.Lock()
 	val, ok := resolver.ipsMap.Load(ip)
 	if ok {
 		existingWorkload, ok := val.(Workload)
 		if ok {
 			if existingWorkload.Kind == "node" && newWorkload.Kind != "node" {
+				resolver.ipsMapMu.Unlock()
 				return
 			}
 		}
 	}
 	resolver.ipsMap.Store(ip, *newWorkload)
+	resolver.ipsMapMu.Unlock()
 }
 
 func (resolver *K8sIPResolver) storePodsIP(ip string, newWorkload *Workload) {
