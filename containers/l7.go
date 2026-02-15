@@ -126,14 +126,16 @@ func (s *L7Stats) observe(protocol l7.Protocol, status, method, path string, dur
 		metricsProtocol = l7.ProtocolHTTP
 	}
 
+	destWorkload := key.GetDestinationWorkload()
+
 	// Base labels that all protocols use (with string interning for memory optimization)
 	labelValues := []string{
 		labelInterner.intern(status),
 		labelInterner.intern(key.DestinationLabelValue()),
 		labelInterner.intern(key.ActualDestinationLabelValue()),
-		labelInterner.intern(key.GetDestinationWorkload().Kind),
-		labelInterner.intern(key.GetDestinationWorkload().Name),
-		labelInterner.intern(key.GetDestinationWorkload().Namespace),
+		labelInterner.intern(destWorkload.Kind),
+		labelInterner.intern(destWorkload.Name),
+		labelInterner.intern(destWorkload.Namespace),
 		labelInterner.intern(srcWorkload.Kind),
 		labelInterner.intern(srcWorkload.Name),
 		labelInterner.intern(srcWorkload.Namespace),
@@ -142,6 +144,8 @@ func (s *L7Stats) observe(protocol l7.Protocol, status, method, path string, dur
 		labelInterner.intern(actualDestWorkload.Namespace),
 		labelInterner.intern(srcWorkload.Region),
 		labelInterner.intern(srcWorkload.Zone),
+		labelInterner.intern(destWorkload.Region),
+		labelInterner.intern(destWorkload.Zone),
 		labelInterner.intern(actualDestWorkload.Region),
 		labelInterner.intern(actualDestWorkload.Zone),
 		labelInterner.intern(actualDestWorkload.Instance),
@@ -224,7 +228,7 @@ func (s *L7Stats) ensureInitialized(protocol l7.Protocol) {
 		metricsProtocol = l7.ProtocolHTTP
 	}
 
-	// Base labels for all protocols
+	// Base labels for all protocols (aligned with TCP metric label names)
 	baseLabels := []string{
 		"status",
 		"destination",
@@ -240,9 +244,11 @@ func (s *L7Stats) ensureInitialized(protocol l7.Protocol) {
 		"actual_destination_workload_namespace",
 		"src_region",
 		"src_az",
-		"destination_region",
-		"destination_az",
-		"destination_instance",
+		"destination_workload_region",
+		"destination_workload_az",
+		"actual_destination_region",
+		"actual_destination_az",
+		"actual_destination_instance",
 	}
 
 	// Initialize request counter

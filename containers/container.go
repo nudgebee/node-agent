@@ -82,19 +82,14 @@ func (p *LogParser) Stop() {
 }
 
 type ConnectionKey struct {
-	src                netaddr.IPPort
-	dst                netaddr.IPPort
-	srcWorkload        common.Workload
-	dstWorkload        common.Workload
-	actualDestWorkload common.Workload
+	src netaddr.IPPort
+	dst netaddr.IPPort
 }
 
 type ActiveConnection struct {
-	DestinationKey     common.DestinationKey
-	srcWorkload        common.Workload
-	dstWorkload        common.Workload
-	actualDestWorkload common.Workload
-	Pid                uint32
+	DestinationKey common.DestinationKey
+	srcWorkload    common.Workload
+	Pid            uint32
 	Fd                 uint64
 	Timestamp          uint64
 	Closed             time.Time
@@ -783,13 +778,11 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 		stats.Count++
 		stats.TotalTime += duration
 		connection := &ActiveConnection{
-			DestinationKey:     key,
-			Pid:                pid,
-			Fd:                 fd,
-			Timestamp:          timestamp,
-			srcWorkload:        srcWorkload,
-			dstWorkload:        dstWorkload,
-			actualDestWorkload: actualDstWorkload,
+			DestinationKey: key,
+			Pid:            pid,
+			Fd:             fd,
+			Timestamp:      timestamp,
+			srcWorkload:    srcWorkload,
 		}
 		c.activeConnections[ConnectionKey{src: src, dst: dst}] = connection
 		k := PidFd{Pid: pid, Fd: fd}
@@ -840,13 +833,11 @@ func (c *Container) createConnectionFromSocketInfo(pid uint32, fd uint64, socket
 
 	// Create connection
 	connection := &ActiveConnection{
-		DestinationKey:     key,
-		Pid:                pid,
-		Fd:                 fd,
-		Timestamp:          0, // We don't have timestamp from socket info
-		srcWorkload:        srcWorkload,
-		dstWorkload:        dstWorkload,
-		actualDestWorkload: actualDstWorkload,
+		DestinationKey: key,
+		Pid:            pid,
+		Fd:             fd,
+		Timestamp:      0, // We don't have timestamp from socket info
+		srcWorkload:    srcWorkload,
 	}
 
 	// Store in connectionsByPidFd for future L7 events on same connection
@@ -1170,16 +1161,11 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		}
 	}
 
-	// Create trace with proper parameters (enhanced version)
+	// Create trace — migrateConnectionKeyIfNeeded already enriched the key with FQDN
 	var trace *tracing.Trace
 	if !ebpfTracesDisabled {
-		// Last-minute DNS enrichment for traces
 		destWorkload := conn.DestinationKey.GetDestinationWorkload()
 		actualDestWorkload := conn.DestinationKey.GetActualDestinationWorkload()
-		if domain := c.registry.getDomain(conn.DestinationKey.ActualDestinationIfKnown().IP()); domain != nil {
-			destWorkload.Name = domain.FQDN
-			actualDestWorkload.Name = domain.FQDN
-		}
 		trace = c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown(), conn.srcWorkload, destWorkload, actualDestWorkload)
 	}
 
