@@ -90,9 +90,9 @@ type ActiveConnection struct {
 	DestinationKey common.DestinationKey
 	srcWorkload    common.Workload
 	Pid            uint32
-	Fd                 uint64
-	Timestamp          uint64
-	Closed             time.Time
+	Fd             uint64
+	Timestamp      uint64
+	Closed         time.Time
 
 	BytesSent     uint64
 	BytesReceived uint64

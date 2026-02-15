@@ -154,7 +154,6 @@ func ParseHTTPRequest(data []byte) (*http.Request, error) {
 	return req, nil
 }
 
-
 func ConvertHeadersToBase64String(headers http.Header) string {
 	headerMap := make(map[string][]string)
 	for key, values := range headers {
@@ -175,4 +174,3 @@ func SanitizeString(value string) string {
 	}
 	return strings.Repeat("*", 5)
 }
-
