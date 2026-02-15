@@ -154,7 +154,7 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 
 	// DEBUG: Log every attempt to attach Go TLS uprobes (at Info level for visibility)
 	exeName, _ := os.Readlink(path)
-	klog.Infof("GO_TLS_ATTACH_ATTEMPT: pid=%d exe=%s", pid, exeName)
+	klog.V(2).Infof("GO_TLS_ATTACH_ATTEMPT: pid=%d exe=%s", pid, exeName)
 
 	var err error
 	var name, version string
@@ -163,7 +163,7 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 			for _, s := range []string{"not a Go executable", "no such file or directory", "no such process", "permission denied"} {
 				if strings.HasSuffix(err.Error(), s) {
 					// DEBUG: Log filtered errors at Info level for visibility
-					klog.Infof("GO_TLS_FILTERED: pid=%d exe=%s msg=%s err=%s", pid, exeName, msg, err.Error())
+					klog.V(3).Infof("GO_TLS_FILTERED: pid=%d exe=%s msg=%s err=%s", pid, exeName, msg, err.Error())
 					return
 				}
 			}
@@ -178,7 +178,7 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 		log("failed to read build info", err)
 		return nil, isGolangApp
 	}
-	klog.Infof("GO_TLS_BUILD_INFO: pid=%d exe=%s go_version=%s", pid, exeName, bi.GoVersion)
+	klog.V(2).Infof("GO_TLS_BUILD_INFO: pid=%d exe=%s go_version=%s", pid, exeName, bi.GoVersion)
 	isGolangApp = true
 
 	name, err = os.Readlink(path)

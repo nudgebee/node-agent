@@ -853,7 +853,7 @@ func (c *Container) createConnectionFromSocketInfo(pid uint32, fd uint64, socket
 	k := PidFd{Pid: pid, Fd: fd}
 	c.connectionsByPidFd[k] = connection
 
-	klog.V(2).Infof("L7_CONN_CREATED_FROM_SOCKET: pid=%d fd=%d src=%s dst=%s domain=%v",
+	klog.V(3).Infof("L7_CONN_CREATED_FROM_SOCKET: pid=%d fd=%d src=%s dst=%s domain=%v",
 		pid, fd, src, dst, domain)
 
 	return connection
@@ -913,7 +913,7 @@ func (c *Container) updateConnectionTrafficStats(ac *ActiveConnection, sent, rec
 }
 
 func (c *Container) trackLLMRequest(provider LLMProvider, host, path, payloadBase64, responseBase64 string, duration time.Duration) {
-	klog.V(2).Infof("LLM_TRACK_START: provider=%s host=%s path=%s reqBase64Len=%d respBase64Len=%d",
+	klog.V(4).Infof("LLM_TRACK_START: provider=%s host=%s path=%s reqBase64Len=%d respBase64Len=%d",
 		provider, host, path, len(payloadBase64), len(responseBase64))
 	// Parse request data
 	llmReq, err := ParseLLMRequest(provider, payloadBase64, path)
@@ -921,11 +921,11 @@ func (c *Container) trackLLMRequest(provider LLMProvider, host, path, payloadBas
 		klog.Infof("LLM_TRACK_PARSE_REQ_FAIL: provider=%s err=%v req=%v", provider, err, llmReq)
 		return // Skip tracking if we can't parse the request
 	}
-	klog.V(2).Infof("LLM_TRACK_REQ_PARSED: model=%s operation=%s", llmReq.Model, llmReq.Operation)
+	klog.V(4).Infof("LLM_TRACK_REQ_PARSED: model=%s operation=%s", llmReq.Model, llmReq.Operation)
 
 	// Parse response data for token usage
 	llmResp, respErr := ParseLLMResponse(provider, responseBase64, path)
-	klog.V(2).Infof("LLM_TRACK_RESP_PARSED: resp=%+v err=%v", llmResp, respErr)
+	klog.V(4).Infof("LLM_TRACK_RESP_PARSED: resp=%+v err=%v", llmResp, respErr)
 
 	// Determine operation from path (for OTel GenAI conventions)
 	operation := GetOperation(path)
@@ -984,7 +984,7 @@ func (c *Container) trackLLMRequest(provider LLMProvider, host, path, payloadBas
 // onLLMStreamComplete is called when an LLM stream completes (detected via SSE markers)
 // This handles emitting metrics and traces for streaming LLM responses
 func (c *Container) onLLMStreamComplete(stream *LLMStream) {
-	klog.V(2).Infof("LLM_CALLBACK_CALLED: container=%s stream=%+v", c.id, stream != nil)
+	klog.V(4).Infof("LLM_CALLBACK_CALLED: container=%s stream=%+v", c.id, stream != nil)
 	if stream == nil {
 		return
 	}
@@ -1126,7 +1126,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		// TCP connection tracking failed - common for Go TLS due to goroutine thread switching
 		// Try to create connection from socket info extracted directly from fd in eBPF
 		if socketInfo != nil && socketInfo.Valid {
-			klog.V(2).Infof("L7_CREATING_CONN_FROM_SOCKET_INFO: pid=%d fd=%d dst=%s:%d container=%s",
+			klog.V(3).Infof("L7_CREATING_CONN_FROM_SOCKET_INFO: pid=%d fd=%d dst=%s:%d container=%s",
 				pid, fd, socketInfo.DstIP, socketInfo.DstPort, c.id)
 			conn = c.createConnectionFromSocketInfo(pid, fd, socketInfo)
 		}
@@ -1135,17 +1135,17 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			// For HTTP/2 TLS connections, we can still process LLM detection using
 			// the :authority header from HTTP/2 frames (fallback path)
 			if r.Protocol == l7.ProtocolHTTP2 {
-				klog.V(2).Infof("HTTP2_CONN_NOT_FOUND: pid=%d fd=%d container=%s - attempting connectionless processing",
+				klog.V(3).Infof("HTTP2_CONN_NOT_FOUND: pid=%d fd=%d container=%s - attempting connectionless processing",
 					pid, fd, c.id)
 				return c.processHTTP2WithoutConnection(pid, fd, r)
 			}
-			klog.V(2).Infof("L7_EVENT_CONN_NOT_FOUND: pid=%d fd=%d container=%s num_connections=%d",
+			klog.V(3).Infof("L7_EVENT_CONN_NOT_FOUND: pid=%d fd=%d container=%s num_connections=%d",
 				pid, fd, c.id, len(c.connectionsByPidFd))
 			return nil, L7RequestConnNotFound
 		}
 	}
 	if timestamp != 0 && conn.Timestamp != timestamp {
-		klog.V(2).Infof("L7_EVENT_TIMESTAMP_MISMATCH: pid=%d fd=%d event_ts=%d conn_ts=%d protocol=%d",
+		klog.V(5).Infof("L7_EVENT_TIMESTAMP_MISMATCH: pid=%d fd=%d event_ts=%d conn_ts=%d protocol=%d",
 			pid, fd, timestamp, conn.Timestamp, r.Protocol)
 		// For HTTP/2, fall through to connectionless processing instead of dropping.
 		// This handles Go TLS connections (S2A, gRPC) where ensure_connection_tracked()
@@ -1315,7 +1315,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			}
 		}
 		for _, req := range requests {
-			klog.V(2).Infof("HTTP2_COMPLETED_REQUEST: pid=%d fd=%d method=%s path=%s status=%d req_payload_len=%d resp_payload_len=%d",
+			klog.V(4).Infof("HTTP2_COMPLETED_REQUEST: pid=%d fd=%d method=%s path=%s status=%d req_payload_len=%d resp_payload_len=%d",
 				pid, fd, req.Method, req.Path, req.Status, len(req.RequestPayload), len(req.ResponsePayload))
 			if !common.HttpFilter.ShouldBeSkipped(req.Path) {
 				status := req.Status.Http()
@@ -1454,7 +1454,7 @@ func (c *Container) processHTTP2WithoutConnection(pid uint32, fd uint64, r *l7.R
 			// dynamic table and can't be decoded.
 			if domain := c.registry.getDomain(dstIP[0]); domain != nil {
 				host = domain.FQDN
-				klog.V(2).Infof("HTTP2_CONNECTIONLESS: resolved host from DNS cache: ip=%s host=%s path=%s", dstIP[0], host, req.Path)
+				klog.V(4).Infof("HTTP2_CONNECTIONLESS: resolved host from DNS cache: ip=%s host=%s path=%s", dstIP[0], host, req.Path)
 			}
 		}
 		// Detect LLM provider: try host first, then path, then response structure
@@ -1486,7 +1486,7 @@ func (c *Container) processHTTP2WithoutConnection(pid uint32, fd uint64, r *l7.R
 				host = providerDefaultHost(provider)
 			}
 
-			klog.V(2).Infof("HTTP2_CONNECTIONLESS_LLM_DETECTED: pid=%d fd=%d provider=%s host=%s path=%s reqLen=%d respLen=%d",
+			klog.V(4).Infof("HTTP2_CONNECTIONLESS_LLM_DETECTED: pid=%d fd=%d provider=%s host=%s path=%s reqLen=%d respLen=%d",
 				pid, fd, provider, host, req.Path, len(req.RequestPayload), len(req.ResponsePayload))
 
 			requestPayloadBase64 := base64.StdEncoding.EncodeToString(req.RequestPayload)
