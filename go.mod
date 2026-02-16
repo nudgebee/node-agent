@@ -3,19 +3,18 @@ module github.com/coroot/coroot-node-agent
 go 1.24.7
 
 require (
-	cloud.google.com/go/compute/metadata v0.9.0
 	github.com/ClickHouse/ch-go v0.65.0
 	github.com/NVIDIA/go-nvml v0.12.4-1
 	github.com/agoda-com/opentelemetry-logs-go v0.4.1
 	github.com/cilium/cilium v1.17.3
-	github.com/cilium/ebpf v0.19.0
-	github.com/containerd/cgroups v1.0.4
-	github.com/containerd/containerd v1.6.38
-	github.com/coreos/go-systemd/v22 v22.5.0
+	github.com/cilium/ebpf v0.20.0
+	github.com/containerd/cgroups v1.1.0
+	github.com/containerd/containerd v1.7.29
+	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/docker/docker v28.0.0+incompatible
 	github.com/florianl/go-conntrack v0.3.0
 	github.com/go-kit/log v0.2.1
-	github.com/godbus/dbus/v5 v5.1.0
+	github.com/godbus/dbus/v5 v5.2.2
 	github.com/golang/snappy v0.0.4
 	github.com/google/uuid v1.6.0
 	github.com/grafana/pyroscope/ebpf v0.4.9
@@ -23,7 +22,7 @@ require (
 	github.com/jpillora/backoff v1.0.0
 	github.com/mdlayher/taskstats v0.0.0-20230712191918-387b3d561d14
 	github.com/nudgebee/logparser v0.0.0-20250610175416-3edee28c2059
-	github.com/opencontainers/runtime-spec v1.0.3-0.20210326190908-1c3f411f0417
+	github.com/opencontainers/runtime-spec v1.1.0
 	github.com/prometheus/client_golang v1.20.5
 	github.com/prometheus/client_model v0.6.1
 	github.com/prometheus/common v0.61.0
@@ -42,7 +41,7 @@ require (
 	golang.org/x/arch v0.4.0
 	golang.org/x/exp v0.0.0-20240808152545-0cdaa3abc0fa
 	golang.org/x/net v0.46.0
-	golang.org/x/sys v0.37.0
+	golang.org/x/sys v0.40.0
 	golang.org/x/time v0.14.0
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
 	gopkg.in/yaml.v2 v2.4.0
@@ -60,8 +59,10 @@ require (
 
 require (
 	cyphar.com/go-pathrs v0.2.1 // indirect
+	github.com/AdaLogics/go-fuzz-headers v0.0.0-20240806141605-e8a1dd7889d6 // indirect
+	github.com/AdamKorcz/go-118-fuzz-build v0.0.0-20230306123547-8075edf89bb0 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
-	github.com/Microsoft/hcsshim v0.9.12 // indirect
+	github.com/Microsoft/hcsshim v0.11.7 // indirect
 	github.com/alecthomas/template v0.0.0-20190718012654-fb15b899a751 // indirect
 	github.com/alecthomas/units v0.0.0-20231202071711-9a357b53e9c9 // indirect
 	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 // indirect
@@ -75,12 +76,14 @@ require (
 	github.com/cilium/statedb v0.3.6 // indirect
 	github.com/cilium/stream v0.0.0-20241203114243-53c3e5d79744 // indirect
 	github.com/cilium/workerpool v1.2.0 // indirect
-	github.com/containerd/continuity v0.3.0 // indirect
-	github.com/containerd/errdefs v0.1.0 // indirect
-	github.com/containerd/fifo v1.0.0 // indirect
+	github.com/containerd/containerd/api v1.8.0 // indirect
+	github.com/containerd/continuity v0.4.4 // indirect
+	github.com/containerd/errdefs v0.3.0 // indirect
+	github.com/containerd/fifo v1.1.0 // indirect
 	github.com/containerd/log v0.1.0 // indirect
-	github.com/containerd/ttrpc v1.1.2 // indirect
-	github.com/containerd/typeurl v1.0.2 // indirect
+	github.com/containerd/platforms v0.2.1 // indirect
+	github.com/containerd/ttrpc v1.2.7 // indirect
+	github.com/containerd/typeurl/v2 v2.1.1 // indirect
 	github.com/coreos/go-semver v0.3.1 // indirect
 	github.com/cyphar/filepath-securejoin v0.6.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
@@ -107,7 +110,6 @@ require (
 	github.com/go-openapi/strfmt v0.23.0 // indirect
 	github.com/go-openapi/swag v0.23.0 // indirect
 	github.com/go-openapi/validate v0.24.0 // indirect
-	github.com/gogo/googleapis v1.4.0 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
@@ -137,8 +139,10 @@ require (
 	github.com/moby/docker-image-spec v1.3.1 // indirect
 	github.com/moby/locker v1.0.1 // indirect
 	github.com/moby/sys/mountinfo v0.7.1 // indirect
-	github.com/moby/sys/signal v0.6.0 // indirect
+	github.com/moby/sys/sequential v0.5.0 // indirect
+	github.com/moby/sys/signal v0.7.0 // indirect
 	github.com/moby/sys/user v0.3.0 // indirect
+	github.com/moby/sys/userns v0.1.0 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
@@ -186,7 +190,8 @@ require (
 	golang.org/x/sync v0.18.0 // indirect
 	golang.org/x/term v0.36.0 // indirect
 	golang.org/x/text v0.30.0 // indirect
-	golang.org/x/tools v0.37.0 // indirect
+	golang.org/x/tools v0.38.0 // indirect
+	google.golang.org/genproto v0.0.0-20240213162025-012b6fc9bca9 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20251111163417-95abcf5c77ba // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251111163417-95abcf5c77ba // indirect
 	google.golang.org/grpc v1.76.0 // indirect

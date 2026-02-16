@@ -6,9 +6,7 @@ import (
 	"debug/buildinfo"
 	"debug/elf"
 	"encoding/binary"
-	"errors"
 	"fmt"
-	"io"
 	"os"
 	"regexp"
 	"strings"
@@ -17,8 +15,6 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/proc"
-	"golang.org/x/arch/arm64/arm64asm"
-	"golang.org/x/arch/x86/x86asm"
 	"k8s.io/klog/v2"
 )
 
@@ -84,6 +80,11 @@ func (t *Tracer) AttachOpenSslUprobes(pid uint32) []link.Link {
 		return nil
 	}
 	var links []link.Link
+	closeLinks := func() {
+		for _, l := range links {
+			l.Close()
+		}
+	}
 	writeEnter := "openssl_SSL_write_enter"
 	readEnter := "openssl_SSL_read_enter"
 	readExEnter := "openssl_SSL_read_ex_enter"
@@ -121,26 +122,43 @@ func (t *Tracer) AttachOpenSslUprobes(pid uint32) []link.Link {
 			{symbol: "SSL_read_ex", uretprobe: readExit},
 		}...)
 	}
+
+	ef, err := OpenELFFile(libPath)
+	if err != nil {
+		log("open elf", err)
+		return nil
+	}
+	defer ef.Close()
+
 	for _, p := range progs {
+		s, err := ef.GetSymbol(p.symbol)
+		if err != nil {
+			log("failed to get symbol", err)
+			closeLinks()
+			return nil
+		}
 		if p.uprobe != "" {
-			l, err := exe.Uprobe(p.symbol, t.uprobes[p.uprobe], nil)
+			l, err := s.AttachUprobe(exe, t.uprobes[p.uprobe], pid)
 			if err != nil {
 				log("failed to attach uprobe", err)
+				closeLinks()
 				return nil
 			}
 			links = append(links, l)
 		}
 		if p.uretprobe != "" {
-			l, err := exe.Uretprobe(p.symbol, t.uprobes[p.uretprobe], nil)
+			ls, err := s.AttachUretprobes(exe, t.uprobes[p.uretprobe], pid)
+			links = append(links, ls...)
 			if err != nil {
-				log("failed to attach uretprobe", err)
+				log("failed to attach exit uprobe", err)
+				closeLinks()
 				return nil
 			}
-			links = append(links, l)
 		}
 	}
-
-	log("libssl uprobes attached", nil)
+	if len(links) > 0 {
+		log("libssl uprobes attached", nil)
+	}
 	return links
 }
 
@@ -201,29 +219,12 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 		klog.V(2).Infof("pid=%d: failed to populate Go TLS offsets (will use defaults): %v", pid, err)
 	}
 
-	ef, err := elf.Open(path)
+	ef, err := OpenELFFile(path)
 	if err != nil {
 		log("failed to open as elf binary", err)
 		return nil, isGolangApp
 	}
 	defer ef.Close()
-
-	symbols, err := ef.Symbols()
-	if err != nil {
-		if errors.Is(err, elf.ErrNoSymbols) {
-			log("no symbol section", nil)
-			return nil, isGolangApp
-		}
-		log("failed to read symbols", err)
-		return nil, isGolangApp
-	}
-
-	textSection := ef.Section(".text")
-	if textSection == nil {
-		log("no text section", nil)
-		return nil, isGolangApp
-	}
-	textReader := textSection.Open()
 
 	exe, err := link.OpenExecutable(path)
 	if err != nil {
@@ -232,99 +233,56 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 	}
 
 	var links []link.Link
-	// Log all crypto/tls, http2, and S2A symbols found for debugging
-	foundS2A := false
-	foundCryptoTLS := false
-	for _, s := range symbols {
-		if strings.Contains(s.Name, "crypto/tls") || strings.Contains(s.Name, "http2") || strings.Contains(s.Name, "s2a-go") {
-			klog.V(3).Infof("pid=%d: found symbol %s (type=%d, size=%d, value=0x%x)",
-				pid, s.Name, elf.ST_TYPE(s.Info), s.Size, s.Value)
-			if s.Name == goS2AWriteSymbol || s.Name == goS2AReadSymbol {
-				foundS2A = true
-				klog.Infof("GO_TLS_S2A_SYMBOL: pid=%d exe=%s symbol=%s addr=0x%x", pid, name, s.Name, s.Value)
-			}
-			if s.Name == goTlsWriteSymbol || s.Name == goTlsReadSymbol {
-				foundCryptoTLS = true
-				klog.V(1).Infof("GO_TLS_CRYPTO_SYMBOL: pid=%d exe=%s symbol=%s addr=0x%x size=%d", pid, name, s.Name, s.Value, s.Size)
-			}
+	closeLinks := func() {
+		for _, l := range links {
+			l.Close()
 		}
-	}
-	if !foundS2A {
-		klog.V(2).Infof("GO_TLS_NO_S2A: pid=%d exe=%s", pid, name)
-	}
-	if !foundCryptoTLS {
-		klog.V(1).Infof("GO_TLS_NO_CRYPTO_TLS: pid=%d exe=%s - no crypto/tls.(*Conn).Write/Read symbols found", pid, name)
 	}
 
-	for _, s := range symbols {
-		if elf.ST_TYPE(s.Info) != elf.STT_FUNC || s.Size == 0 {
-			continue
-		}
-		switch s.Name {
-		case goTlsWriteSymbol, goTlsReadSymbol, goS2AWriteSymbol, goS2AReadSymbol:
-		default:
-			continue
-		}
-		address := s.Value
-		for _, p := range ef.Progs {
-			if p.Type != elf.PT_LOAD || (p.Flags&elf.PF_X) == 0 {
-				continue
+	// Attach Write uprobes (crypto/tls + S2A)
+	for _, writeSymbol := range []string{goTlsWriteSymbol, goS2AWriteSymbol} {
+		ws, err := ef.GetSymbol(writeSymbol)
+		if err != nil {
+			if writeSymbol == goTlsWriteSymbol {
+				log("failed to get write symbol", err)
+				return nil, isGolangApp
 			}
+			continue // S2A symbol is optional
+		}
+		l, err := ws.AttachUprobe(exe, t.uprobes["go_crypto_tls_write_enter"], pid)
+		if err != nil {
+			log(fmt.Sprintf("failed to attach write_enter uprobe for %s", writeSymbol), err)
+			closeLinks()
+			return nil, isGolangApp
+		}
+		links = append(links, l)
+	}
 
-			if p.Vaddr <= s.Value && s.Value < (p.Vaddr+p.Memsz) {
-				address = s.Value - p.Vaddr + p.Off
-				break
+	// Attach Read uprobes + return-offset exit probes (crypto/tls + S2A)
+	for _, readSymbol := range []string{goTlsReadSymbol, goS2AReadSymbol} {
+		rs, err := ef.GetSymbol(readSymbol)
+		if err != nil {
+			if readSymbol == goTlsReadSymbol {
+				log("failed to get read symbol", err)
+				closeLinks()
+				return nil, isGolangApp
 			}
+			continue // S2A symbol is optional
 		}
-		switch s.Name {
-		case goTlsWriteSymbol, goS2AWriteSymbol:
-			l, err := exe.Uprobe(s.Name, t.uprobes["go_crypto_tls_write_enter"], &link.UprobeOptions{Address: address})
-			if err != nil {
-				log(fmt.Sprintf("failed to attach write_enter uprobe for %s", s.Name), err)
-				return nil, isGolangApp
-			}
-			links = append(links, l)
-			klog.V(1).Infof("GO_TLS_UPROBE_ATTACHED: pid=%d exe=%s symbol=%s type=write_enter addr=0x%x", pid, name, s.Name, address)
-			if s.Name == goS2AWriteSymbol {
-				klog.Infof("GO_TLS_S2A_WRITE_ATTACHED: pid=%d exe=%s addr=0x%x", pid, name, address)
-			}
-		case goTlsReadSymbol, goS2AReadSymbol:
-			l, err := exe.Uprobe(s.Name, t.uprobes["go_crypto_tls_read_enter"], &link.UprobeOptions{Address: address})
-			if err != nil {
-				log(fmt.Sprintf("failed to attach read_enter uprobe for %s", s.Name), err)
-				return nil, isGolangApp
-			}
-			links = append(links, l)
-			klog.V(1).Infof("GO_TLS_UPROBE_ATTACHED: pid=%d exe=%s symbol=%s type=read_enter addr=0x%x", pid, name, s.Name, address)
-			if s.Name == goS2AReadSymbol {
-				klog.Infof("GO_TLS_S2A_READ_ATTACHED: pid=%d exe=%s addr=0x%x", pid, name, address)
-			}
-			sStart := s.Value - textSection.Addr
-			_, err = textReader.Seek(int64(sStart), io.SeekStart)
-			if err != nil {
-				log("failed to seek", err)
-				return nil, isGolangApp
-			}
-			sBytes := make([]byte, s.Size)
-			_, err = textReader.Read(sBytes)
-			if err != nil {
-				log("failed to read", err)
-				return nil, isGolangApp
-			}
-			returnOffsets := getReturnOffsets(ef.Machine, sBytes)
-			if len(returnOffsets) == 0 {
-				log("failed to attach read_exit uprobe", fmt.Errorf("no return offsets found"))
-				return nil, isGolangApp
-			}
-			for _, offset := range returnOffsets {
-				l, err := exe.Uprobe(s.Name, t.uprobes["go_crypto_tls_read_exit"], &link.UprobeOptions{Address: address, Offset: uint64(offset)})
-				if err != nil {
-					log("failed to attach read_exit uprobe", err)
-					return nil, isGolangApp
-				}
-				links = append(links, l)
-			}
-			klog.V(1).Infof("GO_TLS_UPROBE_ATTACHED: pid=%d exe=%s symbol=%s type=read_exit return_offsets=%d", pid, name, s.Name, len(returnOffsets))
+		l, err := rs.AttachUprobe(exe, t.uprobes["go_crypto_tls_read_enter"], pid)
+		if err != nil {
+			log(fmt.Sprintf("failed to attach read_enter uprobe for %s", readSymbol), err)
+			closeLinks()
+			return nil, isGolangApp
+		}
+		links = append(links, l)
+
+		ls, err := rs.AttachUretprobes(exe, t.uprobes["go_crypto_tls_read_exit"], pid)
+		links = append(links, ls...)
+		if err != nil {
+			log(fmt.Sprintf("failed to attach read_exit uprobe for %s", readSymbol), err)
+			closeLinks()
+			return nil, isGolangApp
 		}
 	}
 	if len(links) == 0 {
@@ -439,54 +397,26 @@ func getSslLibPathAndVersion(pid uint32) (string, string) {
 	return libsslPath, "v" + version
 }
 
-func getReturnOffsets(machine elf.Machine, instructions []byte) []int {
-	var res []int
-	switch machine {
-	case elf.EM_X86_64:
-		for i := 0; i < len(instructions); {
-			ins, err := x86asm.Decode(instructions[i:], 64)
-			if err == nil && ins.Op == x86asm.RET {
-				res = append(res, i)
-			}
-			i += ins.Len
-		}
-	case elf.EM_AARCH64:
-		for i := 0; i < len(instructions); {
-			ins, err := arm64asm.Decode(instructions[i:])
-			if err == nil && ins.Op == arm64asm.RET {
-				res = append(res, i)
-			}
-			i += 4
-		}
-	}
-	return res
-}
-
 // populateGoTLSOffsets discovers Go TLS offsets and populates the BPF map for a process.
 // This allows the eBPF code to use dynamic offsets instead of hardcoded values.
 func (t *Tracer) populateGoTLSOffsets(pid uint32, binaryPath string, goVersion string) error {
-	// Get the BPF map
 	offsetsMap := t.collection.Maps["go_tls_offsets_map"]
 	if offsetsMap == nil {
 		return fmt.Errorf("go_tls_offsets_map not found in BPF collection")
 	}
 
-	// Discover offsets from DWARF or use version-based fallbacks
 	offsets, err := DiscoverGoTLSOffsets(binaryPath, goVersion)
 	if err != nil {
 		return fmt.Errorf("failed to discover offsets: %w", err)
 	}
 
-	// Convert to C struct format and write to BPF map
 	offsetsC := offsets.ToC()
 
-	// Serialize the struct to bytes (must match the BPF struct layout)
 	var buf bytes.Buffer
 	if err := binary.Write(&buf, binary.LittleEndian, offsetsC); err != nil {
 		return fmt.Errorf("failed to serialize offsets: %w", err)
 	}
 
-	// Update the BPF map with offsets for this process
 	if err := offsetsMap.Update(unsafe.Pointer(&pid), buf.Bytes(), 0); err != nil {
 		return fmt.Errorf("failed to update BPF map: %w", err)
 	}

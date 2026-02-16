@@ -23,7 +23,7 @@ var (
 	crioIdRegexp        = regexp.MustCompile(`crio-([a-z0-9]{64})`)
 	containerdIdRegexp  = regexp.MustCompile(`cri-containerd[-:]([a-z0-9]{64})`)
 	lxcIdRegexp         = regexp.MustCompile(`/lxc/([^/]+)`)
-	systemSliceIdRegexp = regexp.MustCompile(`(/(system|runtime|reserved)\.slice/([^/]+))`)
+	systemSliceIdRegexp = regexp.MustCompile(`(/(system|runtime|reserved|kube|azure)\.slice/([^/]+))`)
 	talosIdRegexp       = regexp.MustCompile(`/(system|podruntime)/([^/]+)`)
 	lxcPayloadRegexp    = regexp.MustCompile(`/lxc\.payload\.([^/]+)`)
 )
@@ -165,7 +165,7 @@ func containerByCgroup(cgroupPath string) (ContainerType, string, error) {
 	switch {
 	case cgroupPath == "/init":
 		return ContainerTypeTalosRuntime, "/talos/init", nil
-	case prefix == "user.slice" || prefix == "init.scope":
+	case prefix == "user.slice" || prefix == "init.scope" || prefix == "systemd":
 		return ContainerTypeStandaloneProcess, "", nil
 	case prefix == "docker" || (prefix == "system.slice" && len(parts) > 1 && strings.HasPrefix(parts[1], "docker-")):
 		matches := dockerIdRegexp.FindStringSubmatch(cgroupPath)
@@ -196,7 +196,10 @@ func containerByCgroup(cgroupPath string) (ContainerType, string, error) {
 			return ContainerTypeUnknown, "", fmt.Errorf("invalid talos runtime cgroup %s", cgroupPath)
 		}
 		return ContainerTypeTalosRuntime, path.Join("/talos/", matches[2]), nil
-	case prefix == "system.slice" || prefix == "runtime.slice" || prefix == "reserved.slice":
+	case prefix == "system.slice" || prefix == "runtime.slice" || prefix == "reserved.slice" || prefix == "kube.slice" || prefix == "azure.slice":
+		if strings.HasSuffix(cgroupPath, ".scope") {
+			return ContainerTypeStandaloneProcess, "", nil
+		}
 		matches := systemSliceIdRegexp.FindStringSubmatch(cgroupPath)
 		if matches == nil {
 			return ContainerTypeUnknown, "", fmt.Errorf("invalid systemd cgroup %s", cgroupPath)

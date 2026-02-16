@@ -50,16 +50,16 @@ type ContainerNetwork struct {
 }
 
 type ContainerMetadata struct {
-	name               string
-	labels             map[string]string
-	volumes            map[string]string
-	logPath            string
-	image              string
-	logDecoder         logparser.Decoder
-	hostListens        map[string][]netaddr.IPPort
-	networks           map[string]ContainerNetwork
-	env                map[string]string
-	systemdTriggeredBy string
+	name        string
+	labels      map[string]string
+	volumes     map[string]string
+	logPath     string
+	image       string
+	logDecoder  logparser.Decoder
+	hostListens map[string][]netaddr.IPPort
+	networks    map[string]ContainerNetwork
+	env         map[string]string
+	systemd     SystemdProperties
 }
 
 type Delays struct {
@@ -311,8 +311,8 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	}
 	atomic.StoreInt64(&c.lastCollectTime, nowNanos)
 
-	if c.metadata.image != "" || c.metadata.systemdTriggeredBy != "" {
-		ch <- gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemdTriggeredBy)
+	if c.metadata.image != "" || !c.metadata.systemd.IsEmpty() {
+		ch <- gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemd.TriggeredBy, c.metadata.systemd.Type)
 	}
 
 	ch <- counter(metrics.Restarts, float64(c.restarts))
@@ -1799,13 +1799,13 @@ func (c *Container) runLogParser(logPath string) {
 	switch c.cgroup.ContainerType {
 	case cgroup.ContainerTypeSystemdService:
 		ch := make(chan logparser.LogEntry)
-		if err := JournaldSubscribe(c.cgroup, ch); err != nil {
+		if err := JournaldSubscribe(c.metadata.systemd.Unit, ch); err != nil {
 			klog.Warningln(err)
 			return
 		}
 		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.DisableSensitiveLogParsing)
 		stop := func() {
-			JournaldUnsubscribe(c.cgroup)
+			JournaldUnsubscribe(c.metadata.systemd.Unit)
 		}
 		klog.InfoS("started logparser for container", c.id)
 		klog.InfoS("started journald logparser", "cg", c.cgroup.Id)
