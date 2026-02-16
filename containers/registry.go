@@ -357,8 +357,6 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			case ebpftracer.EventTypeConnectionError:
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
 					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, 0, true, e.Duration)
-				} else {
-					klog.Infoln("TCP connection error from unknown container", e)
 				}
 			case ebpftracer.EventTypeConnectionClose:
 				r.containerLock.RLock()
@@ -540,6 +538,9 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		}
 		return nil
 	}
+	if strings.HasSuffix(cg.Id, "(deleted)") {
+		return nil
+	}
 
 	// Check if container exists by cgroup ID with read lock
 	r.containerLock.RLock()
@@ -592,6 +593,14 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		r.containersByPidIgnored[pid] = &t
 		r.containerLock.Unlock()
 		return nil
+	}
+	if cg.ContainerType == cgroup.ContainerTypeSystemdService && *flags.SkipSystemdSystemServices {
+		if md.systemd.IsSystemService() {
+			klog.InfoS("skipping system service", "id", id, "unit", md.systemd.Unit, "type", md.systemd.Type, "triggered_by", md.systemd.TriggeredBy, "pid", pid)
+			t := time.Now()
+			r.containersByPidIgnored[pid] = &t
+			return nil
+		}
 	}
 
 	// Acquire write lock for container creation to prevent race conditions
@@ -827,9 +836,10 @@ func calcId(cg *cgroup.Cgroup, md *ContainerMetadata) ContainerID {
 func getContainerMetadata(cg *cgroup.Cgroup) (*ContainerMetadata, error) {
 	switch cg.ContainerType {
 	case cgroup.ContainerTypeSystemdService:
+		var err error
 		md := &ContainerMetadata{}
-		md.systemdTriggeredBy = SystemdTriggeredBy(cg.ContainerId)
-		return md, nil
+		md.systemd, err = getSystemdProperties(cg.Id)
+		return md, err
 	case cgroup.ContainerTypeDocker, cgroup.ContainerTypeContainerd, cgroup.ContainerTypeSandbox, cgroup.ContainerTypeCrio:
 	default:
 		return &ContainerMetadata{}, nil
