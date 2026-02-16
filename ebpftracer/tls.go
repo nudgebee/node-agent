@@ -154,7 +154,7 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 
 	// DEBUG: Log every attempt to attach Go TLS uprobes (at Info level for visibility)
 	exeName, _ := os.Readlink(path)
-	klog.Infof("GO_TLS_ATTACH_ATTEMPT: pid=%d exe=%s", pid, exeName)
+	klog.V(2).Infof("GO_TLS_ATTACH_ATTEMPT: pid=%d exe=%s", pid, exeName)
 
 	var err error
 	var name, version string
@@ -163,7 +163,7 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 			for _, s := range []string{"not a Go executable", "no such file or directory", "no such process", "permission denied"} {
 				if strings.HasSuffix(err.Error(), s) {
 					// DEBUG: Log filtered errors at Info level for visibility
-					klog.Infof("GO_TLS_FILTERED: pid=%d exe=%s msg=%s err=%s", pid, exeName, msg, err.Error())
+					klog.V(3).Infof("GO_TLS_FILTERED: pid=%d exe=%s msg=%s err=%s", pid, exeName, msg, err.Error())
 					return
 				}
 			}
@@ -178,7 +178,7 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 		log("failed to read build info", err)
 		return nil, isGolangApp
 	}
-	klog.Infof("GO_TLS_BUILD_INFO: pid=%d exe=%s go_version=%s", pid, exeName, bi.GoVersion)
+	klog.V(2).Infof("GO_TLS_BUILD_INFO: pid=%d exe=%s go_version=%s", pid, exeName, bi.GoVersion)
 	isGolangApp = true
 
 	name, err = os.Readlink(path)
@@ -347,38 +347,63 @@ func getSslLibPathAndVersion(pid uint32) (string, string) {
 	scanner := bufio.NewScanner(f)
 	scanner.Split(bufio.ScanLines)
 	var libsslPath, libcryptoPath string
+	var bundledSslPath, bundledCryptoPath string
 	klog.V(4).Infof("pid=%d: scanning process maps for SSL libraries...", pid)
+	seen := map[string]bool{}
 	for scanner.Scan() {
 		parts := strings.Fields(scanner.Text())
 		if len(parts) <= 5 {
 			continue
 		}
 		libPath := parts[5]
+		if seen[libPath] {
+			continue
+		}
+		seen[libPath] = true
 
-		isSsl := libSslRe.MatchString(libPath) || (strings.Contains(libPath, "psycopg2") && psycopg2LibRe.MatchString(libPath) && strings.Contains(libPath, "libssl"))
-		isCrypto := libCryptoRe.MatchString(libPath) || (strings.Contains(libPath, "psycopg2") && psycopg2LibRe.MatchString(libPath) && strings.Contains(libPath, "libcrypto"))
+		isBundled := strings.Contains(libPath, "psycopg2") && psycopg2LibRe.MatchString(libPath)
+		isSsl := libSslRe.MatchString(libPath) || (isBundled && strings.Contains(libPath, "libssl"))
+		isCrypto := libCryptoRe.MatchString(libPath) || (isBundled && strings.Contains(libPath, "libcrypto"))
 
-		if libsslPath == "" && isSsl {
+		if isSsl {
 			fullPath := proc.Path(pid, "root", libPath)
 			if _, err = os.Stat(fullPath); err == nil {
-				libsslPath = fullPath
-				klog.V(3).Infof("pid=%d: found libssl at %s", pid, fullPath)
+				if isBundled {
+					if bundledSslPath == "" {
+						bundledSslPath = fullPath
+						klog.V(3).Infof("pid=%d: found bundled libssl at %s (will prefer system lib if available)", pid, fullPath)
+					}
+				} else if libsslPath == "" {
+					libsslPath = fullPath
+					klog.V(3).Infof("pid=%d: found system libssl at %s", pid, fullPath)
+				}
 			} else {
 				klog.V(4).Infof("pid=%d: libssl candidate %s not accessible: %v", pid, fullPath, err)
 			}
-		} else if libcryptoPath == "" && isCrypto {
+		}
+		if isCrypto {
 			fullPath := proc.Path(pid, "root", libPath)
 			if _, err = os.Stat(fullPath); err == nil {
-				libcryptoPath = fullPath
-				klog.V(3).Infof("pid=%d: found libcrypto at %s", pid, fullPath)
+				if isBundled {
+					if bundledCryptoPath == "" {
+						bundledCryptoPath = fullPath
+						klog.V(3).Infof("pid=%d: found bundled libcrypto at %s (will prefer system lib if available)", pid, fullPath)
+					}
+				} else if libcryptoPath == "" {
+					libcryptoPath = fullPath
+					klog.V(3).Infof("pid=%d: found system libcrypto at %s", pid, fullPath)
+				}
 			} else {
 				klog.V(4).Infof("pid=%d: libcrypto candidate %s not accessible: %v", pid, fullPath, err)
 			}
 		}
-
-		if libsslPath != "" && libcryptoPath != "" {
-			break
-		}
+	}
+	// Fall back to bundled libs if no system libs found
+	if libsslPath == "" {
+		libsslPath = bundledSslPath
+	}
+	if libcryptoPath == "" {
+		libcryptoPath = bundledCryptoPath
 	}
 	if libsslPath == "" || libcryptoPath == "" {
 		klog.V(3).Infof("pid=%d: SSL libraries incomplete (libssl='%s', libcrypto='%s')", pid, libsslPath, libcryptoPath)
