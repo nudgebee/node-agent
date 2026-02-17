@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -1995,12 +1996,14 @@ func resolveFd(pid uint32, fd uint64) (mntId string, logPath string) {
 	}
 	mntId = info.MntId
 
-	if info.Flags&os.O_WRONLY != 0 && strings.HasPrefix(info.Dest, "/var/log/") &&
-		!strings.HasPrefix(info.Dest, "/var/log/pods/") &&
-		!strings.HasPrefix(info.Dest, "/var/log/containers/") &&
-		!strings.HasPrefix(info.Dest, "/var/log/journal/") {
-
-		logPath = info.Dest
+	if info.Flags&os.O_WRONLY != 0 {
+		cleaned := filepath.Clean(info.Dest)
+		if strings.HasPrefix(cleaned, "/var/log/") &&
+			!strings.HasPrefix(cleaned, "/var/log/pods/") &&
+			!strings.HasPrefix(cleaned, "/var/log/containers/") &&
+			!strings.HasPrefix(cleaned, "/var/log/journal/") {
+			logPath = cleaned
+		}
 	}
 	return
 }
