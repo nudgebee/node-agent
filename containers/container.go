@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -1783,7 +1784,7 @@ func (c *Container) runLogParser(logPath string) {
 			return
 		}
 		ch := make(chan logparser.LogEntry)
-		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.DisableSensitiveLogParsing)
+		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, *flags.DisableSensitiveLogParsing)
 		reader, err := logs.NewTailReader(proc.HostPath(logPath), ch)
 		if err != nil {
 			klog.Warningln(err)
@@ -1803,7 +1804,7 @@ func (c *Container) runLogParser(logPath string) {
 			klog.Warningln(err)
 			return
 		}
-		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.DisableSensitiveLogParsing)
+		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, *flags.DisableSensitiveLogParsing)
 		stop := func() {
 			JournaldUnsubscribe(c.metadata.systemd.Unit)
 		}
@@ -1820,7 +1821,7 @@ func (c *Container) runLogParser(logPath string) {
 			delete(c.logParsers, "stdout/stderr")
 		}
 		ch := make(chan logparser.LogEntry)
-		parser := logparser.NewParser(ch, c.metadata.logDecoder, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.DisableSensitiveLogParsing)
+		parser := logparser.NewParser(ch, c.metadata.logDecoder, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, *flags.DisableSensitiveLogParsing)
 		reader, err := logs.NewTailReader(proc.HostPath(c.metadata.logPath), ch)
 		if err != nil {
 			klog.Warningln(err)
@@ -1996,12 +1997,14 @@ func resolveFd(pid uint32, fd uint64) (mntId string, logPath string) {
 	}
 	mntId = info.MntId
 
-	if info.Flags&os.O_WRONLY != 0 && strings.HasPrefix(info.Dest, "/var/log/") &&
-		!strings.HasPrefix(info.Dest, "/var/log/pods/") &&
-		!strings.HasPrefix(info.Dest, "/var/log/containers/") &&
-		!strings.HasPrefix(info.Dest, "/var/log/journal/") {
-
-		logPath = info.Dest
+	if info.Flags&os.O_WRONLY != 0 {
+		cleaned := filepath.Clean(info.Dest)
+		if strings.HasPrefix(cleaned, "/var/log/") &&
+			!strings.HasPrefix(cleaned, "/var/log/pods/") &&
+			!strings.HasPrefix(cleaned, "/var/log/containers/") &&
+			!strings.HasPrefix(cleaned, "/var/log/journal/") {
+			logPath = cleaned
+		}
 	}
 	return
 }
