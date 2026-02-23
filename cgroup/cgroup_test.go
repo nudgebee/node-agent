@@ -161,6 +161,16 @@ func TestContainerByCgroup(t *testing.T) {
 	as.Equal("/reserved.slice/kubelet.service", id)
 	as.Nil(err)
 
+	typ, id, err = containerByCgroup("/kube.slice/kubelet.service")
+	as.Equal(typ, ContainerTypeSystemdService)
+	as.Equal("/kube.slice/kubelet.service", id)
+	as.Nil(err)
+
+	typ, id, err = containerByCgroup("/azure.slice/walinuxagent.service")
+	as.Equal(typ, ContainerTypeSystemdService)
+	as.Equal("/azure.slice/walinuxagent.service", id)
+	as.Nil(err)
+
 	typ, id, err = containerByCgroup("/system.slice/system-postgresql.slice/postgresql@9.4-main.service")
 	as.Equal(typ, ContainerTypeSystemdService)
 	as.Equal("/system.slice/system-postgresql.slice", id)
@@ -194,5 +204,25 @@ func TestContainerByCgroup(t *testing.T) {
 	typ, id, err = containerByCgroup("/lxc.monitor.first")
 	as.Equal(ContainerTypeStandaloneProcess, typ)
 	as.Equal("", id)
+	as.Nil(err)
+
+	typ, id, err = containerByCgroup("/systemd/system.slice")
+	as.Equal(ContainerTypeStandaloneProcess, typ)
+	as.Equal("", id)
+	as.Nil(err)
+
+	typ, id, err = containerByCgroup("/system.slice/cri-containerd-69e8ded3c33c9d5e2b93acd74787b17a8629f74d6707bc5bb9b2e095337d0263.scope")
+	as.Equal(ContainerTypeStandaloneProcess, typ)
+	as.Equal("", id)
+	as.Nil(err)
+
+	typ, id, err = containerByCgroup("/system.slice/run-ra2ddf9594bbf4a1986439b594f89eb0f.scope")
+	as.Equal(ContainerTypeStandaloneProcess, typ)
+	as.Equal("", id)
+	as.Nil(err)
+
+	typ, id, err = containerByCgroup("/system.slice/docker-ba7b10d15d16e10e3de7a2dcd408a3d971169ae303f46cfad4c5453c6326fee2.scope")
+	as.Equal(ContainerTypeDocker, typ)
+	as.Equal("ba7b10d15d16e10e3de7a2dcd408a3d971169ae303f46cfad4c5453c6326fee2", id)
 	as.Nil(err)
 }

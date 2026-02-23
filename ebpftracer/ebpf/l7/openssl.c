@@ -37,12 +37,19 @@ struct bio_st_v3_0 {
     int num; // fd
 };
 
+// OpenSSL 1.x: ssl_st has rbio/wbio directly
 struct ssl_st {
     __s32 version;
     struct unused* method;
     struct bio_st* rbio;  // used by SSL_read
     struct bio_st* wbio;  // used by SSL_write
 };
+
+// OpenSSL 3.x: ssl_st is a base struct embedded in ssl_connection_st.
+// rbio/wbio moved to ssl_connection_st at offset 80/88.
+// Layout: ssl_st(64 bytes) + user_ssl(8) + version(4) + pad(4) + rbio + wbio
+#define SSL_V3_RBIO_OFFSET 80
+#define SSL_V3_WBIO_OFFSET 88
 
 #define GET_FD(ctx, bio_t, bio_rw)                                      \
 ({                                                                      \
@@ -59,6 +66,24 @@ struct ssl_st {
         return 0;                                                       \
     }                                                                   \
     fd;                                                                 \
+})
+
+#define GET_FD_V3(ctx, bio_rw_offset)                                       \
+({                                                                          \
+    void *bio_ptr;                                                          \
+    if (bpf_probe_read(&bio_ptr, sizeof(bio_ptr),                           \
+        (void*)PT_REGS_PARM1(ctx) + bio_rw_offset)) {                      \
+        return 0;                                                           \
+    };                                                                      \
+    struct bio_st_v3_0 bio;                                                 \
+    if (bpf_probe_read(&bio, sizeof(bio), bio_ptr)) {                       \
+        return 0;                                                           \
+    };                                                                      \
+    __u32 fd = bio.num;                                                     \
+    if (fd <= 2) {                                                          \
+        return 0;                                                           \
+    }                                                                       \
+    fd;                                                                     \
 })
 
 #define WRITE_ENTER(ctx, bio_t)                                 \
@@ -107,7 +132,13 @@ int openssl_SSL_write_enter_v1_1_1(struct pt_regs *ctx) {
 
 SEC("uprobe/openssl_SSL_write_enter_v3_0")
 int openssl_SSL_write_enter_v3_0(struct pt_regs *ctx) {
-    WRITE_ENTER(ctx, bio_st_v3_0);
+    __u32 fd = GET_FD_V3(ctx, SSL_V3_WBIO_OFFSET);
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 pid = pid_tgid >> 32;
+    ensure_connection_tracked(pid, fd);
+    char* buf_ptr = (char*)PT_REGS_PARM2(ctx);
+    __u64 buf_size = PT_REGS_PARM3(ctx);
+    return trace_enter_write(ctx, fd, 1, buf_ptr, buf_size, 0);
 }
 
 SEC("uprobe/openssl_SSL_read_enter")
@@ -132,12 +163,25 @@ int openssl_SSL_read_ex_enter_v1_1_1(struct pt_regs *ctx) {
 
 SEC("uprobe/openssl_SSL_read_enter_v3_0")
 int openssl_SSL_read_enter_v3_0(struct pt_regs *ctx) {
-    READ_ENTER(ctx, bio_st_v3_0);
+    __u32 fd = GET_FD_V3(ctx, SSL_V3_RBIO_OFFSET);
+    char* buf_ptr = (char*)PT_REGS_PARM2(ctx);
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 pid = pid_tgid >> 32;
+    ensure_connection_tracked(pid, fd);
+    __u64 id = pid_tgid | IS_TLS_READ_ID;
+    return trace_enter_read(id, pid, fd, buf_ptr, 0, 0);
 }
 
 SEC("uprobe/openssl_SSL_read_ex_enter_v3_0")
 int openssl_SSL_read_ex_enter_v3_0(struct pt_regs *ctx) {
-    READ_EX_ENTER(ctx, bio_st_v3_0);
+    __u32 fd = GET_FD_V3(ctx, SSL_V3_RBIO_OFFSET);
+    char* buf_ptr = (char*)PT_REGS_PARM2(ctx);
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 pid = pid_tgid >> 32;
+    ensure_connection_tracked(pid, fd);
+    __u64 id = pid_tgid | IS_TLS_READ_ID;
+    __u64* ret_ptr = (__u64*)PT_REGS_PARM4(ctx);
+    return trace_enter_read(id, pid, fd, buf_ptr, ret_ptr, 0);
 }
 
 SEC("uprobe/openssl_SSL_read_exit")
