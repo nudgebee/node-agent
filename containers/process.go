@@ -113,7 +113,11 @@ func (p *Process) instrumentPython(cmdline []byte, tracer *ebpftracer.Tracer) {
 	if len(cmd) == 0 {
 		return
 	}
-	cmd = bytes.TrimSuffix(bytes.Fields(cmd)[0], []byte{':'})
+	cmdFields := bytes.Fields(cmd)
+	if len(cmdFields) == 0 {
+		return
+	}
+	cmd = bytes.TrimSuffix(cmdFields[0], []byte{':'})
 	if !pythonCmd.Match(cmd) {
 		return
 	}
@@ -172,7 +176,13 @@ func (p *Process) removeOldGpuUsageSamples(cutoff time.Time) {
 
 func (p *Process) Close() {
 	p.cancelFunc()
-	for _, u := range p.uprobes {
-		_ = u.Close()
+	if len(p.uprobes) > 0 {
+		uprobes := p.uprobes
+		p.uprobes = nil
+		go func() {
+			for _, u := range uprobes {
+				_ = u.Close()
+			}
+		}()
 	}
 }

@@ -185,7 +185,7 @@ func (t *LLMStreamTracker) OnRequestHeaders(
 
 	t.streams[key] = stream
 
-	klog.V(2).Infof("LLM_STREAM_START: key=%s provider=%s model=%s op=%s trace_id=%s",
+	klog.V(4).Infof("LLM_STREAM_START: key=%s provider=%s model=%s op=%s trace_id=%s",
 		key, provider, stream.Model, stream.Operation, traceID)
 
 	return true
@@ -255,7 +255,7 @@ func (t *LLMStreamTracker) OnDataFrame(
 	// Track first token time
 	if stream.FirstTokenTime.IsZero() {
 		stream.FirstTokenTime = now
-		klog.V(2).Infof("LLM_STREAM_FIRST_TOKEN: key=%s ttft_ms=%d",
+		klog.V(4).Infof("LLM_STREAM_FIRST_TOKEN: key=%s ttft_ms=%d",
 			key, now.Sub(stream.RequestTime).Milliseconds())
 	}
 	stream.LastDataTime = now

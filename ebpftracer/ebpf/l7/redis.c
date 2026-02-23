@@ -38,6 +38,9 @@ int is_redis_query(char *buf, __u64 buf_size) {
 
 static __always_inline
 int is_redis_response(char *buf, __u64 buf_size, __s32 *status) {
+    if (buf_size < 3) {
+        return 0;
+    }
     char type;
     bpf_read(buf, type);
     char end[2];
