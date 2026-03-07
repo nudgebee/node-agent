@@ -131,7 +131,7 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, ip
 
 	r := &Registry{
 		reg:                    reg,
-		events:                 make(chan ebpftracer.Event, 10000),
+		events:                 make(chan ebpftracer.Event, 2000),
 		containersById:         map[ContainerID]*Container{},
 		containersByCgroupId:   map[string]*Container{},
 		containersByPid:        map[uint32]*Container{},
@@ -392,6 +392,8 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 }
 
 // processL7Event handles an L7 event, queueing it for retry if the connection isn't found yet
+const maxIP2FQDNEntries = 10000
+
 func (r *Registry) processL7Event(e ebpftracer.Event) {
 	if c := r.containersByPid[e.Pid]; c != nil {
 		klog.V(2).Infof("L7_EVENT_CONTAINER_FOUND: pid=%d container=%s", e.Pid, c.id)
@@ -405,8 +407,9 @@ func (r *Registry) processL7Event(e ebpftracer.Event) {
 		}
 		r.ip2fqdnLock.Lock()
 		for ip, domain := range ip2fqdn {
-			r.ip2fqdn[ip] = domain
-			// Also update IP resolver cache for trace hostname display
+			if len(r.ip2fqdn) < maxIP2FQDNEntries {
+				r.ip2fqdn[ip] = domain
+			}
 			r.ip_resolver.CacheDNS(ip.String(), domain.FQDN)
 		}
 		r.ip2fqdnLock.Unlock()
@@ -415,8 +418,9 @@ func (r *Registry) processL7Event(e ebpftracer.Event) {
 		ip2fqdn := r.handleHostDNSRequest(e.L7Request)
 		r.ip2fqdnLock.Lock()
 		for ip, domain := range ip2fqdn {
-			r.ip2fqdn[ip] = domain
-			// Also update IP resolver cache for trace hostname display
+			if len(r.ip2fqdn) < maxIP2FQDNEntries {
+				r.ip2fqdn[ip] = domain
+			}
 			r.ip_resolver.CacheDNS(ip.String(), domain.FQDN)
 		}
 		r.ip2fqdnLock.Unlock()
@@ -429,7 +433,7 @@ func (r *Registry) queueL7EventForRetry(e ebpftracer.Event) {
 	defer r.pendingL7EventsLock.Unlock()
 
 	// Limit queue size to prevent memory issues
-	const maxPendingEvents = 1000
+	const maxPendingEvents = 500
 	if len(r.pendingL7Events) >= maxPendingEvents {
 		klog.V(2).Infof("L7_EVENT_QUEUE_FULL: dropping event pid=%d fd=%d", e.Pid, e.Fd)
 		return

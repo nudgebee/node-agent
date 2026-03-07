@@ -10,6 +10,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"unsafe"
 
 	"github.com/cilium/ebpf/link"
@@ -49,6 +50,11 @@ var (
 	libCryptoRe = regexp.MustCompile(`libcrypto\.so(\.\d+)*`)
 	// A more specific regex for psycopg2's bundled libs
 	psycopg2LibRe = regexp.MustCompile(`lib(ssl|crypto)-[a-f0-9]+\.so\.\d+`)
+
+	// strippedGoExeCache caches exe paths that are Go binaries but have no TLS symbols.
+	// This avoids expensive ELF scanning for the same stripped binary across many
+	// short-lived processes (e.g., kubectl invocations). Uses sync.Map for lock-free reads.
+	strippedGoExeCache = &sync.Map{} // map[string]struct{}
 )
 
 func (t *Tracer) AttachOpenSslUprobes(pid uint32) []link.Link {
@@ -170,9 +176,15 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 
 	path := proc.Path(pid, "exe")
 
-	// DEBUG: Log every attempt to attach Go TLS uprobes (at Info level for visibility)
 	exeName, _ := os.Readlink(path)
-	klog.Infof("GO_TLS_ATTACH_ATTEMPT: pid=%d exe=%s", pid, exeName)
+	klog.V(2).Infof("GO_TLS_ATTACH_ATTEMPT: pid=%d exe=%s", pid, exeName)
+
+	// Skip binaries we already know are stripped (no TLS symbols).
+	// This avoids expensive ELF scanning for repeated short-lived processes like kubectl.
+	if _, stripped := strippedGoExeCache.Load(exeName); stripped {
+		klog.V(3).Infof("GO_TLS_SKIP_STRIPPED: pid=%d exe=%s", pid, exeName)
+		return nil, true // still a Go app, just stripped
+	}
 
 	var err error
 	var name, version string
@@ -180,8 +192,6 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 		if err != nil {
 			for _, s := range []string{"not a Go executable", "no such file or directory", "no such process", "permission denied"} {
 				if strings.HasSuffix(err.Error(), s) {
-					// DEBUG: Log filtered errors at Info level for visibility
-					klog.Infof("GO_TLS_FILTERED: pid=%d exe=%s msg=%s err=%s", pid, exeName, msg, err.Error())
 					return
 				}
 			}
@@ -245,6 +255,10 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 		if err != nil {
 			if writeSymbol == goTlsWriteSymbol {
 				log("failed to get write symbol", err)
+				// Cache this exe as stripped to skip future attempts
+				if exeName != "" {
+					strippedGoExeCache.Store(exeName, struct{}{})
+				}
 				return nil, isGolangApp
 			}
 			continue // S2A symbol is optional

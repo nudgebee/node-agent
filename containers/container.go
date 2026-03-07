@@ -33,7 +33,7 @@ import (
 )
 
 var (
-	gcInterval                = 10 * time.Minute
+	gcInterval                = 5 * time.Minute
 	pingTimeout               = 300 * time.Millisecond
 	multilineCollectorTimeout = time.Second
 	payloadThreshold          = 1024 * 1024
@@ -41,7 +41,7 @@ var (
 )
 
 const (
-	connectionStatsCacheSize = 8192 // LRU cache size for connection stats
+	connectionStatsCacheSize = 4096 // LRU cache size for connection stats
 )
 
 type ContainerID string
@@ -337,7 +337,12 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		ch <- gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemd.TriggeredBy, c.metadata.systemd.Type)
 	}
 
-	ch <- counter(metrics.Restarts, float64(c.restarts))
+	c.lock.RLock()
+	restarts := c.restarts
+	oomKills := c.oomKills
+	c.lock.RUnlock()
+
+	ch <- counter(metrics.Restarts, float64(restarts))
 
 	if cpu := c.cgroup.CpuStat(); cpu != nil {
 		if cpu.LimitCores > 0 {
@@ -370,8 +375,8 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		ch <- counter(metrics.PsiIO, psi.IOSecondsFull, "full")
 	}
 
-	if c.oomKills > 0 {
-		ch <- counter(metrics.OOMKills, float64(c.oomKills))
+	if oomKills > 0 {
+		ch <- counter(metrics.OOMKills, float64(oomKills))
 	}
 
 	if disks, err := node.GetDisks(); err == nil {
@@ -398,20 +403,38 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
-	for addr, open := range c.getListens() {
+	// Snapshot listens under lock since getListens/getProxiedListens access c.listens and c.processes
+	c.lock.RLock()
+	listens := c.getListens()
+	proxiedListens := c.getProxiedListens()
+	c.lock.RUnlock()
+
+	for addr, open := range listens {
 		ch <- gauge(metrics.NetListenInfo, float64(open), addr.String(), "")
 	}
-	for proxy, addrs := range c.getProxiedListens() {
+	for proxy, addrs := range proxiedListens {
 		for addr := range addrs {
 			ch <- gauge(metrics.NetListenInfo, 1, addr.String(), proxy)
 		}
 	}
 
+	// Snapshot connectionStats under lock since the LRU cache is not concurrent-safe
+	type connStatSnapshot struct {
+		key   common.DestinationKey
+		stats ConnectionStats
+	}
+	c.lock.RLock()
+	connSnapshots := make([]connStatSnapshot, 0, c.connectionStats.Len())
 	for _, d := range c.connectionStats.Keys() {
-		stats, ok := c.connectionStats.Peek(d)
-		if !ok {
-			continue
+		if stats, ok := c.connectionStats.Peek(d); ok {
+			connSnapshots = append(connSnapshots, connStatSnapshot{key: d, stats: *stats})
 		}
+	}
+	c.lock.RUnlock()
+
+	for _, snap := range connSnapshots {
+		d := snap.key
+		stats := snap.stats
 		workload_src := c.srcWorkload
 		workload_dest := d.GetDestinationWorkload()
 		actualDestWorkload := d.GetActualDestinationWorkload()
@@ -463,10 +486,14 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	for source, p := range logParsersCopy {
 		for _, ctr := range p.parser.GetCounters() {
 			if ctr.Level == logparser.LevelCritical || ctr.Level == logparser.LevelError {
+				c.lock.RLock()
 				sample, ok := c.logSamples[ctr.Hash]
+				c.lock.RUnlock()
 				if !ok {
 					sample = common.TruncateUtf8(ctr.Sample, *flags.MaxLabelLength)
+					c.lock.Lock()
 					c.logSamples[ctr.Hash] = sample
+					c.lock.Unlock()
 				}
 				ch <- counter(metrics.LogMessages, float64(ctr.Messages), source, ctr.Level.String(), ctr.Hash, sample)
 			}
@@ -730,7 +757,9 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 	if common.PortFilter.ShouldBeSkipped(dst.Port()) {
 		return
 	}
+	c.lock.RLock()
 	p := c.processes[pid]
+	c.lock.RUnlock()
 	if p == nil {
 		return
 	}
@@ -1879,6 +1908,17 @@ func (c *Container) gc(now time.Time) {
 			}
 		}
 	}
+	// Clean up HTTP/2 parsers for closed/dead connections.
+	// Parsers hold HPACK decoders, partial frame buffers, and active request maps
+	// that accumulate memory over time if not cleaned up.
+	if c.googleHTTP2Parsers != nil {
+		for pidFd := range c.googleHTTP2Parsers {
+			if _, alive := c.connectionsByPidFd[pidFd]; !alive {
+				delete(c.googleHTTP2Parsers, pidFd)
+			}
+		}
+	}
+
 	for dst, at := range c.lastConnectionAttempts {
 		_, active := establishedDst[dst]
 		if !active && !at.IsZero() && now.Sub(at) > gcInterval {
