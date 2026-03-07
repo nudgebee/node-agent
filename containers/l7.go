@@ -101,17 +101,19 @@ func normalizeHttpPath(path string) string {
 }
 
 type L7Stats struct {
-	mu          sync.RWMutex
-	requests    map[l7.Protocol]*prometheus.CounterVec
-	latency     map[l7.Protocol]*prometheus.HistogramVec
-	initialized map[l7.Protocol]bool
+	mu              sync.RWMutex
+	requests        map[l7.Protocol]*prometheus.CounterVec
+	latency         map[l7.Protocol]*prometheus.HistogramVec
+	initialized     map[l7.Protocol]bool
+	promConstLabels prometheus.Labels // container_id, app_id, machine_id, system_uuid, az, region
 }
 
-func NewL7Stats() L7Stats {
+func NewL7Stats(constLabels prometheus.Labels) L7Stats {
 	return L7Stats{
-		requests:    make(map[l7.Protocol]*prometheus.CounterVec),
-		latency:     make(map[l7.Protocol]*prometheus.HistogramVec),
-		initialized: make(map[l7.Protocol]bool),
+		requests:        make(map[l7.Protocol]*prometheus.CounterVec),
+		latency:         make(map[l7.Protocol]*prometheus.HistogramVec),
+		initialized:     make(map[l7.Protocol]bool),
+		promConstLabels: constLabels,
 	}
 }
 
@@ -253,7 +255,7 @@ func (s *L7Stats) ensureInitialized(protocol l7.Protocol) {
 
 	if cOpts, exists := L7Requests[metricsProtocol]; exists {
 		s.requests[protocol] = prometheus.NewCounterVec(
-			prometheus.CounterOpts{Name: cOpts.Name, Help: cOpts.Help},
+			prometheus.CounterOpts{Name: cOpts.Name, Help: cOpts.Help, ConstLabels: s.promConstLabels},
 			requestLabels,
 		)
 	}
@@ -270,7 +272,7 @@ func (s *L7Stats) ensureInitialized(protocol l7.Protocol) {
 
 	if hOpts, exists := L7Latency[metricsProtocol]; exists {
 		s.latency[protocol] = prometheus.NewHistogramVec(
-			prometheus.HistogramOpts{Name: hOpts.Name, Help: hOpts.Help},
+			prometheus.HistogramOpts{Name: hOpts.Name, Help: hOpts.Help, ConstLabels: s.promConstLabels},
 			histogramLabels,
 		)
 	}

@@ -54,7 +54,8 @@ type IPResolver interface {
 }
 
 type Registry struct {
-	reg prometheus.Registerer
+	reg    prometheus.Registerer // wrapped registerer for ip2fqdn and LLM metrics
+	rawReg prometheus.Registerer // raw registry for containers (no wrapping overhead)
 
 	tracer *ebpftracer.Tracer
 	events chan ebpftracer.Event
@@ -78,6 +79,10 @@ type Registry struct {
 
 	gpuProcessUsageSampleChan chan gpu.ProcessUsageSample
 
+	// nodeConstLabels holds [machine_id, system_uuid, az, region] values
+	// for embedding directly in metrics (avoids WrapRegistererWith overhead).
+	nodeConstLabels []string
+
 	// pendingL7Events stores L7 events that arrived before their connection was established
 	// This handles the race condition between ring buffer (L7 events) and perf buffer (TCP events)
 	pendingL7Events     []pendingL7Event
@@ -91,7 +96,7 @@ type pendingL7Event struct {
 	retryCount int
 }
 
-func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, ip_resolver *common.K8sIPResolver, gpuProcessUsageSampleChan chan gpu.ProcessUsageSample) (*Registry, error) {
+func NewRegistry(reg prometheus.Registerer, rawReg prometheus.Registerer, processInfoCh chan<- ProcessInfo, ip_resolver *common.K8sIPResolver, gpuProcessUsageSampleChan chan gpu.ProcessUsageSample, machineId, systemUuid, az, region string) (*Registry, error) {
 	ns, err := proc.GetSelfNetNs()
 	if err != nil {
 		return nil, err
@@ -131,6 +136,7 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, ip
 
 	r := &Registry{
 		reg:                    reg,
+		rawReg:                 rawReg,
 		events:                 make(chan ebpftracer.Event, 2000),
 		containersById:         map[ContainerID]*Container{},
 		containersByCgroupId:   map[string]*Container{},
@@ -146,6 +152,7 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, ip
 		pythonStatsUpdateCh:  make(chan *PythonStatsUpdate),
 
 		gpuProcessUsageSampleChan: gpuProcessUsageSampleChan,
+		nodeConstLabels:           []string{machineId, systemUuid, az, region},
 	}
 	// Register LLM metrics with the same registerer used for other container metrics
 	RegisterLLMMetrics(reg)
@@ -170,7 +177,7 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 	r.ip2fqdnLock.RLock()
 	defer r.ip2fqdnLock.RUnlock()
 	for ip, domain := range r.ip2fqdn {
-		ch <- gauge(metrics.Ip2Fqdn, 1, ip.String(), domain.FQDN)
+		ch <- prometheus.MustNewConstMetric(metrics.Ip2Fqdn, prometheus.GaugeValue, 1, ip.String(), domain.FQDN)
 	}
 }
 
@@ -239,7 +246,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 					delete(r.containersById, c.id)
 
 					// Unregister from Prometheus (do this after removing from maps)
-					if ok := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(c.id), "app_id": c.appId}, r.reg).Unregister(c); !ok {
+					if ok := r.rawReg.Unregister(c); !ok {
 						klog.Warningf("failed to unregister container: %s", c.id)
 					}
 					c.Close()
@@ -633,7 +640,7 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	}
 	if c := r.containersById[id]; c != nil {
 		klog.Warningln("id conflict, replacing container:", id)
-		prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(c.id), "app_id": c.appId}, r.reg).Unregister(c)
+		r.rawReg.Unregister(c)
 		delete(r.containersById, c.id)
 		for cgid, container := range r.containersByCgroupId {
 			if container == c {
@@ -655,7 +662,7 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		return nil
 	}
 	klog.InfoS("detected a new container", "pid", pid, "cg", cg.Id, "id", id, "app", c.appId)
-	if err := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(id), "app_id": c.appId}, r.reg).Register(c); err != nil {
+	if err := r.rawReg.Register(c); err != nil {
 		klog.Warningf("failed to register container %s: %v", id, err)
 		return nil
 	}

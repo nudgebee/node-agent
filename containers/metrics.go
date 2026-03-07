@@ -5,6 +5,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+// constLabelNames are prepended to every container metric descriptor.
+// Values are set per-container and prepended by Container.counter()/gauge().
+// Must be declared before `metrics` so it's initialized when metric() is called.
+var constLabelNames = []string{"container_id", "app_id", "machine_id", "system_uuid", "az", "region"}
+
 var metrics = struct {
 	ContainerInfo *prometheus.Desc
 	Restarts      *prometheus.Desc
@@ -111,7 +116,10 @@ var metrics = struct {
 	JvmSafepointTime:     metric("container_jvm_safepoint_time_seconds", "Time the application has been stopped for safepoint operations in seconds", "jvm"),
 	JvmSafepointSyncTime: metric("container_jvm_safepoint_sync_time_seconds", "Time spent getting to safepoints in seconds", "jvm"),
 
-	Ip2Fqdn: metric("ip_to_fqdn", "Mapping IP addresses to FQDNs based on DNS requests initiated by containers", "ip", "fqdn"),
+	// Ip2Fqdn is emitted by Registry.Collect, not Container.Collect.
+	// It gets machine_id/system_uuid/az/region from the wrapped registerer,
+	// so it does NOT need constLabelNames.
+	Ip2Fqdn: prometheus.NewDesc("ip_to_fqdn", "Mapping IP addresses to FQDNs based on DNS requests initiated by containers", []string{"ip", "fqdn"}, nil),
 
 	PythonThreadLockWaitTime:   metric("container_python_thread_lock_wait_time_seconds", "Time spent waiting acquiring GIL in seconds"),
 	NodejsEventLoopBlockedTime: metric("container_nodejs_event_loop_blocked_time_seconds_total", "Total time the Node.js event loop spent blocked"),
@@ -156,7 +164,10 @@ var (
 )
 
 func metric(name, help string, labels ...string) *prometheus.Desc {
-	return prometheus.NewDesc(name, help, labels, nil)
+	allLabels := make([]string, 0, len(constLabelNames)+len(labels))
+	allLabels = append(allLabels, constLabelNames...)
+	allLabels = append(allLabels, labels...)
+	return prometheus.NewDesc(name, help, allLabels, nil)
 }
 
 func newCounter(name, help string, constLabels prometheus.Labels) prometheus.Counter {
