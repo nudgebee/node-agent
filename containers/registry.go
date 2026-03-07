@@ -53,6 +53,18 @@ type IPResolver interface {
 	ResolvePodOwner(string, string) common.Workload
 }
 
+type NodeConstLabels struct {
+	MachineID  string
+	SystemUUID string
+	AZ         string
+	Region     string
+}
+
+// Values returns the label values in the order matching constLabelNames.
+func (n NodeConstLabels) Values() []string {
+	return []string{n.MachineID, n.SystemUUID, n.AZ, n.Region}
+}
+
 type Registry struct {
 	reg    prometheus.Registerer // wrapped registerer for ip2fqdn and LLM metrics
 	rawReg prometheus.Registerer // raw registry for containers (no wrapping overhead)
@@ -79,9 +91,9 @@ type Registry struct {
 
 	gpuProcessUsageSampleChan chan gpu.ProcessUsageSample
 
-	// nodeConstLabels holds [machine_id, system_uuid, az, region] values
-	// for embedding directly in metrics (avoids WrapRegistererWith overhead).
-	nodeConstLabels []string
+	// nodeConstLabels holds node-level label values for embedding directly
+	// in container metrics (avoids WrapRegistererWith overhead).
+	nodeConstLabels NodeConstLabels
 
 	// pendingL7Events stores L7 events that arrived before their connection was established
 	// This handles the race condition between ring buffer (L7 events) and perf buffer (TCP events)
@@ -152,7 +164,7 @@ func NewRegistry(reg prometheus.Registerer, rawReg prometheus.Registerer, proces
 		pythonStatsUpdateCh:  make(chan *PythonStatsUpdate),
 
 		gpuProcessUsageSampleChan: gpuProcessUsageSampleChan,
-		nodeConstLabels:           []string{machineId, systemUuid, az, region},
+		nodeConstLabels:           NodeConstLabels{MachineID: machineId, SystemUUID: systemUuid, AZ: az, Region: region},
 	}
 	// Register LLM metrics with the same registerer used for other container metrics
 	RegisterLLMMetrics(reg)

@@ -218,18 +218,19 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 	}
 
 	// Build const labels for direct embedding in metrics (avoids WrapRegistererWith overhead)
-	nodeLabels := registry.nodeConstLabels
-	constLabels := make([]string, 0, 2+len(nodeLabels))
+	nl := registry.nodeConstLabels
+	nodeValues := nl.Values()
+	constLabels := make([]string, 0, 2+len(nodeValues))
 	constLabels = append(constLabels, cid, appId)
-	constLabels = append(constLabels, nodeLabels...)
+	constLabels = append(constLabels, nodeValues...)
 
 	promConstLabels := prometheus.Labels{
 		"container_id": cid,
 		"app_id":       appId,
-		"machine_id":   nodeLabels[0],
-		"system_uuid":  nodeLabels[1],
-		"az":           nodeLabels[2],
-		"region":       nodeLabels[3],
+		"machine_id":   nl.MachineID,
+		"system_uuid":  nl.SystemUUID,
+		"az":           nl.AZ,
+		"region":       nl.Region,
 	}
 
 	c := &Container{
@@ -519,8 +520,8 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 				ch <- c.counter(metrics.LogMessages, float64(ctr.Messages), source, ctr.Level.String(), ctr.Hash, sample)
 			}
 		}
-		for _, c := range p.parser.GetSensitiveCounters() {
-			ch <- c.counter(metrics.SensitiveLogMessages, float64(c.Messages), source, c.Pattern, common.TruncateUtf8(c.Sample, *flags.MaxLabelLength), c.Regex, c.Name, c.Hash)
+		for _, sc := range p.parser.GetSensitiveCounters() {
+			ch <- c.counter(metrics.SensitiveLogMessages, float64(sc.Messages), source, sc.Pattern, common.TruncateUtf8(sc.Sample, *flags.MaxLabelLength), sc.Regex, sc.Name, sc.Hash)
 		}
 	}
 
