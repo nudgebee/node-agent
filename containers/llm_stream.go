@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	maxActiveStreams    = 200              // Max concurrent streams
+	maxActiveStreams   = 200              // Max concurrent streams
 	maxBufferPerStream = 64 * 1024        // 64KB per stream (only need final usage JSON)
 	streamIdleTimeout  = 30 * time.Second // Release abandoned streams
 	streamMaxDuration  = 5 * time.Minute  // Cap for very long streams
