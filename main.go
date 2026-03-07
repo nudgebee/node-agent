@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -132,7 +133,7 @@ func main() {
 	if os.Getenv("GOMEMLIMIT") == "" {
 		if limit, err := readCgroupMemoryLimit(); err == nil && limit > 0 {
 			softLimit := int64(float64(limit) * 0.9)
-			runtime.SetMemoryLimit(softLimit)
+			debug.SetMemoryLimit(softLimit)
 			log.Printf("GOMEMLIMIT set to %dMiB (90%% of cgroup limit %dMiB)", softLimit/1024/1024, limit/1024/1024)
 		}
 	}
