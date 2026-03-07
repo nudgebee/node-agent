@@ -417,8 +417,8 @@ type l7Event struct {
 	AddrFamily      uint16   // AF_INET (2) or AF_INET6 (10)
 	SocketInfoValid uint8    // 1 if socket info was extracted
 	Padding2        uint8
-	Payload         [8192]byte // Must match MAX_PAYLOAD_SIZE in eBPF
-	Response        [8192]byte // Must match MAX_PAYLOAD_SIZE in eBPF
+	Payload         [MaxPayloadSize]byte // Must match MAX_PAYLOAD_SIZE in eBPF
+	Response        [MaxPayloadSize]byte // Must match MAX_PAYLOAD_SIZE in eBPF
 }
 
 // lostSamplesTracker tracks lost samples per perf map and logs them periodically

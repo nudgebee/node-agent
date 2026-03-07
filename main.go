@@ -127,14 +127,15 @@ func getClientSet() (*kubernetes.Clientset, error) {
 }
 
 func main() {
-	// Set GOMEMLIMIT to 90% of cgroup memory limit if available, otherwise use env var.
-	// This tells the Go GC to be more aggressive when approaching the limit,
-	// preventing OOMKills by trading CPU for lower memory usage.
+	// Set GOMEMLIMIT to 60% of cgroup memory limit if available, otherwise use env var.
+	// Use 60% (not 90%) because the cgroup OOM killer counts kernel memory (~80MB for
+	// eBPF maps) and file page cache (~200MB from /proc reads) which GOMEMLIMIT doesn't
+	// control. At 90%, Go heap + kernel + page cache exceeds the cgroup limit.
 	if os.Getenv("GOMEMLIMIT") == "" {
 		if limit, err := readCgroupMemoryLimit(); err == nil && limit > 0 {
-			softLimit := int64(float64(limit) * 0.9)
+			softLimit := int64(float64(limit) * 0.6)
 			debug.SetMemoryLimit(softLimit)
-			log.Printf("GOMEMLIMIT set to %dMiB (90%% of cgroup limit %dMiB)", softLimit/1024/1024, limit/1024/1024)
+			log.Printf("GOMEMLIMIT set to %dMiB (60%% of cgroup limit %dMiB)", softLimit/1024/1024, limit/1024/1024)
 		}
 	}
 
