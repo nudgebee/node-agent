@@ -359,6 +359,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			case ebpftracer.EventTypeListenOpen:
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
 					c.onListenOpen(e.Pid, e.SrcAddr, false)
+					c.attachTlsUprobes(r.tracer, e.Pid)
 				}
 			case ebpftracer.EventTypeListenClose:
 				r.containerLock.RLock()
