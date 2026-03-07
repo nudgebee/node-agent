@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -280,8 +281,7 @@ func readCgroupMemoryLimit() (int64, error) {
 	if data, err := os.ReadFile("/sys/fs/cgroup/memory.max"); err == nil {
 		s := strings.TrimSpace(string(data))
 		if s != "max" {
-			var limit int64
-			if _, err := fmt.Sscanf(s, "%d", &limit); err == nil {
+			if limit, err := strconv.ParseInt(s, 10, 64); err == nil {
 				return limit, nil
 			}
 		}
@@ -289,8 +289,7 @@ func readCgroupMemoryLimit() (int64, error) {
 	// Try cgroup v1
 	if data, err := os.ReadFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"); err == nil {
 		s := strings.TrimSpace(string(data))
-		var limit int64
-		if _, err := fmt.Sscanf(s, "%d", &limit); err == nil {
+		if limit, err := strconv.ParseInt(s, 10, 64); err == nil {
 			// cgroup v1 reports a very large number when unlimited
 			if limit < 1<<62 {
 				return limit, nil

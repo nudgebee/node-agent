@@ -488,9 +488,12 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 				sample, ok := c.logSamples[ctr.Hash]
 				c.lock.RUnlock()
 				if !ok {
-					sample = common.TruncateUtf8(ctr.Sample, *flags.MaxLabelLength)
 					c.lock.Lock()
-					c.logSamples[ctr.Hash] = sample
+					sample, ok = c.logSamples[ctr.Hash]
+					if !ok {
+						sample = common.TruncateUtf8(ctr.Sample, *flags.MaxLabelLength)
+						c.logSamples[ctr.Hash] = sample
+					}
 					c.lock.Unlock()
 				}
 				ch <- counter(metrics.LogMessages, float64(ctr.Messages), source, ctr.Level.String(), ctr.Hash, sample)
