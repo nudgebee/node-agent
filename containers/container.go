@@ -1099,6 +1099,9 @@ func (c *Container) enrichDestinationKey(key common.DestinationKey) common.Desti
 func (c *Container) migrateConnectionKeyToFQDN(conn *ActiveConnection, fqdn string) {
 	oldKey := conn.DestinationKey
 	newKey := oldKey.WithResolvedDomain(fqdn)
+	if oldKey == newKey {
+		return
+	}
 
 	// Migrate connectionStats from old key to new key
 	oldStats, _ := c.connectionStats.Get(oldKey)
@@ -1300,6 +1303,8 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 					ip := conn.DestinationKey.ActualDestinationIfKnown().IP()
 					if common.IsIpExternal(ip) {
 						c.migrateConnectionKeyToFQDN(conn, authority)
+						domain := common.NewDomain(authority, []netaddr.IP{ip})
+						return map[netaddr.IP]*common.Domain{ip: domain}, L7RequestProcessed
 					}
 					break
 				}
