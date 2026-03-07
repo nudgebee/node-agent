@@ -12,9 +12,22 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// safeKernelDuration computes the duration between two kernel timestamps,
+// returning 0 if the result would underflow or exceed 1 hour.
+func safeKernelDuration(end, start uint64) time.Duration {
+	if end <= start {
+		return 0
+	}
+	d := end - start
+	if d >= uint64(time.Hour) {
+		return 0
+	}
+	return time.Duration(d)
+}
+
 const (
 	http2FrameHeaderLength = 9
-	http2DecoderGcInterval = uint64(10 * time.Minute)
+	http2DecoderGcInterval = uint64(2 * time.Minute)
 
 	// HTTP/2 flags
 	http2FlagEndStream  = 0x01
@@ -521,7 +534,7 @@ frameLoop:
 					r.GrpcStatus = -1
 				}
 			}
-			r.Duration = time.Duration(kernelTime - r.kernelTime)
+			r.Duration = safeKernelDuration(kernelTime, r.kernelTime)
 			res = append(res, *r)
 			delete(p.activeRequests, streamId)
 		}
@@ -555,7 +568,7 @@ frameLoop:
 			} else {
 				r.GrpcStatus = -1
 			}
-			r.Duration = time.Duration(kernelTime - r.kernelTime)
+			r.Duration = safeKernelDuration(kernelTime, r.kernelTime)
 			res = append(res, *r)
 			delete(p.activeRequests, streamId)
 		}

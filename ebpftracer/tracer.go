@@ -438,6 +438,16 @@ func getLostSamplesTracker(name string) *lostSamplesTracker {
 	return tracker.(*lostSamplesTracker)
 }
 
+// safeDuration converts a uint64 nanosecond value from eBPF to time.Duration.
+// Returns 0 for values that would overflow int64 (>= 2^63) or exceed 1 hour,
+// which indicate corrupted eBPF timestamps.
+func safeDuration(ns uint64) time.Duration {
+	if ns == 0 || ns >= uint64(time.Hour) {
+		return 0
+	}
+	return time.Duration(ns)
+}
+
 func (t *lostSamplesTracker) recordLostSamples(name string, count uint64, cpu int) {
 	t.count.Add(count)
 	now := time.Now().Unix()
@@ -506,7 +516,7 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 				Protocol:     l7.Protocol(data[32]),
 				Method:       l7.Method(data[33]),
 				Status:       l7.Status(int32(binary.LittleEndian.Uint32(data[20:24]))),
-				Duration:     time.Duration(binary.LittleEndian.Uint64(data[24:32])),
+				Duration:     safeDuration(binary.LittleEndian.Uint64(data[24:32])),
 				StatementId:  binary.LittleEndian.Uint32(data[36:40]),
 				PayloadSize:  payloadSize,
 				ResponseSize: responseSize,
@@ -558,7 +568,7 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 				ActualDstAddr: ipPort(data[86:102], binary.LittleEndian.Uint16(data[52:54])),
 				Fd:            binary.LittleEndian.Uint64(data[0:8]),
 				Timestamp:     binary.LittleEndian.Uint64(data[8:16]),
-				Duration:      time.Duration(binary.LittleEndian.Uint64(data[16:24])),
+				Duration:      safeDuration(binary.LittleEndian.Uint64(data[16:24])),
 			}
 			if typ == EventTypeConnectionClose {
 				event.TrafficStats = &TrafficStats{
@@ -622,7 +632,7 @@ func runRingbufEventsReader(name string, r *ringbuf.Reader, ch chan<- Event) {
 			Protocol:     l7.Protocol(data[32]),
 			Method:       l7.Method(data[33]),
 			Status:       l7.Status(int32(binary.LittleEndian.Uint32(data[20:24]))),
-			Duration:     time.Duration(binary.LittleEndian.Uint64(data[24:32])),
+			Duration:     safeDuration(binary.LittleEndian.Uint64(data[24:32])),
 			StatementId:  binary.LittleEndian.Uint32(data[36:40]),
 			PayloadSize:  payloadSize,
 			ResponseSize: responseSize,
