@@ -142,13 +142,6 @@ func (s *L7Stats) observe(protocol l7.Protocol, status, method, path string, dur
 		labelInterner.intern(actualDestWorkload.Kind),
 		labelInterner.intern(actualDestWorkload.Name),
 		labelInterner.intern(actualDestWorkload.Namespace),
-		labelInterner.intern(srcWorkload.Region),
-		labelInterner.intern(srcWorkload.Zone),
-		labelInterner.intern(destWorkload.Region),
-		labelInterner.intern(destWorkload.Zone),
-		labelInterner.intern(actualDestWorkload.Region),
-		labelInterner.intern(actualDestWorkload.Zone),
-		labelInterner.intern(actualDestWorkload.Instance),
 	}
 
 	// Protocol-specific labels for counters (keep all labels including path for HTTP)
@@ -242,13 +235,6 @@ func (s *L7Stats) ensureInitialized(protocol l7.Protocol) {
 		"actual_destination_workload_kind",
 		"actual_destination_workload_name",
 		"actual_destination_workload_namespace",
-		"src_region",
-		"src_az",
-		"destination_workload_region",
-		"destination_workload_az",
-		"actual_destination_region",
-		"actual_destination_az",
-		"actual_destination_instance",
 	}
 
 	// Initialize request counter
