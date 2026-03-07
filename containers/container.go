@@ -41,7 +41,7 @@ var (
 )
 
 const (
-	connectionStatsCacheSize = 4096 // LRU cache size for connection stats
+	connectionStatsCacheSize = 2048 // LRU cache size for connection stats
 )
 
 type ContainerID string
@@ -437,13 +437,13 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		workload_dest := enrichedKey.GetDestinationWorkload()
 		actualDestWorkload := enrichedKey.GetActualDestinationWorkload()
 
-		ch <- counter(metrics.NetConnectionsSuccessful, float64(stats.Count), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, workload_dest.Region, workload_dest.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
-		ch <- counter(metrics.NetConnectionsTotalTime, stats.TotalTime.Seconds(), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, workload_dest.Region, workload_dest.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
+		ch <- counter(metrics.NetConnectionsSuccessful, float64(stats.Count), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
+		ch <- counter(metrics.NetConnectionsTotalTime, stats.TotalTime.Seconds(), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
 		if stats.Retransmissions > 0 {
-			ch <- counter(metrics.NetRetransmits, float64(stats.Retransmissions), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, workload_dest.Region, workload_dest.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
+			ch <- counter(metrics.NetRetransmits, float64(stats.Retransmissions), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
 		}
-		ch <- counter(metrics.NetBytesSent, float64(stats.BytesSent), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, workload_dest.Region, workload_dest.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
-		ch <- counter(metrics.NetBytesReceived, float64(stats.BytesReceived), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, workload_src.Region, workload_src.Zone, workload_dest.Region, workload_dest.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
+		ch <- counter(metrics.NetBytesSent, float64(stats.BytesSent), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
+		ch <- counter(metrics.NetBytesReceived, float64(stats.BytesReceived), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
 	}
 	// Copy failedConnectionAttempts under read lock to avoid concurrent map access
 	c.lock.RLock()
@@ -455,7 +455,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 
 	for dst, count := range failedConnCopy {
 		workload := c.ip_resolver.ResolveIP(dst.IP().String())
-		ch <- counter(metrics.NetConnectionsFailed, float64(count), dst.String(), workload.Name, workload.Namespace, workload.Kind, workload.Name, workload.Namespace, workload.Kind, c.srcWorkload.Region, c.srcWorkload.Zone, workload.Region, workload.Zone, workload.Region, workload.Zone, workload.Instance)
+		ch <- counter(metrics.NetConnectionsFailed, float64(count), dst.String(), workload.Name, workload.Namespace, workload.Kind, workload.Name, workload.Namespace, workload.Kind)
 	}
 
 	connections := map[common.DestinationKey]int{}
@@ -470,7 +470,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	for enrichedKey, count := range connections {
 		actualDestWorkload := enrichedKey.GetActualDestinationWorkload()
 		destWorkload := enrichedKey.GetDestinationWorkload()
-		ch <- gauge(metrics.NetConnectionsActive, float64(count), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), c.srcWorkload.Name, c.srcWorkload.Namespace, c.srcWorkload.Kind, destWorkload.Name, destWorkload.Namespace, destWorkload.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind, c.srcWorkload.Region, c.srcWorkload.Zone, destWorkload.Region, destWorkload.Zone, actualDestWorkload.Region, actualDestWorkload.Zone, actualDestWorkload.Instance)
+		ch <- gauge(metrics.NetConnectionsActive, float64(count), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), c.srcWorkload.Name, c.srcWorkload.Namespace, c.srcWorkload.Kind, destWorkload.Name, destWorkload.Namespace, destWorkload.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
 	}
 
 	// Copy logParsers under read lock to avoid concurrent map access
@@ -592,7 +592,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	if !*flags.DisablePinger {
 		for ip, rtt := range c.ping() {
 			destination_workload := c.ip_resolver.ResolveIP(ip.String())
-			ch <- gauge(metrics.NetLatency, rtt, ip.String(), destination_workload.Name, destination_workload.Namespace, destination_workload.Kind, destination_workload.Instance)
+			ch <- gauge(metrics.NetLatency, rtt, ip.String(), destination_workload.Name, destination_workload.Namespace, destination_workload.Kind)
 		}
 	}
 

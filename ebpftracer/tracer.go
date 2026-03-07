@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	MaxPayloadSize = 8192 // Must match MAX_PAYLOAD_SIZE in eBPF
+	MaxPayloadSize = 4096 // Must match MAX_PAYLOAD_SIZE in eBPF
 
 	l7EventHeaderSize = 96 // 56 bytes base + 40 bytes socket tuple fields
 	tcpEventSize      = 104

@@ -1,5 +1,5 @@
-#define MAX_CONNECTIONS 1000000
-#define MAX_PAYLOAD_SIZE 8192 // must be power of 2, increased for LLM HTTP/2 payloads
+#define MAX_CONNECTIONS 100000
+#define MAX_PAYLOAD_SIZE 4096 // must be power of 2
 
 struct tcp_event {
     __u64 fd;
@@ -106,7 +106,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(key_size, sizeof(struct l7_request_key));
     __uint(value_size, sizeof(struct l7_request));
-    __uint(max_entries, 8192);
+    __uint(max_entries, 4096);
 } active_l7_requests SEC(".maps");
 
 SEC("tracepoint/sock/inet_sock_set_state")
