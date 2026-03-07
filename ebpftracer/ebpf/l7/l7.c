@@ -104,7 +104,7 @@ struct iovec {
 };
 
 // Ring buffer for L7 events - provides global ordering across CPUs
-// Size: 16MB shared buffer (1 << 24 = 16777216 bytes)
+// Size: 8MB shared buffer (1 << 23 = 8388608 bytes)
 // Benefits over perf buffer:
 //   - Global event ordering (important for SSE streaming)
 //   - More efficient memory usage (shared vs per-CPU)
@@ -112,7 +112,7 @@ struct iovec {
 // Requires kernel 5.8+
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 24);  // 16MB
+    __uint(max_entries, 1 << 23);  // 8MB
 } l7_events SEC(".maps");
 
 struct read_args {
