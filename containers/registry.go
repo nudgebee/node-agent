@@ -381,7 +381,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				if e.L7Request == nil {
 					continue
 				}
-				klog.V(2).Infof("L7_EVENT_REGISTRY: pid=%d fd=%d protocol=%d timestamp=%d",
+				klog.V(5).Infof("L7_EVENT_REGISTRY: pid=%d fd=%d protocol=%d timestamp=%d",
 					e.Pid, e.Fd, e.L7Request.Protocol, e.Timestamp)
 				r.processL7Event(e)
 			}
@@ -396,7 +396,7 @@ const maxIP2FQDNEntries = 10000
 
 func (r *Registry) processL7Event(e ebpftracer.Event) {
 	if c := r.containersByPid[e.Pid]; c != nil {
-		klog.V(2).Infof("L7_EVENT_CONTAINER_FOUND: pid=%d container=%s", e.Pid, c.id)
+		klog.V(5).Infof("L7_EVENT_CONTAINER_FOUND: pid=%d container=%s", e.Pid, c.id)
 		ip2fqdn, result := c.onL7RequestWithResult(e.Pid, e.Fd, e.Timestamp, e.L7Request, e.SocketInfo)
 		if result == L7RequestConnNotFound {
 			// Connection not found - queue for retry
@@ -435,11 +435,11 @@ func (r *Registry) queueL7EventForRetry(e ebpftracer.Event) {
 	// Limit queue size to prevent memory issues
 	const maxPendingEvents = 500
 	if len(r.pendingL7Events) >= maxPendingEvents {
-		klog.V(2).Infof("L7_EVENT_QUEUE_FULL: dropping event pid=%d fd=%d", e.Pid, e.Fd)
+		klog.V(3).Infof("L7_EVENT_QUEUE_FULL: dropping event pid=%d fd=%d", e.Pid, e.Fd)
 		return
 	}
 
-	klog.V(2).Infof("L7_EVENT_QUEUED: pid=%d fd=%d protocol=%d", e.Pid, e.Fd, e.L7Request.Protocol)
+	klog.V(3).Infof("L7_EVENT_QUEUED: pid=%d fd=%d protocol=%d", e.Pid, e.Fd, e.L7Request.Protocol)
 	r.pendingL7Events = append(r.pendingL7Events, pendingL7Event{
 		event:      e,
 		addedAt:    time.Now(),
@@ -469,7 +469,7 @@ func (r *Registry) processPendingL7Events() {
 	for _, p := range pending {
 		// Expire old events
 		if now.Sub(p.addedAt) > maxAge {
-			klog.V(2).Infof("L7_EVENT_EXPIRED: pid=%d fd=%d age=%v", p.event.Pid, p.event.Fd, now.Sub(p.addedAt))
+			klog.V(3).Infof("L7_EVENT_EXPIRED: pid=%d fd=%d age=%v", p.event.Pid, p.event.Fd, now.Sub(p.addedAt))
 			continue
 		}
 
@@ -490,13 +490,13 @@ func (r *Registry) processPendingL7Events() {
 				p.retryCount++
 				stillPending = append(stillPending, p)
 			} else {
-				klog.V(2).Infof("L7_EVENT_MAX_RETRIES: pid=%d fd=%d", p.event.Pid, p.event.Fd)
+				klog.V(3).Infof("L7_EVENT_MAX_RETRIES: pid=%d fd=%d", p.event.Pid, p.event.Fd)
 			}
 			continue
 		}
 
 		// Successfully processed
-		klog.V(2).Infof("L7_EVENT_RETRY_SUCCESS: pid=%d fd=%d retries=%d", p.event.Pid, p.event.Fd, p.retryCount)
+		klog.V(3).Infof("L7_EVENT_RETRY_SUCCESS: pid=%d fd=%d retries=%d", p.event.Pid, p.event.Fd, p.retryCount)
 		r.ip2fqdnLock.Lock()
 		for ip, domain := range ip2fqdn {
 			r.ip2fqdn[ip] = domain
