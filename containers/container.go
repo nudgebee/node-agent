@@ -1093,30 +1093,12 @@ func (c *Container) enrichDestinationKey(key common.DestinationKey) common.Desti
 	return key
 }
 
-// migrateConnectionKeyIfNeeded updates conn.DestinationKey from IP to FQDN when
-// DNS becomes available, and migrates the corresponding connectionStats entry.
-// This fixes the root cause of duplicate metrics: connections opened before DNS
-// was cached get an IP-based key, while later connections get an FQDN-based key.
-// By migrating the key in-place, both converge to the same key.
+// migrateConnectionKeyToFQDN updates conn.DestinationKey from IP to the given FQDN
+// and migrates the corresponding connectionStats entry.
 // Must be called under c.lock.
-func (c *Container) migrateConnectionKeyIfNeeded(conn *ActiveConnection) {
-	if conn == nil {
-		return
-	}
-	if !isIPAddress(conn.DestinationKey.GetDestinationWorkload().Name) {
-		return
-	}
-	ip := conn.DestinationKey.ActualDestinationIfKnown().IP()
-	if !common.IsIpExternal(ip) {
-		return
-	}
-	domain := c.registry.getDomain(ip)
-	if domain == nil {
-		return
-	}
-
+func (c *Container) migrateConnectionKeyToFQDN(conn *ActiveConnection, fqdn string) {
 	oldKey := conn.DestinationKey
-	newKey := oldKey.WithResolvedDomain(domain.FQDN)
+	newKey := oldKey.WithResolvedDomain(fqdn)
 
 	// Migrate connectionStats from old key to new key
 	oldStats, _ := c.connectionStats.Get(oldKey)
@@ -1135,6 +1117,27 @@ func (c *Container) migrateConnectionKeyIfNeeded(conn *ActiveConnection) {
 	}
 
 	conn.DestinationKey = newKey
+}
+
+// migrateConnectionKeyIfNeeded updates conn.DestinationKey from IP to FQDN when
+// DNS becomes available, and migrates the corresponding connectionStats entry.
+// Must be called under c.lock.
+func (c *Container) migrateConnectionKeyIfNeeded(conn *ActiveConnection) {
+	if conn == nil {
+		return
+	}
+	if !isIPAddress(conn.DestinationKey.GetDestinationWorkload().Name) {
+		return
+	}
+	ip := conn.DestinationKey.ActualDestinationIfKnown().IP()
+	if !common.IsIpExternal(ip) {
+		return
+	}
+	domain := c.registry.getDomain(ip)
+	if domain == nil {
+		return
+	}
+	c.migrateConnectionKeyToFQDN(conn, domain.FQDN)
 }
 
 // onL7RequestWithResult processes an L7 request and returns the result along with whether it should be retried
@@ -1238,7 +1241,20 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		// Use new HTTP processor - parse once, use everywhere
 		httpCtx := NewHTTPRequestContext(r, conn, dnsResolver)
 
-		// Update stats with extracted trace ID
+		// If DestinationKey still has a raw IP but the HTTP Host header has an FQDN,
+		// use it to update the connection key and populate ip_to_fqdn.
+		var ip2fqdn map[netaddr.IP]*common.Domain
+		if isIPAddress(conn.DestinationKey.GetDestinationWorkload().Name) &&
+			httpCtx.Host != "" && !isIPAddress(httpCtx.Host) {
+			ip := conn.DestinationKey.ActualDestinationIfKnown().IP()
+			if common.IsIpExternal(ip) {
+				c.migrateConnectionKeyToFQDN(conn, httpCtx.Host)
+				domain := common.NewDomain(httpCtx.Host, []netaddr.IP{ip})
+				ip2fqdn = map[netaddr.IP]*common.Domain{ip: domain}
+			}
+		}
+
+		// Update stats with extracted trace ID (uses resolved key if migrated above)
 		c.l7Stats.observe(r.Protocol, r.Status.Http(), httpCtx.Method, httpCtx.Path, r.Duration, conn.DestinationKey, conn.srcWorkload, r, httpCtx.TraceID)
 
 		// LLM tracking with improved detection
@@ -1251,6 +1267,9 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		if trace != nil {
 			trace.HttpRequest(httpCtx.Method, httpCtx.Path, r.Status, r.Duration, r.PayloadSize,
 				httpCtx.PayloadBase64, httpCtx.Headers, httpCtx.ResponseBase64, httpCtx.Host)
+		}
+		if ip2fqdn != nil {
+			return ip2fqdn, L7RequestProcessed
 		}
 	case l7.ProtocolHTTP2:
 		// HTTP/2 stats will be updated in the loop below
@@ -1271,6 +1290,20 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		if activeCount > 0 {
 			klog.V(3).Infof("HTTP2_PARSE_RESULT: pid=%d fd=%d completed=%d active=%d",
 				pid, fd, len(requests), activeCount)
+		}
+
+		// If DestinationKey still has a raw IP, try to resolve from :authority header
+		if isIPAddress(conn.DestinationKey.GetDestinationWorkload().Name) {
+			for _, req := range requests {
+				authority := stripPort(req.Authority)
+				if authority != "" && !isIPAddress(authority) {
+					ip := conn.DestinationKey.ActualDestinationIfKnown().IP()
+					if common.IsIpExternal(ip) {
+						c.migrateConnectionKeyToFQDN(conn, authority)
+					}
+					break
+				}
+			}
 		}
 
 		// Feed active streams to LLM stream tracker for SSE-based completion detection
