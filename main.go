@@ -3,12 +3,15 @@ package main
 import (
 	"bytes"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -124,6 +127,17 @@ func getClientSet() (*kubernetes.Clientset, error) {
 }
 
 func main() {
+	// Set GOMEMLIMIT to 90% of cgroup memory limit if available, otherwise use env var.
+	// This tells the Go GC to be more aggressive when approaching the limit,
+	// preventing OOMKills by trading CPU for lower memory usage.
+	if os.Getenv("GOMEMLIMIT") == "" {
+		if limit, err := readCgroupMemoryLimit(); err == nil && limit > 0 {
+			softLimit := int64(float64(limit) * 0.9)
+			debug.SetMemoryLimit(softLimit)
+			log.Printf("GOMEMLIMIT set to %dMiB (90%% of cgroup limit %dMiB)", softLimit/1024/1024, limit/1024/1024)
+		}
+	}
+
 	// Initialize klog flags to prevent duplicate output
 	klog.InitFlags(nil)
 	if v := os.Getenv("KLOG_V"); v != "" {
@@ -260,4 +274,28 @@ func (o *RateLimitedLogOutput) Write(data []byte) (int, error) {
 		return len(data), nil
 	}
 	return os.Stderr.Write(data)
+}
+
+// readCgroupMemoryLimit reads the memory limit from cgroup v2 or v1.
+func readCgroupMemoryLimit() (int64, error) {
+	// Try cgroup v2 first
+	if data, err := os.ReadFile("/sys/fs/cgroup/memory.max"); err == nil {
+		s := strings.TrimSpace(string(data))
+		if s != "max" {
+			if limit, err := strconv.ParseInt(s, 10, 64); err == nil {
+				return limit, nil
+			}
+		}
+	}
+	// Try cgroup v1
+	if data, err := os.ReadFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"); err == nil {
+		s := strings.TrimSpace(string(data))
+		if limit, err := strconv.ParseInt(s, 10, 64); err == nil {
+			// cgroup v1 reports a very large number when unlimited
+			if limit < 1<<62 {
+				return limit, nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("unable to read cgroup memory limit")
 }

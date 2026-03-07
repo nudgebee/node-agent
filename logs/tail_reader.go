@@ -41,14 +41,17 @@ func NewTailReader(fileName string, ch chan<- logparser.LogEntry) (*TailReader, 
 		return nil, err
 	}
 	if r.info, err = r.file.Stat(); err != nil {
+		_ = r.file.Close()
 		return nil, err
 	}
 	if _, err = r.file.Seek(0, io.SeekEnd); err != nil {
+		_ = r.file.Close()
 		return nil, err
 	}
 	r.reader = bufio.NewReader(r.file)
 
 	go func() {
+		const maxPrefixLen = 64 * 1024 // 64KB cap on partial line buffer
 		var prefix string
 		for {
 			select {
@@ -58,7 +61,11 @@ func NewTailReader(fileName string, ch chan<- logparser.LogEntry) (*TailReader, 
 			default:
 				line, err := r.reader.ReadString('\n')
 				if err != nil {
-					prefix = line
+					if len(prefix)+len(line) > maxPrefixLen {
+						prefix = "" // drop oversized partial line
+					} else {
+						prefix += line
+					}
 					r.poll(ctx)
 					continue
 				}
@@ -130,6 +137,7 @@ func (r *TailReader) moved(info os.FileInfo) bool {
 	if !os.SameFile(r.info, info) {
 		f, err := os.Open(r.fileName)
 		if err != nil {
+			_ = r.file.Close()
 			r.file = nil
 			return false
 		}

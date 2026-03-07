@@ -45,11 +45,11 @@ func (si *stringInterner) intern(s string) string {
 	}
 
 	// Limit cache size to prevent unbounded growth
-	if len(si.cache) > 10000 {
-		// Clear half the cache when it gets too large
-		newCache := make(map[string]string, 5000)
+	if len(si.cache) > 5000 {
+		// Clear most of the cache when it gets too large
+		newCache := make(map[string]string, 2000)
 		for k, v := range si.cache {
-			if len(newCache) >= 5000 {
+			if len(newCache) >= 2000 {
 				break
 			}
 			newCache[k] = v

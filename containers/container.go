@@ -33,7 +33,7 @@ import (
 )
 
 var (
-	gcInterval                = 10 * time.Minute
+	gcInterval                = 5 * time.Minute
 	pingTimeout               = 300 * time.Millisecond
 	multilineCollectorTimeout = time.Second
 	payloadThreshold          = 1024 * 1024
@@ -41,7 +41,7 @@ var (
 )
 
 const (
-	connectionStatsCacheSize = 8192 // LRU cache size for connection stats
+	connectionStatsCacheSize = 4096 // LRU cache size for connection stats
 )
 
 type ContainerID string
@@ -316,7 +316,12 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		ch <- gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemd.TriggeredBy, c.metadata.systemd.Type)
 	}
 
-	ch <- counter(metrics.Restarts, float64(c.restarts))
+	c.lock.RLock()
+	restarts := c.restarts
+	oomKills := c.oomKills
+	c.lock.RUnlock()
+
+	ch <- counter(metrics.Restarts, float64(restarts))
 
 	if cpu := c.cgroup.CpuStat(); cpu != nil {
 		if cpu.LimitCores > 0 {
@@ -349,8 +354,8 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		ch <- counter(metrics.PsiIO, psi.IOSecondsFull, "full")
 	}
 
-	if c.oomKills > 0 {
-		ch <- counter(metrics.OOMKills, float64(c.oomKills))
+	if oomKills > 0 {
+		ch <- counter(metrics.OOMKills, float64(oomKills))
 	}
 
 	if disks, err := node.GetDisks(); err == nil {
@@ -377,37 +382,53 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
-	for addr, open := range c.getListens() {
+	// Snapshot listens under lock since getListens/getProxiedListens access c.listens and c.processes
+	c.lock.RLock()
+	listens := c.getListens()
+	proxiedListens := c.getProxiedListens()
+	c.lock.RUnlock()
+
+	for addr, open := range listens {
 		ch <- gauge(metrics.NetListenInfo, float64(open), addr.String(), "")
 	}
-	for proxy, addrs := range c.getProxiedListens() {
+	for proxy, addrs := range proxiedListens {
 		for addr := range addrs {
 			ch <- gauge(metrics.NetListenInfo, 1, addr.String(), proxy)
 		}
 	}
 
+	// Snapshot connectionStats under lock since the LRU cache is not concurrent-safe
+	type connStatSnapshot struct {
+		key   common.DestinationKey
+		stats ConnectionStats
+	}
+	c.lock.RLock()
+	connSnapshots := make([]connStatSnapshot, 0, c.connectionStats.Len())
+	for _, d := range c.connectionStats.Keys() {
+		if stats, ok := c.connectionStats.Peek(d); ok {
+			connSnapshots = append(connSnapshots, connStatSnapshot{key: d, stats: *stats})
+		}
+	}
+	c.lock.RUnlock()
+
 	// Aggregate connection stats by enriched key to avoid duplicate metrics
 	// when multiple IPs resolve to the same FQDN (e.g., Google's shared IPs)
 	aggregatedStats := map[common.DestinationKey]*ConnectionStats{}
-	for _, d := range c.connectionStats.Keys() {
-		stats, ok := c.connectionStats.Peek(d)
-		if !ok {
-			continue
-		}
-		enrichedKey := c.enrichDestinationKey(d)
+	for _, snap := range connSnapshots {
+		enrichedKey := c.enrichDestinationKey(snap.key)
 		if existing, ok := aggregatedStats[enrichedKey]; ok {
-			existing.Count += stats.Count
-			existing.TotalTime += stats.TotalTime
-			existing.Retransmissions += stats.Retransmissions
-			existing.BytesSent += stats.BytesSent
-			existing.BytesReceived += stats.BytesReceived
+			existing.Count += snap.stats.Count
+			existing.TotalTime += snap.stats.TotalTime
+			existing.Retransmissions += snap.stats.Retransmissions
+			existing.BytesSent += snap.stats.BytesSent
+			existing.BytesReceived += snap.stats.BytesReceived
 		} else {
 			aggregatedStats[enrichedKey] = &ConnectionStats{
-				Count:           stats.Count,
-				TotalTime:       stats.TotalTime,
-				Retransmissions: stats.Retransmissions,
-				BytesSent:       stats.BytesSent,
-				BytesReceived:   stats.BytesReceived,
+				Count:           snap.stats.Count,
+				TotalTime:       snap.stats.TotalTime,
+				Retransmissions: snap.stats.Retransmissions,
+				BytesSent:       snap.stats.BytesSent,
+				BytesReceived:   snap.stats.BytesReceived,
 			}
 		}
 	}
@@ -463,10 +484,17 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	for source, p := range logParsersCopy {
 		for _, ctr := range p.parser.GetCounters() {
 			if ctr.Level == logparser.LevelCritical || ctr.Level == logparser.LevelError {
+				c.lock.RLock()
 				sample, ok := c.logSamples[ctr.Hash]
+				c.lock.RUnlock()
 				if !ok {
-					sample = common.TruncateUtf8(ctr.Sample, *flags.MaxLabelLength)
-					c.logSamples[ctr.Hash] = sample
+					c.lock.Lock()
+					sample, ok = c.logSamples[ctr.Hash]
+					if !ok {
+						sample = common.TruncateUtf8(ctr.Sample, *flags.MaxLabelLength)
+						c.logSamples[ctr.Hash] = sample
+					}
+					c.lock.Unlock()
 				}
 				ch <- counter(metrics.LogMessages, float64(ctr.Messages), source, ctr.Level.String(), ctr.Hash, sample)
 			}
@@ -730,7 +758,9 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 	if common.PortFilter.ShouldBeSkipped(dst.Port()) {
 		return
 	}
+	c.lock.RLock()
 	p := c.processes[pid]
+	c.lock.RUnlock()
 	if p == nil {
 		return
 	}
@@ -1880,6 +1910,17 @@ func (c *Container) gc(now time.Time) {
 			}
 		}
 	}
+	// Clean up HTTP/2 parsers for closed/dead connections.
+	// Parsers hold HPACK decoders, partial frame buffers, and active request maps
+	// that accumulate memory over time if not cleaned up.
+	if c.googleHTTP2Parsers != nil {
+		for pidFd := range c.googleHTTP2Parsers {
+			if _, alive := c.connectionsByPidFd[pidFd]; !alive {
+				delete(c.googleHTTP2Parsers, pidFd)
+			}
+		}
+	}
+
 	for dst, at := range c.lastConnectionAttempts {
 		_, active := establishedDst[dst]
 		if !active && !at.IsZero() && now.Sub(at) > gcInterval {
