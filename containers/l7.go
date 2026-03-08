@@ -45,11 +45,11 @@ func (si *stringInterner) intern(s string) string {
 	}
 
 	// Limit cache size to prevent unbounded growth
-	if len(si.cache) > 10000 {
-		// Clear half the cache when it gets too large
-		newCache := make(map[string]string, 5000)
+	if len(si.cache) > 5000 {
+		// Clear most of the cache when it gets too large
+		newCache := make(map[string]string, 2000)
 		for k, v := range si.cache {
-			if len(newCache) >= 5000 {
+			if len(newCache) >= 2000 {
 				break
 			}
 			newCache[k] = v
@@ -101,17 +101,19 @@ func normalizeHttpPath(path string) string {
 }
 
 type L7Stats struct {
-	mu          sync.RWMutex
-	requests    map[l7.Protocol]*prometheus.CounterVec
-	latency     map[l7.Protocol]*prometheus.HistogramVec
-	initialized map[l7.Protocol]bool
+	mu              sync.RWMutex
+	requests        map[l7.Protocol]*prometheus.CounterVec
+	latency         map[l7.Protocol]*prometheus.HistogramVec
+	initialized     map[l7.Protocol]bool
+	promConstLabels prometheus.Labels // container_id, app_id, machine_id, system_uuid, az, region
 }
 
-func NewL7Stats() L7Stats {
+func NewL7Stats(constLabels prometheus.Labels) L7Stats {
 	return L7Stats{
-		requests:    make(map[l7.Protocol]*prometheus.CounterVec),
-		latency:     make(map[l7.Protocol]*prometheus.HistogramVec),
-		initialized: make(map[l7.Protocol]bool),
+		requests:        make(map[l7.Protocol]*prometheus.CounterVec),
+		latency:         make(map[l7.Protocol]*prometheus.HistogramVec),
+		initialized:     make(map[l7.Protocol]bool),
+		promConstLabels: constLabels,
 	}
 }
 
@@ -142,13 +144,6 @@ func (s *L7Stats) observe(protocol l7.Protocol, status, method, path string, dur
 		labelInterner.intern(actualDestWorkload.Kind),
 		labelInterner.intern(actualDestWorkload.Name),
 		labelInterner.intern(actualDestWorkload.Namespace),
-		labelInterner.intern(srcWorkload.Region),
-		labelInterner.intern(srcWorkload.Zone),
-		labelInterner.intern(destWorkload.Region),
-		labelInterner.intern(destWorkload.Zone),
-		labelInterner.intern(actualDestWorkload.Region),
-		labelInterner.intern(actualDestWorkload.Zone),
-		labelInterner.intern(actualDestWorkload.Instance),
 	}
 
 	// Protocol-specific labels for counters (keep all labels including path for HTTP)
@@ -242,13 +237,6 @@ func (s *L7Stats) ensureInitialized(protocol l7.Protocol) {
 		"actual_destination_workload_kind",
 		"actual_destination_workload_name",
 		"actual_destination_workload_namespace",
-		"src_region",
-		"src_az",
-		"destination_workload_region",
-		"destination_workload_az",
-		"actual_destination_region",
-		"actual_destination_az",
-		"actual_destination_instance",
 	}
 
 	// Initialize request counter
@@ -267,7 +255,7 @@ func (s *L7Stats) ensureInitialized(protocol l7.Protocol) {
 
 	if cOpts, exists := L7Requests[metricsProtocol]; exists {
 		s.requests[protocol] = prometheus.NewCounterVec(
-			prometheus.CounterOpts{Name: cOpts.Name, Help: cOpts.Help},
+			prometheus.CounterOpts{Name: cOpts.Name, Help: cOpts.Help, ConstLabels: s.promConstLabels},
 			requestLabels,
 		)
 	}
@@ -284,7 +272,7 @@ func (s *L7Stats) ensureInitialized(protocol l7.Protocol) {
 
 	if hOpts, exists := L7Latency[metricsProtocol]; exists {
 		s.latency[protocol] = prometheus.NewHistogramVec(
-			prometheus.HistogramOpts{Name: hOpts.Name, Help: hOpts.Help},
+			prometheus.HistogramOpts{Name: hOpts.Name, Help: hOpts.Help, ConstLabels: s.promConstLabels},
 			histogramLabels,
 		)
 	}
