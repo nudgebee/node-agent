@@ -66,8 +66,7 @@ func (n NodeConstLabels) Values() []string {
 }
 
 type Registry struct {
-	reg    prometheus.Registerer // wrapped registerer for ip2fqdn and LLM metrics
-	rawReg prometheus.Registerer // raw registry for containers (no wrapping overhead)
+	reg prometheus.Registerer // wrapped registerer for ip2fqdn and LLM metrics
 
 	tracer *ebpftracer.Tracer
 	events chan ebpftracer.Event
@@ -142,7 +141,6 @@ func NewRegistry(reg prometheus.Registerer, rawReg prometheus.Registerer, proces
 
 	r := &Registry{
 		reg:                    reg,
-		rawReg:                 rawReg,
 		events:                 make(chan ebpftracer.Event, 2000),
 		containersById:         map[ContainerID]*Container{},
 		containersByCgroupId:   map[string]*Container{},
@@ -160,6 +158,12 @@ func NewRegistry(reg prometheus.Registerer, rawReg prometheus.Registerer, proces
 	// Register LLM metrics with the same registerer used for other container metrics
 	RegisterLLMMetrics(reg)
 	if err = reg.Register(r); err != nil {
+		return nil, err
+	}
+	// Register a single collector for all containers on the raw registry.
+	// Individual containers are NOT registered/unregistered because prometheus.Registry
+	// does not support Unregister for unchecked collectors (empty Describe).
+	if err = rawReg.Register(&containerCollector{registry: r}); err != nil {
 		return nil, err
 	}
 	go r.handleEvents(r.events)
@@ -180,6 +184,31 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 	defer r.ip2fqdnLock.RUnlock()
 	for ip, domain := range r.ip2fqdn {
 		ch <- prometheus.MustNewConstMetric(metrics.Ip2Fqdn, prometheus.GaugeValue, 1, ip.String(), domain.FQDN)
+	}
+}
+
+// containerCollector is registered on the raw Prometheus registry and collects
+// metrics from all known containers. This avoids registering each Container as
+// an individual unchecked collector, which is needed because prometheus.Registry
+// does not support Unregister for unchecked collectors (Describe returns nothing).
+type containerCollector struct {
+	registry *Registry
+}
+
+func (cc *containerCollector) Describe(chan<- *prometheus.Desc) {
+	// Unchecked collector: container metrics are dynamic
+}
+
+func (cc *containerCollector) Collect(ch chan<- prometheus.Metric) {
+	cc.registry.containerLock.RLock()
+	containers := make([]*Container, 0, len(cc.registry.containersById))
+	for _, c := range cc.registry.containersById {
+		containers = append(containers, c)
+	}
+	cc.registry.containerLock.RUnlock()
+
+	for _, c := range containers {
+		c.Collect(ch)
 	}
 }
 
@@ -250,11 +279,6 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 						}
 					}
 					delete(r.containersById, c.id)
-
-					// Unregister from Prometheus (do this after removing from maps)
-					if ok := r.rawReg.Unregister(c); !ok {
-						klog.Warningf("failed to unregister container: %s", c.id)
-					}
 					c.Close()
 				}
 				r.containerLock.Unlock()
@@ -617,7 +641,6 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	}
 	if c := r.containersById[id]; c != nil {
 		klog.Warningln("id conflict, replacing container:", id)
-		r.rawReg.Unregister(c)
 		delete(r.containersById, c.id)
 		for cgid, container := range r.containersByCgroupId {
 			if container == c {
@@ -639,10 +662,6 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		return nil
 	}
 	klog.InfoS("detected a new container", "pid", pid, "cg", cg.Id, "id", id, "app", c.appId)
-	if err := r.rawReg.Register(c); err != nil {
-		klog.Warningf("failed to register container %s: %v", id, err)
-		return nil
-	}
 
 	// Update all maps atomically while holding the lock
 	r.containersByPid[pid] = c
