@@ -3,12 +3,15 @@ package main
 import (
 	"bytes"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -124,6 +127,18 @@ func getClientSet() (*kubernetes.Clientset, error) {
 }
 
 func main() {
+	// Set GOMEMLIMIT to 60% of cgroup memory limit if available, otherwise use env var.
+	// Use 60% (not 90%) because the cgroup OOM killer counts kernel memory (~80MB for
+	// eBPF maps) and file page cache (~200MB from /proc reads) which GOMEMLIMIT doesn't
+	// control. At 90%, Go heap + kernel + page cache exceeds the cgroup limit.
+	if os.Getenv("GOMEMLIMIT") == "" {
+		if limit, err := readCgroupMemoryLimit(); err == nil && limit > 0 {
+			softLimit := int64(float64(limit) * 0.6)
+			debug.SetMemoryLimit(softLimit)
+			log.Printf("GOMEMLIMIT set to %dMiB (60%% of cgroup limit %dMiB)", softLimit/1024/1024, limit/1024/1024)
+		}
+	}
+
 	// Initialize klog flags to prevent duplicate output
 	klog.InitFlags(nil)
 	if v := os.Getenv("KLOG_V"); v != "" {
@@ -204,15 +219,20 @@ func main() {
 	}
 	registerer.MustRegister(info("node_agent_info", version))
 
+	az := ""
+	region := ""
 	if md := nodeCollector.Metadata(); md != nil {
-		region := md.Region
-		az := md.AvailabilityZone
+		region = md.Region
+		az = md.AvailabilityZone
 		if region != "" && az != "" {
 			registerer = prometheus.WrapRegistererWith(prometheus.Labels{"az": az, "region": region}, registerer)
 		}
 	}
 	processInfoCh := profiling.Init(machineId, hostname)
-	cr, err := containers.NewRegistry(registerer, processInfoCh, resolver, gpuCollector.ProcessUsageSampleCh)
+	// Pass both the wrapped registerer (for ip2fqdn and LLM metrics) and the raw
+	// registry (for containers) to avoid WrapRegistererWith allocation overhead on
+	// the hot path. Container metrics embed const labels directly.
+	cr, err := containers.NewRegistry(registerer, registry, processInfoCh, resolver, gpuCollector.ProcessUsageSampleCh, machineId, systemUuid, az, region)
 	if err != nil {
 		klog.Exitln(err)
 	}
@@ -260,4 +280,28 @@ func (o *RateLimitedLogOutput) Write(data []byte) (int, error) {
 		return len(data), nil
 	}
 	return os.Stderr.Write(data)
+}
+
+// readCgroupMemoryLimit reads the memory limit from cgroup v2 or v1.
+func readCgroupMemoryLimit() (int64, error) {
+	// Try cgroup v2 first
+	if data, err := os.ReadFile("/sys/fs/cgroup/memory.max"); err == nil {
+		s := strings.TrimSpace(string(data))
+		if s != "max" {
+			if limit, err := strconv.ParseInt(s, 10, 64); err == nil {
+				return limit, nil
+			}
+		}
+	}
+	// Try cgroup v1
+	if data, err := os.ReadFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"); err == nil {
+		s := strings.TrimSpace(string(data))
+		if limit, err := strconv.ParseInt(s, 10, 64); err == nil {
+			// cgroup v1 reports a very large number when unlimited
+			if limit < 1<<62 {
+				return limit, nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("unable to read cgroup memory limit")
 }

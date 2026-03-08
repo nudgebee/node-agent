@@ -5,6 +5,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+// constLabelNames are prepended to every container metric descriptor.
+// Values are set per-container and prepended by Container.counter()/gauge().
+// Must be declared before `metrics` so it's initialized when metric() is called.
+var constLabelNames = []string{"container_id", "app_id", "machine_id", "system_uuid", "az", "region"}
+
 var metrics = struct {
 	ContainerInfo *prometheus.Desc
 	Restarts      *prometheus.Desc
@@ -90,14 +95,14 @@ var metrics = struct {
 	DiskWriteBytes: metric("container_resources_disk_written_bytes_total", "Total number of bytes written to the disk by the container", "mount_point", "device", "volume"),
 
 	NetListenInfo:            metric("container_net_tcp_listen_info", "Listen address of the container", "listen_addr", "proxy"),
-	NetConnectionsSuccessful: metric("container_net_tcp_successful_connects_total", "Total number of successful TCP connects", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind", "src_region", "src_az", "destination_workload_region", "destination_workload_az", "actual_destination_region", "actual_destination_az", "actual_destination_instance"),
-	NetConnectionsTotalTime:  metric("container_net_tcp_connection_time_seconds_total", "Time spent on TCP connections", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind", "src_region", "src_az", "destination_workload_region", "destination_workload_az", "actual_destination_region", "actual_destination_az", "actual_destination_instance"),
-	NetConnectionsFailed:     metric("container_net_tcp_failed_connects_total", "Total number of failed TCP connects", "destination", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind", "src_region", "src_az", "destination_workload_region", "destination_workload_az", "actual_destination_region", "actual_destination_az", "actual_destination_instance"),
-	NetConnectionsActive:     metric("container_net_tcp_active_connections", "Number of active outbound connections used by the container", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind", "src_region", "src_az", "destination_workload_region", "destination_workload_az", "actual_destination_region", "actual_destination_az", "actual_destination_instance"),
-	NetRetransmits:           metric("container_net_tcp_retransmits_total", "Total number of retransmitted TCP segments", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind", "src_region", "src_az", "destination_workload_region", "destination_workload_az", "actual_destination_region", "actual_destination_az", "actual_destination_instance"),
-	NetLatency:               metric("container_net_latency_seconds", "Round-trip time between the container and a remote IP", "destination_ip", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "destination_instance"),
-	NetBytesSent:             metric("container_net_tcp_bytes_sent_total", "Total number of bytes sent to the peer", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind", "src_region", "src_az", "destination_workload_region", "destination_workload_az", "actual_destination_region", "actual_destination_az", "actual_destination_instance"),
-	NetBytesReceived:         metric("container_net_tcp_bytes_received_total", "Total number of bytes received from the peer", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind", "src_region", "src_az", "destination_workload_region", "destination_workload_az", "actual_destination_region", "actual_destination_az", "actual_destination_instance"),
+	NetConnectionsSuccessful: metric("container_net_tcp_successful_connects_total", "Total number of successful TCP connects", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
+	NetConnectionsTotalTime:  metric("container_net_tcp_connection_time_seconds_total", "Time spent on TCP connections", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
+	NetConnectionsFailed:     metric("container_net_tcp_failed_connects_total", "Total number of failed TCP connects", "destination", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
+	NetConnectionsActive:     metric("container_net_tcp_active_connections", "Number of active outbound connections used by the container", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
+	NetRetransmits:           metric("container_net_tcp_retransmits_total", "Total number of retransmitted TCP segments", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
+	NetLatency:               metric("container_net_latency_seconds", "Round-trip time between the container and a remote IP", "destination_ip", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind"),
+	NetBytesSent:             metric("container_net_tcp_bytes_sent_total", "Total number of bytes sent to the peer", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
+	NetBytesReceived:         metric("container_net_tcp_bytes_received_total", "Total number of bytes received from the peer", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
 
 	LogMessages:          metric("container_log_messages_total", "Number of messages grouped by the automatically extracted repeated pattern", "source", "level", "pattern_hash", "sample"),
 	SensitiveLogMessages: metric("container_sensitive_log_messages_total", "Number of messages that contain sensitive information", "source", "pattern", "sample", "regex", "name", "pattern_hash"),
@@ -111,7 +116,10 @@ var metrics = struct {
 	JvmSafepointTime:     metric("container_jvm_safepoint_time_seconds", "Time the application has been stopped for safepoint operations in seconds", "jvm"),
 	JvmSafepointSyncTime: metric("container_jvm_safepoint_sync_time_seconds", "Time spent getting to safepoints in seconds", "jvm"),
 
-	Ip2Fqdn: metric("ip_to_fqdn", "Mapping IP addresses to FQDNs based on DNS requests initiated by containers", "ip", "fqdn"),
+	// Ip2Fqdn is emitted by Registry.Collect, not Container.Collect.
+	// It gets machine_id/system_uuid/az/region from the wrapped registerer,
+	// so it does NOT need constLabelNames.
+	Ip2Fqdn: prometheus.NewDesc("ip_to_fqdn", "Mapping IP addresses to FQDNs based on DNS requests initiated by containers", []string{"ip", "fqdn"}, nil),
 
 	PythonThreadLockWaitTime:   metric("container_python_thread_lock_wait_time_seconds", "Time spent waiting acquiring GIL in seconds"),
 	NodejsEventLoopBlockedTime: metric("container_nodejs_event_loop_blocked_time_seconds_total", "Total time the Node.js event loop spent blocked"),
@@ -156,7 +164,10 @@ var (
 )
 
 func metric(name, help string, labels ...string) *prometheus.Desc {
-	return prometheus.NewDesc(name, help, labels, nil)
+	allLabels := make([]string, 0, len(constLabelNames)+len(labels))
+	allLabels = append(allLabels, constLabelNames...)
+	allLabels = append(allLabels, labels...)
+	return prometheus.NewDesc(name, help, allLabels, nil)
 }
 
 func newCounter(name, help string, constLabels prometheus.Labels) prometheus.Counter {

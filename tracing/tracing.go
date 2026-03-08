@@ -184,6 +184,9 @@ func (t *Trace) createSpan(name string, duration time.Duration, error bool, trac
 	if t.tracer.otel == nil {
 		return
 	}
+	if duration <= 0 || duration > time.Hour {
+		return
+	}
 	end := time.Now()
 
 	if !shouldSample() {
@@ -454,6 +457,12 @@ type LLMStreamInfo struct {
 // LLMRequest creates a trace span for an LLM API request
 func (t *Trace) LLMRequest(info LLMStreamInfo) {
 	if t == nil || t.tracer.otel == nil {
+		return
+	}
+	if info.RequestTime.IsZero() || info.CompletionTime.IsZero() || !info.CompletionTime.After(info.RequestTime) {
+		return
+	}
+	if info.CompletionTime.Sub(info.RequestTime) > time.Hour {
 		return
 	}
 

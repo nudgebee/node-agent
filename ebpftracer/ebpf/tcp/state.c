@@ -1,5 +1,5 @@
-#define MAX_CONNECTIONS 1000000
-#define MAX_PAYLOAD_SIZE 8192 // must be power of 2, increased for LLM HTTP/2 payloads
+#define MAX_CONNECTIONS 100000
+#define MAX_PAYLOAD_SIZE 4096 // must be power of 2
 
 struct tcp_event {
     __u64 fd;
@@ -106,7 +106,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(key_size, sizeof(struct l7_request_key));
     __uint(value_size, sizeof(struct l7_request));
-    __uint(max_entries, 8192);
+    __uint(max_entries, 4096);
 } active_l7_requests SEC(".maps");
 
 SEC("tracepoint/sock/inet_sock_set_state")
@@ -215,13 +215,56 @@ struct trace_event_raw_args_with_fd__stub {
     __u64 fd;
 };
 
+// sys_enter_connect args: fd, uservaddr, addrlen
+struct trace_event_raw_sys_enter_connect__stub {
+    __u64 unused;
+    __u64 unused2;
+    __u64 fd;
+    void *uservaddr;
+    __u64 addrlen;
+};
+
+// Stores fd and destination port extracted from connect() sockaddr
+struct connect_args {
+    __u64 fd;
+    __u16 dport;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(key_size, sizeof(__u64));
+    __uint(value_size, sizeof(struct connect_args));
+    __uint(max_entries, 10240);
+} connect_args_by_pid_tgid SEC(".maps");
+
 SEC("tracepoint/syscalls/sys_enter_connect")
 int sys_enter_connect(void *ctx) {
-    struct trace_event_raw_args_with_fd__stub args = {};
+    struct trace_event_raw_sys_enter_connect__stub args = {};
     if (bpf_probe_read(&args, sizeof(args), ctx) < 0) {
         return 0;
     }
     __u64 id = bpf_get_current_pid_tgid();
+
+    struct connect_args ca = {};
+    ca.fd = args.fd;
+
+    // Extract destination port from sockaddr
+    if (args.uservaddr && args.addrlen >= 4) {
+        __u16 family = 0;
+        bpf_probe_read_user(&family, sizeof(family), args.uservaddr);
+        if (family == 2 && args.addrlen >= 8) { // AF_INET
+            __be16 port_be = 0;
+            bpf_probe_read_user(&port_be, sizeof(port_be), args.uservaddr + 2);
+            ca.dport = bpf_ntohs(port_be);
+        } else if (family == 10 && args.addrlen >= 8) { // AF_INET6
+            __be16 port_be = 0;
+            bpf_probe_read_user(&port_be, sizeof(port_be), args.uservaddr + 2);
+            ca.dport = bpf_ntohs(port_be);
+        }
+    }
+
+    bpf_map_update_elem(&connect_args_by_pid_tgid, &id, &ca, BPF_ANY);
+    // Keep fd_by_pid_tgid for backwards compatibility with inet_sock_set_state
     bpf_map_update_elem(&fd_by_pid_tgid, &id, &args.fd, BPF_ANY);
     return 0;
 }
@@ -229,18 +272,24 @@ int sys_enter_connect(void *ctx) {
 SEC("tracepoint/syscalls/sys_exit_connect")
 int sys_exit_connect(struct trace_event_raw_sys_exit__stub* ctx) {
     __u64 id = bpf_get_current_pid_tgid();
-    __u64 *fdp = bpf_map_lookup_elem(&fd_by_pid_tgid, &id);
-    if (!fdp) {
+    struct connect_args *ca = bpf_map_lookup_elem(&connect_args_by_pid_tgid, &id);
+    if (!ca) {
+        // Fallback to fd_by_pid_tgid for inet_sock_set_state path
+        bpf_map_delete_elem(&fd_by_pid_tgid, &id);
         return 0;
     }
     struct connection_id cid = {};
     cid.pid = id >> 32;
-    cid.fd = *fdp;
+    cid.fd = ca->fd;
+    __u16 dport = ca->dport;
+    bpf_map_delete_elem(&connect_args_by_pid_tgid, &id);
+
     struct connection *conn = bpf_map_lookup_elem(&active_connections, &cid);
-    if (!conn && ctx->ret == 0) { // non-TCP connection
-        struct connection conn = {};
-        conn.timestamp = bpf_ktime_get_ns();
-        bpf_map_update_elem(&active_connections, &cid, &conn, BPF_ANY);
+    if (!conn && ctx->ret == 0) { // non-TCP connection (e.g., UDP)
+        struct connection new_conn = {};
+        new_conn.timestamp = bpf_ktime_get_ns();
+        new_conn.dport = dport;
+        bpf_map_update_elem(&active_connections, &cid, &new_conn, BPF_ANY);
     }
 
     struct l7_request_key k = {
