@@ -219,15 +219,20 @@ func main() {
 	}
 	registerer.MustRegister(info("node_agent_info", version))
 
+	az := ""
+	region := ""
 	if md := nodeCollector.Metadata(); md != nil {
-		region := md.Region
-		az := md.AvailabilityZone
+		region = md.Region
+		az = md.AvailabilityZone
 		if region != "" && az != "" {
 			registerer = prometheus.WrapRegistererWith(prometheus.Labels{"az": az, "region": region}, registerer)
 		}
 	}
 	processInfoCh := profiling.Init(machineId, hostname)
-	cr, err := containers.NewRegistry(registerer, processInfoCh, resolver, gpuCollector.ProcessUsageSampleCh)
+	// Pass both the wrapped registerer (for ip2fqdn and LLM metrics) and the raw
+	// registry (for containers) to avoid WrapRegistererWith allocation overhead on
+	// the hot path. Container metrics embed const labels directly.
+	cr, err := containers.NewRegistry(registerer, registry, processInfoCh, resolver, gpuCollector.ProcessUsageSampleCh, machineId, systemUuid, az, region)
 	if err != nil {
 		klog.Exitln(err)
 	}

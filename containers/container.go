@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -23,7 +22,6 @@ import (
 	"github.com/coroot/coroot-node-agent/pinger"
 	"github.com/coroot/coroot-node-agent/proc"
 	"github.com/coroot/coroot-node-agent/tracing"
-	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/nudgebee/logparser"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vishvananda/netns"
@@ -38,10 +36,6 @@ var (
 	multilineCollectorTimeout = time.Second
 	payloadThreshold          = 1024 * 1024
 	gpuStatsWindow            = 15 * time.Second
-)
-
-const (
-	connectionStatsCacheSize = 2048 // LRU cache size for connection stats
 )
 
 type ContainerID string
@@ -114,14 +108,6 @@ type PidFd struct {
 	Fd  uint64
 }
 
-type ConnectionStats struct {
-	Count           uint64
-	TotalTime       time.Duration
-	Retransmissions uint64
-	BytesSent       uint64
-	BytesReceived   uint64
-}
-
 type Container struct {
 	id       ContainerID
 	appId    string
@@ -132,28 +118,25 @@ type Container struct {
 
 	startedAt time.Time
 	zombieAt  time.Time
-	restarts  int
 
 	delays      Delays
 	delaysByPid map[uint32]Delays
 
 	listens map[netaddr.IPPort]map[uint32]*ListenDetails
 
-	connectionStats          *lru.Cache[common.DestinationKey, *ConnectionStats]
-	failedConnectionAttempts map[common.HostPort]int64
-	lastConnectionAttempts   map[common.HostPort]time.Time
-	activeConnections        map[ConnectionKey]*ActiveConnection
-	connectionsByPidFd       map[PidFd]*ActiveConnection
-	googleHTTP2Parsers       map[PidFd]*l7.Http2Parser // Per-connection HTTP/2 parsers (keyed by pid:fd for correct HPACK state)
+	lastConnectionAttempts map[common.HostPort]time.Time
+	activeConnections      map[ConnectionKey]*ActiveConnection
+	connectionsByPidFd     map[PidFd]*ActiveConnection
+	googleHTTP2Parsers     map[PidFd]*l7.Http2Parser // Per-connection HTTP/2 parsers (keyed by pid:fd for correct HPACK state)
 
-	l7Stats L7Stats
+	l7Stats    L7Stats
+	tcpMetrics *TCPMetrics
 
 	// LLM stream tracker for SSE-based completion detection
 	llmStreamTracker *LLMStreamTracker
 
 	gpuStats map[string]*GpuUsage
 
-	oomKills    int
 	nodejsStats *ebpftracer.NodejsStats
 	pythonStats *ebpftracer.PythonStats
 
@@ -161,7 +144,7 @@ type Container struct {
 	seenMounts map[uint64]struct{}
 
 	logParsers map[string]*LogParser
-	logSamples map[string]string
+	logSamples sync.Map // map[string]string — hash -> truncated sample (write-once)
 
 	tracer *tracing.Tracer
 
@@ -172,6 +155,7 @@ type Container struct {
 	done        chan struct{}
 	ip_resolver IPResolver
 	srcWorkload common.Workload
+	constLabels []string // [container_id, app_id, machine_id, system_uuid, az, region]
 
 	// Atomic throttling fields for lock-free access
 	collectCallCount int64
@@ -215,6 +199,23 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 	if appId == cid {
 		appId = ""
 	}
+
+	// Build const labels for direct embedding in metrics (avoids WrapRegistererWith overhead)
+	nl := registry.nodeConstLabels
+	nodeValues := nl.Values()
+	constLabels := make([]string, 0, 2+len(nodeValues))
+	constLabels = append(constLabels, cid, appId)
+	constLabels = append(constLabels, nodeValues...)
+
+	promConstLabels := prometheus.Labels{
+		"container_id": cid,
+		"app_id":       appId,
+		"machine_id":   nl.MachineID,
+		"system_uuid":  nl.SystemUUID,
+		"az":           nl.AZ,
+		"region":       nl.Region,
+	}
+
 	c := &Container{
 		id:       id,
 		appId:    appId,
@@ -227,12 +228,11 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 
 		listens: map[netaddr.IPPort]map[uint32]*ListenDetails{},
 
-		connectionStats:          nil, // Will be initialized below
-		failedConnectionAttempts: map[common.HostPort]int64{},
-		lastConnectionAttempts:   map[common.HostPort]time.Time{},
-		activeConnections:        map[ConnectionKey]*ActiveConnection{},
-		connectionsByPidFd:       map[PidFd]*ActiveConnection{},
-		l7Stats:                  NewL7Stats(),
+		lastConnectionAttempts: map[common.HostPort]time.Time{},
+		activeConnections:      map[ConnectionKey]*ActiveConnection{},
+		connectionsByPidFd:     map[PidFd]*ActiveConnection{},
+		l7Stats:                NewL7Stats(promConstLabels),
+		tcpMetrics:             NewTCPMetrics(promConstLabels),
 
 		gpuStats: map[string]*GpuUsage{},
 
@@ -240,7 +240,6 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		seenMounts: map[uint64]struct{}{},
 
 		logParsers: map[string]*LogParser{},
-		logSamples: map[string]string{},
 
 		tracer: tracing.GetContainerTracer(string(id)),
 
@@ -248,14 +247,8 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		ip_resolver: registry.ip_resolver,
 		registry:    registry,
 		srcWorkload: src_workload,
+		constLabels: constLabels,
 	}
-
-	// Initialize the LRU cache for connection stats
-	connStatsCache, err := lru.New[common.DestinationKey, *ConnectionStats](connectionStatsCacheSize)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create connection stats cache: %w", err)
-	}
-	c.connectionStats = connStatsCache
 
 	// Initialize LLM stream tracker with completion callback
 	c.llmStreamTracker = NewLLMStreamTracker(func(stream *LLMStream) {
@@ -296,8 +289,10 @@ func (c *Container) Dead(now time.Time) bool {
 }
 
 func (c *Container) Describe(ch chan<- *prometheus.Desc) {
-	// some fixed metric description is required here to register/unregister the collector correctly
-	ch <- prometheus.NewDesc("container", "", nil, nil)
+	// Unchecked collector: each container emits varying metrics over its lifecycle
+	// (different L7 protocols, connections, etc.), and we manage label uniqueness
+	// via constLabels embedded directly in each metric.
+	// Sending no descriptors lets prometheus handle registration/unregistration by pointer.
 }
 
 func (c *Container) Collect(ch chan<- prometheus.Metric) {
@@ -313,49 +308,40 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	atomic.StoreInt64(&c.lastCollectTime, nowNanos)
 
 	if c.metadata.image != "" || !c.metadata.systemd.IsEmpty() {
-		ch <- gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemd.TriggeredBy, c.metadata.systemd.Type)
+		ch <- c.gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemd.TriggeredBy, c.metadata.systemd.Type)
 	}
 
-	c.lock.RLock()
-	restarts := c.restarts
-	oomKills := c.oomKills
-	c.lock.RUnlock()
-
-	ch <- counter(metrics.Restarts, float64(restarts))
+	// --- Cgroup/procfs metrics (no c.lock needed) ---
 
 	if cpu := c.cgroup.CpuStat(); cpu != nil {
 		if cpu.LimitCores > 0 {
-			ch <- gauge(metrics.CPULimit, cpu.LimitCores)
+			ch <- c.gauge(metrics.CPULimit, cpu.LimitCores)
 		}
-		ch <- counter(metrics.CPUUsage, cpu.UsageSeconds)
-		ch <- counter(metrics.ThrottledTime, cpu.ThrottledTimeSeconds)
+		ch <- c.counter(metrics.CPUUsage, cpu.UsageSeconds)
+		ch <- c.counter(metrics.ThrottledTime, cpu.ThrottledTimeSeconds)
 	}
 
 	if taskstatsClient != nil {
 		c.updateDelays()
-		ch <- counter(metrics.CPUDelay, float64(c.delays.cpu)/float64(time.Second))
-		ch <- counter(metrics.DiskDelay, float64(c.delays.disk)/float64(time.Second))
+		ch <- c.counter(metrics.CPUDelay, float64(c.delays.cpu)/float64(time.Second))
+		ch <- c.counter(metrics.DiskDelay, float64(c.delays.disk)/float64(time.Second))
 	}
 
 	if s := c.cgroup.MemoryStat(); s != nil {
-		ch <- gauge(metrics.MemoryRss, float64(s.RSS))
-		ch <- gauge(metrics.MemoryCache, float64(s.Cache))
+		ch <- c.gauge(metrics.MemoryRss, float64(s.RSS))
+		ch <- c.gauge(metrics.MemoryCache, float64(s.Cache))
 		if s.Limit > 0 {
-			ch <- gauge(metrics.MemoryLimit, float64(s.Limit))
+			ch <- c.gauge(metrics.MemoryLimit, float64(s.Limit))
 		}
 	}
 
 	if psi := c.cgroup.PSI(); psi != nil {
-		ch <- counter(metrics.PsiCPU, psi.CPUSecondsSome, "some")
-		ch <- counter(metrics.PsiCPU, psi.CPUSecondsFull, "full")
-		ch <- counter(metrics.PsiMemory, psi.MemorySecondsSome, "some")
-		ch <- counter(metrics.PsiMemory, psi.MemorySecondsFull, "full")
-		ch <- counter(metrics.PsiIO, psi.IOSecondsSome, "some")
-		ch <- counter(metrics.PsiIO, psi.IOSecondsFull, "full")
-	}
-
-	if oomKills > 0 {
-		ch <- counter(metrics.OOMKills, float64(oomKills))
+		ch <- c.counter(metrics.PsiCPU, psi.CPUSecondsSome, "some")
+		ch <- c.counter(metrics.PsiCPU, psi.CPUSecondsFull, "full")
+		ch <- c.counter(metrics.PsiMemory, psi.MemorySecondsSome, "some")
+		ch <- c.counter(metrics.PsiMemory, psi.MemorySecondsFull, "full")
+		ch <- c.counter(metrics.PsiIO, psi.IOSecondsSome, "some")
+		ch <- c.counter(metrics.PsiIO, psi.IOSecondsFull, "full")
 	}
 
 	if disks, err := node.GetDisks(); err == nil {
@@ -367,113 +353,40 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 			}
 			for mountPoint, fsStat := range mounts {
 				dls := []string{mountPoint, device, c.metadata.volumes[mountPoint]}
-				ch <- gauge(metrics.DiskSize, float64(fsStat.CapacityBytes), dls...)
-				ch <- gauge(metrics.DiskUsed, float64(fsStat.UsedBytes), dls...)
-				ch <- gauge(metrics.DiskReserved, float64(fsStat.ReservedBytes), dls...)
+				ch <- c.gauge(metrics.DiskSize, float64(fsStat.CapacityBytes), dls...)
+				ch <- c.gauge(metrics.DiskUsed, float64(fsStat.UsedBytes), dls...)
+				ch <- c.gauge(metrics.DiskReserved, float64(fsStat.ReservedBytes), dls...)
 				if ioStat != nil {
 					if io, ok := ioStat[majorMinor]; ok {
-						ch <- counter(metrics.DiskReadOps, float64(io.ReadOps), dls...)
-						ch <- counter(metrics.DiskReadBytes, float64(io.ReadBytes), dls...)
-						ch <- counter(metrics.DiskWriteOps, float64(io.WriteOps), dls...)
-						ch <- counter(metrics.DiskWriteBytes, float64(io.WrittenBytes), dls...)
+						ch <- c.counter(metrics.DiskReadOps, float64(io.ReadOps), dls...)
+						ch <- c.counter(metrics.DiskReadBytes, float64(io.ReadBytes), dls...)
+						ch <- c.counter(metrics.DiskWriteOps, float64(io.WriteOps), dls...)
+						ch <- c.counter(metrics.DiskWriteBytes, float64(io.WrittenBytes), dls...)
 					}
 				}
 			}
 		}
 	}
 
-	// Snapshot listens under lock since getListens/getProxiedListens access c.listens and c.processes
+	// --- Listens: brief snapshot under c.lock ---
 	c.lock.RLock()
 	listens := c.getListens()
 	proxiedListens := c.getProxiedListens()
 	c.lock.RUnlock()
 
 	for addr, open := range listens {
-		ch <- gauge(metrics.NetListenInfo, float64(open), addr.String(), "")
+		ch <- c.gauge(metrics.NetListenInfo, float64(open), addr.String(), "")
 	}
 	for proxy, addrs := range proxiedListens {
 		for addr := range addrs {
-			ch <- gauge(metrics.NetListenInfo, 1, addr.String(), proxy)
+			ch <- c.gauge(metrics.NetListenInfo, 1, addr.String(), proxy)
 		}
 	}
 
-	// Snapshot connectionStats under lock since the LRU cache is not concurrent-safe
-	type connStatSnapshot struct {
-		key   common.DestinationKey
-		stats ConnectionStats
-	}
-	c.lock.RLock()
-	connSnapshots := make([]connStatSnapshot, 0, c.connectionStats.Len())
-	for _, d := range c.connectionStats.Keys() {
-		if stats, ok := c.connectionStats.Peek(d); ok {
-			connSnapshots = append(connSnapshots, connStatSnapshot{key: d, stats: *stats})
-		}
-	}
-	c.lock.RUnlock()
+	// --- TCP/connection metrics: push-model, no c.lock ---
+	c.tcpMetrics.collect(ch)
 
-	// Aggregate connection stats by enriched key to avoid duplicate metrics
-	// when multiple IPs resolve to the same FQDN (e.g., Google's shared IPs)
-	aggregatedStats := map[common.DestinationKey]*ConnectionStats{}
-	for _, snap := range connSnapshots {
-		enrichedKey := c.enrichDestinationKey(snap.key)
-		if existing, ok := aggregatedStats[enrichedKey]; ok {
-			existing.Count += snap.stats.Count
-			existing.TotalTime += snap.stats.TotalTime
-			existing.Retransmissions += snap.stats.Retransmissions
-			existing.BytesSent += snap.stats.BytesSent
-			existing.BytesReceived += snap.stats.BytesReceived
-		} else {
-			aggregatedStats[enrichedKey] = &ConnectionStats{
-				Count:           snap.stats.Count,
-				TotalTime:       snap.stats.TotalTime,
-				Retransmissions: snap.stats.Retransmissions,
-				BytesSent:       snap.stats.BytesSent,
-				BytesReceived:   snap.stats.BytesReceived,
-			}
-		}
-	}
-	for enrichedKey, stats := range aggregatedStats {
-		workload_src := c.srcWorkload
-		workload_dest := enrichedKey.GetDestinationWorkload()
-		actualDestWorkload := enrichedKey.GetActualDestinationWorkload()
-
-		ch <- counter(metrics.NetConnectionsSuccessful, float64(stats.Count), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
-		ch <- counter(metrics.NetConnectionsTotalTime, stats.TotalTime.Seconds(), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
-		if stats.Retransmissions > 0 {
-			ch <- counter(metrics.NetRetransmits, float64(stats.Retransmissions), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
-		}
-		ch <- counter(metrics.NetBytesSent, float64(stats.BytesSent), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
-		ch <- counter(metrics.NetBytesReceived, float64(stats.BytesReceived), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), workload_src.Name, workload_src.Namespace, workload_src.Kind, workload_dest.Name, workload_dest.Namespace, workload_dest.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
-	}
-	// Copy failedConnectionAttempts under read lock to avoid concurrent map access
-	c.lock.RLock()
-	failedConnCopy := make(map[common.HostPort]int64, len(c.failedConnectionAttempts))
-	for k, v := range c.failedConnectionAttempts {
-		failedConnCopy[k] = v
-	}
-	c.lock.RUnlock()
-
-	for dst, count := range failedConnCopy {
-		workload := c.ip_resolver.ResolveIP(dst.IP().String())
-		ch <- counter(metrics.NetConnectionsFailed, float64(count), dst.String(), workload.Name, workload.Namespace, workload.Kind, workload.Name, workload.Namespace, workload.Kind)
-	}
-
-	connections := map[common.DestinationKey]int{}
-	c.lock.RLock()
-	for _, conn := range c.activeConnections {
-		if !conn.Closed.IsZero() {
-			continue
-		}
-		connections[c.enrichDestinationKey(conn.DestinationKey)]++
-	}
-	c.lock.RUnlock()
-	for enrichedKey, count := range connections {
-		actualDestWorkload := enrichedKey.GetActualDestinationWorkload()
-		destWorkload := enrichedKey.GetDestinationWorkload()
-		ch <- gauge(metrics.NetConnectionsActive, float64(count), enrichedKey.DestinationLabelValue(), enrichedKey.ActualDestinationLabelValue(), c.srcWorkload.Name, c.srcWorkload.Namespace, c.srcWorkload.Kind, destWorkload.Name, destWorkload.Namespace, destWorkload.Kind, actualDestWorkload.Name, actualDestWorkload.Namespace, actualDestWorkload.Kind)
-	}
-
-	// Copy logParsers under read lock to avoid concurrent map access
+	// --- Log metrics: use sync.Map for samples, brief c.lock for logParsers snapshot ---
 	c.lock.RLock()
 	logParsersCopy := make(map[string]*LogParser, len(c.logParsers))
 	for k, v := range c.logParsers {
@@ -484,31 +397,20 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	for source, p := range logParsersCopy {
 		for _, ctr := range p.parser.GetCounters() {
 			if ctr.Level == logparser.LevelCritical || ctr.Level == logparser.LevelError {
-				c.lock.RLock()
-				sample, ok := c.logSamples[ctr.Hash]
-				c.lock.RUnlock()
-				if !ok {
-					c.lock.Lock()
-					sample, ok = c.logSamples[ctr.Hash]
-					if !ok {
-						sample = common.TruncateUtf8(ctr.Sample, *flags.MaxLabelLength)
-						c.logSamples[ctr.Hash] = sample
-					}
-					c.lock.Unlock()
-				}
-				ch <- counter(metrics.LogMessages, float64(ctr.Messages), source, ctr.Level.String(), ctr.Hash, sample)
+				sample, _ := c.logSamples.LoadOrStore(ctr.Hash, common.TruncateUtf8(ctr.Sample, *flags.MaxLabelLength))
+				ch <- c.counter(metrics.LogMessages, float64(ctr.Messages), source, ctr.Level.String(), ctr.Hash, sample.(string))
 			}
 		}
-		for _, c := range p.parser.GetSensitiveCounters() {
-			ch <- counter(metrics.SensitiveLogMessages, float64(c.Messages), source, c.Pattern, common.TruncateUtf8(c.Sample, *flags.MaxLabelLength), c.Regex, c.Name, c.Hash)
+		for _, sc := range p.parser.GetSensitiveCounters() {
+			ch <- c.counter(metrics.SensitiveLogMessages, float64(sc.Messages), source, sc.Pattern, common.TruncateUtf8(sc.Sample, *flags.MaxLabelLength), sc.Regex, sc.Name, sc.Hash)
 		}
 	}
 
+	// --- Process-level metrics: brief snapshot under c.lock ---
 	appTypes := map[string]struct{}{}
 	seenJvms := map[string]bool{}
 	seenDotNetApps := map[string]bool{}
 
-	// Copy processes map under read lock to avoid concurrent map access
 	c.lock.RLock()
 	processesCopy := make(map[uint32]*Process, len(c.processes))
 	for pid, p := range c.processes {
@@ -541,7 +443,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 		switch {
 		case proc.IsJvm(cmdline):
-			jvm, jMetrics := jvmMetrics(pid)
+			jvm, jMetrics := c.jvmMetrics(pid)
 			if len(jMetrics) > 0 && !seenJvms[jvm] {
 				seenJvms[jvm] = true
 				for _, m := range jMetrics {
@@ -573,26 +475,27 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 	for uuid, usage := range c.gpuStats {
-		ch <- gauge(metrics.GpuUsagePercent, usage.GPU, uuid)
-		ch <- gauge(metrics.GpuMemoryUsagePercent, usage.Memory, uuid)
+		ch <- c.gauge(metrics.GpuUsagePercent, usage.GPU, uuid)
+		ch <- c.gauge(metrics.GpuMemoryUsagePercent, usage.Memory, uuid)
 	}
 
 	for appType := range appTypes {
-		ch <- gauge(metrics.ApplicationType, 1, appType)
+		ch <- c.gauge(metrics.ApplicationType, 1, appType)
 	}
 	if c.pythonStats != nil {
-		ch <- counter(metrics.PythonThreadLockWaitTime, c.pythonStats.ThreadLockWaitTime.Seconds())
+		ch <- c.counter(metrics.PythonThreadLockWaitTime, c.pythonStats.ThreadLockWaitTime.Seconds())
 	}
 	if c.nodejsStats != nil {
-		ch <- counter(metrics.NodejsEventLoopBlockedTime, c.nodejsStats.EventLoopBlockedTime.Seconds())
+		ch <- c.counter(metrics.NodejsEventLoopBlockedTime, c.nodejsStats.EventLoopBlockedTime.Seconds())
 	}
 
+	// --- L7 metrics: push-model, own lock ---
 	c.l7Stats.collect(ch)
 
 	if !*flags.DisablePinger {
 		for ip, rtt := range c.ping() {
 			destination_workload := c.ip_resolver.ResolveIP(ip.String())
-			ch <- gauge(metrics.NetLatency, rtt, ip.String(), destination_workload.Name, destination_workload.Namespace, destination_workload.Kind)
+			ch <- c.gauge(metrics.NetLatency, rtt, ip.String(), destination_workload.Name, destination_workload.Namespace, destination_workload.Kind)
 		}
 	}
 
@@ -629,7 +532,7 @@ func (c *Container) onProcessStart(pid uint32) *Process {
 			}
 		}
 		if min.After(c.startedAt) {
-			c.restarts++
+			c.tcpMetrics.ObserveRestart()
 			c.startedAt = min
 		}
 	}
@@ -648,7 +551,7 @@ func (c *Container) onProcessExit(pid uint32, oomKill bool) {
 	}
 	delete(c.delaysByPid, pid)
 	if oomKill {
-		c.oomKills++
+		c.tcpMetrics.ObserveOOMKill()
 	}
 }
 
@@ -791,23 +694,18 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 		return
 	}
 
-	c.lock.Lock()
-	defer c.lock.Unlock()
-
-	// Fast Path (or slow path that found no match):
-	// Proceed with creating the key and updating stats as usual.
 	key := common.NewDestinationKey(dst, actualDst, c.registry.getDomain(dst.IP()), dstWorkload, actualDstWorkload)
 
 	if failed {
-		c.failedConnectionAttempts[key.Destination()]++
+		c.tcpMetrics.ObserveConnectionFailed(key.Destination(), dstWorkload)
 	} else {
-		stats, _ := c.connectionStats.Get(key)
-		if stats == nil {
-			stats = &ConnectionStats{}
-			c.connectionStats.Add(key, stats)
-		}
-		stats.Count++
-		stats.TotalTime += duration
+		c.tcpMetrics.ObserveConnectionOpen(key, srcWorkload, duration.Seconds())
+	}
+
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	if !failed {
 		connection := &ActiveConnection{
 			DestinationKey: key,
 			Pid:            pid,
@@ -919,19 +817,18 @@ func (c *Container) updateConnectionTrafficStats(ac *ActiveConnection, sent, rec
 		return
 	}
 	c.migrateConnectionKeyIfNeeded(ac)
-	stats, _ := c.connectionStats.Get(ac.DestinationKey)
-	if stats == nil {
-		stats = &ConnectionStats{}
-		c.connectionStats.Add(ac.DestinationKey, stats)
-	}
+	var sentDelta, recvDelta uint64
 	if sent > ac.BytesSent {
-		stats.BytesSent += sent - ac.BytesSent
+		sentDelta = sent - ac.BytesSent
 	}
 	if received > ac.BytesReceived {
-		stats.BytesReceived += received - ac.BytesReceived
+		recvDelta = received - ac.BytesReceived
 	}
 	ac.BytesSent = sent
 	ac.BytesReceived = received
+	if sentDelta > 0 || recvDelta > 0 {
+		c.tcpMetrics.ObserveTraffic(ac.DestinationKey, ac.srcWorkload, sentDelta, recvDelta)
+	}
 }
 
 func (c *Container) trackLLMRequest(provider LLMProvider, host, path, payloadBase64, responseBase64 string, duration time.Duration) {
@@ -1093,37 +990,15 @@ func (c *Container) enrichDestinationKey(key common.DestinationKey) common.Desti
 	return key
 }
 
-// migrateConnectionKeyToFQDN updates conn.DestinationKey from IP to the given FQDN
-// and migrates the corresponding connectionStats entry.
+// migrateConnectionKeyToFQDN updates conn.DestinationKey from IP to the given FQDN.
 // Must be called under c.lock.
 func (c *Container) migrateConnectionKeyToFQDN(conn *ActiveConnection, fqdn string) {
-	oldKey := conn.DestinationKey
-	newKey := oldKey.WithResolvedDomain(fqdn)
-	if oldKey == newKey {
-		return
-	}
-
-	// Migrate connectionStats from old key to new key
-	oldStats, _ := c.connectionStats.Get(oldKey)
-	if oldStats != nil {
-		c.connectionStats.Remove(oldKey)
-		newStats, _ := c.connectionStats.Get(newKey)
-		if newStats != nil {
-			newStats.Count += oldStats.Count
-			newStats.TotalTime += oldStats.TotalTime
-			newStats.Retransmissions += oldStats.Retransmissions
-			newStats.BytesSent += oldStats.BytesSent
-			newStats.BytesReceived += oldStats.BytesReceived
-		} else {
-			c.connectionStats.Add(newKey, oldStats)
-		}
-	}
-
+	newKey := conn.DestinationKey.WithResolvedDomain(fqdn)
 	conn.DestinationKey = newKey
 }
 
 // migrateConnectionKeyIfNeeded updates conn.DestinationKey from IP to FQDN when
-// DNS becomes available, and migrates the corresponding connectionStats entry.
+// DNS becomes available.
 // Must be called under c.lock.
 func (c *Container) migrateConnectionKeyIfNeeded(conn *ActiveConnection) {
 	if conn == nil {
@@ -1557,19 +1432,49 @@ func (c *Container) processHTTP2WithoutConnection(pid uint32, fd uint64, r *l7.R
 	return nil, L7RequestProcessed
 }
 
+// refreshActiveConnections snapshots active connections under c.lock and
+// pushes the gauge values to TCPMetrics. Called periodically from the
+// event handler goroutine (not from Collect).
+func (c *Container) refreshActiveConnections() {
+	c.lock.RLock()
+	counts := map[common.DestinationKey]activeConnAgg{}
+	for _, conn := range c.activeConnections {
+		if !conn.Closed.IsZero() {
+			continue
+		}
+		enrichedKey := c.enrichDestinationKey(conn.DestinationKey)
+		agg, ok := counts[enrichedKey]
+		if !ok {
+			agg = activeConnAgg{src: conn.srcWorkload}
+		}
+		agg.count++
+		counts[enrichedKey] = agg
+	}
+	c.lock.RUnlock()
+
+	entries := make([]activeEntry, 0, len(counts))
+	for key, agg := range counts {
+		entries = append(entries, activeEntry{
+			labels: tcpLabels(key, agg.src),
+			count:  agg.count,
+		})
+	}
+	c.tcpMetrics.resetAndSetActive(entries)
+}
+
+type activeConnAgg struct {
+	src   common.Workload
+	count int
+}
+
 func (c *Container) onRetransmission(src netaddr.IPPort, dst netaddr.IPPort) bool {
-	c.lock.Lock()
-	defer c.lock.Unlock()
+	c.lock.RLock()
 	conn, ok := c.activeConnections[ConnectionKey{src: src, dst: dst}]
+	c.lock.RUnlock()
 	if !ok {
 		return false
 	}
-	stats, _ := c.connectionStats.Get(conn.DestinationKey)
-	if stats == nil {
-		stats = &ConnectionStats{}
-		c.connectionStats.Add(conn.DestinationKey, stats)
-	}
-	stats.Retransmissions++
+	c.tcpMetrics.ObserveRetransmission(conn.DestinationKey, conn.srcWorkload)
 	return true
 }
 
@@ -1681,14 +1586,12 @@ func (c *Container) getMounts() map[string]map[string]*proc.FSStat {
 	return res
 }
 
+// getListens must be called with c.lock held (at least RLock).
 func (c *Container) getListens() map[netaddr.IPPort]int {
-	// Copy processes under read lock — c.processes is mutated by handleEvents goroutine
-	c.lock.RLock()
 	processesCopy := make(map[uint32]*Process, len(c.processes))
 	for pid, p := range c.processes {
 		processesCopy[pid] = p
 	}
-	c.lock.RUnlock()
 
 	res := map[netaddr.IPPort]int{}
 	for addr, byPid := range c.listens {
@@ -1802,16 +1705,13 @@ func (c *Container) ping() map[netaddr.IP]float64 {
 	}
 
 	ips := map[netaddr.IP]struct{}{}
-	for _, d := range c.connectionStats.Keys() {
-		if ip := d.ActualDestination().IP(); !ip.IsZero() {
+	c.lock.RLock()
+	for _, conn := range c.activeConnections {
+		if ip := conn.DestinationKey.ActualDestinationIfKnown().IP(); !ip.IsZero() {
 			ips[ip] = struct{}{}
 		}
 	}
-	for dst := range c.failedConnectionAttempts {
-		if ip := dst.IP(); !ip.IsZero() {
-			ips[dst.IP()] = struct{}{}
-		}
-	}
+	c.lock.RUnlock()
 	if len(ips) == 0 {
 		return nil
 	}
@@ -1963,12 +1863,6 @@ func (c *Container) gc(now time.Time) {
 		_, active := establishedDst[dst]
 		if !active && !at.IsZero() && now.Sub(at) > gcInterval {
 			delete(c.lastConnectionAttempts, dst)
-			delete(c.failedConnectionAttempts, dst)
-			for _, d := range c.connectionStats.Keys() {
-				if d.Destination() == dst {
-					c.connectionStats.Remove(d)
-				}
-			}
 			c.l7Stats.delete(dst)
 		}
 	}
@@ -2202,10 +2096,16 @@ func detectProviderFromRequestStructure(requestData []byte) LLMProvider {
 	return ProviderUnknown
 }
 
-func counter(desc *prometheus.Desc, value float64, labelValues ...string) prometheus.Metric {
-	return prometheus.MustNewConstMetric(desc, prometheus.CounterValue, value, labelValues...)
+func (c *Container) counter(desc *prometheus.Desc, value float64, labelValues ...string) prometheus.Metric {
+	allLabels := make([]string, 0, len(c.constLabels)+len(labelValues))
+	allLabels = append(allLabels, c.constLabels...)
+	allLabels = append(allLabels, labelValues...)
+	return prometheus.MustNewConstMetric(desc, prometheus.CounterValue, value, allLabels...)
 }
 
-func gauge(desc *prometheus.Desc, value float64, labelValues ...string) prometheus.Metric {
-	return prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, value, labelValues...)
+func (c *Container) gauge(desc *prometheus.Desc, value float64, labelValues ...string) prometheus.Metric {
+	allLabels := make([]string, 0, len(c.constLabels)+len(labelValues))
+	allLabels = append(allLabels, c.constLabels...)
+	allLabels = append(allLabels, labelValues...)
+	return prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, value, allLabels...)
 }

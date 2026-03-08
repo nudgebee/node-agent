@@ -13,7 +13,7 @@ import (
 	"k8s.io/klog/v2"
 )
 
-func jvmMetrics(pid uint32) (string, []prometheus.Metric) {
+func (c *Container) jvmMetrics(pid uint32) (string, []prometheus.Metric) {
 	nsPid, err := proc.GetNsPid(pid)
 	if err != nil {
 		if !common.IsNotExist(err) {
@@ -37,7 +37,7 @@ func jvmMetrics(pid uint32) (string, []prometheus.Metric) {
 	jvm := pd.getString("sun.rt.javaCommand")
 	var res []prometheus.Metric
 
-	res = append(res, gauge(metrics.JvmInfo, 1, jvm, pd.getString("java.property.java.version")))
+	res = append(res, c.gauge(metrics.JvmInfo, 1, jvm, pd.getString("java.property.java.version")))
 
 	func() {
 		size := float64(0)
@@ -49,8 +49,8 @@ func jvmMetrics(pid uint32) (string, []prometheus.Metric) {
 				used += float64(pd.getInt64("sun.gc.generation.%d.space.%d.used", gen, s))
 			}
 		}
-		res = append(res, gauge(metrics.JvmHeapSize, size, jvm))
-		res = append(res, gauge(metrics.JvmHeapUsed, used, jvm))
+		res = append(res, c.gauge(metrics.JvmHeapSize, size, jvm))
+		res = append(res, c.gauge(metrics.JvmHeapUsed, used, jvm))
 	}()
 
 	gc := func(prefix string) {
@@ -58,14 +58,14 @@ func jvmMetrics(pid uint32) (string, []prometheus.Metric) {
 		if name == "" {
 			return
 		}
-		res = append(res, counter(metrics.JvmGCTime, time.Duration(pd.getInt64(prefix+"time")).Seconds(), jvm, name))
+		res = append(res, c.counter(metrics.JvmGCTime, time.Duration(pd.getInt64(prefix+"time")).Seconds(), jvm, name))
 	}
 	gc("sun.gc.collector.0.")
 	gc("sun.gc.collector.1.")
 	gc("sun.gc.collector.2.")
 
-	res = append(res, counter(metrics.JvmSafepointTime, time.Duration(pd.getInt64("sun.rt.safepointTime")).Seconds(), jvm))
-	res = append(res, counter(metrics.JvmSafepointSyncTime, time.Duration(pd.getInt64("sun.rt.safepointSyncTime")).Seconds(), jvm))
+	res = append(res, c.counter(metrics.JvmSafepointTime, time.Duration(pd.getInt64("sun.rt.safepointTime")).Seconds(), jvm))
+	res = append(res, c.counter(metrics.JvmSafepointSyncTime, time.Duration(pd.getInt64("sun.rt.safepointSyncTime")).Seconds(), jvm))
 	return jvm, res
 }
 

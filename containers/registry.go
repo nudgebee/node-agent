@@ -53,8 +53,20 @@ type IPResolver interface {
 	ResolvePodOwner(string, string) common.Workload
 }
 
+type NodeConstLabels struct {
+	MachineID  string
+	SystemUUID string
+	AZ         string
+	Region     string
+}
+
+// Values returns the label values in the order matching constLabelNames.
+func (n NodeConstLabels) Values() []string {
+	return []string{n.MachineID, n.SystemUUID, n.AZ, n.Region}
+}
+
 type Registry struct {
-	reg prometheus.Registerer
+	reg prometheus.Registerer // wrapped registerer for ip2fqdn and LLM metrics
 
 	tracer *ebpftracer.Tracer
 	events chan ebpftracer.Event
@@ -70,13 +82,11 @@ type Registry struct {
 	processInfoCh chan<- ProcessInfo
 	ip_resolver   IPResolver
 
-	ebpfStatsLastUpdated time.Time
-	ebpfStatsLock        sync.Mutex
-	trafficStatsUpdateCh chan *TrafficStatsUpdate
-	nodejsStatsUpdateCh  chan *NodejsStatsUpdate
-	pythonStatsUpdateCh  chan *PythonStatsUpdate
-
 	gpuProcessUsageSampleChan chan gpu.ProcessUsageSample
+
+	// nodeConstLabels holds node-level label values for embedding directly
+	// in container metrics (avoids WrapRegistererWith overhead).
+	nodeConstLabels NodeConstLabels
 
 	// pendingL7Events stores L7 events that arrived before their connection was established
 	// This handles the race condition between ring buffer (L7 events) and perf buffer (TCP events)
@@ -91,7 +101,7 @@ type pendingL7Event struct {
 	retryCount int
 }
 
-func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, ip_resolver *common.K8sIPResolver, gpuProcessUsageSampleChan chan gpu.ProcessUsageSample) (*Registry, error) {
+func NewRegistry(reg prometheus.Registerer, rawReg prometheus.Registerer, processInfoCh chan<- ProcessInfo, ip_resolver *common.K8sIPResolver, gpuProcessUsageSampleChan chan gpu.ProcessUsageSample, machineId, systemUuid, az, region string) (*Registry, error) {
 	ns, err := proc.GetSelfNetNs()
 	if err != nil {
 		return nil, err
@@ -138,18 +148,22 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, ip
 		containersByPidIgnored: map[uint32]*time.Time{},
 		ip2fqdn:                map[netaddr.IP]*common.Domain{},
 
-		processInfoCh:        processInfoCh,
-		ip_resolver:          ip_resolver,
-		tracer:               ebpftracer.NewTracer(hostNetNs, selfNetNs, *flags.DisableL7Tracing),
-		trafficStatsUpdateCh: make(chan *TrafficStatsUpdate),
-		nodejsStatsUpdateCh:  make(chan *NodejsStatsUpdate),
-		pythonStatsUpdateCh:  make(chan *PythonStatsUpdate),
+		processInfoCh: processInfoCh,
+		ip_resolver:   ip_resolver,
+		tracer:        ebpftracer.NewTracer(hostNetNs, selfNetNs, *flags.DisableL7Tracing),
 
 		gpuProcessUsageSampleChan: gpuProcessUsageSampleChan,
+		nodeConstLabels:           NodeConstLabels{MachineID: machineId, SystemUUID: systemUuid, AZ: az, Region: region},
 	}
 	// Register LLM metrics with the same registerer used for other container metrics
 	RegisterLLMMetrics(reg)
 	if err = reg.Register(r); err != nil {
+		return nil, err
+	}
+	// Register a single collector for all containers on the raw registry.
+	// Individual containers are NOT registered/unregistered because prometheus.Registry
+	// does not support Unregister for unchecked collectors (empty Describe).
+	if err = rawReg.Register(&containerCollector{registry: r}); err != nil {
 		return nil, err
 	}
 	go r.handleEvents(r.events)
@@ -166,11 +180,35 @@ func (r *Registry) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (r *Registry) Collect(ch chan<- prometheus.Metric) {
-	r.updateStatsFromEbpfMapsIfNecessary()
 	r.ip2fqdnLock.RLock()
 	defer r.ip2fqdnLock.RUnlock()
 	for ip, domain := range r.ip2fqdn {
-		ch <- gauge(metrics.Ip2Fqdn, 1, ip.String(), domain.FQDN)
+		ch <- prometheus.MustNewConstMetric(metrics.Ip2Fqdn, prometheus.GaugeValue, 1, ip.String(), domain.FQDN)
+	}
+}
+
+// containerCollector is registered on the raw Prometheus registry and collects
+// metrics from all known containers. This avoids registering each Container as
+// an individual unchecked collector, which is needed because prometheus.Registry
+// does not support Unregister for unchecked collectors (Describe returns nothing).
+type containerCollector struct {
+	registry *Registry
+}
+
+func (cc *containerCollector) Describe(chan<- *prometheus.Desc) {
+	// Unchecked collector: container metrics are dynamic
+}
+
+func (cc *containerCollector) Collect(ch chan<- prometheus.Metric) {
+	cc.registry.containerLock.RLock()
+	containers := make([]*Container, 0, len(cc.registry.containersById))
+	for _, c := range cc.registry.containersById {
+		containers = append(containers, c)
+	}
+	cc.registry.containerLock.RUnlock()
+
+	for _, c := range containers {
+		c.Collect(ch)
 	}
 }
 
@@ -182,8 +220,12 @@ func (r *Registry) Close() {
 func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 	gcTicker := time.NewTicker(gcInterval)
 	defer gcTicker.Stop()
+	ebpfStatsTicker := time.NewTicker(MinTrafficStatsUpdateInterval)
+	defer ebpfStatsTicker.Stop()
 	for {
 		select {
+		case <-ebpfStatsTicker.C:
+			r.updateEbpfStatsAndActiveConns()
 		case now := <-gcTicker.C:
 			for pid, c := range r.containersByPid {
 				cg, err := proc.ReadCgroup(pid)
@@ -237,11 +279,6 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 						}
 					}
 					delete(r.containersById, c.id)
-
-					// Unregister from Prometheus (do this after removing from maps)
-					if ok := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(c.id), "app_id": c.appId}, r.reg).Unregister(c); !ok {
-						klog.Warningf("failed to unregister container: %s", c.id)
-					}
 					c.Close()
 				}
 				r.containerLock.Unlock()
@@ -253,36 +290,6 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				}
 			}
 			r.ip2fqdnLock.Unlock()
-		case u := <-r.trafficStatsUpdateCh:
-			if u == nil {
-				continue
-			}
-			r.containerLock.RLock()
-			c := r.containersByPid[u.Pid]
-			r.containerLock.RUnlock()
-			if c != nil {
-				c.updateTrafficStats(u)
-			}
-		case u := <-r.nodejsStatsUpdateCh:
-			if u == nil {
-				continue
-			}
-			r.containerLock.RLock()
-			c := r.containersByPid[u.Pid]
-			r.containerLock.RUnlock()
-			if c != nil {
-				c.updateNodejsStats(*u)
-			}
-		case u := <-r.pythonStatsUpdateCh:
-			if u == nil {
-				continue
-			}
-			r.containerLock.RLock()
-			c := r.containersByPid[u.Pid]
-			r.containerLock.RUnlock()
-			if c != nil {
-				c.updatePythonStats(*u)
-			}
 		case sample := <-r.gpuProcessUsageSampleChan:
 			r.containerLock.RLock()
 			c := r.containersByPid[sample.Pid]
@@ -634,7 +641,6 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	}
 	if c := r.containersById[id]; c != nil {
 		klog.Warningln("id conflict, replacing container:", id)
-		prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(c.id), "app_id": c.appId}, r.reg).Unregister(c)
 		delete(r.containersById, c.id)
 		for cgid, container := range r.containersByCgroupId {
 			if container == c {
@@ -656,10 +662,6 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		return nil
 	}
 	klog.InfoS("detected a new container", "pid", pid, "cg", cg.Id, "id", id, "app", c.appId)
-	if err := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(id), "app_id": c.appId}, r.reg).Register(c); err != nil {
-		klog.Warningf("failed to register container %s: %v", id, err)
-		return nil
-	}
 
 	// Update all maps atomically while holding the lock
 	r.containersByPid[pid] = c
@@ -668,70 +670,72 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	return c
 }
 
-func (r *Registry) updateStatsFromEbpfMapsIfNecessary() {
-	if !r.ebpfStatsLock.TryLock() {
-		return // Skip update if another one is already in progress.
-	}
-	defer r.ebpfStatsLock.Unlock()
-
-	if time.Now().Sub(r.ebpfStatsLastUpdated) < MinTrafficStatsUpdateInterval {
-		return
-	}
-
-	r.updateTrafficStats()
-	r.updateNodejsStats()
-	r.updatePythonStats()
-
-	r.ebpfStatsLastUpdated = time.Now()
-}
-
-func (r *Registry) updateTrafficStats() {
+// updateEbpfStatsAndActiveConns reads eBPF maps and updates container stats
+// directly from the event handler goroutine. Also refreshes active connection gauges.
+func (r *Registry) updateEbpfStatsAndActiveConns() {
+	// Traffic stats from eBPF maps
 	iter := r.tracer.ActiveConnectionsIterator()
 	cid := ebpftracer.ConnectionId{}
 	stats := ebpftracer.Connection{}
 	for iter.Next(&cid, &stats) {
-		r.trafficStatsUpdateCh <- &TrafficStatsUpdate{
-			Pid:           cid.PID,
-			FD:            cid.FD,
-			BytesSent:     stats.BytesSent,
-			BytesReceived: stats.BytesReceived,
-			Protocol:      stats.Protocol,
+		r.containerLock.RLock()
+		c := r.containersByPid[cid.PID]
+		r.containerLock.RUnlock()
+		if c != nil {
+			c.updateTrafficStats(&TrafficStatsUpdate{
+				Pid:           cid.PID,
+				FD:            cid.FD,
+				BytesSent:     stats.BytesSent,
+				BytesReceived: stats.BytesReceived,
+				Protocol:      stats.Protocol,
+			})
 		}
 	}
 	if err := iter.Err(); err != nil {
 		klog.Warningln(err)
 	}
-	r.trafficStatsUpdateCh <- nil
-}
 
-func (r *Registry) updateNodejsStats() {
-	iter := r.tracer.NodejsStatsIterator()
+	// Node.js stats
+	njsIter := r.tracer.NodejsStatsIterator()
 	var pid uint64
-	stats := ebpftracer.NodejsStats{}
-
-	for iter.Next(&pid, &stats) {
-		r.nodejsStatsUpdateCh <- &NodejsStatsUpdate{Pid: uint32(pid), Stats: stats}
+	njsStats := ebpftracer.NodejsStats{}
+	for njsIter.Next(&pid, &njsStats) {
+		r.containerLock.RLock()
+		c := r.containersByPid[uint32(pid)]
+		r.containerLock.RUnlock()
+		if c != nil {
+			c.updateNodejsStats(NodejsStatsUpdate{Pid: uint32(pid), Stats: njsStats})
+		}
 	}
-
-	if err := iter.Err(); err != nil {
+	if err := njsIter.Err(); err != nil {
 		klog.Warningln(err)
 	}
-	r.nodejsStatsUpdateCh <- nil
-}
 
-func (r *Registry) updatePythonStats() {
-	iter := r.tracer.PythonStatsIterator()
-	var pid uint64
-	stats := ebpftracer.PythonStats{}
-
-	for iter.Next(&pid, &stats) {
-		r.pythonStatsUpdateCh <- &PythonStatsUpdate{Pid: uint32(pid), Stats: stats}
+	// Python stats
+	pyIter := r.tracer.PythonStatsIterator()
+	pyStats := ebpftracer.PythonStats{}
+	for pyIter.Next(&pid, &pyStats) {
+		r.containerLock.RLock()
+		c := r.containersByPid[uint32(pid)]
+		r.containerLock.RUnlock()
+		if c != nil {
+			c.updatePythonStats(PythonStatsUpdate{Pid: uint32(pid), Stats: pyStats})
+		}
 	}
-
-	if err := iter.Err(); err != nil {
+	if err := pyIter.Err(); err != nil {
 		klog.Warningln(err)
 	}
-	r.pythonStatsUpdateCh <- nil
+
+	// Refresh active connection gauges for all containers
+	r.containerLock.RLock()
+	containers := make([]*Container, 0, len(r.containersById))
+	for _, c := range r.containersById {
+		containers = append(containers, c)
+	}
+	r.containerLock.RUnlock()
+	for _, c := range containers {
+		c.refreshActiveConnections()
+	}
 }
 
 func (r *Registry) getDomain(ip netaddr.IP) *common.Domain {
