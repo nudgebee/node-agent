@@ -12,7 +12,11 @@ import (
 func TestLogParser(t *testing.T) {
 	const defaultPatternsPerLevel = 256
 	ch := make(chan logparser.LogEntry)
-	parser := logparser.NewParser(ch, nil, nil, 1*time.Second, defaultPatternsPerLevel, false)
+	parser := logparser.NewParser(ch, nil, nil, 1*time.Second, defaultPatternsPerLevel, logparser.SensitiveConfig{
+		Enabled:       true,
+		MinConfidence: "high",
+		MaxDetections: 100,
+	})
 
 	ch <- logparser.LogEntry{Timestamp: time.Now(), Content: "INFO:root:AWS access key: AKIAIOSFODNN7EXAMPLE", Level: logparser.LevelInfo}
 
