@@ -37,6 +37,12 @@ const (
 
 	// Max accumulated header block size (64KB) to prevent unbounded growth
 	maxPendingHeaderBlockSize = 64 * 1024
+
+	// Max accumulated DATA payload size per stream (128KB).
+	// Prevents unbounded memory growth on high-throughput HTTP/2 connections.
+	// Payloads are only used for LLM provider detection and trace spans,
+	// which need at most a few KB of data.
+	maxDataPayloadSize = 128 * 1024
 )
 
 type Http2FrameHeader struct {
@@ -401,20 +407,30 @@ frameLoop:
 
 			switch method {
 			case MethodHttp2ClientFrames:
-				// Client DATA frame = request payload
+				// Client DATA frame = request payload (capped to prevent unbounded growth)
 				req := p.activeRequests[h.StreamId]
-				if req != nil {
+				if req != nil && len(req.RequestPayload) < maxDataPayloadSize {
+					remaining := maxDataPayloadSize - len(req.RequestPayload)
+					if len(dataPayload) > remaining {
+						dataPayload = dataPayload[:remaining]
+					}
 					req.RequestPayload = append(req.RequestPayload, dataPayload...)
 				}
 			case MethodHttp2ServerFrames:
-				// Server DATA frame = response payload
+				// Server DATA frame = response payload (capped to prevent unbounded growth)
 				req := p.activeRequests[h.StreamId]
 				if req != nil {
 					// Track first response time for TTFT
 					if req.firstResponseTime == 0 && len(dataPayload) > 0 {
 						req.firstResponseTime = kernelTime
 					}
-					req.ResponsePayload = append(req.ResponsePayload, dataPayload...)
+					if len(req.ResponsePayload) < maxDataPayloadSize {
+						remaining := maxDataPayloadSize - len(req.ResponsePayload)
+						if len(dataPayload) > remaining {
+							dataPayload = dataPayload[:remaining]
+						}
+						req.ResponsePayload = append(req.ResponsePayload, dataPayload...)
+					}
 					// Check for END_STREAM flag on DATA frame
 					if h.Flags&http2FlagEndStream != 0 {
 						req.responseEndStream = true
