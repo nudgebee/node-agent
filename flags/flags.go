@@ -64,7 +64,7 @@ var (
 	DisableSensitiveLogParsing            = kingpin.Flag("disable-sensitive-log-parsing", "disable sensitive log parsing").Default("true").Envar("DISABLE_SENSITIVE_LOG_PARSING").Bool()
 	SensitiveLogSampleRate                = kingpin.Flag("sensitive-log-sample-rate", "Sample rate for sensitive log detection: check 1-in-N lines (0 or 1 = every line)").Default("100").Envar("SENSITIVE_LOG_SAMPLE_RATE").Int()
 	SensitiveLogMinConfidence             = kingpin.Flag("sensitive-log-min-confidence", "Minimum confidence level for sensitive patterns: high, medium, low").Default("medium").Envar("SENSITIVE_LOG_MIN_CONFIDENCE").String()
-	SensitiveLogMaxDetectionsPerContainer = kingpin.Flag("sensitive-log-max-detections", "Max unique sensitive patterns tracked per container (0 = unlimited)").Default("100").Envar("SENSITIVE_LOG_MAX_DETECTIONS").Int()
+	SensitiveLogMaxDetectionsPerContainer = kingpin.Flag("sensitive-log-max-detections-per-container", "Max unique sensitive patterns tracked per container (0 = unlimited)").Default("100").Envar("SENSITIVE_LOG_MAX_DETECTIONS_PER_CONTAINER").Int()
 	TraceIdHeaders                        = kingpin.Flag("trace-id-headers", "trace id headers").Default("Traceparent,X-Request-Id").Envar("TRACE_ID_HEADERS").String()
 
 	HttpPathNormalizationRules = kingpin.Flag("http-path-normalization-rules", "Custom HTTP path normalization rules in format 'pattern1:replacement1,pattern2:replacement2'").Envar("HTTP_PATH_NORMALIZATION_RULES").String()

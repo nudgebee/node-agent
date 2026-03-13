@@ -1746,18 +1746,19 @@ func (c *Container) runLogParser(logPath string) {
 	}
 
 	containerId := string(c.id)
+	sensitiveCfg := logparser.SensitiveConfig{
+		Enabled:       !*flags.DisableSensitiveLogParsing,
+		SampleRate:    *flags.SensitiveLogSampleRate,
+		MinConfidence: *flags.SensitiveLogMinConfidence,
+		MaxDetections: *flags.SensitiveLogMaxDetectionsPerContainer,
+	}
 
 	if logPath != "" {
 		if c.logParsers[logPath] != nil {
 			return
 		}
 		ch := make(chan logparser.LogEntry)
-		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, logparser.SensitiveConfig{
-			Enabled:       !*flags.DisableSensitiveLogParsing,
-			SampleRate:    *flags.SensitiveLogSampleRate,
-			MinConfidence: *flags.SensitiveLogMinConfidence,
-			MaxDetections: *flags.SensitiveLogMaxDetectionsPerContainer,
-		})
+		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, sensitiveCfg)
 		reader, err := logs.NewTailReader(proc.HostPath(logPath), ch)
 		if err != nil {
 			klog.Warningln(err)
@@ -1777,12 +1778,7 @@ func (c *Container) runLogParser(logPath string) {
 			klog.Warningln(err)
 			return
 		}
-		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, logparser.SensitiveConfig{
-			Enabled:       !*flags.DisableSensitiveLogParsing,
-			SampleRate:    *flags.SensitiveLogSampleRate,
-			MinConfidence: *flags.SensitiveLogMinConfidence,
-			MaxDetections: *flags.SensitiveLogMaxDetectionsPerContainer,
-		})
+		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, sensitiveCfg)
 		stop := func() {
 			JournaldUnsubscribe(c.metadata.systemd.Unit)
 		}
@@ -1799,12 +1795,7 @@ func (c *Container) runLogParser(logPath string) {
 			delete(c.logParsers, "stdout/stderr")
 		}
 		ch := make(chan logparser.LogEntry)
-		parser := logparser.NewParser(ch, c.metadata.logDecoder, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, logparser.SensitiveConfig{
-			Enabled:       !*flags.DisableSensitiveLogParsing,
-			SampleRate:    *flags.SensitiveLogSampleRate,
-			MinConfidence: *flags.SensitiveLogMinConfidence,
-			MaxDetections: *flags.SensitiveLogMaxDetectionsPerContainer,
-		})
+		parser := logparser.NewParser(ch, c.metadata.logDecoder, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, sensitiveCfg)
 		reader, err := logs.NewTailReader(proc.HostPath(c.metadata.logPath), ch)
 		if err != nil {
 			klog.Warningln(err)
