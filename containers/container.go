@@ -38,6 +38,12 @@ var (
 	gpuStatsWindow            = 15 * time.Second
 )
 
+const (
+	// Max per-connection HTTP/2 parsers per container.
+	// Each parser holds HPACK decoders and active request state.
+	maxHTTP2ParsersPerContainer = 50
+)
+
 type ContainerID string
 
 type ContainerNetwork struct {
@@ -1158,9 +1164,14 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		}
 		pidFd := PidFd{Pid: pid, Fd: fd}
 		if c.googleHTTP2Parsers[pidFd] == nil {
-			c.googleHTTP2Parsers[pidFd] = l7.NewHttp2Parser()
+			if len(c.googleHTTP2Parsers) >= maxHTTP2ParsersPerContainer {
+				return nil, L7RequestProcessed
+			}
+			p := l7.NewHttp2Parser()
+			p.Lightweight = true
+			p.LLMHostChecker = isLLMRelevantHost
+			c.googleHTTP2Parsers[pidFd] = p
 		}
-		// Use per-connection parser (each HTTP/2 connection has its own HPACK dynamic table)
 		parser := c.googleHTTP2Parsers[pidFd]
 		conn.http2Parser = parser // Keep reference on connection for compatibility
 		requests := parser.Parse(r.Method, r.Payload, uint64(r.Duration))
@@ -1188,7 +1199,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 
 		// Feed active streams to LLM stream tracker for SSE-based completion detection
 		// This handles streaming LLM responses that don't send END_STREAM until complete
-		if c.llmStreamTracker != nil {
+		if c.llmStreamTracker != nil && !parser.Lightweight {
 			// Resolve host for LLM detection
 			host := conn.DestinationKey.GetDestinationWorkload().Name
 			if isIPAddress(host) {
@@ -1196,18 +1207,16 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 					host = domain.FQDN
 				}
 			}
+			activeStreams := parser.GetActiveStreamsForLLM()
 			// Also try :authority header if host is still an IP
 			if host == "" || isIPAddress(host) {
-				for _, update := range parser.GetActiveStreamsForLLM() {
+				for _, update := range activeStreams {
 					if update.Authority != "" && !isIPAddress(update.Authority) {
 						host = update.Authority
 						break
 					}
 				}
 			}
-
-			// Process active streams for LLM tracking
-			activeStreams := parser.GetActiveStreamsForLLM()
 			for _, update := range activeStreams {
 				streamHost := host
 				if streamHost == "" && update.Authority != "" {
@@ -1364,7 +1373,12 @@ func (c *Container) processHTTP2WithoutConnection(pid uint32, fd uint64, r *l7.R
 	pidFd := PidFd{Pid: pid, Fd: fd}
 	parser := c.googleHTTP2Parsers[pidFd]
 	if parser == nil {
+		if len(c.googleHTTP2Parsers) >= maxHTTP2ParsersPerContainer {
+			return nil, L7RequestProcessed
+		}
 		parser = l7.NewHttp2Parser()
+		parser.Lightweight = true
+		parser.LLMHostChecker = isLLMRelevantHost
 		c.googleHTTP2Parsers[pidFd] = parser
 	}
 
@@ -1857,11 +1871,17 @@ func (c *Container) gc(now time.Time) {
 	// Clean up HTTP/2 parsers for closed/dead connections.
 	// Parsers hold HPACK decoders, partial frame buffers, and active request maps
 	// that accumulate memory over time if not cleaned up.
+	// Also handles connectionless parsers (processHTTP2WithoutConnection path)
+	// which are not in connectionsByPidFd — check if the pid is still alive.
 	if c.googleHTTP2Parsers != nil {
 		for pidFd := range c.googleHTTP2Parsers {
-			if _, alive := c.connectionsByPidFd[pidFd]; !alive {
-				delete(c.googleHTTP2Parsers, pidFd)
+			if _, hasConn := c.connectionsByPidFd[pidFd]; hasConn {
+				continue
 			}
+			if _, hasProc := c.processes[pidFd.Pid]; hasProc {
+				continue
+			}
+			delete(c.googleHTTP2Parsers, pidFd)
 		}
 	}
 

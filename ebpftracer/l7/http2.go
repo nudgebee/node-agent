@@ -43,6 +43,10 @@ const (
 	// Payloads are only used for LLM provider detection and trace spans,
 	// which need at most a few KB of data.
 	maxDataPayloadSize = 128 * 1024
+
+	// Max concurrent HTTP/2 streams tracked per connection.
+	// Prevents unbounded memory growth when responses never complete (orphan streams).
+	maxActiveRequests = 100
 )
 
 type Http2FrameHeader struct {
@@ -96,6 +100,10 @@ type Http2Parser struct {
 	activeRequests map[uint32]*Http2Request
 	lastGcTime     uint64
 
+	// Reusable maps cleared on each Parse() call to avoid per-call allocation
+	statuses     map[uint32]Status
+	grpcStatuses map[uint32]Status
+
 	// Buffers for partial frame reassembly across Read() calls
 	// Needed because S2A/TLS returns small chunks that may split HTTP/2 frames
 	clientPartialFrame []byte
@@ -110,13 +118,26 @@ type Http2Parser struct {
 	// Static table headers still work; dynamic table rebuilds over time.
 	clientDecoderDegraded bool
 	serverDecoderDegraded bool
+
+	// Lightweight mode skips DATA payload accumulation and RequestHeaders map.
+	// Used for non-LLM HTTP/2 traffic (gRPC, K8s API, etc.) where only status
+	// codes are needed for L7 metrics. Auto-upgrades to full mode when an
+	// LLM-relevant :authority header is detected.
+	Lightweight bool
+
+	// LLMHostChecker is called with :authority values to determine if this
+	// connection serves LLM traffic. When it returns true, Lightweight is
+	// set to false and full payload capture begins.
+	LLMHostChecker func(host string) bool
 }
 
 func NewHttp2Parser() *Http2Parser {
 	return &Http2Parser{
 		clientDecoder:  hpack.NewDecoder(4096, nil),
 		serverDecoder:  hpack.NewDecoder(4096, nil),
-		activeRequests: map[uint32]*Http2Request{},
+		activeRequests: make(map[uint32]*Http2Request),
+		statuses:       make(map[uint32]Status),
+		grpcStatuses:   make(map[uint32]Status),
 	}
 }
 
@@ -234,14 +255,20 @@ func (p *Http2Parser) decodeHeaderBlock(
 	case MethodHttp2ClientFrames:
 		req := p.activeRequests[streamId]
 		if req == nil {
+			if len(p.activeRequests) >= maxActiveRequests {
+				// Too many active streams; skip to prevent unbounded growth
+				break
+			}
 			req = &Http2Request{
-				kernelTime:     kernelTime,
-				RequestHeaders: make(map[string]string),
+				kernelTime: kernelTime,
+			}
+			if !p.Lightweight {
+				req.RequestHeaders = make(map[string]string)
 			}
 			p.activeRequests[streamId] = req
 		}
 		decoder.SetEmitFunc(func(hf hpack.HeaderField) {
-			// Store all headers for trace correlation
+			// Store all headers for trace correlation (full mode only)
 			if req.RequestHeaders != nil {
 				req.RequestHeaders[hf.Name] = hf.Value
 			}
@@ -262,6 +289,13 @@ func (p *Http2Parser) decodeHeaderBlock(
 			case ":authority":
 				if req.Authority == "" && hf.Value != "" {
 					req.Authority = hf.Value
+					// Auto-upgrade: if authority matches an LLM host, switch to full mode
+					if p.Lightweight && p.LLMHostChecker != nil && p.LLMHostChecker(hf.Value) {
+						p.Lightweight = false
+						if req.RequestHeaders == nil {
+							req.RequestHeaders = make(map[string]string)
+						}
+					}
 				}
 			case "content-type":
 				if req.ContentType == "" && hf.Value != "" {
@@ -336,8 +370,10 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64) []
 	}
 
 	var decoder *hpack.Decoder
-	statuses := map[uint32]Status{}
-	grpcStatuses := map[uint32]Status{}
+	clear(p.statuses)
+	clear(p.grpcStatuses)
+	statuses := p.statuses
+	grpcStatuses := p.grpcStatuses
 
 	// Prepend any saved partial frame data from previous Parse() call
 	// This handles HTTP/2 frames split across multiple S2A/TLS Read() calls
@@ -403,37 +439,42 @@ frameLoop:
 				offset = frameStart
 				break frameLoop
 			}
-			dataPayload := payload[offset : offset+h.Length]
 
-			switch method {
-			case MethodHttp2ClientFrames:
-				// Client DATA frame = request payload (capped to prevent unbounded growth)
-				req := p.activeRequests[h.StreamId]
-				if req != nil && len(req.RequestPayload) < maxDataPayloadSize {
-					remaining := maxDataPayloadSize - len(req.RequestPayload)
-					if len(dataPayload) > remaining {
-						dataPayload = dataPayload[:remaining]
+			if p.Lightweight {
+				// Lightweight mode: only track END_STREAM, skip payload copy
+				if method == MethodHttp2ServerFrames && h.Flags&http2FlagEndStream != 0 {
+					if req := p.activeRequests[h.StreamId]; req != nil {
+						req.responseEndStream = true
 					}
-					req.RequestPayload = append(req.RequestPayload, dataPayload...)
 				}
-			case MethodHttp2ServerFrames:
-				// Server DATA frame = response payload (capped to prevent unbounded growth)
-				req := p.activeRequests[h.StreamId]
-				if req != nil {
-					// Track first response time for TTFT
-					if req.firstResponseTime == 0 && len(dataPayload) > 0 {
-						req.firstResponseTime = kernelTime
-					}
-					if len(req.ResponsePayload) < maxDataPayloadSize {
-						remaining := maxDataPayloadSize - len(req.ResponsePayload)
+			} else {
+				dataPayload := payload[offset : offset+h.Length]
+				switch method {
+				case MethodHttp2ClientFrames:
+					req := p.activeRequests[h.StreamId]
+					if req != nil && len(req.RequestPayload) < maxDataPayloadSize {
+						remaining := maxDataPayloadSize - len(req.RequestPayload)
 						if len(dataPayload) > remaining {
 							dataPayload = dataPayload[:remaining]
 						}
-						req.ResponsePayload = append(req.ResponsePayload, dataPayload...)
+						req.RequestPayload = append(req.RequestPayload, dataPayload...)
 					}
-					// Check for END_STREAM flag on DATA frame
-					if h.Flags&http2FlagEndStream != 0 {
-						req.responseEndStream = true
+				case MethodHttp2ServerFrames:
+					req := p.activeRequests[h.StreamId]
+					if req != nil {
+						if req.firstResponseTime == 0 && len(dataPayload) > 0 {
+							req.firstResponseTime = kernelTime
+						}
+						if len(req.ResponsePayload) < maxDataPayloadSize {
+							remaining := maxDataPayloadSize - len(req.ResponsePayload)
+							if len(dataPayload) > remaining {
+								dataPayload = dataPayload[:remaining]
+							}
+							req.ResponsePayload = append(req.ResponsePayload, dataPayload...)
+						}
+						if h.Flags&http2FlagEndStream != 0 {
+							req.responseEndStream = true
+						}
 					}
 				}
 			}
