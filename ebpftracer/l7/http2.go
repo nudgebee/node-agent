@@ -162,6 +162,13 @@ func (p *Http2Parser) ActiveRequestCount() int {
 	return len(p.activeRequests)
 }
 
+// HasPartialData returns true if the parser has buffered partial frame data
+// that would be lost if the parser were garbage collected.
+func (p *Http2Parser) HasPartialData() bool {
+	return len(p.clientPartialFrame) > 0 || len(p.serverPartialFrame) > 0 ||
+		p.clientPendingHeaders != nil || p.serverPendingHeaders != nil
+}
+
 // Http2StreamUpdate contains information about an active HTTP/2 stream
 // Used for notifying LLM stream tracker about streaming responses
 type Http2StreamUpdate struct {
@@ -440,14 +447,15 @@ frameLoop:
 				break frameLoop
 			}
 
-			if p.Lightweight {
-				// Lightweight mode: only track END_STREAM, skip payload copy
-				if method == MethodHttp2ServerFrames && h.Flags&http2FlagEndStream != 0 {
-					if req := p.activeRequests[h.StreamId]; req != nil {
-						req.responseEndStream = true
-					}
+			// Track END_STREAM on server DATA frames unconditionally (needed for both modes)
+			if method == MethodHttp2ServerFrames && h.Flags&http2FlagEndStream != 0 {
+				if req := p.activeRequests[h.StreamId]; req != nil {
+					req.responseEndStream = true
 				}
-			} else {
+			}
+
+			// Payload accumulation only in full mode
+			if !p.Lightweight {
 				dataPayload := payload[offset : offset+h.Length]
 				switch method {
 				case MethodHttp2ClientFrames:
@@ -471,9 +479,6 @@ frameLoop:
 								dataPayload = dataPayload[:remaining]
 							}
 							req.ResponsePayload = append(req.ResponsePayload, dataPayload...)
-						}
-						if h.Flags&http2FlagEndStream != 0 {
-							req.responseEndStream = true
 						}
 					}
 				}

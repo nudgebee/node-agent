@@ -1871,17 +1871,28 @@ func (c *Container) gc(now time.Time) {
 	// Clean up HTTP/2 parsers for closed/dead connections.
 	// Parsers hold HPACK decoders, partial frame buffers, and active request maps
 	// that accumulate memory over time if not cleaned up.
-	// Also handles connectionless parsers (processHTTP2WithoutConnection path)
-	// which are not in connectionsByPidFd — check if the pid is still alive.
+	// Two cases: (1) connection-tracked parsers — delete when connection is gone,
+	// (2) connectionless parsers (processHTTP2WithoutConnection) — delete when pid dies.
 	if c.googleHTTP2Parsers != nil {
 		for pidFd := range c.googleHTTP2Parsers {
 			if _, hasConn := c.connectionsByPidFd[pidFd]; hasConn {
+				continue // connection still alive
+			}
+			if _, hasProc := c.processes[pidFd.Pid]; !hasProc {
+				delete(c.googleHTTP2Parsers, pidFd) // pid dead — connectionless parser cleanup
 				continue
 			}
-			if _, hasProc := c.processes[pidFd.Pid]; hasProc {
-				continue
+			// Pid is alive but no connection — could be a connectionless parser
+			// (still needed) or a closed connection's parser (stale).
+			// Check if this parser was created via the connectionless path by
+			// seeing if there was ever a tracked connection for this pidFd.
+			// If activeConnections had it at some point, it's stale.
+			// Use a simple heuristic: if the parser has zero active requests
+			// and no partial frame data, it's safe to clean up.
+			p := c.googleHTTP2Parsers[pidFd]
+			if p.ActiveRequestCount() == 0 && !p.HasPartialData() {
+				delete(c.googleHTTP2Parsers, pidFd)
 			}
-			delete(c.googleHTTP2Parsers, pidFd)
 		}
 	}
 
