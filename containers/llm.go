@@ -96,6 +96,12 @@ func providerDefaultHost(provider LLMProvider) string {
 	}
 }
 
+// isLLMRelevantHost returns true if the host matches a known LLM provider.
+// Used by Http2Parser to auto-upgrade from lightweight to full mode.
+func isLLMRelevantHost(host string) bool {
+	return DetectLLMProvider(host) != ProviderUnknown
+}
+
 // DetectLLMProvider identifies if a hostname belongs to an LLM provider
 func DetectLLMProvider(hostname string) LLMProvider {
 	hostname = strings.ToLower(hostname)
