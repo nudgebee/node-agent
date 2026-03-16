@@ -448,6 +448,15 @@ func safeDuration(ns uint64) time.Duration {
 	return time.Duration(ns)
 }
 
+// clampSize safely converts a uint64 size to int, capping at maxSize.
+// Prevents negative int from uint64 values with the high bit set.
+func clampSize(size uint64, maxSize int) int {
+	if size > uint64(maxSize) {
+		return maxSize
+	}
+	return int(size)
+}
+
 func (t *lostSamplesTracker) recordLostSamples(name string, count uint64, cpu int) {
 	t.count.Add(count)
 	now := time.Now().Unix()
@@ -492,14 +501,8 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 			}
 			payloadSize := binary.LittleEndian.Uint64(data[40:48])
 			responseSize := binary.LittleEndian.Uint64(data[48:56])
-			payloadLen := int(payloadSize)
-			if payloadLen > MaxPayloadSize {
-				payloadLen = MaxPayloadSize
-			}
-			responseLen := int(responseSize)
-			if responseLen > MaxPayloadSize {
-				responseLen = MaxPayloadSize
-			}
+			payloadLen := clampSize(payloadSize, MaxPayloadSize)
+			responseLen := clampSize(responseSize, MaxPayloadSize)
 
 			payloadData := make([]byte, payloadLen)
 			if l7EventHeaderSize+payloadLen <= len(data) {
@@ -607,15 +610,8 @@ func runRingbufEventsReader(name string, r *ringbuf.Reader, ch chan<- Event) {
 
 		payloadSize := binary.LittleEndian.Uint64(data[40:48])
 		responseSize := binary.LittleEndian.Uint64(data[48:56])
-
-		payloadLen := int(payloadSize)
-		if payloadLen > MaxPayloadSize {
-			payloadLen = MaxPayloadSize
-		}
-		responseLen := int(responseSize)
-		if responseLen > MaxPayloadSize {
-			responseLen = MaxPayloadSize
-		}
+		payloadLen := clampSize(payloadSize, MaxPayloadSize)
+		responseLen := clampSize(responseSize, MaxPayloadSize)
 
 		payloadData := make([]byte, payloadLen)
 		if l7EventHeaderSize+payloadLen <= len(data) {
