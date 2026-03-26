@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -163,16 +164,16 @@ func main() {
 	if err != nil {
 		klog.Errorf("Error starting resolver: %v", err)
 	}
+	defer resolver.StopWatching()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	go func() {
 		sigChannel := make(chan os.Signal, 1)
-		defer close(sigChannel)
-
 		signal.Notify(sigChannel, os.Interrupt, syscall.SIGTERM)
 		<-sigChannel
-
 		klog.Infoln("Received signal, shutting down")
-		resolver.StopWatching()
-		os.Exit(0) // Ensure graceful termination
+		cancel()
 	}()
 	hostname, kv, err := uname()
 	if err != nil {
@@ -252,8 +253,21 @@ func main() {
 		"Metrics collection timeout",
 	))
 
+	srv := &http.Server{Addr: *flags.ListenAddress}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			klog.Errorf("HTTP server shutdown error: %v", err)
+		}
+	}()
+
 	klog.Infoln("listening on:", *flags.ListenAddress)
-	klog.Errorln(http.ListenAndServe(*flags.ListenAddress, nil))
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		klog.Errorln(err)
+	}
+	klog.Infoln("shutdown complete")
 }
 
 func info(name, version string) prometheus.Collector {

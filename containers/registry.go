@@ -222,10 +222,14 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 	defer gcTicker.Stop()
 	ebpfStatsTicker := time.NewTicker(MinTrafficStatsUpdateInterval)
 	defer ebpfStatsTicker.Stop()
+	counterEvictTicker := time.NewTicker(gcInterval)
+	defer counterEvictTicker.Stop()
 	for {
 		select {
 		case <-ebpfStatsTicker.C:
 			r.updateEbpfStatsAndActiveConns()
+		case <-counterEvictTicker.C:
+			r.evictStaleCounterLabels()
 		case now := <-gcTicker.C:
 			for pid, c := range r.containersByPid {
 				cg, err := proc.ReadCgroup(pid)
@@ -403,6 +407,11 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 const maxIP2FQDNEntries = 10000
 
 func (r *Registry) processL7Event(e ebpftracer.Event) {
+	defer func() {
+		if p := recover(); p != nil {
+			klog.Errorf("recovered from panic in L7 event handler: pid=%d fd=%d protocol=%d: %v", e.Pid, e.Fd, e.L7Request.Protocol, p)
+		}
+	}()
 	if c := r.containersByPid[e.Pid]; c != nil {
 		klog.V(5).Infof("L7_EVENT_CONTAINER_FOUND: pid=%d container=%s", e.Pid, c.id)
 		ip2fqdn, result := c.onL7RequestWithResult(e.Pid, e.Fd, e.Timestamp, e.L7Request, e.SocketInfo)
@@ -491,7 +500,10 @@ func (r *Registry) processPendingL7Events() {
 			continue
 		}
 
-		ip2fqdn, result := c.onL7RequestWithResult(p.event.Pid, p.event.Fd, p.event.Timestamp, p.event.L7Request, p.event.SocketInfo)
+		ip2fqdn, result, panicked := r.safeOnL7Request(c, p.event)
+		if panicked {
+			continue
+		}
 		if result == L7RequestConnNotFound {
 			// Still not found - keep in queue if not exceeded max retries
 			if p.retryCount < maxRetries {
@@ -519,6 +531,17 @@ func (r *Registry) processPendingL7Events() {
 		r.pendingL7Events = append(r.pendingL7Events, stillPending...)
 		r.pendingL7EventsLock.Unlock()
 	}
+}
+
+func (r *Registry) safeOnL7Request(c *Container, e ebpftracer.Event) (ip2fqdn map[netaddr.IP]*common.Domain, result L7RequestResult, panicked bool) {
+	defer func() {
+		if p := recover(); p != nil {
+			klog.Errorf("recovered from panic in pending L7 retry: pid=%d fd=%d protocol=%d: %v", e.Pid, e.Fd, e.L7Request.Protocol, p)
+			panicked = true
+		}
+	}()
+	ip2fqdn, result = c.onL7RequestWithResult(e.Pid, e.Fd, e.Timestamp, e.L7Request, e.SocketInfo)
+	return
 }
 
 func (r *Registry) getOrCreateContainer(pid uint32) *Container {
@@ -735,6 +758,22 @@ func (r *Registry) updateEbpfStatsAndActiveConns() {
 	r.containerLock.RUnlock()
 	for _, c := range containers {
 		c.refreshActiveConnections()
+	}
+}
+
+// evictStaleCounterLabels removes CounterVec entries for destinations that no
+// longer have active connections. Runs at gcInterval from the event handler goroutine.
+func (r *Registry) evictStaleCounterLabels() {
+	r.containerLock.RLock()
+	containers := make([]*Container, 0, len(r.containersById))
+	for _, c := range r.containersById {
+		containers = append(containers, c)
+	}
+	r.containerLock.RUnlock()
+
+	for _, c := range containers {
+		activeKeys, activeFailedDsts := c.activeCounterLabelKeys()
+		c.tcpMetrics.EvictStaleLabels(activeKeys, activeFailedDsts)
 	}
 }
 
