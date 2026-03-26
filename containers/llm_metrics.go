@@ -7,10 +7,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// LLM Metrics - container_llm_* naming convention
-// These metrics track LLM API usage from containers
+// LLM Metrics — container_llm_* naming convention.
+// Label names follow OTel GenAI semantic conventions where possible.
 var (
-	// ContainerLLMRequestsTotal tracks total LLM API requests
 	ContainerLLMRequestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "container_llm_requests_total",
@@ -19,14 +18,13 @@ var (
 		[]string{
 			"container_id",
 			"gen_ai_operation_name",     // chat, text_completion, embeddings, generate_content
-			"gen_ai_request_model",      // gemini-2.5-pro, gpt-4, claude-3, etc.
-			"gen_ai_system",             // openai, anthropic, gcp.gemini, aws.bedrock, azure.ai.openai
+			"gen_ai_request_model",      // gpt-4, claude-3, gemini-2.5-pro, etc.
+			"gen_ai_system",             // openai, anthropic, gcp.gemini, aws.bedrock
 			"server_address",            // api.openai.com, generativelanguage.googleapis.com
-			"http_response_status_code", // 200, 400, 429, 500, etc.
+			"http_response_status_code", // 200, 400, 429, 500
 		},
 	)
 
-	// ContainerLLMTokenUsageTotal tracks tokens consumed
 	ContainerLLMTokenUsageTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "container_llm_token_usage_total",
@@ -42,7 +40,6 @@ var (
 		},
 	)
 
-	// ContainerLLMTimeToFirstToken tracks TTFT - critical UX metric
 	ContainerLLMTimeToFirstToken = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "container_llm_time_to_first_token_seconds",
@@ -58,11 +55,10 @@ var (
 		},
 	)
 
-	// ContainerLLMRequestDuration tracks total request duration
 	ContainerLLMRequestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "container_llm_request_duration_seconds",
-			Help:    "Total LLM request duration from first byte to stream complete",
+			Help:    "Total LLM request duration",
 			Buckets: []float64{0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0},
 		},
 		[]string{
@@ -74,7 +70,6 @@ var (
 		},
 	)
 
-	// ContainerLLMTokensPerSecond tracks generation throughput
 	ContainerLLMTokensPerSecond = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "container_llm_tokens_per_second",
@@ -89,7 +84,6 @@ var (
 		},
 	)
 
-	// ContainerLLMErrorsTotal tracks errors by type
 	ContainerLLMErrorsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "container_llm_errors_total",
@@ -104,8 +98,7 @@ var (
 	)
 )
 
-// RegisterLLMMetrics registers LLM metrics with the provided registerer.
-// This must be called with the same registerer used for other container metrics.
+// RegisterLLMMetrics registers all LLM metrics with the provided registerer.
 func RegisterLLMMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(
 		ContainerLLMRequestsTotal,
@@ -117,24 +110,29 @@ func RegisterLLMMetrics(reg prometheus.Registerer) {
 	)
 }
 
-// RecordLLMStreamMetrics records metrics for a completed LLM stream
-func RecordLLMStreamMetrics(stream *LLMStream) {
-	if stream == nil {
+// RecordLLMEvent is the single entry point for recording LLM metrics.
+// Both HTTP/1.1 and HTTP/2, streaming and non-streaming, use this function.
+// This replaces the old split between trackLLMRequest() and RecordLLMStreamMetrics().
+func RecordLLMEvent(event *LLMEvent) {
+	if event == nil {
 		return
 	}
 
-	containerID := stream.ContainerID
-
-	provider := string(stream.Provider)
-	model := stream.Model
+	containerID := event.ContainerID
+	provider := string(event.Provider)
+	model := event.Model
 	if model == "" {
 		model = "unknown"
 	}
-	operation := stream.Operation
+	operation := event.Operation
 	if operation == "" {
 		operation = "unknown"
 	}
-	serverAddress := stream.ServerAddress
+
+	statusStr := strconv.Itoa(event.StatusCode)
+	if event.StatusCode == 0 {
+		statusStr = "200" // Default for non-streaming where status wasn't captured
+	}
 
 	// Request counter
 	ContainerLLMRequestsTotal.With(prometheus.Labels{
@@ -142,57 +140,55 @@ func RecordLLMStreamMetrics(stream *LLMStream) {
 		"gen_ai_operation_name":     operation,
 		"gen_ai_request_model":      model,
 		"gen_ai_system":             provider,
-		"server_address":            serverAddress,
-		"http_response_status_code": strconv.Itoa(stream.StatusCode),
+		"server_address":            event.ServerAddress,
+		"http_response_status_code": statusStr,
 	}).Inc()
-
-	// Token usage
-	if stream.InputTokens > 0 {
-		ContainerLLMTokenUsageTotal.With(prometheus.Labels{
-			"container_id":          containerID,
-			"gen_ai_operation_name": operation,
-			"gen_ai_request_model":  model,
-			"gen_ai_system":         provider,
-			"server_address":        serverAddress,
-			"gen_ai_token_type":     "input",
-		}).Add(float64(stream.InputTokens))
-	}
-	if stream.OutputTokens > 0 {
-		ContainerLLMTokenUsageTotal.With(prometheus.Labels{
-			"container_id":          containerID,
-			"gen_ai_operation_name": operation,
-			"gen_ai_request_model":  model,
-			"gen_ai_system":         provider,
-			"server_address":        serverAddress,
-			"gen_ai_token_type":     "output",
-		}).Add(float64(stream.OutputTokens))
-	}
 
 	baseLabels := prometheus.Labels{
 		"container_id":          containerID,
 		"gen_ai_operation_name": operation,
 		"gen_ai_request_model":  model,
 		"gen_ai_system":         provider,
-		"server_address":        serverAddress,
+		"server_address":        event.ServerAddress,
 	}
 
-	// TTFT (Time to First Token)
-	if !stream.FirstTokenTime.IsZero() {
-		ttft := stream.FirstTokenTime.Sub(stream.RequestTime).Seconds()
-		ContainerLLMTimeToFirstToken.With(baseLabels).Observe(ttft)
+	// Token usage
+	if event.InputTokens > 0 {
+		ContainerLLMTokenUsageTotal.With(prometheus.Labels{
+			"container_id":          containerID,
+			"gen_ai_operation_name": operation,
+			"gen_ai_request_model":  model,
+			"gen_ai_system":         provider,
+			"server_address":        event.ServerAddress,
+			"gen_ai_token_type":     "input",
+		}).Add(float64(event.InputTokens))
+	}
+	if event.OutputTokens > 0 {
+		ContainerLLMTokenUsageTotal.With(prometheus.Labels{
+			"container_id":          containerID,
+			"gen_ai_operation_name": operation,
+			"gen_ai_request_model":  model,
+			"gen_ai_system":         provider,
+			"server_address":        event.ServerAddress,
+			"gen_ai_token_type":     "output",
+		}).Add(float64(event.OutputTokens))
 	}
 
-	// Request duration
-	if !stream.CompletionTime.IsZero() {
-		duration := stream.CompletionTime.Sub(stream.RequestTime).Seconds()
-		ContainerLLMRequestDuration.With(baseLabels).Observe(duration)
+	// Duration
+	if event.Duration > 0 {
+		ContainerLLMRequestDuration.With(baseLabels).Observe(event.Duration.Seconds())
 	}
 
-	// Tokens per second
-	if stream.OutputTokens > 0 && !stream.FirstTokenTime.IsZero() && !stream.CompletionTime.IsZero() {
-		genDuration := stream.CompletionTime.Sub(stream.FirstTokenTime).Seconds()
+	// TTFT (streaming only)
+	if event.TTFT > 0 {
+		ContainerLLMTimeToFirstToken.With(baseLabels).Observe(event.TTFT.Seconds())
+	}
+
+	// Tokens per second (streaming: output_tokens / generation_time)
+	if event.OutputTokens > 0 && event.TTFT > 0 && event.Duration > event.TTFT {
+		genDuration := (event.Duration - event.TTFT).Seconds()
 		if genDuration > 0 {
-			tps := float64(stream.OutputTokens) / genDuration
+			tps := float64(event.OutputTokens) / genDuration
 			ContainerLLMTokensPerSecond.With(prometheus.Labels{
 				"container_id":          containerID,
 				"gen_ai_operation_name": operation,
@@ -203,21 +199,17 @@ func RecordLLMStreamMetrics(stream *LLMStream) {
 	}
 
 	// Errors
-	if stream.State == StreamStateError || stream.StatusCode >= 400 {
-		errorType := categorizeHTTPError(stream.StatusCode)
-		if stream.State == StreamStateTimedOut {
-			errorType = "timeout"
-		}
+	if event.StatusCode >= 400 {
 		ContainerLLMErrorsTotal.With(prometheus.Labels{
 			"container_id":         containerID,
 			"gen_ai_system":        provider,
 			"gen_ai_request_model": model,
-			"error_type":           errorType,
+			"error_type":           categorizeHTTPError(event.StatusCode),
 		}).Inc()
 	}
 }
 
-// categorizeHTTPError converts HTTP status code to error type
+// categorizeHTTPError converts HTTP status code to error type.
 func categorizeHTTPError(statusCode int) string {
 	switch statusCode {
 	case 429:

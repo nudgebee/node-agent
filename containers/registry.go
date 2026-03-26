@@ -92,6 +92,11 @@ type Registry struct {
 	// This handles the race condition between ring buffer (L7 events) and perf buffer (TCP events)
 	pendingL7Events     []pendingL7Event
 	pendingL7EventsLock sync.Mutex
+
+	// llmDetector provides connection-level LLM detection from DNS cache.
+	// Shared across all containers so DNS resolutions from one container
+	// benefit LLM detection in others.
+	llmDetector *LLMDetector
 }
 
 // pendingL7Event stores an L7 event that's waiting for its connection to be established
@@ -154,6 +159,7 @@ func NewRegistry(reg prometheus.Registerer, rawReg prometheus.Registerer, proces
 
 		gpuProcessUsageSampleChan: gpuProcessUsageSampleChan,
 		nodeConstLabels:           NodeConstLabels{MachineID: machineId, SystemUUID: systemUuid, AZ: az, Region: region},
+		llmDetector:               NewLLMDetector(),
 	}
 	// Register LLM metrics with the same registerer used for other container metrics
 	RegisterLLMMetrics(reg)
@@ -430,6 +436,8 @@ func (r *Registry) processL7Event(e ebpftracer.Event) {
 			r.ip_resolver.CacheDNS(ip.String(), domain.FQDN)
 		}
 		r.ip2fqdnLock.Unlock()
+		// Feed DNS resolutions to LLM detector for connection-level detection
+		r.feedDNSToLLMDetector(ip2fqdn)
 	} else if e.L7Request.Protocol == l7.ProtocolDNS {
 		// Handle DNS queries from non-monitored processes for global ip2fqdn mapping
 		ip2fqdn := r.handleHostDNSRequest(e.L7Request)
@@ -441,6 +449,7 @@ func (r *Registry) processL7Event(e ebpftracer.Event) {
 			r.ip_resolver.CacheDNS(ip.String(), domain.FQDN)
 		}
 		r.ip2fqdnLock.Unlock()
+		r.feedDNSToLLMDetector(ip2fqdn)
 	}
 }
 
@@ -781,6 +790,21 @@ func (r *Registry) getDomain(ip netaddr.IP) *common.Domain {
 	r.ip2fqdnLock.RLock()
 	defer r.ip2fqdnLock.RUnlock()
 	return r.ip2fqdn[ip]
+}
+
+// feedDNSToLLMDetector notifies the LLM detector about DNS resolutions.
+// This builds the IP→LLM provider cache for connection-level detection.
+func (r *Registry) feedDNSToLLMDetector(ip2fqdn map[netaddr.IP]*common.Domain) {
+	if r.llmDetector == nil || len(ip2fqdn) == 0 {
+		return
+	}
+	for ip, domain := range ip2fqdn {
+		if domain == nil || domain.FQDN == "" {
+			continue
+		}
+		// OnDNS will check if it's an LLM provider internally
+		r.llmDetector.OnDNS(domain.FQDN, []netaddr.IP{ip})
+	}
 }
 
 // handleHostDNSRequest processes DNS queries from non-monitored processes

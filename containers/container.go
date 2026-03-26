@@ -1,8 +1,6 @@
 package containers
 
 import (
-	"bytes"
-	"encoding/base64"
 	"errors"
 	"os"
 	"path/filepath"
@@ -137,13 +135,13 @@ type Container struct {
 	activeConnections      map[ConnectionKey]*ActiveConnection
 	connectionsByPidFd     map[PidFd]*ActiveConnection
 	googleHTTP2Parsers     map[PidFd]*l7.Http2Parser // Per-connection HTTP/2 parsers (keyed by pid:fd for correct HPACK state)
-	http2SkipSet           map[PidFd]struct{}        // pid:fd pairs confirmed as non-LLM — skip all future HTTP/2 events
 
 	l7Stats    L7Stats
 	tcpMetrics *TCPMetrics
 
-	// LLM stream tracker for SSE-based completion detection
-	llmStreamTracker *LLMStreamTracker
+	// LLM observability pipeline
+	llmDetector *LLMDetector // Connection-level LLM detection (shared across containers via registry)
+	llmParser   *LLMParser   // Per-container LLM response parser
 
 	gpuStats map[string]*GpuUsage
 
@@ -260,10 +258,12 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		constLabels: constLabels,
 	}
 
-	// Initialize LLM stream tracker with completion callback
-	c.llmStreamTracker = NewLLMStreamTracker(func(stream *LLMStream) {
-		c.onLLMStreamComplete(stream)
-	})
+	// Initialize LLM pipeline
+	c.llmDetector = registry.llmDetector
+	c.llmParser = NewLLMParser(string(id), src_workload.Name, src_workload.Namespace,
+		func(event *LLMEvent) {
+			c.onLLMEvent(event)
+		})
 
 	c.runLogParser("")
 
@@ -287,9 +287,9 @@ func (c *Container) Close() {
 	for _, p := range c.logParsers {
 		p.Stop()
 	}
-	// Stop the LLM stream tracker
-	if c.llmStreamTracker != nil {
-		c.llmStreamTracker.Stop()
+	// Stop the LLM parser
+	if c.llmParser != nil {
+		c.llmParser.Stop()
 	}
 	close(c.done)
 }
@@ -841,133 +841,50 @@ func (c *Container) updateConnectionTrafficStats(ac *ActiveConnection, sent, rec
 	}
 }
 
-func (c *Container) trackLLMRequest(provider LLMProvider, host, path, payloadBase64, responseBase64 string, duration time.Duration) {
-	klog.V(4).Infof("LLM_TRACK_START: provider=%s host=%s path=%s reqBase64Len=%d respBase64Len=%d",
-		provider, host, path, len(payloadBase64), len(responseBase64))
-	// Parse request data
-	llmReq, err := ParseLLMRequest(provider, payloadBase64, path)
-	if err != nil || llmReq == nil {
-		klog.Infof("LLM_TRACK_PARSE_REQ_FAIL: provider=%s err=%v req=%v", provider, err, llmReq)
-		return // Skip tracking if we can't parse the request
-	}
-	klog.V(4).Infof("LLM_TRACK_REQ_PARSED: model=%s operation=%s", llmReq.Model, llmReq.Operation)
-
-	// Parse response data for token usage
-	llmResp, respErr := ParseLLMResponse(provider, responseBase64, path)
-	klog.V(4).Infof("LLM_TRACK_RESP_PARSED: resp=%+v err=%v", llmResp, respErr)
-
-	// Determine operation from path (for OTel GenAI conventions)
-	operation := GetOperation(path)
-
-	// Emit Prometheus metrics
-	model := llmReq.Model
-	if model == "" {
-		model = "unknown"
-	}
-	if operation == "" {
-		operation = "unknown"
-	}
-	containerID := string(c.id)
-
-	ContainerLLMRequestsTotal.With(prometheus.Labels{
-		"container_id":              containerID,
-		"gen_ai_operation_name":     operation,
-		"gen_ai_request_model":      model,
-		"gen_ai_system":             string(provider),
-		"server_address":            host,
-		"http_response_status_code": "200",
-	}).Inc()
-
-	if llmResp != nil {
-		if llmResp.PromptTokens > 0 {
-			ContainerLLMTokenUsageTotal.With(prometheus.Labels{
-				"container_id":          containerID,
-				"gen_ai_operation_name": operation,
-				"gen_ai_request_model":  model,
-				"gen_ai_system":         string(provider),
-				"server_address":        host,
-				"gen_ai_token_type":     "input",
-			}).Add(float64(llmResp.PromptTokens))
-		}
-		if llmResp.CompletionTokens > 0 {
-			ContainerLLMTokenUsageTotal.With(prometheus.Labels{
-				"container_id":          containerID,
-				"gen_ai_operation_name": operation,
-				"gen_ai_request_model":  model,
-				"gen_ai_system":         string(provider),
-				"server_address":        host,
-				"gen_ai_token_type":     "output",
-			}).Add(float64(llmResp.CompletionTokens))
-		}
-	}
-
-	ContainerLLMRequestDuration.With(prometheus.Labels{
-		"container_id":          containerID,
-		"gen_ai_operation_name": operation,
-		"gen_ai_request_model":  model,
-		"gen_ai_system":         string(provider),
-		"server_address":        host,
-	}).Observe(duration.Seconds())
-}
-
-// onLLMStreamComplete is called when an LLM stream completes (detected via SSE markers)
-// This handles emitting metrics and traces for streaming LLM responses
-func (c *Container) onLLMStreamComplete(stream *LLMStream) {
-	klog.V(4).Infof("LLM_CALLBACK_CALLED: container=%s stream=%+v", c.id, stream != nil)
-	if stream == nil {
+// onLLMEvent is called by LLMParser when an LLM request completes (streaming or non-streaming).
+// Single code path for all LLM metrics and traces.
+func (c *Container) onLLMEvent(event *LLMEvent) {
+	if event == nil {
 		return
 	}
 
-	// Fill in container context if not set
-	if stream.ContainerID == "" {
-		stream.ContainerID = string(c.id)
-	}
-	if stream.PodName == "" {
-		stream.PodName = c.srcWorkload.Name
-	}
-	if stream.Namespace == "" {
-		stream.Namespace = c.srcWorkload.Namespace
-	}
-
 	// Record Prometheus metrics
-	RecordLLMStreamMetrics(stream)
+	RecordLLMEvent(event)
 
 	// Emit OTel trace if tracer is available
 	if c.tracer != nil {
-		// Create a trace for the LLM request
-		dstWorkload := common.Workload{Name: stream.ServerAddress}
+		dstWorkload := common.Workload{Name: event.ServerAddress}
 		trace := c.tracer.NewTrace(
-			common.HostPortWithEmptyIP(stream.ServerAddress, 443),
+			common.HostPortWithEmptyIP(event.ServerAddress, 443),
 			c.srcWorkload,
 			dstWorkload,
 			dstWorkload,
 		)
 		if trace != nil {
+			requestTime := time.Now().Add(-event.Duration)
+			completionTime := time.Now()
+			var firstTokenTime time.Time
+			if event.TTFT > 0 {
+				firstTokenTime = requestTime.Add(event.TTFT)
+			}
+
 			trace.LLMRequest(tracing.LLMStreamInfo{
-				Provider:         string(stream.Provider),
-				Model:            stream.Model,
-				Operation:        stream.Operation,
-				ServerAddress:    stream.ServerAddress,
-				TraceID:          stream.TraceID,
-				ParentSpanID:     stream.ParentSpanID,
-				RequestTime:      stream.RequestTime,
-				FirstTokenTime:   stream.FirstTokenTime,
-				CompletionTime:   stream.CompletionTime,
-				InputTokens:      stream.InputTokens,
-				OutputTokens:     stream.OutputTokens,
-				StatusCode:       stream.StatusCode,
-				IsError:          stream.State == StreamStateError || stream.StatusCode >= 400,
-				CompletionReason: stream.CompletionReason,
+				Provider:       string(event.Provider),
+				Model:          event.Model,
+				Operation:      event.Operation,
+				ServerAddress:  event.ServerAddress,
+				TraceID:        event.TraceID,
+				ParentSpanID:   event.ParentSpanID,
+				RequestTime:    requestTime,
+				FirstTokenTime: firstTokenTime,
+				CompletionTime: completionTime,
+				InputTokens:    event.InputTokens,
+				OutputTokens:   event.OutputTokens,
+				StatusCode:     event.StatusCode,
+				IsError:        event.StatusCode >= 400,
 			})
 		}
 	}
-
-	klog.V(1).Infof("LLM_STREAM_METRICS_EMITTED: container=%s provider=%s model=%s "+
-		"input_tokens=%d output_tokens=%d duration_ms=%d ttft_ms=%d",
-		c.id, stream.Provider, stream.Model,
-		stream.InputTokens, stream.OutputTokens,
-		stream.CompletionTime.Sub(stream.RequestTime).Milliseconds(),
-		stream.FirstTokenTime.Sub(stream.RequestTime).Milliseconds())
 }
 
 // L7RequestResult indicates the result of processing an L7 request
@@ -1153,10 +1070,19 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		// Update stats with extracted trace ID (uses resolved key if migrated above)
 		c.l7Stats.observe(r.Protocol, r.Status.Http(), httpCtx.Method, httpCtx.Path, r.Duration, conn.DestinationKey, conn.srcWorkload, r, httpCtx.TraceID)
 
-		// LLM tracking with improved detection
-		if httpCtx.IsLLMRequest() {
-			provider := httpCtx.GetLLMProvider()
-			c.trackLLMRequest(provider, httpCtx.Host, httpCtx.Path, httpCtx.PayloadBase64, httpCtx.ResponseBase64, r.Duration)
+		// LLM tracking via DNS-based connection detection
+		if c.llmParser != nil {
+			destIP := conn.DestinationKey.ActualDestinationIfKnown().IP()
+			llmTag := c.llmDetector.IsLLMConnection(pidFd, destIP)
+			// Late-tag fallback from Host header
+			if llmTag == nil && httpCtx.Host != "" {
+				llmTag = c.llmDetector.LateTag(pidFd, httpCtx.Host, destIP)
+			}
+			if llmTag != nil {
+				c.llmParser.ParseHTTP1(llmTag, int(r.Status),
+					httpCtx.Path, extractHTTPBody(r.Payload), extractHTTPBody(r.Response),
+					r.Duration, httpCtx.TraceID)
+			}
 		}
 
 		// Create trace with processed context
@@ -1209,59 +1135,39 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			}
 		}
 
-		// Feed active streams to LLM stream tracker for SSE-based completion detection
-		// This handles streaming LLM responses that don't send END_STREAM until complete
-		if c.llmStreamTracker != nil && !parser.Lightweight {
-			// Resolve host for LLM detection
-			host := conn.DestinationKey.GetDestinationWorkload().Name
-			if isIPAddress(host) {
-				if domain := c.registry.getDomain(conn.DestinationKey.ActualDestinationIfKnown().IP()); domain != nil {
-					host = domain.FQDN
-				}
-			}
-			activeStreams := parser.GetActiveStreamsForLLM()
-			// Also try :authority header if host is still an IP
-			if host == "" || isIPAddress(host) {
-				for _, update := range activeStreams {
-					if update.Authority != "" && !isIPAddress(update.Authority) {
-						host = update.Authority
+		// Feed active streams to LLM parser if this is an LLM-tagged connection
+		destIP := conn.DestinationKey.ActualDestinationIfKnown().IP()
+		llmTag := c.llmDetector.IsLLMConnection(pidFd, destIP)
+
+		// Late-tag fallback: if not tagged yet, check :authority from parsed requests
+		if llmTag == nil {
+			for _, req := range requests {
+				authority := stripPort(req.Authority)
+				if authority != "" && !isIPAddress(authority) {
+					llmTag = c.llmDetector.LateTag(pidFd, authority, destIP)
+					if llmTag != nil {
 						break
 					}
 				}
 			}
+		}
+
+		if llmTag != nil && c.llmParser != nil {
+			activeStreams := parser.GetActiveStreamsForLLM()
 			for _, update := range activeStreams {
-				streamHost := host
-				if streamHost == "" && update.Authority != "" {
-					streamHost = update.Authority
-				}
+				// Feed request data
+				c.llmParser.FeedHTTP2Data(llmTag, update.StreamId,
+					nil, false, update.Path, 0, update.RequestHeaders)
 
-				klog.V(3).Infof("LLM_STREAM_UPDATE: pid=%d fd=%d stream=%d host=%s path=%s hasStatus=%v respPayloadLen=%d",
-					pid, fd, update.StreamId, streamHost, update.Path, update.HasResponseStatus, len(update.ResponsePayload))
-
-				// Notify stream tracker of request headers (for new streams)
-				c.llmStreamTracker.OnRequestHeaders(
-					pid, uint32(fd), update.StreamId,
-					streamHost, update.Path,
-					update.RequestHeaders,
-					string(c.id), c.srcWorkload.Name, c.srcWorkload.Namespace,
-				)
-
-				// Notify stream tracker of response status
+				// Feed response status
 				if update.HasResponseStatus {
-					c.llmStreamTracker.OnResponseHeaders(
-						pid, uint32(fd), update.StreamId,
-						int(update.Status), nil,
-					)
+					c.llmParser.OnHTTP2Status(update.StreamId, int(update.Status))
 				}
 
-				// Feed response data for SSE completion detection
+				// Feed response data
 				if len(update.ResponsePayload) > 0 {
-					klog.V(3).Infof("LLM_STREAM_DATA: pid=%d fd=%d stream=%d dataLen=%d",
-						pid, fd, update.StreamId, len(update.ResponsePayload))
-					c.llmStreamTracker.OnDataFrame(
-						pid, uint32(fd), update.StreamId,
-						update.ResponsePayload, true,
-					)
+					c.llmParser.FeedHTTP2Data(llmTag, update.StreamId,
+						update.ResponsePayload, true, update.Path, int(update.Status), nil)
 				}
 			}
 		}
@@ -1279,10 +1185,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 				}
 			}
 
-			// HTTP/2 LLM tracking is handled by the stream tracker (lines above)
-			// which feeds OnRequestHeaders/OnDataFrame/OnResponseHeaders for all
-			// active streams. This avoids double-counting since trackLLMRequest()
-			// and RecordLLMStreamMetrics() both emit to the same global counters.
+			// HTTP/2 LLM tracking is handled by the LLM parser above via FeedHTTP2Data.
 		}
 	case l7.ProtocolPostgres:
 		// Update stats for Postgres
@@ -1400,36 +1303,25 @@ func (c *Container) trackParseFail(conn *ActiveConnection, pid uint32, fd uint64
 // This is common for Go TLS connections where goroutines switch threads between
 // TCP connect and TLS write, causing fd_by_pid_tgid lookup to fail in eBPF.
 //
-// Since this path produces NO L7 metrics (no connection = no DestinationKey), the only
-// purpose is LLM detection. To avoid wasting CPU on non-LLM traffic (gRPC, K8s API, etc.),
-// we use a two-phase approach:
-//  1. If dstIP is known, check DNS cache first — skip if not LLM-relevant.
-//  2. Otherwise, parse only the first event per pid:fd to extract :authority.
-//     If not LLM-relevant, add to skip-set and never parse that fd again.
+// Uses LLMDetector for fast IP-based detection. No skip-set needed — the detector
+// handles caching at the connection level.
 func (c *Container) processHTTP2WithoutConnection(pid uint32, fd uint64, r *l7.RequestData, dstIP ...netaddr.IP) (map[netaddr.IP]*common.Domain, L7RequestResult) {
 	pidFd := PidFd{Pid: pid, Fd: fd}
 
-	// Fast path: already determined this fd is not LLM-relevant
-	if c.http2SkipSet != nil {
-		if _, skip := c.http2SkipSet[pidFd]; skip {
-			return nil, L7RequestProcessed
-		}
-	}
-
-	// If we have a destination IP, check DNS cache before parsing
+	// Check if this is an LLM connection via IP-based detection
+	var llmTag *LLMConnectionTag
 	if len(dstIP) > 0 && !dstIP[0].IsZero() {
-		host := ""
-		if domain := c.registry.getDomain(dstIP[0]); domain != nil {
-			host = domain.FQDN
-		}
-		if host == "" || !isLLMRelevantHost(host) {
-			// Not an LLM destination — skip this and all future events
-			c.addToHTTP2SkipSet(pidFd)
-			return nil, L7RequestProcessed
-		}
+		llmTag = c.llmDetector.IsLLMConnection(pidFd, dstIP[0])
 	}
 
-	// Parse the HTTP/2 frames to extract :authority for LLM detection
+	// If not tagged and no IP, we still need to parse to try :authority fallback.
+	// If tagged as non-LLM via IP, skip parsing entirely.
+	if llmTag == nil && len(dstIP) > 0 && !dstIP[0].IsZero() {
+		// IP known but not an LLM provider — skip
+		return nil, L7RequestProcessed
+	}
+
+	// Parse the HTTP/2 frames
 	if c.googleHTTP2Parsers == nil {
 		c.googleHTTP2Parsers = make(map[PidFd]*l7.Http2Parser)
 	}
@@ -1446,63 +1338,57 @@ func (c *Container) processHTTP2WithoutConnection(pid uint32, fd uint64, r *l7.R
 
 	requests := parser.Parse(r.Method, r.Payload, uint64(r.Duration))
 
-	// If parser is still in lightweight mode after parsing, no LLM host was found.
-	// Once we've seen at least one completed request (or enough HEADERS to decide),
-	// add to skip-set. We check ActiveRequestCount==0 to ensure we've seen a full
-	// request-response cycle (not just the first DATA frame before any HEADERS).
-	if parser.Lightweight && len(requests) > 0 {
-		// Parsed completed requests but none were LLM — this fd is non-LLM
-		c.addToHTTP2SkipSet(pidFd)
-		delete(c.googleHTTP2Parsers, pidFd)
+	// Late-tag from :authority header if not yet tagged
+	if llmTag == nil {
+		for _, req := range requests {
+			if req.Authority != "" {
+				host := stripPort(req.Authority)
+				if !isIPAddress(host) {
+					ip := netaddr.IP{}
+					if len(dstIP) > 0 {
+						ip = dstIP[0]
+					}
+					llmTag = c.llmDetector.LateTag(pidFd, host, ip)
+					if llmTag != nil {
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// If still not LLM, nothing to do on this connectionless path
+	if llmTag == nil {
+		if len(requests) > 0 {
+			// Completed non-LLM requests — clean up parser
+			delete(c.googleHTTP2Parsers, pidFd)
+		}
 		return nil, L7RequestProcessed
 	}
 
-	for _, req := range requests {
-		host := req.Authority
-		if host == "" && len(dstIP) > 0 && !dstIP[0].IsZero() {
-			if domain := c.registry.getDomain(dstIP[0]); domain != nil {
-				host = domain.FQDN
-			}
-		}
-		provider := ProviderUnknown
-		if host != "" {
-			provider = DetectLLMProvider(host)
-		}
-		if provider == ProviderUnknown && req.Path != "" {
-			provider, _ = DetectLLMProviderFromPath(req.Path)
-		}
-		isGRPC := strings.HasPrefix(req.ContentType, "application/grpc")
-		if provider == ProviderUnknown && !isGRPC && len(req.ResponsePayload) > 0 {
-			provider = detectProviderFromResponseStructure(req.ResponsePayload)
-		}
-		if provider == ProviderUnknown && !isGRPC && len(req.RequestPayload) > 0 {
-			provider = detectProviderFromRequestStructure(req.RequestPayload)
+	// Feed completed requests to LLM parser
+	if c.llmParser != nil {
+		for _, req := range requests {
+			c.llmParser.ParseHTTP1(llmTag, int(req.Status),
+				req.Path, req.RequestPayload, req.ResponsePayload, req.Duration, "")
 		}
 
-		if provider != ProviderUnknown {
-			if host == "" {
-				host = providerDefaultHost(provider)
+		// Feed active streams
+		activeStreams := parser.GetActiveStreamsForLLM()
+		for _, update := range activeStreams {
+			c.llmParser.FeedHTTP2Data(llmTag, update.StreamId,
+				nil, false, update.Path, 0, update.RequestHeaders)
+			if update.HasResponseStatus {
+				c.llmParser.OnHTTP2Status(update.StreamId, int(update.Status))
 			}
-			klog.V(4).Infof("HTTP2_CONNECTIONLESS_LLM_DETECTED: pid=%d fd=%d provider=%s host=%s path=%s",
-				pid, fd, provider, host, req.Path)
-
-			requestPayloadBase64 := base64.StdEncoding.EncodeToString(req.RequestPayload)
-			responsePayloadBase64 := ""
-			if len(req.ResponsePayload) > 0 {
-				responsePayloadBase64 = base64.StdEncoding.EncodeToString(req.ResponsePayload)
+			if len(update.ResponsePayload) > 0 {
+				c.llmParser.FeedHTTP2Data(llmTag, update.StreamId,
+					update.ResponsePayload, true, update.Path, int(update.Status), nil)
 			}
-			c.trackLLMRequest(provider, host, req.Path, requestPayloadBase64, responsePayloadBase64, req.Duration)
 		}
 	}
 
 	return nil, L7RequestProcessed
-}
-
-func (c *Container) addToHTTP2SkipSet(pidFd PidFd) {
-	if c.http2SkipSet == nil {
-		c.http2SkipSet = make(map[PidFd]struct{})
-	}
-	c.http2SkipSet[pidFd] = struct{}{}
 }
 
 // refreshActiveConnections snapshots active connections under c.lock and
@@ -1981,10 +1867,12 @@ func (c *Container) gc(now time.Time) {
 		}
 	}
 
-	// Clean up skip-set entries for dead pids
-	for pidFd := range c.http2SkipSet {
-		if _, hasProc := c.processes[pidFd.Pid]; !hasProc {
-			delete(c.http2SkipSet, pidFd)
+	// Clean up LLM detector connection cache for dead pids
+	if c.llmDetector != nil {
+		for pidFd := range c.googleHTTP2Parsers {
+			if _, hasProc := c.processes[pidFd.Pid]; !hasProc {
+				c.llmDetector.RemoveConnection(pidFd)
+			}
 		}
 	}
 
@@ -2109,120 +1997,6 @@ func resolveFd(pid uint32, fd uint64) (mntId string, logPath string) {
 		}
 	}
 	return
-}
-
-// detectLLMFromHTTPRequest detects LLM provider from HTTP request URL and response when hostname detection fails
-func detectLLMFromHTTPRequest(requestPayload []byte, responseBase64 string) LLMProvider {
-	// Parse HTTP request to extract URL path
-	requestStr := string(requestPayload)
-
-	// Use centralized path-based detection from llm.go
-	if path := extractHTTPPath(requestStr); path != "" {
-		provider, _ := DetectLLMProviderFromPath(path)
-		if provider != ProviderUnknown {
-			return provider
-		}
-	}
-
-	// Fallback: Analyze response structure if available
-	if responseBase64 != "" {
-		if responseBytes, err := base64.StdEncoding.DecodeString(responseBase64); err == nil {
-			return detectProviderFromResponseStructure(responseBytes)
-		}
-	}
-
-	return ProviderUnknown
-}
-
-// extractHTTPPath extracts the URL path from HTTP request payload
-func extractHTTPPath(request string) string {
-	// Look for "GET /path" or "POST /path" patterns
-	lines := strings.Split(request, "\n")
-	if len(lines) > 0 {
-		firstLine := lines[0]
-		parts := strings.Fields(firstLine)
-		if len(parts) >= 2 {
-			return parts[1] // URL path
-		}
-	}
-
-	// Also check Host header and full URLs
-	if hostStart := strings.Index(request, "Host: "); hostStart != -1 {
-		hostEnd := strings.Index(request[hostStart:], "\n")
-		if hostEnd != -1 {
-			hostLine := request[hostStart : hostStart+hostEnd]
-			if host := strings.TrimPrefix(hostLine, "Host: "); host != "" {
-				return strings.TrimSpace(host)
-			}
-		}
-	}
-
-	return ""
-}
-
-// detectProviderFromResponseStructure analyzes response JSON to identify provider
-func detectProviderFromResponseStructure(responseData []byte) LLMProvider {
-	// Look for JSON in response (skip HTTP headers)
-	jsonStart := bytes.Index(responseData, []byte("{"))
-	if jsonStart == -1 {
-		return ProviderUnknown
-	}
-
-	jsonStr := string(responseData[jsonStart:])
-
-	// Google Gemini: "candidates" array with "content" objects
-	if (strings.Contains(jsonStr, `"candidates"`) && strings.Contains(jsonStr, `"content"`)) ||
-		strings.Contains(jsonStr, `"usageMetadata"`) {
-		return ProviderGoogle
-	}
-
-	// OpenAI: "choices" array with "message" objects
-	if (strings.Contains(jsonStr, `"choices"`) && strings.Contains(jsonStr, `"message"`)) ||
-		(strings.Contains(jsonStr, `"usage"`) && strings.Contains(jsonStr, `"prompt_tokens"`)) {
-		return ProviderOpenAI
-	}
-
-	// Anthropic: "content" array with "text" objects
-	if (strings.Contains(jsonStr, `"content"`) && strings.Contains(jsonStr, `"text"`)) ||
-		(strings.Contains(jsonStr, `"usage"`) && strings.Contains(jsonStr, `"input_tokens"`)) {
-		return ProviderAnthropic
-	}
-
-	// Cohere: "generations" array or "message" with "text"
-	if strings.Contains(jsonStr, `"generations"`) ||
-		(strings.Contains(jsonStr, `"meta"`) && strings.Contains(jsonStr, `"tokens"`)) {
-		return ProviderCohere
-	}
-
-	return ProviderUnknown
-}
-
-// detectProviderFromRequestStructure detects LLM provider from request payload.
-// This is used as a last resort when :authority and :path are both unavailable
-// (e.g., mid-stream HPACK join for HTTP/2 TLS connections).
-func detectProviderFromRequestStructure(requestData []byte) LLMProvider {
-	jsonStart := bytes.Index(requestData, []byte("{"))
-	if jsonStart == -1 {
-		return ProviderUnknown
-	}
-	jsonStr := string(requestData[jsonStart:])
-
-	// Google Gemini: request body has "contents" array with "parts" objects
-	// and optionally "generationConfig"
-	if strings.Contains(jsonStr, `"contents"`) && strings.Contains(jsonStr, `"parts"`) {
-		return ProviderGoogle
-	}
-
-	// OpenAI: request body has "messages" array with "role" and "content"
-	if strings.Contains(jsonStr, `"messages"`) && strings.Contains(jsonStr, `"role"`) {
-		// Could be OpenAI or Anthropic - check for Anthropic-specific fields
-		if strings.Contains(jsonStr, `"max_tokens"`) && !strings.Contains(jsonStr, `"model"`) {
-			return ProviderAnthropic
-		}
-		return ProviderOpenAI
-	}
-
-	return ProviderUnknown
 }
 
 func (c *Container) counter(desc *prometheus.Desc, value float64, labelValues ...string) prometheus.Metric {
