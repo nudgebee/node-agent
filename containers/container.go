@@ -1495,6 +1495,32 @@ type activeConnAgg struct {
 	count int
 }
 
+// activeCounterLabelKeys returns the set of labelKey() values for destinations
+// that have at least one open connection, and the set of destination strings
+// for destinations still in lastConnectionAttempts (for failed-connect eviction).
+// Called from the event handler goroutine.
+func (c *Container) activeCounterLabelKeys() (activeKeys map[string]struct{}, activeFailedDsts map[string]struct{}) {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+
+	activeKeys = make(map[string]struct{})
+	for _, conn := range c.activeConnections {
+		if !conn.Closed.IsZero() {
+			continue
+		}
+		enrichedKey := c.enrichDestinationKey(conn.DestinationKey)
+		labels := tcpLabels(enrichedKey, conn.srcWorkload)
+		activeKeys[labelKey(labels)] = struct{}{}
+	}
+
+	activeFailedDsts = make(map[string]struct{}, len(c.lastConnectionAttempts))
+	for dst := range c.lastConnectionAttempts {
+		activeFailedDsts[dst.String()] = struct{}{}
+	}
+
+	return activeKeys, activeFailedDsts
+}
+
 func (c *Container) onRetransmission(src netaddr.IPPort, dst netaddr.IPPort) bool {
 	c.lock.RLock()
 	conn, ok := c.activeConnections[ConnectionKey{src: src, dst: dst}]

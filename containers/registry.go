@@ -222,10 +222,14 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 	defer gcTicker.Stop()
 	ebpfStatsTicker := time.NewTicker(MinTrafficStatsUpdateInterval)
 	defer ebpfStatsTicker.Stop()
+	counterEvictTicker := time.NewTicker(gcInterval)
+	defer counterEvictTicker.Stop()
 	for {
 		select {
 		case <-ebpfStatsTicker.C:
 			r.updateEbpfStatsAndActiveConns()
+		case <-counterEvictTicker.C:
+			r.evictStaleCounterLabels()
 		case now := <-gcTicker.C:
 			for pid, c := range r.containersByPid {
 				cg, err := proc.ReadCgroup(pid)
@@ -754,6 +758,22 @@ func (r *Registry) updateEbpfStatsAndActiveConns() {
 	r.containerLock.RUnlock()
 	for _, c := range containers {
 		c.refreshActiveConnections()
+	}
+}
+
+// evictStaleCounterLabels removes CounterVec entries for destinations that no
+// longer have active connections. Runs at gcInterval from the event handler goroutine.
+func (r *Registry) evictStaleCounterLabels() {
+	r.containerLock.RLock()
+	containers := make([]*Container, 0, len(r.containersById))
+	for _, c := range r.containersById {
+		containers = append(containers, c)
+	}
+	r.containerLock.RUnlock()
+
+	for _, c := range containers {
+		activeKeys, activeFailedDsts := c.activeCounterLabelKeys()
+		c.tcpMetrics.EvictStaleLabels(activeKeys, activeFailedDsts)
 	}
 }
 
