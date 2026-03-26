@@ -1072,11 +1072,12 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 
 		// LLM tracking via DNS-based connection detection
 		if c.llmParser != nil {
+			httpPidFd := PidFd{Pid: pid, Fd: fd}
 			destIP := conn.DestinationKey.ActualDestinationIfKnown().IP()
-			llmTag := c.llmDetector.IsLLMConnection(pidFd, destIP)
+			llmTag := c.llmDetector.IsLLMConnection(httpPidFd, destIP)
 			// Late-tag fallback from Host header
 			if llmTag == nil && httpCtx.Host != "" {
-				llmTag = c.llmDetector.LateTag(pidFd, httpCtx.Host, destIP)
+				llmTag = c.llmDetector.LateTag(httpPidFd, httpCtx.Host, destIP)
 			}
 			if llmTag != nil {
 				c.llmParser.ParseHTTP1(llmTag, int(r.Status),

@@ -2,6 +2,8 @@ package containers
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -11,6 +13,12 @@ import (
 
 	"k8s.io/klog/v2"
 )
+
+func generateSpanID() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
 
 // Pre-compiled regexes for token extraction from streaming responses.
 // These are used by extractTokensFromSSE and must never be compiled per-call.
