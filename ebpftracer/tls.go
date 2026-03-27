@@ -28,6 +28,15 @@ const (
 	// https://github.com/google/s2a-go
 	goS2AWriteSymbol = "github.com/google/s2a-go/internal/record.(*conn).Write"
 	goS2AReadSymbol  = "github.com/google/s2a-go/internal/record.(*conn).Read"
+
+	// ALTS (Application Layer Transport Security) symbols for Google Cloud
+	// gRPC connections on GCP. ALTS provides mutual authentication and
+	// transport encryption without TLS — uses its own record protocol.
+	// On GCP with Private Google Access, Google API calls may use ALTS
+	// instead of TLS, completely bypassing crypto/tls and S2A.
+	// The conn struct embeds net.Conn at offset 0, same as tls.Conn.
+	goALTSWriteSymbol = "google.golang.org/grpc/credentials/alts/internal/conn.(*conn).Write"
+	goALTSReadSymbol  = "google.golang.org/grpc/credentials/alts/internal/conn.(*conn).Read"
 )
 
 // Additional TLS symbols to hook for HTTP/2 and gRPC connections
@@ -251,8 +260,8 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 		}
 	}
 
-	// Attach Write uprobes (crypto/tls + S2A)
-	for _, writeSymbol := range []string{goTlsWriteSymbol, goS2AWriteSymbol} {
+	// Attach Write uprobes (crypto/tls + S2A + ALTS)
+	for _, writeSymbol := range []string{goTlsWriteSymbol, goS2AWriteSymbol, goALTSWriteSymbol} {
 		ws, err := ef.GetSymbol(writeSymbol)
 		if err != nil {
 			if writeSymbol == goTlsWriteSymbol {
@@ -274,8 +283,8 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 		links = append(links, l)
 	}
 
-	// Attach Read uprobes + return-offset exit probes (crypto/tls + S2A)
-	for _, readSymbol := range []string{goTlsReadSymbol, goS2AReadSymbol} {
+	// Attach Read uprobes + return-offset exit probes (crypto/tls + S2A + ALTS)
+	for _, readSymbol := range []string{goTlsReadSymbol, goS2AReadSymbol, goALTSReadSymbol} {
 		rs, err := ef.GetSymbol(readSymbol)
 		if err != nil {
 			if readSymbol == goTlsReadSymbol {

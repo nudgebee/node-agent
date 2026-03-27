@@ -112,7 +112,7 @@ struct iovec {
 // Requires kernel 5.8+
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 23);  // 8MB
+    __uint(max_entries, 1 << 25);  // 32MB — prevents event drops on busy nodes
 } l7_events SEC(".maps");
 
 struct read_args {
