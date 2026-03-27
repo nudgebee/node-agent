@@ -47,6 +47,16 @@ func (d *LLMDetector) OnDNS(fqdn string, ips []netaddr.IP) {
 		return
 	}
 
+	// Skip IP caching for Google APIs — Google uses shared anycast IPs across
+	// ALL *.googleapis.com services (compute, billing, AI, etc.). Caching
+	// generativelanguage.googleapis.com's IP would false-positive tag
+	// compute.googleapis.com connections as LLM.
+	// For Google, we rely entirely on late-tag from HTTP Host/:authority header.
+	if provider == ProviderGoogle {
+		klog.V(3).Infof("LLM_DETECTOR: skipping IP cache for %s (Google shared anycast)", fqdn)
+		return
+	}
+
 	tag := &LLMConnectionTag{
 		Provider: provider,
 		Host:     fqdn,
@@ -55,13 +65,6 @@ func (d *LLMDetector) OnDNS(fqdn string, ips []netaddr.IP) {
 	d.mu.Lock()
 	for _, ip := range ips {
 		key := ip.String()
-		if existing, ok := d.ipCache[key]; ok {
-			// Update if provider changed (unlikely but handle it)
-			if existing.Provider != provider {
-				klog.V(3).Infof("LLM_DETECTOR: IP %s re-mapped from %s to %s (%s)",
-					key, existing.Provider, provider, fqdn)
-			}
-		}
 		d.ipCache[key] = tag
 	}
 	d.mu.Unlock()
