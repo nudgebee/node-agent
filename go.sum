@@ -325,6 +325,8 @@ github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 h1:C3w9PqII01/Oq
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822/go.mod h1:+n7T8mK8HuQTcFwEeznm/DIxMOiR9yIdICNftLE1DvQ=
 github.com/nudgebee/logparser v0.0.0-20260313095946-b22168b95d9c h1:C0Jx8+61ndlWeKrS25W7hFJW/qpxUpG96tBQdjffd5I=
 github.com/nudgebee/logparser v0.0.0-20260313095946-b22168b95d9c/go.mod h1:oFnM9D6YEjZzb1jy0kJ/NUkTbkZA+BgNYjpLO4n4szA=
+github.com/nudgebee/logparser v0.0.0-20260406040008-c408d0a5c69c h1:drsGFCiBXp5OZm92HE0iVx8U4XhpzAxL5vVKubBGl+I=
+github.com/nudgebee/logparser v0.0.0-20260406040008-c408d0a5c69c/go.mod h1:oFnM9D6YEjZzb1jy0kJ/NUkTbkZA+BgNYjpLO4n4szA=
 github.com/oklog/ulid v1.3.1 h1:EGfNDEx6MqHz8B3uNV6QAib1UR2Lm97sHi3ocA6ESJ4=
 github.com/oklog/ulid v1.3.1/go.mod h1:CirwcVhetQ6Lv90oh/F+FBtV6XMibvdAFo93nm5qn4U=
 github.com/onsi/ginkgo v1.16.5 h1:8xi0RTUf59SOSfEtZMvwTvXYMzG4gV23XVHOZiXNtnE=
