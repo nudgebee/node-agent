@@ -6,7 +6,7 @@ require (
 	github.com/ClickHouse/ch-go v0.65.0
 	github.com/NVIDIA/go-nvml v0.12.4-1
 	github.com/agoda-com/opentelemetry-logs-go v0.4.1
-	github.com/cilium/cilium v1.17.3
+	github.com/cilium/cilium v1.17.14
 	github.com/cilium/ebpf v0.20.0
 	github.com/containerd/cgroups v1.1.0
 	github.com/containerd/containerd v1.7.29
@@ -46,9 +46,9 @@ require (
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
 	gopkg.in/yaml.v2 v2.4.0
 	inet.af/netaddr v0.0.0-20230525184311-b8eac61e914a
-	k8s.io/api v0.32.0
-	k8s.io/apimachinery v0.32.0
-	k8s.io/client-go v0.32.0
+	k8s.io/api v0.32.13
+	k8s.io/apimachinery v0.32.13
+	k8s.io/client-go v0.32.13
 	k8s.io/klog/v2 v2.130.1
 )
 
@@ -71,9 +71,9 @@ require (
 	github.com/blang/semver/v4 v4.0.0 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/cilium/hive v0.0.0-20250121145729-e67f66eb0375 // indirect
-	github.com/cilium/proxy v0.0.0-20250408103314-d3be7c547203 // indirect
-	github.com/cilium/statedb v0.3.6 // indirect
+	github.com/cilium/hive v0.0.0-20250522145610-0734675df148 // indirect
+	github.com/cilium/proxy v0.0.0-20250526114940-b80199397e8a // indirect
+	github.com/cilium/statedb v0.4.5 // indirect
 	github.com/cilium/stream v0.0.0-20241203114243-53c3e5d79744 // indirect
 	github.com/cilium/workerpool v1.2.0 // indirect
 	github.com/containerd/containerd/api v1.8.0 // indirect
@@ -94,7 +94,7 @@ require (
 	github.com/emicklei/go-restful/v3 v3.12.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/fsnotify/fsnotify v1.8.0 // indirect
-	github.com/fxamacker/cbor/v2 v2.7.0 // indirect
+	github.com/fxamacker/cbor/v2 v2.8.0 // indirect
 	github.com/go-faster/city v1.0.1 // indirect
 	github.com/go-faster/errors v0.7.1 // indirect
 	github.com/go-logfmt/logfmt v0.6.0 // indirect
@@ -184,6 +184,7 @@ require (
 	go.uber.org/dig v1.17.1 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
+	go.yaml.in/yaml/v3 v3.0.3 // indirect
 	go4.org/intern v0.0.0-20211027215823-ae77deb06f29 // indirect
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
 	go4.org/unsafe/assume-no-moving-gc v0.0.0-20230525183740-e7c30c78aeb2 // indirect
@@ -201,14 +202,14 @@ require (
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	k8s.io/apiextensions-apiserver v0.32.0 // indirect
+	k8s.io/apiextensions-apiserver v0.32.13 // indirect
 	k8s.io/kube-openapi v0.0.0-20241105132330-32ad38e42d3f // indirect
-	k8s.io/utils v0.0.0-20241210054802-24370beab758 // indirect
-	sigs.k8s.io/controller-runtime v0.20.1 // indirect
+	k8s.io/utils v0.0.0-20260210185600-b8788abfbbc2 // indirect
+	sigs.k8s.io/controller-runtime v0.20.4 // indirect
 	sigs.k8s.io/gateway-api v1.2.1 // indirect
 	sigs.k8s.io/json v0.0.0-20241010143419-9aa6b5e7a4b3 // indirect
 	sigs.k8s.io/mcs-api v0.1.1-0.20250116162235-62ede9a032dc // indirect
-	sigs.k8s.io/structured-merge-diff/v4 v4.4.2 // indirect
+	sigs.k8s.io/structured-merge-diff/v4 v4.7.0 // indirect
 	sigs.k8s.io/yaml v1.4.0 // indirect
 )
 
