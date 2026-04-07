@@ -408,8 +408,6 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
             req->protocol = PROTOCOL_RABBITMQ;
         } else if (is_amqp_method_frame(payload, size)) {
             req->protocol = PROTOCOL_RABBITMQ;
-        } else if (is_clickhouse_query(payload, size)) {
-            req->protocol = PROTOCOL_CLICKHOUSE;
         } else if (is_zk_request(payload, total_size)) {
             req->protocol = PROTOCOL_ZOOKEEPER;
         }  else if (is_kafka_request(payload, size, &req->request_id)) {
