@@ -2,9 +2,12 @@ package l7
 
 import (
 	"bytes"
+	"io"
 
 	"github.com/ClickHouse/ch-go/proto"
 )
+
+const clickhouseClientCodeQuery = 1
 
 func ParseClickhouse(payload []byte) (result string) {
 	// Recover from panics caused by malformed/incomplete packets
@@ -14,7 +17,28 @@ func ParseClickhouse(payload []byte) (result string) {
 		}
 	}()
 
-	r := proto.NewReader(bytes.NewReader(payload))
+	// Layer 2: Structural validation before invoking ch-go.
+	// Reject misidentified payloads early, before the library can
+	// decode garbage varint lengths and attempt unbounded allocations.
+	if len(payload) < 3 {
+		return ""
+	}
+	if payload[0] != clickhouseClientCodeQuery {
+		return ""
+	}
+	// Query ID length is varint-encoded. Single-byte varints (0-127) cover
+	// all practical query IDs. Multi-byte varints (>127) in this position
+	// indicate garbage data from a misidentified connection.
+	if payload[1] > 127 {
+		return ""
+	}
+
+	// Layer 1: Bound the reader to the actual payload size.
+	// ch-go's proto.Reader decodes varint string lengths and pre-allocates
+	// that many bytes. With corrupted data, the varint can decode to TB-scale
+	// values, causing a fatal OOM that bypasses defer/recover.
+	// LimitReader caps reads at len(payload), turning the OOM into io.EOF.
+	r := proto.NewReader(io.LimitReader(bytes.NewReader(payload), int64(len(payload))))
 	var err error
 	if _, err = r.Byte(); err != nil {
 		return ""

@@ -26,6 +26,15 @@ func (p *PostgresParser) Parse(payload []byte) string {
 		return ""
 	}
 	cmd := payload[0]
+	// Reject unknown frame types early — Postgres detection in eBPF is weak
+	// (single-byte check), so misidentified connections can reach here.
+	// Accept all valid frontend message types per the Postgres wire protocol.
+	switch cmd {
+	case PostgresFrameQuery, PostgresFrameBind, PostgresFrameParse, PostgresFrameClose,
+		'E', 'D', 'S', 'H', 'X': // Execute, Describe, Sync, Flush, Terminate
+	default:
+		return ""
+	}
 	switch cmd {
 	case PostgresFrameQuery:
 		var query string

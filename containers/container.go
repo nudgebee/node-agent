@@ -102,6 +102,9 @@ type ActiveConnection struct {
 	http2Parser    *l7.Http2Parser
 	postgresParser *l7.PostgresParser
 	mysqlParser    *l7.MysqlParser
+
+	parseFailCount   int
+	protocolOverride l7.Protocol // non-zero = override eBPF-detected protocol
 }
 
 type ListenDetails struct {
@@ -1088,8 +1091,16 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		trace = c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown(), conn.srcWorkload, destWorkload, actualDestWorkload)
 	}
 
+	// Protocol reclassification: if previous parse attempts failed repeatedly,
+	// the connection was likely misidentified by eBPF heuristics. Use the
+	// override to skip further parsing for this connection.
+	protocol := r.Protocol
+	if conn.protocolOverride != 0 {
+		protocol = conn.protocolOverride
+	}
+
 	// Process L7 requests and update metrics
-	switch r.Protocol {
+	switch protocol {
 	case l7.ProtocolDNS:
 		status := r.Status.DNS()
 		if status == "" {
@@ -1282,6 +1293,11 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			conn.postgresParser = l7.NewPostgresParser()
 		}
 		query := conn.postgresParser.Parse(r.Payload)
+		if query == "" && r.Method != l7.MethodStatementClose {
+			c.trackParseFail(conn, pid, fd, r.Protocol)
+		} else {
+			conn.parseFailCount = 0
+		}
 		if trace != nil {
 			trace.PostgresQuery(query, r.Status.Error(), r.Duration)
 		}
@@ -1331,6 +1347,11 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		// Update stats for Clickhouse
 		c.l7Stats.observe(r.Protocol, r.Status.String(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		query := l7.ParseClickhouse(r.Payload)
+		if query == "" {
+			c.trackParseFail(conn, pid, fd, r.Protocol)
+		} else {
+			conn.parseFailCount = 0
+		}
 		if trace != nil {
 			trace.ClickhouseQuery(query, r.Status.Error(), r.Duration)
 		}
@@ -1338,6 +1359,11 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		// Update stats for Zookeeper
 		c.l7Stats.observe(r.Protocol, r.Status.Zookeeper(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		op, arg := l7.ParseZookeeper(r.Payload)
+		if op == "" {
+			c.trackParseFail(conn, pid, fd, r.Protocol)
+		} else {
+			conn.parseFailCount = 0
+		}
 		if trace != nil {
 			trace.ZookeeperRequest(op, arg, r.Status, r.Duration)
 		}
@@ -1349,6 +1375,25 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		c.l7Stats.observe(r.Protocol, "unknown", "", "", 0, conn.DestinationKey, conn.srcWorkload, r, "")
 	}
 	return nil, L7RequestProcessed
+}
+
+const (
+	parseFailThreshold   = 3
+	protocolReclassified = l7.Protocol(0xFF) // sentinel: no protocol matches, hits default case
+)
+
+// trackParseFail tracks consecutive parse failures on a connection. After
+// parseFailThreshold failures, the connection's protocol is overridden to
+// skip further parsing. This handles eBPF protocol misidentification where
+// weak heuristics (e.g., 3-byte ClickHouse check) tag a non-matching
+// connection permanently.
+func (c *Container) trackParseFail(conn *ActiveConnection, pid uint32, fd uint64, proto l7.Protocol) {
+	conn.parseFailCount++
+	if conn.parseFailCount == parseFailThreshold {
+		conn.protocolOverride = protocolReclassified
+		klog.Warningf("reclassified connection pid=%d fd=%d from %s to unknown after %d consecutive parse failures",
+			pid, fd, proto, conn.parseFailCount)
+	}
 }
 
 // processHTTP2WithoutConnection handles HTTP/2 events when TCP connection tracking failed.
