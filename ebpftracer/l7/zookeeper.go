@@ -108,10 +108,24 @@ func zkReadString(r io.Reader) string {
 	return string(res[:n])
 }
 
+func isValidZkOp(op int32) bool {
+	switch op {
+	case zkOpCreate, zkOpDelete, zkOpExists, zkOpGetData, zkOpSetData,
+		zkOpGetAcl, zkOpSetAcl, zkOpGetChildren, zkOpSync, zkOpPing,
+		zkOpGetChildren2, zkOpCheck, zkOpMulti, zkOpReconfig,
+		zkOpCreateContainer, zkOpCreateTTL, zkOpClose, zkOpSetAuth, zkOpSetWatches:
+		return true
+	}
+	return false
+}
+
 func ParseZookeeper(payload []byte) (string, string) {
 	r := bytes.NewReader(payload)
 	h := zkRequestHeader{}
 	if err := binary.Read(r, binary.BigEndian, &h); err != nil {
+		return "", ""
+	}
+	if !isValidZkOp(h.OpType) {
 		return "", ""
 	}
 	return zkParse(r, h.OpType)

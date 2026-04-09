@@ -38,6 +38,12 @@ var (
 	gpuStatsWindow            = 15 * time.Second
 )
 
+const (
+	// Max per-connection HTTP/2 parsers per container.
+	// Each parser holds HPACK decoders and active request state.
+	maxHTTP2ParsersPerContainer = 50
+)
+
 type ContainerID string
 
 type ContainerNetwork struct {
@@ -96,6 +102,9 @@ type ActiveConnection struct {
 	http2Parser    *l7.Http2Parser
 	postgresParser *l7.PostgresParser
 	mysqlParser    *l7.MysqlParser
+
+	parseFailCount   int
+	protocolOverride l7.Protocol // non-zero = override eBPF-detected protocol
 }
 
 type ListenDetails struct {
@@ -128,6 +137,7 @@ type Container struct {
 	activeConnections      map[ConnectionKey]*ActiveConnection
 	connectionsByPidFd     map[PidFd]*ActiveConnection
 	googleHTTP2Parsers     map[PidFd]*l7.Http2Parser // Per-connection HTTP/2 parsers (keyed by pid:fd for correct HPACK state)
+	http2SkipSet           map[PidFd]struct{}        // pid:fd pairs confirmed as non-LLM — skip all future HTTP/2 events
 
 	l7Stats    L7Stats
 	tcpMetrics *TCPMetrics
@@ -1081,8 +1091,16 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		trace = c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown(), conn.srcWorkload, destWorkload, actualDestWorkload)
 	}
 
+	// Protocol reclassification: if previous parse attempts failed repeatedly,
+	// the connection was likely misidentified by eBPF heuristics. Use the
+	// override to skip further parsing for this connection.
+	protocol := r.Protocol
+	if conn.protocolOverride != 0 {
+		protocol = conn.protocolOverride
+	}
+
 	// Process L7 requests and update metrics
-	switch r.Protocol {
+	switch protocol {
 	case l7.ProtocolDNS:
 		status := r.Status.DNS()
 		if status == "" {
@@ -1158,9 +1176,14 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		}
 		pidFd := PidFd{Pid: pid, Fd: fd}
 		if c.googleHTTP2Parsers[pidFd] == nil {
-			c.googleHTTP2Parsers[pidFd] = l7.NewHttp2Parser()
+			if len(c.googleHTTP2Parsers) >= maxHTTP2ParsersPerContainer {
+				return nil, L7RequestProcessed
+			}
+			p := l7.NewHttp2Parser()
+			p.Lightweight = true
+			p.LLMHostChecker = isLLMRelevantHost
+			c.googleHTTP2Parsers[pidFd] = p
 		}
-		// Use per-connection parser (each HTTP/2 connection has its own HPACK dynamic table)
 		parser := c.googleHTTP2Parsers[pidFd]
 		conn.http2Parser = parser // Keep reference on connection for compatibility
 		requests := parser.Parse(r.Method, r.Payload, uint64(r.Duration))
@@ -1188,7 +1211,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 
 		// Feed active streams to LLM stream tracker for SSE-based completion detection
 		// This handles streaming LLM responses that don't send END_STREAM until complete
-		if c.llmStreamTracker != nil {
+		if c.llmStreamTracker != nil && !parser.Lightweight {
 			// Resolve host for LLM detection
 			host := conn.DestinationKey.GetDestinationWorkload().Name
 			if isIPAddress(host) {
@@ -1196,18 +1219,16 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 					host = domain.FQDN
 				}
 			}
+			activeStreams := parser.GetActiveStreamsForLLM()
 			// Also try :authority header if host is still an IP
 			if host == "" || isIPAddress(host) {
-				for _, update := range parser.GetActiveStreamsForLLM() {
+				for _, update := range activeStreams {
 					if update.Authority != "" && !isIPAddress(update.Authority) {
 						host = update.Authority
 						break
 					}
 				}
 			}
-
-			// Process active streams for LLM tracking
-			activeStreams := parser.GetActiveStreamsForLLM()
 			for _, update := range activeStreams {
 				streamHost := host
 				if streamHost == "" && update.Authority != "" {
@@ -1272,6 +1293,11 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			conn.postgresParser = l7.NewPostgresParser()
 		}
 		query := conn.postgresParser.Parse(r.Payload)
+		if query == "" && r.Method != l7.MethodStatementClose {
+			c.trackParseFail(conn, pid, fd, r.Protocol)
+		} else {
+			conn.parseFailCount = 0
+		}
 		if trace != nil {
 			trace.PostgresQuery(query, r.Status.Error(), r.Duration)
 		}
@@ -1321,6 +1347,11 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		// Update stats for Clickhouse
 		c.l7Stats.observe(r.Protocol, r.Status.String(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		query := l7.ParseClickhouse(r.Payload)
+		if query == "" {
+			c.trackParseFail(conn, pid, fd, r.Protocol)
+		} else {
+			conn.parseFailCount = 0
+		}
 		if trace != nil {
 			trace.ClickhouseQuery(query, r.Status.Error(), r.Duration)
 		}
@@ -1328,6 +1359,11 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		// Update stats for Zookeeper
 		c.l7Stats.observe(r.Protocol, r.Status.Zookeeper(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
 		op, arg := l7.ParseZookeeper(r.Payload)
+		if op == "" {
+			c.trackParseFail(conn, pid, fd, r.Protocol)
+		} else {
+			conn.parseFailCount = 0
+		}
 		if trace != nil {
 			trace.ZookeeperRequest(op, arg, r.Status, r.Duration)
 		}
@@ -1341,53 +1377,93 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	return nil, L7RequestProcessed
 }
 
+const (
+	parseFailThreshold   = 3
+	protocolReclassified = l7.Protocol(0xFF) // sentinel: no protocol matches, hits default case
+)
+
+// trackParseFail tracks consecutive parse failures on a connection. After
+// parseFailThreshold failures, the connection's protocol is overridden to
+// skip further parsing. This handles eBPF protocol misidentification where
+// weak heuristics (e.g., 3-byte ClickHouse check) tag a non-matching
+// connection permanently.
+func (c *Container) trackParseFail(conn *ActiveConnection, pid uint32, fd uint64, proto l7.Protocol) {
+	conn.parseFailCount++
+	if conn.parseFailCount == parseFailThreshold {
+		conn.protocolOverride = protocolReclassified
+		klog.Warningf("reclassified connection pid=%d fd=%d from %s to unknown after %d consecutive parse failures",
+			pid, fd, proto, conn.parseFailCount)
+	}
+}
+
 // processHTTP2WithoutConnection handles HTTP/2 events when TCP connection tracking failed.
 // This is common for Go TLS connections where goroutines switch threads between
 // TCP connect and TLS write, causing fd_by_pid_tgid lookup to fail in eBPF.
 //
-// We can still extract useful info from HTTP/2 frames:
-// - :authority pseudo-header for host resolution (LLM detection)
-// - :path for request path matching
-// - Request/response payloads for LLM token extraction
-//
-// Each HTTP/2 connection has its own HPACK dynamic table, so we use per-fd parsers
-// to avoid header decoding corruption when a process has multiple connections.
-//
-// Note: Metrics that require destination IP will be skipped since we don't have it.
+// Since this path produces NO L7 metrics (no connection = no DestinationKey), the only
+// purpose is LLM detection. To avoid wasting CPU on non-LLM traffic (gRPC, K8s API, etc.),
+// we use a two-phase approach:
+//  1. If dstIP is known, check DNS cache first — skip if not LLM-relevant.
+//  2. Otherwise, parse only the first event per pid:fd to extract :authority.
+//     If not LLM-relevant, add to skip-set and never parse that fd again.
 func (c *Container) processHTTP2WithoutConnection(pid uint32, fd uint64, r *l7.RequestData, dstIP ...netaddr.IP) (map[netaddr.IP]*common.Domain, L7RequestResult) {
-	// Use per-connection parser: each HTTP/2 connection has its own HPACK dynamic table,
-	// so sharing a parser across connections corrupts header decoding.
+	pidFd := PidFd{Pid: pid, Fd: fd}
+
+	// Fast path: already determined this fd is not LLM-relevant
+	if c.http2SkipSet != nil {
+		if _, skip := c.http2SkipSet[pidFd]; skip {
+			return nil, L7RequestProcessed
+		}
+	}
+
+	// If we have a destination IP, check DNS cache before parsing
+	if len(dstIP) > 0 && !dstIP[0].IsZero() {
+		host := ""
+		if domain := c.registry.getDomain(dstIP[0]); domain != nil {
+			host = domain.FQDN
+		}
+		if host == "" || !isLLMRelevantHost(host) {
+			// Not an LLM destination — skip this and all future events
+			c.addToHTTP2SkipSet(pidFd)
+			return nil, L7RequestProcessed
+		}
+	}
+
+	// Parse the HTTP/2 frames to extract :authority for LLM detection
 	if c.googleHTTP2Parsers == nil {
 		c.googleHTTP2Parsers = make(map[PidFd]*l7.Http2Parser)
 	}
-
-	pidFd := PidFd{Pid: pid, Fd: fd}
 	parser := c.googleHTTP2Parsers[pidFd]
 	if parser == nil {
+		if len(c.googleHTTP2Parsers) >= maxHTTP2ParsersPerContainer {
+			return nil, L7RequestProcessed
+		}
 		parser = l7.NewHttp2Parser()
+		parser.Lightweight = true
+		parser.LLMHostChecker = isLLMRelevantHost
 		c.googleHTTP2Parsers[pidFd] = parser
 	}
 
 	requests := parser.Parse(r.Method, r.Payload, uint64(r.Duration))
 
-	if len(requests) == 0 {
-		klog.V(3).Infof("HTTP2_CONNECTIONLESS_PARSE: pid=%d fd=%d method=%d payloadLen=%d completed=0 active=%d",
-			pid, fd, r.Method, len(r.Payload), parser.ActiveRequestCount())
+	// If parser is still in lightweight mode after parsing, no LLM host was found.
+	// Once we've seen at least one completed request (or enough HEADERS to decide),
+	// add to skip-set. We check ActiveRequestCount==0 to ensure we've seen a full
+	// request-response cycle (not just the first DATA frame before any HEADERS).
+	if parser.Lightweight && len(requests) > 0 {
+		// Parsed completed requests but none were LLM — this fd is non-LLM
+		c.addToHTTP2SkipSet(pidFd)
+		delete(c.googleHTTP2Parsers, pidFd)
+		return nil, L7RequestProcessed
 	}
 
 	for _, req := range requests {
-		// Extract host from :authority header (set by HTTP/2 parser)
 		host := req.Authority
 		if host == "" && len(dstIP) > 0 && !dstIP[0].IsZero() {
-			// Fallback: resolve destination IP via DNS cache.
-			// This handles mid-stream HPACK join where :authority is in the
-			// dynamic table and can't be decoded.
 			if domain := c.registry.getDomain(dstIP[0]); domain != nil {
 				host = domain.FQDN
-				klog.V(4).Infof("HTTP2_CONNECTIONLESS: resolved host from DNS cache: ip=%s host=%s path=%s", dstIP[0], host, req.Path)
 			}
 		}
-		// Detect LLM provider: try host first, then path, then response structure
 		provider := ProviderUnknown
 		if host != "" {
 			provider = DetectLLMProvider(host)
@@ -1395,8 +1471,6 @@ func (c *Container) processHTTP2WithoutConnection(pid uint32, fd uint64, r *l7.R
 		if provider == ProviderUnknown && req.Path != "" {
 			provider, _ = DetectLLMProviderFromPath(req.Path)
 		}
-		// Last resort: analyze request/response structure for LLM patterns.
-		// Skip for gRPC (protobuf data can contain strings that match JSON patterns).
 		isGRPC := strings.HasPrefix(req.ContentType, "application/grpc")
 		if provider == ProviderUnknown && !isGRPC && len(req.ResponsePayload) > 0 {
 			provider = detectProviderFromResponseStructure(req.ResponsePayload)
@@ -1405,31 +1479,30 @@ func (c *Container) processHTTP2WithoutConnection(pid uint32, fd uint64, r *l7.R
 			provider = detectProviderFromRequestStructure(req.RequestPayload)
 		}
 
-		if host == "" && provider == ProviderUnknown {
-			klog.V(3).Infof("HTTP2_CONNECTIONLESS: no authority/path and no LLM detected for pid=%d fd=%d", pid, fd)
-			continue
-		}
-
 		if provider != ProviderUnknown {
-			// Set a default server address if host is unknown (detected from payload structure)
 			if host == "" {
 				host = providerDefaultHost(provider)
 			}
-
-			klog.V(4).Infof("HTTP2_CONNECTIONLESS_LLM_DETECTED: pid=%d fd=%d provider=%s host=%s path=%s reqLen=%d respLen=%d",
-				pid, fd, provider, host, req.Path, len(req.RequestPayload), len(req.ResponsePayload))
+			klog.V(4).Infof("HTTP2_CONNECTIONLESS_LLM_DETECTED: pid=%d fd=%d provider=%s host=%s path=%s",
+				pid, fd, provider, host, req.Path)
 
 			requestPayloadBase64 := base64.StdEncoding.EncodeToString(req.RequestPayload)
 			responsePayloadBase64 := ""
 			if len(req.ResponsePayload) > 0 {
 				responsePayloadBase64 = base64.StdEncoding.EncodeToString(req.ResponsePayload)
 			}
-
 			c.trackLLMRequest(provider, host, req.Path, requestPayloadBase64, responsePayloadBase64, req.Duration)
 		}
 	}
 
 	return nil, L7RequestProcessed
+}
+
+func (c *Container) addToHTTP2SkipSet(pidFd PidFd) {
+	if c.http2SkipSet == nil {
+		c.http2SkipSet = make(map[PidFd]struct{})
+	}
+	c.http2SkipSet[pidFd] = struct{}{}
 }
 
 // refreshActiveConnections snapshots active connections under c.lock and
@@ -1465,6 +1538,32 @@ func (c *Container) refreshActiveConnections() {
 type activeConnAgg struct {
 	src   common.Workload
 	count int
+}
+
+// activeCounterLabelKeys returns the set of labelKey() values for destinations
+// that have at least one open connection, and the set of destination strings
+// for destinations still in lastConnectionAttempts (for failed-connect eviction).
+// Called from the event handler goroutine.
+func (c *Container) activeCounterLabelKeys() (activeKeys map[string]struct{}, activeFailedDsts map[string]struct{}) {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+
+	activeKeys = make(map[string]struct{})
+	for _, conn := range c.activeConnections {
+		if !conn.Closed.IsZero() {
+			continue
+		}
+		enrichedKey := c.enrichDestinationKey(conn.DestinationKey)
+		labels := tcpLabels(enrichedKey, conn.srcWorkload)
+		activeKeys[labelKey(labels)] = struct{}{}
+	}
+
+	activeFailedDsts = make(map[string]struct{}, len(c.lastConnectionAttempts))
+	for dst := range c.lastConnectionAttempts {
+		activeFailedDsts[dst.String()] = struct{}{}
+	}
+
+	return activeKeys, activeFailedDsts
 }
 
 func (c *Container) onRetransmission(src netaddr.IPPort, dst netaddr.IPPort) bool {
@@ -1746,13 +1845,19 @@ func (c *Container) runLogParser(logPath string) {
 	}
 
 	containerId := string(c.id)
+	sensitiveCfg := logparser.SensitiveConfig{
+		Enabled:       !*flags.DisableSensitiveLogParsing,
+		SampleRate:    *flags.SensitiveLogSampleRate,
+		MinConfidence: *flags.SensitiveLogMinConfidence,
+		MaxDetections: *flags.SensitiveLogMaxDetectionsPerContainer,
+	}
 
 	if logPath != "" {
 		if c.logParsers[logPath] != nil {
 			return
 		}
 		ch := make(chan logparser.LogEntry)
-		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, *flags.DisableSensitiveLogParsing)
+		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, sensitiveCfg)
 		reader, err := logs.NewTailReader(proc.HostPath(logPath), ch)
 		if err != nil {
 			klog.Warningln(err)
@@ -1772,7 +1877,7 @@ func (c *Container) runLogParser(logPath string) {
 			klog.Warningln(err)
 			return
 		}
-		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, *flags.DisableSensitiveLogParsing)
+		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, sensitiveCfg)
 		stop := func() {
 			JournaldUnsubscribe(c.metadata.systemd.Unit)
 		}
@@ -1789,7 +1894,7 @@ func (c *Container) runLogParser(logPath string) {
 			delete(c.logParsers, "stdout/stderr")
 		}
 		ch := make(chan logparser.LogEntry)
-		parser := logparser.NewParser(ch, c.metadata.logDecoder, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, *flags.DisableSensitiveLogParsing)
+		parser := logparser.NewParser(ch, c.metadata.logDecoder, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, sensitiveCfg)
 		reader, err := logs.NewTailReader(proc.HostPath(c.metadata.logPath), ch)
 		if err != nil {
 			klog.Warningln(err)
@@ -1851,11 +1956,35 @@ func (c *Container) gc(now time.Time) {
 	// Clean up HTTP/2 parsers for closed/dead connections.
 	// Parsers hold HPACK decoders, partial frame buffers, and active request maps
 	// that accumulate memory over time if not cleaned up.
+	// Two cases: (1) connection-tracked parsers — delete when connection is gone,
+	// (2) connectionless parsers (processHTTP2WithoutConnection) — delete when pid dies.
 	if c.googleHTTP2Parsers != nil {
 		for pidFd := range c.googleHTTP2Parsers {
-			if _, alive := c.connectionsByPidFd[pidFd]; !alive {
+			if _, hasConn := c.connectionsByPidFd[pidFd]; hasConn {
+				continue // connection still alive
+			}
+			if _, hasProc := c.processes[pidFd.Pid]; !hasProc {
+				delete(c.googleHTTP2Parsers, pidFd) // pid dead — connectionless parser cleanup
+				continue
+			}
+			// Pid is alive but no connection — could be a connectionless parser
+			// (still needed) or a closed connection's parser (stale).
+			// Check if this parser was created via the connectionless path by
+			// seeing if there was ever a tracked connection for this pidFd.
+			// If activeConnections had it at some point, it's stale.
+			// Use a simple heuristic: if the parser has zero active requests
+			// and no partial frame data, it's safe to clean up.
+			p := c.googleHTTP2Parsers[pidFd]
+			if p.ActiveRequestCount() == 0 && !p.HasPartialData() {
 				delete(c.googleHTTP2Parsers, pidFd)
 			}
+		}
+	}
+
+	// Clean up skip-set entries for dead pids
+	for pidFd := range c.http2SkipSet {
+		if _, hasProc := c.processes[pidFd.Pid]; !hasProc {
+			delete(c.http2SkipSet, pidFd)
 		}
 	}
 

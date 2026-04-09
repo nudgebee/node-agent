@@ -10,12 +10,12 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"sync"
 	"unsafe"
 
 	"github.com/cilium/ebpf/link"
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/proc"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"k8s.io/klog/v2"
 )
 
@@ -53,8 +53,9 @@ var (
 
 	// strippedGoExeCache caches exe paths that are Go binaries but have no TLS symbols.
 	// This avoids expensive ELF scanning for the same stripped binary across many
-	// short-lived processes (e.g., kubectl invocations). Uses sync.Map for lock-free reads.
-	strippedGoExeCache = &sync.Map{} // map[string]struct{}
+	// short-lived processes (e.g., kubectl invocations). Capped at 1000 entries to
+	// prevent unbounded growth on CI/CD nodes with many unique Go binaries.
+	strippedGoExeCache, _ = lru.New[string, struct{}](1000)
 )
 
 func (t *Tracer) AttachOpenSslUprobes(pid uint32) []link.Link {
@@ -181,7 +182,7 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 
 	// Skip binaries we already know are stripped (no TLS symbols).
 	// This avoids expensive ELF scanning for repeated short-lived processes like kubectl.
-	if _, stripped := strippedGoExeCache.Load(exeName); stripped {
+	if strippedGoExeCache.Contains(exeName) {
 		klog.V(3).Infof("GO_TLS_SKIP_STRIPPED: pid=%d exe=%s", pid, exeName)
 		return nil, true // still a Go app, just stripped
 	}
@@ -258,7 +259,7 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 				log("failed to get write symbol", err)
 				// Cache this exe as stripped to skip future attempts
 				if exeName != "" {
-					strippedGoExeCache.Store(exeName, struct{}{})
+					strippedGoExeCache.Add(exeName, struct{}{})
 				}
 				return nil, isGolangApp
 			}
