@@ -297,8 +297,29 @@ func (o *RateLimitedLogOutput) Write(data []byte) (int, error) {
 }
 
 // readCgroupMemoryLimit reads the memory limit from cgroup v2 or v1.
+// The agent runs with hostPID, so /proc/1/cgroup points to the host root (init.scope)
+// which has no memory limit. We use /proc/self/cgroup to find the container's own
+// cgroup path where kubelet enforces the pod memory limit.
 func readCgroupMemoryLimit() (int64, error) {
-	// Try cgroup v2 first
+	// Try cgroup v2: read our own cgroup path and look up memory.max there.
+	if data, err := os.ReadFile("/proc/self/cgroup"); err == nil {
+		// cgroupv2 format: "0::/kubepods.slice/.../cri-containerd-xxx.scope"
+		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+			parts := strings.SplitN(line, ":", 3)
+			if len(parts) == 3 && parts[0] == "0" {
+				cgPath := "/sys/fs/cgroup" + parts[2] + "/memory.max"
+				if mem, err := os.ReadFile(cgPath); err == nil {
+					s := strings.TrimSpace(string(mem))
+					if s != "max" {
+						if limit, err := strconv.ParseInt(s, 10, 64); err == nil {
+							return limit, nil
+						}
+					}
+				}
+			}
+		}
+	}
+	// Fallback: try cgroup v2 at root (non-hostPID containers)
 	if data, err := os.ReadFile("/sys/fs/cgroup/memory.max"); err == nil {
 		s := strings.TrimSpace(string(data))
 		if s != "max" {
