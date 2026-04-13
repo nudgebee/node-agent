@@ -301,17 +301,26 @@ func (o *RateLimitedLogOutput) Write(data []byte) (int, error) {
 // which has no memory limit. We use /proc/self/cgroup to find the container's own
 // cgroup path where kubelet enforces the pod memory limit.
 func readCgroupMemoryLimit() (int64, error) {
-	// Try cgroup v2: read our own cgroup path and look up memory.max there.
+	// Parse /proc/self/cgroup to find the container's own cgroup path.
+	// cgroupv2: "0::/kubepods.slice/.../cri-containerd-xxx.scope"
+	// cgroupv1: "N:memory:/kubepods/burstable/pod-xxx/container-yyy"
 	if data, err := os.ReadFile("/proc/self/cgroup"); err == nil {
-		// cgroupv2 format: "0::/kubepods.slice/.../cri-containerd-xxx.scope"
 		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
 			parts := strings.SplitN(line, ":", 3)
-			if len(parts) == 3 && parts[0] == "0" {
-				cgPath := "/sys/fs/cgroup" + parts[2] + "/memory.max"
+			if len(parts) < 3 {
+				continue
+			}
+			var cgPath string
+			if parts[0] == "0" { // cgroup v2
+				cgPath = "/sys/fs/cgroup" + parts[2] + "/memory.max"
+			} else if strings.Contains(parts[1], "memory") { // cgroup v1
+				cgPath = "/sys/fs/cgroup/memory" + parts[2] + "/memory.limit_in_bytes"
+			}
+			if cgPath != "" {
 				if mem, err := os.ReadFile(cgPath); err == nil {
 					s := strings.TrimSpace(string(mem))
 					if s != "max" {
-						if limit, err := strconv.ParseInt(s, 10, 64); err == nil {
+						if limit, err := strconv.ParseInt(s, 10, 64); err == nil && limit > 0 && limit < 1<<62 {
 							return limit, nil
 						}
 					}
@@ -328,11 +337,10 @@ func readCgroupMemoryLimit() (int64, error) {
 			}
 		}
 	}
-	// Try cgroup v1
+	// Fallback: try cgroup v1 at root (non-hostPID containers)
 	if data, err := os.ReadFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"); err == nil {
 		s := strings.TrimSpace(string(data))
 		if limit, err := strconv.ParseInt(s, 10, 64); err == nil {
-			// cgroup v1 reports a very large number when unlimited
 			if limit < 1<<62 {
 				return limit, nil
 			}
