@@ -69,6 +69,8 @@ var (
 
 	HttpPathNormalizationRules = kingpin.Flag("http-path-normalization-rules", "Custom HTTP path normalization rules in format 'pattern1:replacement1,pattern2:replacement2'").Envar("HTTP_PATH_NORMALIZATION_RULES").String()
 
+	AggregateEphemeralWorkloads = kingpin.Flag("aggregate-ephemeral-workloads", "Aggregate metrics for bare pods and standalone Jobs using standard labels to reduce series cardinality").Default("true").Envar("AGGREGATE_EPHEMERAL_WORKLOADS").Bool()
+
 	agentVersion = kingpin.Flag("version", "Print version and exit").Default("false").Bool()
 	Version      = "unknown"
 )
