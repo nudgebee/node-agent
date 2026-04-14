@@ -2,7 +2,6 @@ package logs
 
 import (
 	"context"
-	"crypto/tls"
 	"time"
 
 	otel "github.com/agoda-com/opentelemetry-logs-go"
@@ -41,7 +40,7 @@ func Init(machineId, hostname, version string) {
 	if endpointUrl.Scheme != "https" {
 		opts = append(opts, otlplogshttp.WithInsecure())
 	} else {
-		opts = append(opts, otlplogshttp.WithTLSClientConfig(&tls.Config{InsecureSkipVerify: *flags.InsecureSkipVerify}))
+		opts = append(opts, otlplogshttp.WithTLSClientConfig(common.TlsConfig()))
 	}
 	client := otlplogshttp.NewClient(opts...)
 	exporter, _ := otlplogs.NewExporter(context.Background(), otlplogs.WithClient(client))
