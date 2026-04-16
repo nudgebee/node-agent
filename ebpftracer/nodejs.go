@@ -14,7 +14,7 @@ import (
 func (t *Tracer) AttachNodejsProbes(pid uint32, exe string) []link.Link {
 	log := func(libPath, msg string, err error) {
 		if err != nil {
-			for _, s := range []string{"no such file or directory", "no such process", "permission denied"} {
+			for _, s := range []string{"no such file or directory", "no such process", "permission denied", "not found"} {
 				if strings.HasSuffix(err.Error(), s) {
 					return
 				}
