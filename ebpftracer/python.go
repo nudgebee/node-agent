@@ -20,10 +20,13 @@ var (
 func (t *Tracer) AttachPythonThreadLockProbes(pid uint32) []link.Link {
 	log := func(libPath, msg string, err error) {
 		if err != nil {
-			for _, s := range []string{"no such file or directory", "no such process", "permission denied", "not found"} {
+			for _, s := range []string{"no such file or directory", "no such process", "permission denied"} {
 				if strings.HasSuffix(err.Error(), s) {
 					return
 				}
+			}
+			if strings.Contains(err.Error(), "symbol") && strings.HasSuffix(err.Error(), "not found") {
+				return
 			}
 			klog.ErrorfDepth(1, "pid=%d lib=%s: %s: %s", pid, libPath, msg, err)
 			return
