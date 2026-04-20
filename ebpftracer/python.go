@@ -25,6 +25,9 @@ func (t *Tracer) AttachPythonThreadLockProbes(pid uint32) []link.Link {
 					return
 				}
 			}
+			if strings.Contains(err.Error(), "symbol") && strings.HasSuffix(err.Error(), "not found") {
+				return
+			}
 			klog.ErrorfDepth(1, "pid=%d lib=%s: %s: %s", pid, libPath, msg, err)
 			return
 		}

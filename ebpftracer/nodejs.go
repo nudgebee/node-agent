@@ -19,6 +19,9 @@ func (t *Tracer) AttachNodejsProbes(pid uint32, exe string) []link.Link {
 					return
 				}
 			}
+			if strings.Contains(err.Error(), "symbol") && strings.HasSuffix(err.Error(), "not found") {
+				return
+			}
 			klog.ErrorfDepth(1, "pid=%d lib=%s: %s: %s", pid, libPath, msg, err)
 			return
 		}
