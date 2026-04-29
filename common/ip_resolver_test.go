@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coroot/coroot-node-agent/flags"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	appsv1 "k8s.io/api/apps/v1"
@@ -25,6 +26,7 @@ type podDescriptor struct {
 	Phase      v1.PodPhase
 	UID        types.UID
 	Controller *workloadResourceDescriptor
+	Labels     map[string]string
 }
 
 type nodeDescriptor struct {
@@ -122,6 +124,7 @@ func generatePod(pod podDescriptor) runtime.Object {
 			Name:      pod.Name,
 			Namespace: pod.Namespace,
 			UID:       pod.UID,
+			Labels:    pod.Labels,
 		},
 		Status: v1.PodStatus{
 			PodIP: pod.IP,
@@ -397,7 +400,7 @@ func TestResolving(t *testing.T) {
 			initialState: testStep{
 				shouldWait: false,
 				newPods: []podDescriptor{
-					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.New().String()), nil},
+					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.New().String()), nil, nil},
 				},
 				expectedResolves: map[string]Workload{
 					"1.1.1.2": {
@@ -413,7 +416,7 @@ func TestResolving(t *testing.T) {
 			initialState: testStep{
 				shouldWait: false,
 				newPods: []podDescriptor{
-					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.New().String()), nil},
+					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.New().String()), nil, nil},
 				},
 				expectedResolves: map[string]Workload{
 					"1.1.1.1": {
@@ -429,9 +432,9 @@ func TestResolving(t *testing.T) {
 			initialState: testStep{
 				shouldWait: false,
 				newPods: []podDescriptor{
-					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.New().String()), nil},
-					{"pod2", "namespaceA", "1.1.1.2", v1.PodRunning, types.UID(uuid.New().String()), nil},
-					{"pod3", "namespaceA", "1.1.1.3", v1.PodRunning, types.UID(uuid.New().String()), nil},
+					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.New().String()), nil, nil},
+					{"pod2", "namespaceA", "1.1.1.2", v1.PodRunning, types.UID(uuid.New().String()), nil, nil},
+					{"pod3", "namespaceA", "1.1.1.3", v1.PodRunning, types.UID(uuid.New().String()), nil, nil},
 				},
 				expectedResolves: map[string]Workload{
 					"1.1.1.1": {
@@ -468,7 +471,7 @@ func TestResolving(t *testing.T) {
 				{
 					shouldWait: true,
 					newPods: []podDescriptor{
-						{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.New().String()), nil},
+						{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.New().String()), nil, nil},
 					},
 					expectedResolves: map[string]Workload{
 						"1.1.1.1": {
@@ -524,7 +527,7 @@ func TestResolving(t *testing.T) {
 				{
 					shouldWait: true,
 					newPods: []podDescriptor{
-						{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.New().String()), nil},
+						{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.New().String()), nil, nil},
 					},
 					newNodes: []nodeDescriptor{
 						{"Node1", "1.1.1.0", types.UID(uuid.NewString())},
@@ -549,7 +552,7 @@ func TestResolving(t *testing.T) {
 			initialState: testStep{
 				shouldWait: false,
 				newPods: []podDescriptor{
-					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.New().String()), nil},
+					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.New().String()), nil, nil},
 				},
 				expectedResolves: map[string]Workload{
 					"1.1.1.1": {
@@ -568,7 +571,7 @@ func TestResolving(t *testing.T) {
 				{
 					shouldWait: true,
 					modifiedPods: []podDescriptor{
-						{"pod1", "namespaceA", "1.1.1.2", v1.PodRunning, types.UID(uuid.New().String()), nil},
+						{"pod1", "namespaceA", "1.1.1.2", v1.PodRunning, types.UID(uuid.New().String()), nil, nil},
 					},
 					expectedResolves: map[string]Workload{
 						"1.1.1.1": { // the resolver shouldn't delete old not-reused entries
@@ -590,7 +593,7 @@ func TestResolving(t *testing.T) {
 			initialState: testStep{
 				shouldWait: false,
 				newPods: []podDescriptor{
-					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID("1"), nil},
+					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID("1"), nil, nil},
 				},
 				expectedResolves: map[string]Workload{
 					"1.1.1.1": {
@@ -609,14 +612,14 @@ func TestResolving(t *testing.T) {
 				{
 					shouldWait: false,
 					modifiedPods: []podDescriptor{
-						{"pod1", "namespaceA", "1.1.1.2", v1.PodRunning, types.UID("1"), nil},
+						{"pod1", "namespaceA", "1.1.1.2", v1.PodRunning, types.UID("1"), nil, nil},
 					},
 					expectedResolves: map[string]Workload{},
 				},
 				{
 					shouldWait: true,
 					newPods: []podDescriptor{
-						{"pod2", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.New().String()), nil},
+						{"pod2", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.New().String()), nil, nil},
 					},
 					expectedResolves: map[string]Workload{
 						"1.1.1.1": {
@@ -638,7 +641,7 @@ func TestResolving(t *testing.T) {
 			initialState: testStep{
 				shouldWait: false,
 				newPods: []podDescriptor{
-					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID("1"), nil},
+					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID("1"), nil, nil},
 				},
 				expectedResolves: map[string]Workload{
 					"1.1.1.1": {
@@ -657,7 +660,7 @@ func TestResolving(t *testing.T) {
 				{
 					shouldWait: false,
 					modifiedPods: []podDescriptor{
-						{"pod1", "namespaceA", "1.1.1.2", v1.PodRunning, types.UID("1"), nil},
+						{"pod1", "namespaceA", "1.1.1.2", v1.PodRunning, types.UID("1"), nil, nil},
 					},
 					expectedResolves: map[string]Workload{},
 				},
@@ -766,7 +769,7 @@ func TestResolving(t *testing.T) {
 				{
 					shouldWait: true,
 					newPods: []podDescriptor{
-						{"pod1", "namespaceA", "1.1.1.0", v1.PodRunning, types.UID(uuid.New().String()), nil},
+						{"pod1", "namespaceA", "1.1.1.0", v1.PodRunning, types.UID(uuid.New().String()), nil, nil},
 					},
 					expectedResolves: map[string]Workload{
 						"1.1.1.0": {
@@ -793,7 +796,7 @@ func TestControllersResolving(t *testing.T) {
 			initialState: testStep{
 				shouldWait: false,
 				newPods: []podDescriptor{
-					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), &testDeployment},
+					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), &testDeployment, nil},
 				},
 				newWorkloadResource: []workloadResourceDescriptor{testDeployment},
 				expectedResolves: map[string]Workload{
@@ -810,7 +813,7 @@ func TestControllersResolving(t *testing.T) {
 			initialState: testStep{
 				shouldWait: false,
 				newPods: []podDescriptor{
-					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), &testReplicaSet},
+					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), &testReplicaSet, nil},
 				},
 				newWorkloadResource: []workloadResourceDescriptor{testReplicaSet},
 				expectedResolves: map[string]Workload{
@@ -827,7 +830,7 @@ func TestControllersResolving(t *testing.T) {
 			initialState: testStep{
 				shouldWait: false,
 				newPods: []podDescriptor{
-					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), &testDaemonSet},
+					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), &testDaemonSet, nil},
 				},
 				newWorkloadResource: []workloadResourceDescriptor{testDaemonSet},
 				expectedResolves: map[string]Workload{
@@ -844,7 +847,7 @@ func TestControllersResolving(t *testing.T) {
 			initialState: testStep{
 				shouldWait: false,
 				newPods: []podDescriptor{
-					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), &testStatefulSet},
+					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), &testStatefulSet, nil},
 				},
 				newWorkloadResource: []workloadResourceDescriptor{testStatefulSet},
 				expectedResolves: map[string]Workload{
@@ -861,7 +864,7 @@ func TestControllersResolving(t *testing.T) {
 			initialState: testStep{
 				shouldWait: false,
 				newPods: []podDescriptor{
-					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), &testJob},
+					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), &testJob, nil},
 				},
 				newWorkloadResource: []workloadResourceDescriptor{testJob},
 				expectedResolves: map[string]Workload{
@@ -878,7 +881,7 @@ func TestControllersResolving(t *testing.T) {
 			initialState: testStep{
 				shouldWait: false,
 				newPods: []podDescriptor{
-					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), &testCronjob},
+					{"pod1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), &testCronjob, nil},
 				},
 				newWorkloadResource: []workloadResourceDescriptor{testCronjob},
 				expectedResolves: map[string]Workload{
@@ -892,6 +895,190 @@ func TestControllersResolving(t *testing.T) {
 		},
 	}
 	for _, test := range controllersTests {
+		t.Run(test.description, func(t *testing.T) {
+			runTest(t, test)
+		})
+	}
+}
+
+func TestResolveEphemeralWorkloadName(t *testing.T) {
+	tests := []struct {
+		name      string
+		labels    map[string]string
+		namespace string
+		expected  string
+	}{
+		{
+			name:      "app.kubernetes.io/name label",
+			labels:    map[string]string{"app.kubernetes.io/name": "airflow-worker"},
+			namespace: "airflow",
+			expected:  "airflow-worker",
+		},
+		{
+			name:      "app label",
+			labels:    map[string]string{"app": "my-batch-job"},
+			namespace: "data",
+			expected:  "my-batch-job",
+		},
+		{
+			name:      "component label",
+			labels:    map[string]string{"component": "dag-runner"},
+			namespace: "airflow",
+			expected:  "dag-runner",
+		},
+		{
+			name:      "app.kubernetes.io/name takes priority over app",
+			labels:    map[string]string{"app.kubernetes.io/name": "preferred", "app": "fallback"},
+			namespace: "ns",
+			expected:  "preferred",
+		},
+		{
+			name:      "no matching labels falls back to namespace-ephemeral",
+			labels:    map[string]string{"dag_id": "etl_pipeline", "run_id": "abc123"},
+			namespace: "airflow",
+			expected:  "airflow-ephemeral",
+		},
+		{
+			name:      "nil labels falls back to namespace-ephemeral",
+			labels:    nil,
+			namespace: "default",
+			expected:  "default-ephemeral",
+		},
+		{
+			name:      "empty label value is skipped",
+			labels:    map[string]string{"app": "", "component": "worker"},
+			namespace: "airflow",
+			expected:  "worker",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveEphemeralWorkloadName(tt.labels, tt.namespace)
+			assert.Equal(t, tt.expected, got)
+		})
+	}
+}
+
+func TestEphemeralWorkloadAggregation(t *testing.T) {
+	orig := flags.AggregateEphemeralWorkloads
+	enabled := true
+	flags.AggregateEphemeralWorkloads = &enabled
+	t.Cleanup(func() { flags.AggregateEphemeralWorkloads = orig })
+
+	var tests = []testScenario{
+		{
+			description: "bare pod with app label aggregates to label value",
+			initialState: testStep{
+				shouldWait: false,
+				newPods: []podDescriptor{
+					{"abbvie-val-m24-108-spdm-7ugt2ge6", "airflow", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), nil, map[string]string{"app": "airflow-task"}},
+				},
+				expectedResolves: map[string]Workload{
+					"1.1.1.1": {
+						Name:      "airflow-task",
+						Namespace: "airflow",
+						Kind:      "pod",
+					},
+				},
+			},
+		},
+		{
+			description: "bare pod without standard labels aggregates to namespace-ephemeral",
+			initialState: testStep{
+				shouldWait: false,
+				newPods: []podDescriptor{
+					{"abbvie-val-m24-108-spdm-7ugt2ge6", "airflow", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), nil, map[string]string{"dag_id": "etl"}},
+				},
+				expectedResolves: map[string]Workload{
+					"1.1.1.1": {
+						Name:      "airflow-ephemeral",
+						Namespace: "airflow",
+						Kind:      "pod",
+					},
+				},
+			},
+		},
+		{
+			description: "standalone Job aggregates to label value",
+			initialState: testStep{
+				shouldWait: false,
+				newPods: []podDescriptor{
+					{"job-pod-1", "airflow", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), &testJob, map[string]string{"app.kubernetes.io/name": "dag-executor"}},
+				},
+				newWorkloadResource: []workloadResourceDescriptor{testJob},
+				expectedResolves: map[string]Workload{
+					"1.1.1.1": {
+						Name:      "dag-executor",
+						Namespace: "airflow",
+						Kind:      "Job",
+					},
+				},
+			},
+		},
+		{
+			description: "CronJob-owned pod is NOT aggregated",
+			initialState: testStep{
+				shouldWait: false,
+				newPods: []podDescriptor{
+					{"cronjob-pod-1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), &testCronjob, map[string]string{"app": "should-not-use"}},
+				},
+				newWorkloadResource: []workloadResourceDescriptor{testCronjob},
+				expectedResolves: map[string]Workload{
+					"1.1.1.1": {
+						Name:      testCronjob.Name,
+						Namespace: testCronjob.Namespace,
+						Kind:      testCronjob.Kind,
+					},
+				},
+			},
+		},
+		{
+			description: "Deployment-owned pod is NOT aggregated",
+			initialState: testStep{
+				shouldWait: false,
+				newPods: []podDescriptor{
+					{"deploy-pod-1", "namespaceA", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), &testDeployment, map[string]string{"app": "should-not-use"}},
+				},
+				newWorkloadResource: []workloadResourceDescriptor{testDeployment},
+				expectedResolves: map[string]Workload{
+					"1.1.1.1": {
+						Name:      testDeployment.Name,
+						Namespace: testDeployment.Namespace,
+						Kind:      testDeployment.Kind,
+					},
+				},
+			},
+		},
+		{
+			description: "multiple ephemeral pods collapse to same workload name",
+			initialState: testStep{
+				shouldWait: false,
+				newPods: []podDescriptor{
+					{"task-pod-aaa", "airflow", "1.1.1.1", v1.PodRunning, types.UID(uuid.NewString()), nil, nil},
+					{"task-pod-bbb", "airflow", "1.1.1.2", v1.PodRunning, types.UID(uuid.NewString()), nil, nil},
+					{"task-pod-ccc", "airflow", "1.1.1.3", v1.PodRunning, types.UID(uuid.NewString()), nil, nil},
+				},
+				expectedResolves: map[string]Workload{
+					"1.1.1.1": {
+						Name:      "airflow-ephemeral",
+						Namespace: "airflow",
+						Kind:      "pod",
+					},
+					"1.1.1.2": {
+						Name:      "airflow-ephemeral",
+						Namespace: "airflow",
+						Kind:      "pod",
+					},
+					"1.1.1.3": {
+						Name:      "airflow-ephemeral",
+						Namespace: "airflow",
+						Kind:      "pod",
+					},
+				},
+			},
+		},
+	}
+	for _, test := range tests {
 		t.Run(test.description, func(t *testing.T) {
 			runTest(t, test)
 		})
