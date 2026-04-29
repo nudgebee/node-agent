@@ -263,7 +263,10 @@ func (p *Http2Parser) decodeHeaderBlock(
 		req := p.activeRequests[streamId]
 		if req == nil {
 			if len(p.activeRequests) >= maxActiveRequests {
-				// Too many active streams; skip to prevent unbounded growth
+				// Too many active streams; set no-op emit so decoder.Write still
+				// processes the HPACK block (keeps dynamic table in sync) without
+				// dereferencing a nil request.
+				decoder.SetEmitFunc(func(hf hpack.HeaderField) {})
 				break
 			}
 			req = &Http2Request{

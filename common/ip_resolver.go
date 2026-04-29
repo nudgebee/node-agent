@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/coroot/coroot-node-agent/flags"
 	lrucache "github.com/hashicorp/golang-lru/v2"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -829,6 +830,27 @@ func (resolver *K8sIPResolver) getControllerOfOwner(owner *metav1.OwnerReference
 	return getControllerOwnerRef(info.OwnerReferences), nil
 }
 
+// workloadIdentityLabels defines the priority order for finding a stable
+// workload identity from pod labels when no higher-level controller exists.
+var workloadIdentityLabels = []string{
+	"app.kubernetes.io/name",
+	"app",
+	"app.kubernetes.io/component",
+	"component",
+}
+
+// resolveEphemeralWorkloadName returns a stable workload name for bare pods
+// and standalone Jobs by checking standard Kubernetes labels. Falls back to
+// "<namespace>-ephemeral" to prevent cardinality explosion from unique pod names.
+func resolveEphemeralWorkloadName(labels map[string]string, namespace string) string {
+	for _, key := range workloadIdentityLabels {
+		if val, ok := labels[key]; ok && val != "" {
+			return val
+		}
+	}
+	return namespace + "-ephemeral"
+}
+
 func (resolver *K8sIPResolver) resolvePodDescriptor(pod *MinimalPod) Workload {
 	existing, ok := resolver.snapshot.PodDescriptors.Load(pod.UID)
 	if ok {
@@ -864,6 +886,12 @@ func (resolver *K8sIPResolver) resolvePodDescriptor(pod *MinimalPod) Workload {
 				break
 			}
 		}
+	}
+
+	// Aggregate ephemeral workloads (bare pods and standalone Jobs) to prevent
+	// cardinality explosion from unique pod/job names (e.g. Airflow task pods).
+	if *flags.AggregateEphemeralWorkloads && (kind == "pod" || kind == "Job") {
+		name = resolveEphemeralWorkloadName(pod.Labels, namespace)
 	}
 
 	instanceMeta, ok := resolver.instanceMetaMap.Load(pod.NodeName)
