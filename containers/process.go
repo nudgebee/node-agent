@@ -91,6 +91,15 @@ func (p *Process) isHostNs() bool {
 }
 
 func (p *Process) instrument(tracer *ebpftracer.Tracer) {
+	if delay := *flags.InstrumentationDelay; delay > 0 && !p.StartedAt.IsZero() {
+		if wait := delay - time.Since(p.StartedAt); wait > 0 {
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-time.After(wait):
+			}
+		}
+	}
 	b := backoff.Backoff{Factor: 2, Min: time.Second, Max: time.Minute}
 	for {
 		select {
