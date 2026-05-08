@@ -15,6 +15,7 @@
 #define PROTOCOL_CLICKHOUSE 14
 #define PROTOCOL_ZOOKEEPER  15
 #define PROTOCOL_FOUNDATIONDB 16
+#define PROTOCOL_TLS_CLIENTHELLO 17
 
 #define STATUS_UNKNOWN  0
 #define STATUS_OK       200
@@ -70,6 +71,7 @@
 #include "clickhouse.c"
 #include "zookeeper.c"
 #include "foundationdb.c"
+#include "sni.c"
 
 // Include socket info extraction (must be before l7_event uses socket_tuple)
 #include "../socket_info.c"
@@ -338,6 +340,21 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
     }
 
     if (req->protocol == PROTOCOL_UNKNOWN) { // Only detect protocol if it's not already known
+        // TLS ClientHello detection — capture SNI to enable LLM provider
+        // tagging on long-lived HTTP/2 connections where HPACK :authority
+        // decoding fails after a mid-stream agent attach.
+        if (conn->dport == 443 && is_tls_clienthello(payload, size)) {
+            struct l7_event *e = reserve_l7_event();
+            if (!e) { return 0; }
+            e->protocol = PROTOCOL_TLS_CLIENTHELLO;
+            e->method = 0;
+            e->duration = bpf_ktime_get_ns();
+            e->payload_size = size;
+            COPY_PAYLOAD_RINGBUF(e, e->payload, size, payload);
+            send_event(ctx, e, cid, conn);
+            return 0;
+        }
+
         // Port-based HTTP/2 hint: Try HTTP/2 detection first for HTTPS traffic (port 443/8443)
         // Most modern HTTPS traffic uses HTTP/2, and this helps detect gRPC DATA frames
         // that don't have the connection preface

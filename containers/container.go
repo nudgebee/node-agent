@@ -1274,6 +1274,23 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	case l7.ProtocolFoundationDB:
 		// Update stats for FoundationDB
 		c.l7Stats.observe(r.Protocol, r.Status.String(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+	case l7.ProtocolTLSClientHello:
+		// SNI-based LLM detection. The eBPF side captures TLS ClientHello
+		// records on outbound port-443 writes; here we parse the SNI and
+		// tag the connection if it matches a known LLM provider. This
+		// fires once per TCP connection (at handshake) and is independent
+		// of HPACK state, so it works for HTTP/2 connections where
+		// :authority parsing fails after a mid-stream agent attach.
+		host, err := l7.ParseSNI(r.Payload)
+		if err != nil || host == "" || c.llmDetector == nil {
+			return nil, L7RequestProcessed
+		}
+		destIP := conn.DestinationKey.ActualDestinationIfKnown().IP()
+		pidFd := PidFd{Pid: pid, Fd: fd}
+		if tag := c.llmDetector.LateTag(pidFd, host, destIP); tag != nil {
+			klog.V(2).Infof("LLM_SNI_TAG: pid=%d fd=%d sni=%s provider=%s",
+				pid, fd, host, tag.Provider)
+		}
 	default:
 		// For all other protocols, update stats
 		c.l7Stats.observe(r.Protocol, "unknown", "", "", 0, conn.DestinationKey, conn.srcWorkload, r, "")
