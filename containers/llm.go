@@ -38,10 +38,22 @@ var llmProviders = map[string]LLMProvider{
 	"aiplatform.googleapis.com":         ProviderGoogle,
 	"api.cohere.ai":                     ProviderCohere,
 	"api.cohere.com":                    ProviderCohere,
+	// OpenAI-API-compatible providers — same request/response shape, reuse the OpenAI parser.
+	"api.groq.com":      ProviderOpenAICompatible,
+	"api.together.xyz":  ProviderOpenAICompatible,
+	"api.fireworks.ai":  ProviderOpenAICompatible,
+	"api.deepseek.com":  ProviderOpenAICompatible,
+	"api.mistral.ai":    ProviderOpenAICompatible,
+	"api.perplexity.ai": ProviderOpenAICompatible,
 }
 
 var bedrockHostnameRegex = regexp.MustCompile(`^bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com$`)
 var azureOpenAIHostnameRegex = regexp.MustCompile(`^[a-z0-9-]+\.openai\.azure\.com$`)
+
+// Vertex AI regional endpoints: us-central1-aiplatform.googleapis.com,
+// europe-west4-aiplatform.googleapis.com, etc. The unregioned
+// aiplatform.googleapis.com is matched by the exact-match table above.
+var vertexAIRegionalRegex = regexp.MustCompile(`^[a-z0-9-]+-aiplatform\.googleapis\.com$`)
 
 // DetectLLMProvider identifies if a hostname belongs to an LLM provider.
 func DetectLLMProvider(hostname string) LLMProvider {
@@ -60,6 +72,9 @@ func DetectLLMProvider(hostname string) LLMProvider {
 	}
 	if azureOpenAIHostnameRegex.MatchString(hostname) {
 		return ProviderAzureOpenAI
+	}
+	if vertexAIRegionalRegex.MatchString(hostname) {
+		return ProviderGoogle
 	}
 
 	// Subdomain matching (e.g., "chat.openai.com")
