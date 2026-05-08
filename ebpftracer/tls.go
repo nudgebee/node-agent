@@ -187,7 +187,14 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 	path := proc.Path(pid, "exe")
 
 	exeName, _ := os.Readlink(path)
-	klog.V(2).Infof("GO_TLS_ATTACH_ATTEMPT: pid=%d exe=%s", pid, exeName)
+	if exeName == "" {
+		// /proc/<pid>/exe is unreadable (transient process exiting, namespace
+		// issues, etc.). Demote to V(3) so we don't spam at default verbosity —
+		// this fires for every short-lived process the agent observes.
+		klog.V(3).Infof("GO_TLS_ATTACH_ATTEMPT: pid=%d exe=<unreadable>", pid)
+	} else {
+		klog.V(2).Infof("GO_TLS_ATTACH_ATTEMPT: pid=%d exe=%s", pid, exeName)
+	}
 
 	// Skip binaries we already know are stripped (no TLS symbols).
 	// This avoids expensive ELF scanning for repeated short-lived processes like kubectl.
