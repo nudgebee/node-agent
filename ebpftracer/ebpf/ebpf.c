@@ -27,8 +27,8 @@
     }                                                 \
 })
 
-// Debug logging — re-enabled to diagnose SNI gap. Disable after verification.
-#define BPF_DEBUG 1
+// Debug logging disabled - uncomment below to enable
+// #define BPF_DEBUG 1
 
 #undef bpf_printk
 #ifdef BPF_DEBUG
