@@ -27,8 +27,8 @@
     }                                                 \
 })
 
-// Debug logging disabled - uncomment below to enable
-// #define BPF_DEBUG 1
+// Debug logging — temporarily enabled to diagnose SNI detection. Revert after.
+#define BPF_DEBUG 1
 
 #undef bpf_printk
 #ifdef BPF_DEBUG

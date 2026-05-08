@@ -1016,6 +1016,12 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		protocol = conn.protocolOverride
 	}
 
+	// DEBUG: log every event protocol so we can tell if PROTOCOL_TLS_CLIENTHELLO
+	// (=17) is being emitted from eBPF. Will remove once SNI detection is verified.
+	if protocol == l7.ProtocolTLSClientHello {
+		klog.V(2).Infof("L7_EVENT_TLSCH: pid=%d fd=%d size=%d", pid, fd, len(r.Payload))
+	}
+
 	// Process L7 requests and update metrics
 	switch protocol {
 	case l7.ProtocolDNS:
