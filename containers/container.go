@@ -1016,12 +1016,6 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		protocol = conn.protocolOverride
 	}
 
-	// DEBUG: log every event protocol so we can tell if PROTOCOL_TLS_CLIENTHELLO
-	// (=17) is being emitted from eBPF. Will remove once SNI detection is verified.
-	if protocol == l7.ProtocolTLSClientHello {
-		klog.V(2).Infof("L7_EVENT_TLSCH: pid=%d fd=%d size=%d", pid, fd, len(r.Payload))
-	}
-
 	// Process L7 requests and update metrics
 	switch protocol {
 	case l7.ProtocolDNS:
@@ -1287,14 +1281,8 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		// fires once per TCP connection (at handshake) and is independent
 		// of HPACK state, so it works for HTTP/2 connections where
 		// :authority parsing fails after a mid-stream agent attach.
-		klog.V(2).Infof("LLM_SNI_EVENT: pid=%d fd=%d payload_size=%d", pid, fd, len(r.Payload))
 		host, err := l7.ParseSNI(r.Payload)
-		if err != nil {
-			klog.V(2).Infof("LLM_SNI_PARSE_FAIL: pid=%d fd=%d err=%v size=%d", pid, fd, err, len(r.Payload))
-			return nil, L7RequestProcessed
-		}
-		klog.V(2).Infof("LLM_SNI_PARSED: pid=%d fd=%d sni=%s", pid, fd, host)
-		if host == "" || c.llmDetector == nil {
+		if err != nil || host == "" || c.llmDetector == nil {
 			return nil, L7RequestProcessed
 		}
 		destIP := conn.DestinationKey.ActualDestinationIfKnown().IP()
@@ -1302,8 +1290,6 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		if tag := c.llmDetector.LateTag(pidFd, host, destIP); tag != nil {
 			klog.V(2).Infof("LLM_SNI_TAG: pid=%d fd=%d sni=%s provider=%s",
 				pid, fd, host, tag.Provider)
-		} else {
-			klog.V(2).Infof("LLM_SNI_NO_PROVIDER: pid=%d fd=%d sni=%s", pid, fd, host)
 		}
 	default:
 		// For all other protocols, update stats
