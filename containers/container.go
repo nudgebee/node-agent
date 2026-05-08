@@ -1315,12 +1315,12 @@ func (c *Container) processHTTP2WithoutConnection(pid uint32, fd uint64, r *l7.R
 		llmTag = c.llmDetector.IsLLMConnection(pidFd, dstIP[0])
 	}
 
-	// If not tagged and no IP, we still need to parse to try :authority fallback.
-	// If tagged as non-LLM via IP, skip parsing entirely.
-	if llmTag == nil && len(dstIP) > 0 && !dstIP[0].IsZero() {
-		// IP known but not an LLM provider — skip
-		return nil, L7RequestProcessed
-	}
+	// Note: do NOT early-skip when llmTag is nil. The IP cache is positive-only —
+	// Google providers (generativelanguage.googleapis.com, *-aiplatform.googleapis.com)
+	// are intentionally excluded from the cache because they share anycast IPs with
+	// non-LLM googleapis.com services. For those, detection MUST come from the
+	// HTTP/2 :authority header below. We bound overhead with Lightweight mode and
+	// per-container parser caps; non-LLM parsers are deleted after first completion.
 
 	// Parse the HTTP/2 frames
 	if c.googleHTTP2Parsers == nil {
@@ -1351,6 +1351,8 @@ func (c *Container) processHTTP2WithoutConnection(pid uint32, fd uint64, r *l7.R
 					}
 					llmTag = c.llmDetector.LateTag(pidFd, host, ip)
 					if llmTag != nil {
+						klog.V(2).Infof("LLM_LATETAG_FALLBACK: pid=%d fd=%d host=%s provider=%s",
+							pid, fd, host, llmTag.Provider)
 						break
 					}
 				}
