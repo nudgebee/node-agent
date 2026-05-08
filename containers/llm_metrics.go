@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -96,9 +97,34 @@ var (
 			"error_type", // rate_limit, timeout, invalid_request, server_error, auth_error
 		},
 	)
+
+	// LLMSNITagsTotal counts successful SNI-based provider tags. Each
+	// increment means the agent caught a TLS ClientHello with an SNI that
+	// matched a known LLM provider. Useful for spotting tagging regressions
+	// independently of whether downstream HTTP/2 parsing succeeds.
+	LLMSNITagsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "node_agent_llm_sni_tags_total",
+			Help: "Total LLM connections tagged via TLS ClientHello SNI",
+		},
+		[]string{"provider"},
+	)
+
+	// LLMHPACKDecodeErrorsTotal counts HPACK decode failures in the HTTP/2
+	// parser. When non-zero on llm-server connections, indicates the agent
+	// joined a long-lived HTTP/2 connection mid-stream and lost dynamic-table
+	// state (the classic Go-TLS-HTTP/2 mid-stream-join failure mode).
+	// The SNI path bypasses this; this counter is the early warning.
+	LLMHPACKDecodeErrorsTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "node_agent_hpack_decode_errors_total",
+			Help: "Total HPACK decode errors in HTTP/2 parser (mid-stream join indicator)",
+		},
+	)
 )
 
-// RegisterLLMMetrics registers all LLM metrics with the provided registerer.
+// RegisterLLMMetrics registers all LLM metrics with the provided registerer
+// and wires l7-package callbacks that increment self-observability counters.
 func RegisterLLMMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(
 		ContainerLLMRequestsTotal,
@@ -107,7 +133,12 @@ func RegisterLLMMetrics(reg prometheus.Registerer) {
 		ContainerLLMRequestDuration,
 		ContainerLLMTokensPerSecond,
 		ContainerLLMErrorsTotal,
+		LLMSNITagsTotal,
+		LLMHPACKDecodeErrorsTotal,
 	)
+	// Hook the HTTP/2 parser's HPACK error path so we get a counter without
+	// l7 having to import prometheus.
+	l7.OnHPACKDecodeError = func() { LLMHPACKDecodeErrorsTotal.Inc() }
 }
 
 // RecordLLMEvent is the single entry point for recording LLM metrics.

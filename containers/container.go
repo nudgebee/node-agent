@@ -1288,6 +1288,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		destIP := conn.DestinationKey.ActualDestinationIfKnown().IP()
 		pidFd := PidFd{Pid: pid, Fd: fd}
 		if tag := c.llmDetector.LateTag(pidFd, host, destIP); tag != nil {
+			LLMSNITagsTotal.WithLabelValues(string(tag.Provider)).Inc()
 			klog.V(2).Infof("LLM_SNI_TAG: pid=%d fd=%d sni=%s provider=%s",
 				pid, fd, host, tag.Provider)
 		}
