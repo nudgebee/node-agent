@@ -121,6 +121,57 @@ var (
 			Help: "Total HPACK decode errors in HTTP/2 parser (mid-stream join indicator)",
 		},
 	)
+
+	// ContainerLLMCachedTokensTotal counts input tokens served from the
+	// provider's prompt cache. Already counted in token_usage_total{type=input};
+	// this is a separate metric to make cache-hit rate computable.
+	ContainerLLMCachedTokensTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "container_llm_cached_input_tokens_total",
+			Help: "Cumulative input tokens served from the provider's prompt cache",
+		},
+		[]string{
+			"container_id",
+			"gen_ai_operation_name",
+			"gen_ai_request_model",
+			"gen_ai_system",
+			"server_address",
+		},
+	)
+
+	// ContainerLLMToolCallsTotal counts tool/function-call invocations in
+	// completed responses. Useful for spotting agentic workloads and per-
+	// request tool fan-out.
+	ContainerLLMToolCallsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "container_llm_tool_calls_total",
+			Help: "Cumulative tool/function-call invocations in LLM responses",
+		},
+		[]string{
+			"container_id",
+			"gen_ai_operation_name",
+			"gen_ai_request_model",
+			"gen_ai_system",
+		},
+	)
+
+	// ContainerLLMCostUSDTotal records derived cost in USD from a static
+	// pricing table (containers/llm_pricing.go). Best-effort and excludes
+	// volume discounts; reconcile with provider invoices for billing.
+	// Series only emitted when pricing matches the model.
+	ContainerLLMCostUSDTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "container_llm_cost_usd_total",
+			Help: "Cumulative LLM cost in USD (best-effort, list prices, no volume discount)",
+		},
+		[]string{
+			"container_id",
+			"gen_ai_operation_name",
+			"gen_ai_request_model",
+			"gen_ai_system",
+			"server_address",
+		},
+	)
 )
 
 // RegisterLLMMetrics registers all LLM metrics with the provided registerer
@@ -135,6 +186,9 @@ func RegisterLLMMetrics(reg prometheus.Registerer) {
 		ContainerLLMErrorsTotal,
 		LLMSNITagsTotal,
 		LLMHPACKDecodeErrorsTotal,
+		ContainerLLMCachedTokensTotal,
+		ContainerLLMToolCallsTotal,
+		ContainerLLMCostUSDTotal,
 	)
 	// Hook the HTTP/2 parser's HPACK error path so we get a counter without
 	// l7 having to import prometheus.
@@ -203,6 +257,29 @@ func RecordLLMEvent(event *LLMEvent) {
 			"server_address":        event.ServerAddress,
 			"gen_ai_token_type":     "output",
 		}).Add(float64(event.OutputTokens))
+	}
+
+	// Cached input tokens (subset of input tokens served from prompt cache).
+	if event.CachedInputTokens > 0 {
+		ContainerLLMCachedTokensTotal.With(baseLabels).Add(float64(event.CachedInputTokens))
+	}
+
+	// Tool/function calls observed in the response.
+	if event.ToolCallCount > 0 {
+		ContainerLLMToolCallsTotal.With(prometheus.Labels{
+			"container_id":          containerID,
+			"gen_ai_operation_name": operation,
+			"gen_ai_request_model":  model,
+			"gen_ai_system":         provider,
+		}).Add(float64(event.ToolCallCount))
+	}
+
+	// Cost in USD (best-effort from static pricing table). Only emitted when
+	// a pricing entry matches the model — absent series means "no pricing"
+	// rather than "$0".
+	if cost := CalculateCostUSD(event.Provider, event.Model,
+		event.InputTokens, event.OutputTokens, event.CachedInputTokens); cost > 0 {
+		ContainerLLMCostUSDTotal.With(baseLabels).Add(cost)
 	}
 
 	// Duration

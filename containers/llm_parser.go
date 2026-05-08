@@ -59,6 +59,13 @@ type LLMEvent struct {
 	StatusCode    int
 	InputTokens   int
 	OutputTokens  int
+	// CachedInputTokens are input tokens served from the provider's prompt
+	// cache. Already counted in InputTokens; the cost calculator subtracts
+	// them and applies the cached rate.
+	CachedInputTokens int
+	// ToolCallCount is the number of tool/function-call invocations in the
+	// response. 0 for non-tool-using requests.
+	ToolCallCount int
 	Duration      time.Duration
 	TTFT          time.Duration // Zero if non-streaming or unknown
 	IsStreaming   bool
@@ -144,6 +151,8 @@ func (p *LLMParser) ParseHTTP1(tag *LLMConnectionTag, statusCode int,
 	traceID string) {
 
 	model, inputTokens, outputTokens := extractFromResponseBody(tag.Provider, responseBody)
+	cachedTokens := extractCachedTokens(tag.Provider, responseBody)
+	toolCalls := extractToolCallCount(tag.Provider, responseBody)
 
 	// Fallback: try request body for model if response didn't have it
 	if model == "" {
@@ -163,19 +172,21 @@ func (p *LLMParser) ParseHTTP1(tag *LLMConnectionTag, statusCode int,
 	}
 
 	event := &LLMEvent{
-		Provider:      tag.Provider,
-		Model:         model,
-		Operation:     operation,
-		ServerAddress: tag.Host,
-		StatusCode:    statusCode,
-		InputTokens:   inputTokens,
-		OutputTokens:  outputTokens,
-		Duration:      duration,
-		IsStreaming:   false,
-		ContainerID:   p.containerID,
-		PodName:       p.podName,
-		Namespace:     p.namespace,
-		TraceID:       traceID,
+		Provider:          tag.Provider,
+		Model:             model,
+		Operation:         operation,
+		ServerAddress:     tag.Host,
+		StatusCode:        statusCode,
+		InputTokens:       inputTokens,
+		OutputTokens:      outputTokens,
+		CachedInputTokens: cachedTokens,
+		ToolCallCount:     toolCalls,
+		Duration:          duration,
+		IsStreaming:       false,
+		ContainerID:       p.containerID,
+		PodName:           p.podName,
+		Namespace:         p.namespace,
+		TraceID:           traceID,
 	}
 
 	klog.V(3).Infof("LLM_HTTP1: provider=%s model=%s status=%d input=%d output=%d dur=%s",
@@ -333,6 +344,8 @@ func (p *LLMParser) completeStream(streamID uint32) {
 
 	// Extract model and tokens from accumulated response data
 	model, inputTokens, outputTokens := extractFromSSEBuffer(s.provider, bufData)
+	cachedTokens := extractCachedTokensFromSSEBuffer(s.provider, bufData)
+	toolCalls := extractToolCallCountFromSSEBuffer(s.provider, bufData)
 	if model == "" {
 		model = modelFromPath(s.provider, s.path)
 	}
@@ -346,22 +359,24 @@ func (p *LLMParser) completeStream(streamID uint32) {
 	}
 
 	event := &LLMEvent{
-		Provider:      s.provider,
-		Model:         model,
-		Operation:     operation,
-		ServerAddress: s.host,
-		StatusCode:    s.statusCode,
-		InputTokens:   inputTokens,
-		OutputTokens:  outputTokens,
-		Duration:      duration,
-		TTFT:          ttft,
-		IsStreaming:   true,
-		ContainerID:   p.containerID,
-		PodName:       p.podName,
-		Namespace:     p.namespace,
-		TraceID:       s.traceID,
-		ParentSpanID:  s.parentSpanID,
-		SpanID:        s.spanID,
+		Provider:          s.provider,
+		Model:             model,
+		Operation:         operation,
+		ServerAddress:     s.host,
+		StatusCode:        s.statusCode,
+		InputTokens:       inputTokens,
+		OutputTokens:      outputTokens,
+		CachedInputTokens: cachedTokens,
+		ToolCallCount:     toolCalls,
+		Duration:          duration,
+		TTFT:              ttft,
+		IsStreaming:       true,
+		ContainerID:       p.containerID,
+		PodName:           p.podName,
+		Namespace:         p.namespace,
+		TraceID:           s.traceID,
+		ParentSpanID:      s.parentSpanID,
+		SpanID:            s.spanID,
 	}
 
 	klog.Infof("LLM_STREAM_COMPLETE: provider=%s model=%s status=%d input=%d output=%d dur=%s ttft=%s",
@@ -530,6 +545,172 @@ func extractFromResponseBody(provider LLMProvider, body []byte) (model string, i
 	return
 }
 
+// extractCachedTokens extracts the number of input tokens served from the
+// provider's prompt cache (already counted in InputTokens above). Returns
+// 0 when the provider does not report caching info.
+func extractCachedTokens(provider LLMProvider, body []byte) int {
+	if len(body) == 0 {
+		return 0
+	}
+	switch provider {
+	case ProviderOpenAI, ProviderOpenAICompatible, ProviderAzureOpenAI:
+		var resp struct {
+			Usage struct {
+				PromptTokensDetails struct {
+					CachedTokens int `json:"cached_tokens"`
+				} `json:"prompt_tokens_details"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal(body, &resp); err == nil {
+			return resp.Usage.PromptTokensDetails.CachedTokens
+		}
+	case ProviderAnthropic:
+		var resp struct {
+			Usage struct {
+				CacheReadInputTokens int `json:"cache_read_input_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal(body, &resp); err == nil {
+			return resp.Usage.CacheReadInputTokens
+		}
+	case ProviderGoogle:
+		var resp struct {
+			UsageMetadata struct {
+				CachedContentTokenCount int `json:"cachedContentTokenCount"`
+			} `json:"usageMetadata"`
+		}
+		if err := json.Unmarshal(body, &resp); err == nil {
+			return resp.UsageMetadata.CachedContentTokenCount
+		}
+	case ProviderAWSBedrock:
+		// Anthropic-on-Bedrock InvokeModel has the same field as Anthropic direct.
+		var resp struct {
+			Usage struct {
+				CacheReadInputTokens int `json:"cache_read_input_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal(body, &resp); err == nil {
+			return resp.Usage.CacheReadInputTokens
+		}
+	}
+	return 0
+}
+
+// extractToolCallCount counts tool/function calls in a non-streaming response
+// body. Tool-call counting is independent of token tokens — used to spot
+// agentic workloads and characterize per-request tool fan-out.
+func extractToolCallCount(provider LLMProvider, body []byte) int {
+	if len(body) == 0 {
+		return 0
+	}
+	switch provider {
+	case ProviderOpenAI, ProviderOpenAICompatible, ProviderAzureOpenAI:
+		// Chat Completions: choices[].message.tool_calls[]; legacy: function_call (count 1)
+		var resp struct {
+			Choices []struct {
+				Message struct {
+					ToolCalls []struct {
+						ID string `json:"id"`
+					} `json:"tool_calls"`
+					FunctionCall *struct {
+						Name string `json:"name"`
+					} `json:"function_call"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(body, &resp); err == nil {
+			n := 0
+			for _, c := range resp.Choices {
+				n += len(c.Message.ToolCalls)
+				if c.Message.FunctionCall != nil && c.Message.FunctionCall.Name != "" {
+					n++
+				}
+			}
+			return n
+		}
+	case ProviderAnthropic:
+		// Messages API: content[] entries with type="tool_use".
+		var resp struct {
+			Content []struct {
+				Type string `json:"type"`
+			} `json:"content"`
+		}
+		if err := json.Unmarshal(body, &resp); err == nil {
+			n := 0
+			for _, c := range resp.Content {
+				if c.Type == "tool_use" {
+					n++
+				}
+			}
+			return n
+		}
+	case ProviderGoogle:
+		// Gemini: candidates[].content.parts[] entries with functionCall.
+		var resp struct {
+			Candidates []struct {
+				Content struct {
+					Parts []struct {
+						FunctionCall *struct {
+							Name string `json:"name"`
+						} `json:"functionCall"`
+					} `json:"parts"`
+				} `json:"content"`
+			} `json:"candidates"`
+		}
+		if err := json.Unmarshal(body, &resp); err == nil {
+			n := 0
+			for _, c := range resp.Candidates {
+				for _, p := range c.Content.Parts {
+					if p.FunctionCall != nil && p.FunctionCall.Name != "" {
+						n++
+					}
+				}
+			}
+			return n
+		}
+	case ProviderAWSBedrock:
+		// Converse: output.message.content[] with toolUse entries.
+		var converse struct {
+			Output struct {
+				Message struct {
+					Content []struct {
+						ToolUse *struct {
+							ToolUseID string `json:"toolUseId"`
+						} `json:"toolUse"`
+					} `json:"content"`
+				} `json:"message"`
+			} `json:"output"`
+		}
+		if err := json.Unmarshal(body, &converse); err == nil {
+			n := 0
+			for _, c := range converse.Output.Message.Content {
+				if c.ToolUse != nil && c.ToolUse.ToolUseID != "" {
+					n++
+				}
+			}
+			if n > 0 {
+				return n
+			}
+		}
+		// InvokeModel (Anthropic-shaped) fallback.
+		var anthropic struct {
+			Content []struct {
+				Type string `json:"type"`
+			} `json:"content"`
+		}
+		if err := json.Unmarshal(body, &anthropic); err == nil {
+			n := 0
+			for _, c := range anthropic.Content {
+				if c.Type == "tool_use" {
+					n++
+				}
+			}
+			return n
+		}
+	}
+	return 0
+}
+
 // --- SSE buffer parsing (streaming) ---
 
 // extractFromSSEBuffer extracts model, input tokens, and output tokens from
@@ -669,4 +850,75 @@ func cleanBedrockModel(raw string) string {
 	}
 
 	return decoded
+}
+
+// --- SSE buffer parsing for cached tokens and tool calls ---
+
+// SSE responses are sequences of JSON fragments rather than single objects;
+// each fragment may carry partial state. We use regex over the accumulated
+// buffer rather than json.Unmarshal because the byte sequence is not a
+// single valid JSON document.
+var (
+	// OpenAI SSE: "usage":{"prompt_tokens_details":{"cached_tokens":N}}
+	reOpenAICachedTokens = regexp.MustCompile(`"prompt_tokens_details"\s*:\s*\{[^}]*"cached_tokens"\s*:\s*(\d+)`)
+	// Anthropic SSE: "cache_read_input_tokens":N
+	reAnthropicCachedTokens = regexp.MustCompile(`"cache_read_input_tokens"\s*:\s*(\d+)`)
+	// Gemini SSE: "cachedContentTokenCount":N
+	reGeminiCachedTokens = regexp.MustCompile(`"cachedContentTokenCount"\s*:\s*(\d+)`)
+
+	// OpenAI tool_calls in stream deltas: each tool_call has an "index" field
+	// and may be split across many delta frames. Counting unique indices
+	// approximates the tool call count without joining fragments.
+	reOpenAIToolCallIndex = regexp.MustCompile(`"tool_calls"\s*:\s*\[\s*\{[^}]*"index"\s*:\s*(\d+)`)
+	// Anthropic stream: content_block_start with type:tool_use, one per call.
+	reAnthropicToolUseStart = regexp.MustCompile(`"type"\s*:\s*"content_block_start"[^}]*"type"\s*:\s*"tool_use"`)
+	// Gemini streaming: functionCall objects appearing in parts[].
+	reGeminiFunctionCall = regexp.MustCompile(`"functionCall"\s*:\s*\{`)
+)
+
+func extractCachedTokensFromSSEBuffer(provider LLMProvider, data []byte) int {
+	if len(data) == 0 {
+		return 0
+	}
+	var re *regexp.Regexp
+	switch provider {
+	case ProviderOpenAI, ProviderOpenAICompatible, ProviderAzureOpenAI:
+		re = reOpenAICachedTokens
+	case ProviderAnthropic, ProviderAWSBedrock:
+		re = reAnthropicCachedTokens
+	case ProviderGoogle:
+		re = reGeminiCachedTokens
+	default:
+		return 0
+	}
+	if m := re.FindSubmatch(data); len(m) >= 2 {
+		var n int
+		fmt.Sscanf(string(m[1]), "%d", &n)
+		return n
+	}
+	return 0
+}
+
+func extractToolCallCountFromSSEBuffer(provider LLMProvider, data []byte) int {
+	if len(data) == 0 {
+		return 0
+	}
+	switch provider {
+	case ProviderOpenAI, ProviderOpenAICompatible, ProviderAzureOpenAI:
+		// Count distinct tool_call indices observed in delta frames.
+		matches := reOpenAIToolCallIndex.FindAllSubmatch(data, -1)
+		if len(matches) == 0 {
+			return 0
+		}
+		seen := map[string]struct{}{}
+		for _, m := range matches {
+			seen[string(m[1])] = struct{}{}
+		}
+		return len(seen)
+	case ProviderAnthropic, ProviderAWSBedrock:
+		return len(reAnthropicToolUseStart.FindAllIndex(data, -1))
+	case ProviderGoogle:
+		return len(reGeminiFunctionCall.FindAllIndex(data, -1))
+	}
+	return 0
 }
