@@ -274,6 +274,13 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
             // are never in active_connections. Allow DNS through for ip2fqdn resolution.
             conn_on_stack.dport = 53;
             conn = &conn_on_stack;
+        } else if (get_socket_tuple_from_fd((__u32)fd, &tuple) && tuple.dport == 443) {
+            // Port 443 fallback: TLS ClientHello detection requires reaching
+            // the protocol-detection chain even when active_connections lookup
+            // races with the connect (common for Go where connect and the
+            // first write may run on different threads).
+            conn_on_stack.dport = 443;
+            conn = &conn_on_stack;
         }
     }
 
