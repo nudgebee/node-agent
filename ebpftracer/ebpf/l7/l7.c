@@ -347,10 +347,16 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
     }
 
     if (req->protocol == PROTOCOL_UNKNOWN) { // Only detect protocol if it's not already known
+        // Diagnostic: log every protocol-detection entry on port 443 to confirm
+        // sys_enter_write is reaching here for outbound HTTPS.
+        if (conn->dport == 443) {
+            bpf_printk("sni_check: pid=%u fd=%llu size=%llu", cid.pid, fd, size);
+        }
         // TLS ClientHello detection — capture SNI to enable LLM provider
         // tagging on long-lived HTTP/2 connections where HPACK :authority
         // decoding fails after a mid-stream agent attach.
         if (conn->dport == 443 && is_tls_clienthello(payload, size)) {
+            bpf_printk("sni_match: pid=%u fd=%llu size=%llu", cid.pid, fd, size);
             struct l7_event *e = reserve_l7_event();
             if (!e) { return 0; }
             e->protocol = PROTOCOL_TLS_CLIENTHELLO;
@@ -359,6 +365,7 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
             e->payload_size = size;
             COPY_PAYLOAD_RINGBUF(e, e->payload, size, payload);
             send_event(ctx, e, cid, conn);
+            bpf_printk("sni_sent: pid=%u fd=%llu", cid.pid, fd);
             return 0;
         }
 
