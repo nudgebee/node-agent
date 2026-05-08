@@ -438,6 +438,14 @@ func (r *Registry) processL7Event(e ebpftracer.Event) {
 		r.ip2fqdnLock.Unlock()
 		// Feed DNS resolutions to LLM detector for connection-level detection
 		r.feedDNSToLLMDetector(ip2fqdn)
+	} else if e.L7Request.Protocol == l7.ProtocolTLSClientHello {
+		// SNI events from pids not yet tracked in containersByPid (transient
+		// processes, or the race where the main /app/services pid is sending
+		// its first ClientHello before the agent's process detection has
+		// indexed it). Queue for retry — by the time the agent processes
+		// the next batch the pid is usually mapped.
+		r.queueL7EventForRetry(e)
+		return
 	} else if e.L7Request.Protocol == l7.ProtocolDNS {
 		// Handle DNS queries from non-monitored processes for global ip2fqdn mapping
 		ip2fqdn := r.handleHostDNSRequest(e.L7Request)
