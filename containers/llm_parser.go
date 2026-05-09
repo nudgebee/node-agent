@@ -349,6 +349,18 @@ func (p *LLMParser) completeStream(streamID uint32) {
 	model, inputTokens, outputTokens := extractFromSSEBuffer(s.provider, bufData)
 	cachedTokens := extractCachedTokensFromSSEBuffer(s.provider, bufData)
 	toolCalls := extractToolCallCountFromSSEBuffer(s.provider, bufData)
+	// DEBUG: log buffer characteristics when token extraction yields zero
+	// to help diagnose why downstream metrics (cost/tokens) aren't emitted
+	// even when model resolves cleanly via path. Remove once we have a fix.
+	if klog.V(2).Enabled() && (inputTokens == 0 && outputTokens == 0) && len(bufData) > 0 {
+		isGzip := len(bufData) >= 2 && bufData[0] == 0x1f && bufData[1] == 0x8b
+		head := bufData
+		if len(head) > 200 {
+			head = head[:200]
+		}
+		klog.V(2).Infof("LLM_BUFFER_DEBUG: provider=%s path=%s buf_len=%d gzip=%v head=%q",
+			s.provider, s.path, len(bufData), isGzip, string(head))
+	}
 	if model == "" {
 		model = modelFromPath(s.provider, s.path)
 	}
