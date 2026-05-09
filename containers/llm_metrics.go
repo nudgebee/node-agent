@@ -20,7 +20,7 @@ var (
 			"container_id",
 			"gen_ai_operation_name",     // chat, text_completion, embeddings, generate_content
 			"gen_ai_request_model",      // gpt-4, claude-3, gemini-2.5-pro, etc.
-			"gen_ai_system",             // openai, anthropic, gcp.gemini, aws.bedrock
+			"gen_ai_provider_name",      // openai, anthropic, gcp.gemini, aws.bedrock
 			"server_address",            // api.openai.com, generativelanguage.googleapis.com
 			"http_response_status_code", // 200, 400, 429, 500
 		},
@@ -35,7 +35,7 @@ var (
 			"container_id",
 			"gen_ai_operation_name",
 			"gen_ai_request_model",
-			"gen_ai_system",
+			"gen_ai_provider_name",
 			"server_address",
 			"gen_ai_token_type", // input, output
 		},
@@ -43,30 +43,32 @@ var (
 
 	ContainerLLMTimeToFirstToken = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "container_llm_time_to_first_token_seconds",
-			Help:    "Time from request sent to first response token received",
-			Buckets: []float64{0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0},
+			Name: "container_llm_time_to_first_token_seconds",
+			Help: "Time from request sent to first response token received",
+			// OTel GenAI v1.37 recommended boundaries for gen_ai.server.time_to_first_token.
+			Buckets: []float64{0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0},
 		},
 		[]string{
 			"container_id",
 			"gen_ai_operation_name",
 			"gen_ai_request_model",
-			"gen_ai_system",
+			"gen_ai_provider_name",
 			"server_address",
 		},
 	)
 
 	ContainerLLMRequestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "container_llm_request_duration_seconds",
-			Help:    "Total LLM request duration",
-			Buckets: []float64{0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0},
+			Name: "container_llm_request_duration_seconds",
+			Help: "Total LLM request duration",
+			// OTel GenAI v1.37 recommended boundaries for gen_ai.client.operation.duration.
+			Buckets: []float64{0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92},
 		},
 		[]string{
 			"container_id",
 			"gen_ai_operation_name",
 			"gen_ai_request_model",
-			"gen_ai_system",
+			"gen_ai_provider_name",
 			"server_address",
 		},
 	)
@@ -81,7 +83,7 @@ var (
 			"container_id",
 			"gen_ai_operation_name",
 			"gen_ai_request_model",
-			"gen_ai_system",
+			"gen_ai_provider_name",
 		},
 	)
 
@@ -92,7 +94,7 @@ var (
 		},
 		[]string{
 			"container_id",
-			"gen_ai_system",
+			"gen_ai_provider_name",
 			"gen_ai_request_model",
 			"error_type", // rate_limit, timeout, invalid_request, server_error, auth_error
 		},
@@ -134,7 +136,7 @@ var (
 			"container_id",
 			"gen_ai_operation_name",
 			"gen_ai_request_model",
-			"gen_ai_system",
+			"gen_ai_provider_name",
 			"server_address",
 		},
 	)
@@ -151,7 +153,7 @@ var (
 			"container_id",
 			"gen_ai_operation_name",
 			"gen_ai_request_model",
-			"gen_ai_system",
+			"gen_ai_provider_name",
 		},
 	)
 
@@ -168,7 +170,7 @@ var (
 			"container_id",
 			"gen_ai_operation_name",
 			"gen_ai_request_model",
-			"gen_ai_system",
+			"gen_ai_provider_name",
 			"server_address",
 		},
 	)
@@ -224,7 +226,7 @@ func RecordLLMEvent(event *LLMEvent) {
 		"container_id":              containerID,
 		"gen_ai_operation_name":     operation,
 		"gen_ai_request_model":      model,
-		"gen_ai_system":             provider,
+		"gen_ai_provider_name":      provider,
 		"server_address":            event.ServerAddress,
 		"http_response_status_code": statusStr,
 	}).Inc()
@@ -233,7 +235,7 @@ func RecordLLMEvent(event *LLMEvent) {
 		"container_id":          containerID,
 		"gen_ai_operation_name": operation,
 		"gen_ai_request_model":  model,
-		"gen_ai_system":         provider,
+		"gen_ai_provider_name":  provider,
 		"server_address":        event.ServerAddress,
 	}
 
@@ -243,7 +245,7 @@ func RecordLLMEvent(event *LLMEvent) {
 			"container_id":          containerID,
 			"gen_ai_operation_name": operation,
 			"gen_ai_request_model":  model,
-			"gen_ai_system":         provider,
+			"gen_ai_provider_name":  provider,
 			"server_address":        event.ServerAddress,
 			"gen_ai_token_type":     "input",
 		}).Add(float64(event.InputTokens))
@@ -253,7 +255,7 @@ func RecordLLMEvent(event *LLMEvent) {
 			"container_id":          containerID,
 			"gen_ai_operation_name": operation,
 			"gen_ai_request_model":  model,
-			"gen_ai_system":         provider,
+			"gen_ai_provider_name":  provider,
 			"server_address":        event.ServerAddress,
 			"gen_ai_token_type":     "output",
 		}).Add(float64(event.OutputTokens))
@@ -270,7 +272,7 @@ func RecordLLMEvent(event *LLMEvent) {
 			"container_id":          containerID,
 			"gen_ai_operation_name": operation,
 			"gen_ai_request_model":  model,
-			"gen_ai_system":         provider,
+			"gen_ai_provider_name":  provider,
 		}).Add(float64(event.ToolCallCount))
 	}
 
@@ -301,7 +303,7 @@ func RecordLLMEvent(event *LLMEvent) {
 				"container_id":          containerID,
 				"gen_ai_operation_name": operation,
 				"gen_ai_request_model":  model,
-				"gen_ai_system":         provider,
+				"gen_ai_provider_name":  provider,
 			}).Observe(tps)
 		}
 	}
@@ -310,7 +312,7 @@ func RecordLLMEvent(event *LLMEvent) {
 	if event.StatusCode >= 400 {
 		ContainerLLMErrorsTotal.With(prometheus.Labels{
 			"container_id":         containerID,
-			"gen_ai_system":        provider,
+			"gen_ai_provider_name": provider,
 			"gen_ai_request_model": model,
 			"error_type":           categorizeHTTPError(event.StatusCode),
 		}).Inc()
