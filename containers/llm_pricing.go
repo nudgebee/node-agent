@@ -55,6 +55,7 @@ var modelPricing = map[string]ModelPricing{
 	"gcp.gemini:gemini-3-flash":      {0.10, 0.40, 0.025},
 	"gcp.gemini:gemini-3.1-pro":      {1.25, 10.00, 0.31},
 	"gcp.gemini:text-embedding-004":  {0.025, 0, 0},
+	"gcp.gemini:gemini-embedding":    {0.15, 0, 0}, // gemini-embedding-001 and successors
 
 	// AWS Bedrock — Anthropic on Bedrock pricing matches direct
 	"aws.bedrock:anthropic.claude-3-5-haiku":  {1.00, 5.00, 0.10},
