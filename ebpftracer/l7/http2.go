@@ -485,12 +485,13 @@ frameLoop:
 						if req.firstResponseTime == 0 && len(dataPayload) > 0 {
 							req.firstResponseTime = kernelTime
 						}
-						if len(req.ResponsePayload) < maxDataPayloadSize {
-							remaining := maxDataPayloadSize - len(req.ResponsePayload)
-							if len(dataPayload) > remaining {
-								dataPayload = dataPayload[:remaining]
-							}
-							req.ResponsePayload = append(req.ResponsePayload, dataPayload...)
+						// Ring-buffer accumulate: keep the LAST maxDataPayloadSize
+						// bytes. SSE-style LLM responses (Gemini, Anthropic, OpenAI)
+						// carry finishReason/modelVersion/usageMetadata in trailing
+						// chunks; first-N capping loses them on long responses.
+						req.ResponsePayload = append(req.ResponsePayload, dataPayload...)
+						if len(req.ResponsePayload) > maxDataPayloadSize {
+							req.ResponsePayload = req.ResponsePayload[len(req.ResponsePayload)-maxDataPayloadSize:]
 						}
 					}
 				}
