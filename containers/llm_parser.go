@@ -275,15 +275,18 @@ func (p *LLMParser) FeedHTTP2Data(tag *LLMConnectionTag, streamID uint32,
 	}
 	s.lastDataAt = now
 
-	// Accumulate response (bounded)
-	if s.bufferSize < llmMaxBuffer {
-		n := len(data)
-		if s.bufferSize+n > llmMaxBuffer {
-			n = llmMaxBuffer - s.bufferSize
-		}
-		s.buffer.Write(data[:n])
-		s.bufferSize += n
+	// Accumulate response with ring-buffer behavior — keep the LAST llmMaxBuffer
+	// bytes, dropping older bytes when over the cap. For Gemini streaming
+	// (and most SSE-style LLM responses), the chunks carrying modelVersion
+	// and usageMetadata are continuous through the stream OR concentrated
+	// at the tail (finishReason + total tokens). Keeping the head and
+	// dropping the tail (the previous behavior) reliably loses both. Ring-
+	// buffer behavior preserves the tail.
+	s.buffer.Write(data)
+	if s.buffer.Len() > llmMaxBuffer {
+		s.buffer.Next(s.buffer.Len() - llmMaxBuffer)
 	}
+	s.bufferSize = s.buffer.Len()
 
 	// Check for SSE completion markers
 	completed, reason := checkSSECompletion(data)
