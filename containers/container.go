@@ -1153,8 +1153,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			}
 		}
 
-		// DEBUG: routing decision visibility for HTTP/2 LLM traffic
-		if klog.V(2).Enabled() {
+		if klog.V(4).Enabled() {
 			activeStreamsDbg := parser.GetActiveStreamsForLLM()
 			authorities := []string{}
 			respLens := []int{}
@@ -1168,7 +1167,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			if llmTag != nil {
 				tagStr = string(llmTag.Provider) + "/" + llmTag.Host
 			}
-			klog.V(2).Infof("LLM_ROUTE: pid=%d fd=%d destIP=%s llmTag=%s activeStreams=%d authorities=%v respLens=%v hasStatus=%v requestsLen=%d",
+			klog.V(4).Infof("LLM_ROUTE: pid=%d fd=%d destIP=%s llmTag=%s activeStreams=%d authorities=%v respLens=%v hasStatus=%v requestsLen=%d",
 				pid, fd, destIP, tagStr, len(activeStreamsDbg), authorities, respLens, hasStatus, len(requests))
 		}
 
