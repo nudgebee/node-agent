@@ -951,6 +951,31 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
+	// TLS ClientHello SNI parsing needs only the payload — not the conn entry,
+	// not a matching timestamp. The conn lookup and timestamp-equality checks
+	// downstream both reject ClientHellos: Go's crypto/tls runs the handshake
+	// on goroutines that may not be associated with the fd by tcp_connect yet,
+	// and the eBPF event timestamp rarely matches conn.Timestamp. Handle SNI
+	// here so we don't lose the only signal that survives mid-stream-join
+	// HPACK failure on long-lived HTTP/2 connections.
+	if r.Protocol == l7.ProtocolTLSClientHello {
+		if c.llmDetector != nil {
+			if host, err := l7.ParseSNI(r.Payload); err == nil && host != "" {
+				pidFd := PidFd{Pid: pid, Fd: fd}
+				destIP := netaddr.IP{}
+				if conn := c.connectionsByPidFd[pidFd]; conn != nil {
+					destIP = conn.DestinationKey.ActualDestinationIfKnown().IP()
+				}
+				if tag := c.llmDetector.LateTag(pidFd, host, destIP); tag != nil {
+					LLMSNITagsTotal.WithLabelValues(string(tag.Provider)).Inc()
+					klog.V(2).Infof("LLM_SNI_TAG: pid=%d fd=%d sni=%s provider=%s",
+						pid, fd, host, tag.Provider)
+				}
+			}
+		}
+		return nil, L7RequestProcessed
+	}
+
 	conn := c.connectionsByPidFd[PidFd{Pid: pid, Fd: fd}]
 	if conn == nil {
 		// TCP connection tracking failed - common for Go TLS due to goroutine thread switching
@@ -968,25 +993,6 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 				klog.V(3).Infof("HTTP2_CONN_NOT_FOUND: pid=%d fd=%d container=%s - attempting connectionless processing",
 					pid, fd, c.id)
 				return c.processHTTP2WithoutConnection(pid, fd, r)
-			}
-			// TLS ClientHello SNI parsing needs only the payload, not the conn.
-			// Go's crypto/tls runs the handshake on a goroutine that often
-			// hasn't been associated with the fd yet via tcp_connect tracepoint
-			// when the first ClientHello write fires; without this branch the
-			// event would get queued, retried, and expire — defeating SNI-based
-			// LLM tagging for the very connection where we need it most.
-			if r.Protocol == l7.ProtocolTLSClientHello {
-				host, err := l7.ParseSNI(r.Payload)
-				if err != nil || host == "" || c.llmDetector == nil {
-					return nil, L7RequestProcessed
-				}
-				pidFd := PidFd{Pid: pid, Fd: fd}
-				if tag := c.llmDetector.LateTag(pidFd, host, netaddr.IP{}); tag != nil {
-					LLMSNITagsTotal.WithLabelValues(string(tag.Provider)).Inc()
-					klog.V(2).Infof("LLM_SNI_TAG_NOCONN: pid=%d fd=%d sni=%s provider=%s",
-						pid, fd, host, tag.Provider)
-				}
-				return nil, L7RequestProcessed
 			}
 			klog.V(3).Infof("L7_EVENT_CONN_NOT_FOUND: pid=%d fd=%d container=%s num_connections=%d",
 				pid, fd, c.id, len(c.connectionsByPidFd))
@@ -1311,24 +1317,6 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	case l7.ProtocolFoundationDB:
 		// Update stats for FoundationDB
 		c.l7Stats.observe(r.Protocol, r.Status.String(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
-	case l7.ProtocolTLSClientHello:
-		// SNI-based LLM detection. The eBPF side captures TLS ClientHello
-		// records on outbound port-443 writes; here we parse the SNI and
-		// tag the connection if it matches a known LLM provider. This
-		// fires once per TCP connection (at handshake) and is independent
-		// of HPACK state, so it works for HTTP/2 connections where
-		// :authority parsing fails after a mid-stream agent attach.
-		host, err := l7.ParseSNI(r.Payload)
-		if err != nil || host == "" || c.llmDetector == nil {
-			return nil, L7RequestProcessed
-		}
-		destIP := conn.DestinationKey.ActualDestinationIfKnown().IP()
-		pidFd := PidFd{Pid: pid, Fd: fd}
-		if tag := c.llmDetector.LateTag(pidFd, host, destIP); tag != nil {
-			LLMSNITagsTotal.WithLabelValues(string(tag.Provider)).Inc()
-			klog.V(2).Infof("LLM_SNI_TAG: pid=%d fd=%d sni=%s provider=%s",
-				pid, fd, host, tag.Provider)
-		}
 	default:
 		// For all other protocols, update stats
 		c.l7Stats.observe(r.Protocol, "unknown", "", "", 0, conn.DestinationKey, conn.srcWorkload, r, "")
