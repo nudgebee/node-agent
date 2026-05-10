@@ -969,6 +969,25 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 					pid, fd, c.id)
 				return c.processHTTP2WithoutConnection(pid, fd, r)
 			}
+			// TLS ClientHello SNI parsing needs only the payload, not the conn.
+			// Go's crypto/tls runs the handshake on a goroutine that often
+			// hasn't been associated with the fd yet via tcp_connect tracepoint
+			// when the first ClientHello write fires; without this branch the
+			// event would get queued, retried, and expire — defeating SNI-based
+			// LLM tagging for the very connection where we need it most.
+			if r.Protocol == l7.ProtocolTLSClientHello {
+				host, err := l7.ParseSNI(r.Payload)
+				if err != nil || host == "" || c.llmDetector == nil {
+					return nil, L7RequestProcessed
+				}
+				pidFd := PidFd{Pid: pid, Fd: fd}
+				if tag := c.llmDetector.LateTag(pidFd, host, netaddr.IP{}); tag != nil {
+					LLMSNITagsTotal.WithLabelValues(string(tag.Provider)).Inc()
+					klog.V(2).Infof("LLM_SNI_TAG_NOCONN: pid=%d fd=%d sni=%s provider=%s",
+						pid, fd, host, tag.Provider)
+				}
+				return nil, L7RequestProcessed
+			}
 			klog.V(3).Infof("L7_EVENT_CONN_NOT_FOUND: pid=%d fd=%d container=%s num_connections=%d",
 				pid, fd, c.id, len(c.connectionsByPidFd))
 			return nil, L7RequestConnNotFound
