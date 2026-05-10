@@ -2,11 +2,14 @@ package containers
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -146,11 +149,20 @@ func (p *LLMParser) Stop() {
 	close(p.stopCh)
 }
 
-// ParseHTTP1 handles a completed HTTP/1.1 LLM request/response pair.
+// ParseHTTP1 handles a completed HTTP/1.1 LLM request/response bytes.
 // Called when the full request and response are available (non-streaming or SSE complete).
 func (p *LLMParser) ParseHTTP1(tag *LLMConnectionTag, statusCode int,
 	path string, requestBody, responseBody []byte, duration time.Duration,
 	traceID string) {
+
+	// HTTP/1.1 LLM responses (Gemini in particular) often arrive as
+	// Transfer-Encoding: chunked + Content-Encoding: gzip. The eBPF capture
+	// has stripped the response headers in extractHTTPBody, but the body
+	// still carries chunk-size framing and gzip-compressed bytes — both
+	// invisible to plain regex. Decode best-effort before extraction.
+	if decoded := decodeHTTPBody(responseBody); decoded != nil {
+		responseBody = decoded
+	}
 
 	model, inputTokens, outputTokens := extractFromResponseBody(tag.Provider, responseBody)
 	cachedTokens := extractCachedTokens(tag.Provider, responseBody)
@@ -830,6 +842,95 @@ func modelFromPath(provider LLMProvider, path string) string {
 	}
 
 	return ""
+}
+
+// decodeHTTPBody best-effort decodes an HTTP/1.1 response body that may be
+// chunked-transfer-encoded and/or gzip-compressed. Returns nil when no
+// decoding applies (caller keeps the original bytes); returns the decoded
+// bytes on success or partial-success (truncated capture is normal because
+// eBPF caps payloads at 4KB).
+//
+// Detection is by content shape rather than headers: extractHTTPBody
+// already stripped the headers, and for chunked encoding we look for the
+// "<hex>\r\n" framing at offset 0; for gzip we look for the 1f 8b magic at
+// offset 0 of the dechunked stream.
+func decodeHTTPBody(body []byte) []byte {
+	out := body
+	// Step 1: dechunk if it looks like chunked transfer encoding.
+	if dechunked := dechunkHTTPBody(body); dechunked != nil {
+		out = dechunked
+	}
+	// Step 2: gunzip if it has the gzip magic.
+	if len(out) >= 2 && out[0] == 0x1f && out[1] == 0x8b {
+		gz, err := gzip.NewReader(bytes.NewReader(out))
+		if err == nil {
+			defer gz.Close()
+			// Cap output at 1 MiB — these are LLM responses, not file
+			// uploads, and a runaway stream shouldn't OOM the agent.
+			plain, err := io.ReadAll(io.LimitReader(gz, 1<<20))
+			if (err == nil || err == io.ErrUnexpectedEOF) && len(plain) > 0 {
+				return plain
+			}
+		}
+	}
+	if !bytes.Equal(out, body) {
+		return out
+	}
+	return nil
+}
+
+// dechunkHTTPBody parses HTTP/1.1 chunked transfer encoding. Returns the
+// concatenated chunk data or nil if the body doesn't look chunked. Handles
+// truncation gracefully: a partial final chunk is included up to the bytes
+// available.
+func dechunkHTTPBody(body []byte) []byte {
+	// Quick reject: must start with hex digits followed by \r\n.
+	first := bytes.Index(body, []byte("\r\n"))
+	if first <= 0 || first > 16 {
+		return nil
+	}
+	for _, c := range body[:first] {
+		if !isHexDigit(c) {
+			return nil
+		}
+	}
+	out := make([]byte, 0, len(body))
+	pos := 0
+	for pos < len(body) {
+		nl := bytes.Index(body[pos:], []byte("\r\n"))
+		if nl <= 0 || nl > 16 {
+			break
+		}
+		sizeStr := string(body[pos : pos+nl])
+		// Strip optional chunk extensions after ';'
+		if i := strings.IndexByte(sizeStr, ';'); i >= 0 {
+			sizeStr = sizeStr[:i]
+		}
+		size64, err := strconv.ParseUint(sizeStr, 16, 32)
+		if err != nil {
+			break
+		}
+		pos += nl + 2
+		if size64 == 0 {
+			break
+		}
+		end := pos + int(size64)
+		if end > len(body) {
+			// Truncated mid-chunk — include what we have and stop.
+			out = append(out, body[pos:]...)
+			break
+		}
+		out = append(out, body[pos:end]...)
+		pos = end + 2 // skip trailing \r\n
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func isHexDigit(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }
 
 // cleanBedrockModel cleans up a Bedrock model identifier.
