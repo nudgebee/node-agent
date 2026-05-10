@@ -34,6 +34,8 @@ var (
 	// Google Gemini: "promptTokenCount": 10, "candidatesTokenCount": 50
 	reGeminiPrompt     = regexp.MustCompile(`"promptTokenCount"\s*:\s*(\d+)`)
 	reGeminiCandidates = regexp.MustCompile(`"candidatesTokenCount"\s*:\s*(\d+)`)
+	reGeminiCached     = regexp.MustCompile(`"cachedContentTokenCount"\s*:\s*(\d+)`)
+	reGeminiFuncCall   = regexp.MustCompile(`"functionCall"\s*:\s*\{`)
 
 	// AWS Bedrock: "inputTokens": 10, "outputTokens": 50
 	reBedrockInput  = regexp.MustCompile(`"inputTokens"\s*:\s*(\d+)`)
@@ -506,15 +508,15 @@ func extractFromResponseBody(provider LLMProvider, body []byte) (model string, i
 		}
 
 	case ProviderGoogle:
-		var resp struct {
-			UsageMetadata struct {
-				PromptTokenCount     int `json:"promptTokenCount"`
-				CandidatesTokenCount int `json:"candidatesTokenCount"`
-			} `json:"usageMetadata"`
+		// Gemini's streamGenerateContent returns SSE (multiple "data: {...}"
+		// events), not a single JSON object — json.Unmarshal silently fails
+		// on the concatenated body. Use regex over the last match so we get
+		// the most recent (cumulative) usageMetadata chunk.
+		if m := reGeminiPrompt.FindAllSubmatch(body, -1); len(m) > 0 {
+			fmt.Sscanf(string(m[len(m)-1][1]), "%d", &input)
 		}
-		if err := json.Unmarshal(body, &resp); err == nil {
-			input = resp.UsageMetadata.PromptTokenCount
-			output = resp.UsageMetadata.CandidatesTokenCount
+		if m := reGeminiCandidates.FindAllSubmatch(body, -1); len(m) > 0 {
+			fmt.Sscanf(string(m[len(m)-1][1]), "%d", &output)
 		}
 
 	case ProviderCohere:
@@ -589,13 +591,11 @@ func extractCachedTokens(provider LLMProvider, body []byte) int {
 			return resp.Usage.CacheReadInputTokens
 		}
 	case ProviderGoogle:
-		var resp struct {
-			UsageMetadata struct {
-				CachedContentTokenCount int `json:"cachedContentTokenCount"`
-			} `json:"usageMetadata"`
-		}
-		if err := json.Unmarshal(body, &resp); err == nil {
-			return resp.UsageMetadata.CachedContentTokenCount
+		// Regex: SSE stream isn't a single JSON object; pick the latest match.
+		if m := reGeminiCached.FindAllSubmatch(body, -1); len(m) > 0 {
+			n := 0
+			fmt.Sscanf(string(m[len(m)-1][1]), "%d", &n)
+			return n
 		}
 	case ProviderAWSBedrock:
 		// Anthropic-on-Bedrock InvokeModel has the same field as Anthropic direct.
@@ -660,29 +660,9 @@ func extractToolCallCount(provider LLMProvider, body []byte) int {
 			return n
 		}
 	case ProviderGoogle:
-		// Gemini: candidates[].content.parts[] entries with functionCall.
-		var resp struct {
-			Candidates []struct {
-				Content struct {
-					Parts []struct {
-						FunctionCall *struct {
-							Name string `json:"name"`
-						} `json:"functionCall"`
-					} `json:"parts"`
-				} `json:"content"`
-			} `json:"candidates"`
-		}
-		if err := json.Unmarshal(body, &resp); err == nil {
-			n := 0
-			for _, c := range resp.Candidates {
-				for _, p := range c.Content.Parts {
-					if p.FunctionCall != nil && p.FunctionCall.Name != "" {
-						n++
-					}
-				}
-			}
-			return n
-		}
+		// Gemini: count "functionCall": { occurrences. Regex handles SSE
+		// (multiple data: events) where json.Unmarshal would fail.
+		return len(reGeminiFuncCall.FindAllIndex(body, -1))
 	case ProviderAWSBedrock:
 		// Converse: output.message.content[] with toolUse entries.
 		var converse struct {
