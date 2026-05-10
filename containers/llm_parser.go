@@ -39,6 +39,10 @@ var (
 	reGeminiCandidates = regexp.MustCompile(`"candidatesTokenCount"\s*:\s*(\d+)`)
 	reGeminiCached     = regexp.MustCompile(`"cachedContentTokenCount"\s*:\s*(\d+)`)
 	reGeminiFuncCall   = regexp.MustCompile(`"functionCall"\s*:\s*\{`)
+	// Gemini embeddings (:embedContent / :batchEmbedContents) return
+	// "totalTokens" at top level instead of usageMetadata. Embeddings have
+	// no output, so this maps to input_tokens.
+	reGeminiTotalTokens = regexp.MustCompile(`"totalTokens"\s*:\s*(\d+)`)
 
 	// AWS Bedrock: "inputTokens": 10, "outputTokens": 50
 	reBedrockInput  = regexp.MustCompile(`"inputTokens"\s*:\s*(\d+)`)
@@ -541,6 +545,14 @@ func extractFromResponseBody(provider LLMProvider, body []byte) (model string, i
 		}
 		if m := reGeminiCandidates.FindAllSubmatch(body, -1); len(m) > 0 {
 			fmt.Sscanf(string(m[len(m)-1][1]), "%d", &output)
+		}
+		// Embeddings (:embedContent, :batchEmbedContents) report only
+		// "totalTokens" at top level. Map to input_tokens since there is
+		// no output to bill.
+		if input == 0 {
+			if m := reGeminiTotalTokens.FindSubmatch(body); len(m) >= 2 {
+				fmt.Sscanf(string(m[1]), "%d", &input)
+			}
 		}
 
 	case ProviderCohere:
