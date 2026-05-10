@@ -194,6 +194,17 @@ func (p *LLMParser) ParseHTTP1(tag *LLMConnectionTag, statusCode int,
 	klog.V(3).Infof("LLM_HTTP1: provider=%s model=%s status=%d input=%d output=%d dur=%s",
 		tag.Provider, model, statusCode, inputTokens, outputTokens, duration)
 
+	if klog.V(2).Enabled() && inputTokens == 0 && outputTokens == 0 && len(responseBody) > 0 {
+		hasPromptTok := bytes.Contains(responseBody, []byte("promptTokenCount"))
+		hasUsageMeta := bytes.Contains(responseBody, []byte("usageMetadata"))
+		tail := responseBody
+		if len(tail) > 300 {
+			tail = tail[len(tail)-300:]
+		}
+		klog.V(2).Infof("LLM_HTTP1_NOTOKENS: provider=%s len=%d hasPromptTokenCount=%v hasUsageMetadata=%v tail=%q",
+			tag.Provider, len(responseBody), hasPromptTok, hasUsageMeta, string(tail))
+	}
+
 	if p.onEvent != nil {
 		p.onEvent(event)
 	}
