@@ -41,11 +41,11 @@ func TestDetectLLMProvider(t *testing.T) {
 		{"v1.api.openai.com", ProviderOpenAI},
 
 		// False-positive guards — these must NOT match an LLM provider
-		{"chat.googleapis.com", ProviderUnknown},                    // Google Chat, not LLM
-		{"compute.googleapis.com", ProviderUnknown},                 // GCE
-		{"storage.googleapis.com", ProviderUnknown},                 // GCS
-		{"openaipublic.blob.core.windows.net", ProviderUnknown},     // OpenAI tokenizer CDN, not API
-		{"discovery.openai.com", ProviderUnknown},                   // not a known LLM endpoint pattern
+		{"chat.googleapis.com", ProviderUnknown},                // Google Chat, not LLM
+		{"compute.googleapis.com", ProviderUnknown},             // GCE
+		{"storage.googleapis.com", ProviderUnknown},             // GCS
+		{"openaipublic.blob.core.windows.net", ProviderUnknown}, // OpenAI tokenizer CDN, not API
+		{"discovery.openai.com", ProviderUnknown},               // not a known LLM endpoint pattern
 		{"foo.bar.baz", ProviderUnknown},
 		{"", ProviderUnknown},
 
