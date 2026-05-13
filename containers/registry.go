@@ -300,6 +300,9 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				}
 			}
 			r.ip2fqdnLock.Unlock()
+			if r.llmDetector != nil {
+				r.llmDetector.GC(llmDetectorMaxIPCache)
+			}
 		case sample := <-r.gpuProcessUsageSampleChan:
 			r.containerLock.RLock()
 			c := r.containersByPid[sample.Pid]

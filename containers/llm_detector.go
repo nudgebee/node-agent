@@ -7,6 +7,11 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// llmDetectorMaxIPCache caps the per-host IP→provider cache. LLM providers
+// resolve to a small set of IPs (~tens), so this is a memory ceiling, not a
+// working-set target.
+const llmDetectorMaxIPCache = 1024
+
 // LLMConnectionTag holds the LLM provider info for a tagged connection.
 // Once a connection is tagged, all L7 data on it is routed to the LLM parser.
 type LLMConnectionTag struct {
@@ -113,8 +118,10 @@ func (d *LLMDetector) LateTag(pidFd PidFd, host string, destIP netaddr.IP) *LLMC
 
 	d.mu.Lock()
 	d.connCache[pidFd] = tag
-	// Also cache the IP for future connections
-	if !destIP.IsZero() {
+	// Cache the IP for future connections — but skip Google: *.googleapis.com
+	// shares anycast IPs across all services, so an LLM tag on that IP would
+	// false-positive non-LLM Google traffic. See OnDNS for the same guard.
+	if !destIP.IsZero() && provider != ProviderGoogle {
 		d.ipCache[destIP.String()] = tag
 	}
 	d.mu.Unlock()
