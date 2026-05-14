@@ -492,8 +492,16 @@ func (t *Trace) LLMRequest(info LLMStreamInfo) {
 		}
 	}
 
-	// Span name follows OTel GenAI conventions: "{provider} {operation}"
-	spanName := fmt.Sprintf("%s %s", sanitizeUTF8(info.Provider), sanitizeUTF8(info.Operation))
+	// OTel GenAI v1.37 inference-span name: "{operation} {model}".
+	// Falls back to operation alone if model is unknown.
+	op := sanitizeUTF8(info.Operation)
+	model := sanitizeUTF8(info.Model)
+	var spanName string
+	if model != "" && model != "unknown" {
+		spanName = fmt.Sprintf("%s %s", op, model)
+	} else {
+		spanName = op
+	}
 
 	// Create span with explicit start time
 	_, span := t.tracer.otel.Start(ctx, spanName,
@@ -501,9 +509,13 @@ func (t *Trace) LLMRequest(info LLMStreamInfo) {
 		trace.WithSpanKind(trace.SpanKindClient),
 	)
 
-	// OTel GenAI semantic conventions attributes
+	// OTel GenAI v1.37 attributes. `gen_ai.provider.name` replaces the
+	// deprecated `gen_ai.system`; `gen_ai.system` is also emitted for
+	// short-term backward-compat with consumers on older spec versions
+	// — drop after the spec stabilizes (expected late 2026).
 	attrs := []attribute.KeyValue{
-		attribute.String("gen_ai.system", sanitizeUTF8(info.Provider)),
+		attribute.String("gen_ai.provider.name", sanitizeUTF8(info.Provider)),
+		attribute.String("gen_ai.system", sanitizeUTF8(info.Provider)), // deprecated alias
 		attribute.String("gen_ai.operation.name", sanitizeUTF8(info.Operation)),
 		attribute.String("gen_ai.request.model", sanitizeUTF8(info.Model)),
 		attribute.String("server.address", sanitizeUTF8(info.ServerAddress)),

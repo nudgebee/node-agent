@@ -44,10 +44,6 @@ type HTTPRequestContext struct {
 	HasValidUTF8Payload  bool
 	HasValidUTF8Response bool
 	IsSSE                bool // Server-Sent Events (streaming response)
-
-	// LLM detection cache (computed once)
-	llmProvider     LLMProvider
-	llmProviderDone bool
 }
 
 // NewHTTPRequestContext creates and processes HTTP request data.
@@ -208,32 +204,6 @@ func (ctx *HTTPRequestContext) detectSSE() {
 		headerStr := strings.ToLower(string(headers))
 		ctx.IsSSE = strings.Contains(headerStr, "text/event-stream")
 	}
-}
-
-// GetLLMProvider returns the detected LLM provider with caching.
-func (ctx *HTTPRequestContext) GetLLMProvider() LLMProvider {
-	if ctx.llmProviderDone {
-		return ctx.llmProvider
-	}
-	ctx.llmProviderDone = true
-
-	// Primary: hostname-based detection
-	ctx.llmProvider = DetectLLMProvider(ctx.Host)
-	if ctx.llmProvider != ProviderUnknown {
-		return ctx.llmProvider
-	}
-
-	// Fallback: content-based detection for unknown hosts
-	if ctx.HasValidUTF8Payload {
-		ctx.llmProvider = detectLLMFromHTTPRequest(ctx.RawPayload, ctx.ResponseBase64)
-	}
-
-	return ctx.llmProvider
-}
-
-// IsLLMRequest returns true if this is an LLM API request.
-func (ctx *HTTPRequestContext) IsLLMRequest() bool {
-	return ctx.GetLLMProvider() != ProviderUnknown
 }
 
 // --- Helper functions ---

@@ -12,6 +12,12 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// OnHPACKDecodeError is an optional callback invoked when the HTTP/2 parser
+// fails to decode an HPACK header block. Wired from the containers package
+// to a Prometheus counter so that the mid-stream-join failure mode is
+// observable without needing to read agent logs.
+var OnHPACKDecodeError func()
+
 // safeKernelDuration computes the duration between two kernel timestamps,
 // returning 0 if the result would underflow or exceed 1 hour.
 func safeKernelDuration(end, start uint64) time.Duration {
@@ -354,6 +360,9 @@ func (p *Http2Parser) decodeHeaderBlock(
 		// starts monitoring after HTTP/2 connection was established. The remote encoder's
 		// dynamic table has entries our decoder doesn't have.
 		klog.V(3).Infof("http2: HPACK decode error on stream %d: %v (partial headers preserved)", streamId, err)
+		if OnHPACKDecodeError != nil {
+			OnHPACKDecodeError()
+		}
 
 		// Mark the request as having partial headers so downstream can apply fallbacks
 		if req := p.activeRequests[streamId]; req != nil {
@@ -476,12 +485,13 @@ frameLoop:
 						if req.firstResponseTime == 0 && len(dataPayload) > 0 {
 							req.firstResponseTime = kernelTime
 						}
-						if len(req.ResponsePayload) < maxDataPayloadSize {
-							remaining := maxDataPayloadSize - len(req.ResponsePayload)
-							if len(dataPayload) > remaining {
-								dataPayload = dataPayload[:remaining]
-							}
-							req.ResponsePayload = append(req.ResponsePayload, dataPayload...)
+						// Ring-buffer accumulate: keep the LAST maxDataPayloadSize
+						// bytes. SSE-style LLM responses (Gemini, Anthropic, OpenAI)
+						// carry finishReason/modelVersion/usageMetadata in trailing
+						// chunks; first-N capping loses them on long responses.
+						req.ResponsePayload = append(req.ResponsePayload, dataPayload...)
+						if len(req.ResponsePayload) > maxDataPayloadSize {
+							req.ResponsePayload = req.ResponsePayload[len(req.ResponsePayload)-maxDataPayloadSize:]
 						}
 					}
 				}
