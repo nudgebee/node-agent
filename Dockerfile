@@ -27,4 +27,4 @@ RUN microdnf install -y openssl-libs
 
 COPY --from=builder /tmp/src/nudgebee-node-agent /usr/bin/nudgebee-node-agent
 
-ENTRYPOINT ["nudgebee-node-agent"]
+ENTRYPOINT ["/usr/bin/nudgebee-node-agent"]
