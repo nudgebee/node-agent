@@ -19,6 +19,10 @@ func guessApplicationTypeByCmdline(cmdline []byte) string {
 	}
 	cmd := bytes.TrimSuffix(bytes.Fields(parts[0])[0], []byte{':'})
 	switch {
+	case bytes.HasSuffix(cmd, []byte("nudgebee-node-agent")):
+		return "nudgebee-node-agent"
+	case bytes.HasSuffix(cmd, []byte("nudgebee-cluster-agent")):
+		return "nudgebee-cluster-agent"
 	case bytes.HasSuffix(cmd, []byte("coroot")):
 		return "coroot-community-edition"
 	case bytes.HasSuffix(cmd, []byte("coroot-ee")):

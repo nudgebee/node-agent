@@ -5,9 +5,9 @@
 
 set -e
 
-NAMESPACE="nudgebee-agent"
-APP_LABEL="app=nudgebee-node-agent"
-BASE_PORT=8090
+NAMESPACE="${NAMESPACE:-nudgebee}"
+APP_LABEL="${APP_LABEL:-app=nudgebee-node-agent}"
+BASE_PORT="${BASE_PORT:-8090}"
 
 echo "=== Testing Metrics Endpoint for All Nudgebee Agent Pods ==="
 echo "Namespace: $NAMESPACE"
