@@ -1,0 +1,58 @@
+name: Bug report
+description: The agent is doing the wrong thing or crashing
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. The more concrete detail
+        you can give, the faster we can fix it.
+
+        Please do **not** include real credentials, tokens, or internal
+        hostnames in this issue. Replace them with `example.com` or `<redacted>`.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did the agent do, and what did you expect instead?
+      placeholder: e.g. agent crashed with a panic after ~10 minutes on nodes with > 200 containers
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal repro. Workload type, kernel version, anything special about the environment.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Agent version
+      description: Output of `nudgebee-node-agent --version`, or the image tag.
+      placeholder: v1.2.3 / ghcr.io/nudgebee/node-agent:1.2.3
+    validations:
+      required: true
+  - type: input
+    id: kernel
+    attributes:
+      label: Linux kernel version
+      placeholder: e.g. 5.15.0-1042-aws
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution / runtime
+      placeholder: e.g. Ubuntu 22.04 on EKS 1.30, containerd 1.7
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste the relevant agent logs. Scrub any secrets first.
+      render: shell
+  - type: textarea
+    id: metrics
+    attributes:
+      label: Relevant metrics / Prometheus output (optional)
+      render: shell

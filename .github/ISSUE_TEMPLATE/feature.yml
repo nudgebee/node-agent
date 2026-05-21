@@ -1,0 +1,27 @@
+name: Feature request
+description: Suggest a new capability or enhancement
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the use case, not the solution. We're looking for the underlying need.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like to see?
+      description: A concrete proposal if you have one. Mock metric names, sample configs, CLI flags — anything that helps make it real.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links to related issues, upstream coroot/coroot-node-agent discussions, blog posts, etc.
