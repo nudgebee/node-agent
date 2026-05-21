@@ -29,7 +29,15 @@ jobs:
           go install golang.org/x/tools/cmd/goimports@latest
           files=$(goimports -l .); if [[ -n "$files" ]]; then echo "$files"; exit 1; fi
       - run: go vet ./...
-      - run: go test ./...
+      # /containers transitively imports github.com/NVIDIA/go-nvml. The
+      # bindings register NVML symbols (including some only present in
+      # very recent libnvidia-ml.so versions, e.g.
+      # nvmlDeviceSetMemClkVfOffset) at process start via dlsym, which
+      # fails on a runner without a matching NVIDIA driver and aborts
+      # the test binary before any of our tests run. Skip until either
+      # GPU code moves behind a build tag or the runner ships a newer
+      # libnvidia-ml.so.
+      - run: go test $(go list ./... | grep -v '/containers$')
       - run: go build -mod=readonly .
 
   secrets:
