@@ -161,18 +161,25 @@ set -x
 systemctl stop ${SYSTEM_NAME}
 systemctl disable ${SYSTEM_NAME}
 systemctl reset-failed ${SYSTEM_NAME}
+# Also disable the legacy upstream unit if it's still installed; ignore failures
+# so this script also works on hosts that never ran coroot-node-agent.
+systemctl stop coroot-node-agent 2>/dev/null || true
+systemctl disable coroot-node-agent 2>/dev/null || true
+systemctl reset-failed coroot-node-agent 2>/dev/null || true
 systemctl daemon-reload
 
 rm -f ${FILE_SERVICE}
 rm -f ${FILE_ENV}
+rm -f ${SYSTEMD_DIR}/coroot-node-agent.service
+rm -f ${SYSTEMD_DIR}/coroot-node-agent.service.env
 
 remove_uninstall() {
     rm -f ${UNINSTALL_SH}
 }
 trap remove_uninstall EXIT
 
-rm -rf /var/lib/${SYSTEM_NAME} || true
-rm -f ${BIN_DIR}/${SYSTEM_NAME}
+rm -rf /var/lib/${SYSTEM_NAME} /var/lib/coroot-node-agent || true
+rm -f ${BIN_DIR}/${SYSTEM_NAME} ${BIN_DIR}/coroot-node-agent
 EOF
     $SUDO chmod 755 ${UNINSTALL_SH}
     $SUDO chown root:root ${UNINSTALL_SH}
