@@ -1,7 +1,7 @@
 # Nudgebee Node Agent
 
 [![Continuous Integration](https://github.com/nudgebee/node-agent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/nudgebee/node-agent/actions/workflows/ci.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/nudgebee/node-agent)](https://goreportcard.com/report/github.com/nudgebee/node-agent)
+[![Go Report Card](https://goreportcard.com/badge/github.com/coroot/coroot-node-agent)](https://goreportcard.com/report/github.com/coroot/coroot-node-agent)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 A per-node observability agent for Kubernetes and Linux hosts. The agent
@@ -37,13 +37,15 @@ Minimum Linux kernel: **5.1** (eBPF CO-RE).
 
 ### Added in this fork
 
-- **LLM observability** — detects calls to OpenAI, Anthropic, AWS
-  Bedrock, Google AI, Mistral, and OpenAI-compatible endpoints from
-  eBPF-traced TLS sessions, and emits per-request metrics including
-  model name, token counts, latency, and estimated cost.
-- **IP-to-FQDN resolver** — enriches outbound flows with hostnames by
-  observing HTTP `Host` headers and DNS responses, so the service map
-  shows `api.example.com` instead of `203.0.113.42`.
+- **[LLM observability](docs/llm-observability.md)** — detects calls
+  to OpenAI, Anthropic, AWS Bedrock, Google AI / Vertex, Azure OpenAI,
+  Cohere, and OpenAI-compatible endpoints from eBPF-traced TLS
+  sessions, and emits per-request metrics including model name, token
+  counts, latency, time-to-first-token, and estimated cost.
+- **[IP-to-FQDN resolver](docs/ip-fqdn-resolver.md)** — enriches
+  outbound flows with hostnames and K8s workload identity by
+  combining Service/Pod/Node informers with the DNS cache, so the
+  service map shows `payments-api` instead of `10.0.5.41`.
 - **Enhanced L7 protocol detection** — TLS SNI extraction, lightweight
   HTTP/2 parsing with HPACK, improved Go TLS capture, Node.js TLS,
   FoundationDB.
@@ -86,11 +88,13 @@ ghcr.io/nudgebee/node-agent:<major>
 ## Metrics
 
 The agent exposes Prometheus metrics on `:80/metrics`. Self-identifying
-label: `job="nudgebee-node-agent"`. The full metric catalogue
-(inherited from upstream) is documented at
-[docs.coroot.com/metrics/node-agent](https://docs.coroot.com/metrics/node-agent);
-nudgebee-specific LLM and FQDN-resolver metrics will be documented
-under `docs/` in this repo.
+label: `job="nudgebee-node-agent"`.
+
+- Nudgebee-specific metrics:
+  - [LLM observability](docs/llm-observability.md#metrics-emitted)
+  - [IP-to-FQDN resolver](docs/ip-fqdn-resolver.md)
+- The full inherited metric catalogue is documented upstream at
+  [docs.coroot.com/metrics/node-agent](https://docs.coroot.com/metrics/node-agent).
 
 ## Contributing
 
