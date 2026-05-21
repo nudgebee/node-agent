@@ -1,2 +1,41 @@
-.idea
-.vagrant
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Vagrant
+.vagrant/
+
+# Go build artifacts
+/nudgebee-node-agent
+/coroot-node-agent
+*.exe
+*.test
+*.out
+
+# Go coverage / profiling
+*.prof
+*.pprof
+coverage.txt
+coverage.html
+
+# Build / dist
+/dist/
+/build/
+/bin/
+
+# Vendored modules (we don't vendor)
+/vendor/
+
+# Local env files
+.env
+.env.local
+
+# eBPF build outputs (regenerated via ebpftracer/make build)
+ebpftracer/ebpf/*.o

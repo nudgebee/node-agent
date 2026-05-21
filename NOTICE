@@ -1,0 +1,17 @@
+Nudgebee Node Agent
+Copyright 2024-present Nudgebee, Inc.
+
+This product is a derivative work of coroot-node-agent
+(https://github.com/coroot/coroot-node-agent), originally developed
+by Coroot, Inc. (Copyright 2020-present Coroot, Inc.) and licensed
+under the Apache License, Version 2.0.
+
+The Go code in this repository is distributed under the Apache License,
+Version 2.0. See LICENSE for the full text.
+
+The eBPF C code under ebpftracer/ebpf/ is distributed under the
+GNU General Public License, Version 2.0. See LICENSES/GPL-2.0.txt for
+the full text.
+
+This product includes software developed by third parties; see go.sum
+for the complete list of Go module dependencies and their licenses.
