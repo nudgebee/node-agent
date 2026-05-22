@@ -17,7 +17,7 @@ COPY . .
 
 # Build statically linked binary
 ARG VERSION=unknown
-RUN CGO_ENABLED=1 go build -mod=readonly -ldflags "-extldflags='-Wl,-z,lazy' -X 'github.com/coroot/coroot-node-agent/flags.Version=${VERSION}'" -o coroot-node-agent .
+RUN CGO_ENABLED=1 go build -mod=readonly -ldflags "-extldflags='-Wl,-z,lazy' -X 'github.com/coroot/coroot-node-agent/flags.Version=${VERSION}'" -o nudgebee-node-agent .
 
 # Runtime stage
 FROM alpine:3.22 AS release-stage
@@ -28,10 +28,10 @@ RUN apk add --no-cache openssl libssl3 ca-certificates
 WORKDIR /app
 
 # Copy the statically linked binary
-COPY --from=builder /app/coroot-node-agent /usr/bin/coroot-node-agent
+COPY --from=builder /app/nudgebee-node-agent /usr/bin/nudgebee-node-agent
 
 # Ensure it's executable
-RUN chmod +x /usr/bin/coroot-node-agent
+RUN chmod +x /usr/bin/nudgebee-node-agent
 
 # Run it
-CMD ["/usr/bin/coroot-node-agent"]
+CMD ["/usr/bin/nudgebee-node-agent"]

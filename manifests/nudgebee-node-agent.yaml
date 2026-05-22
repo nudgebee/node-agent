@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nudgebee
+  labels:
+    # The agent requires privileged + hostPID; allow that explicitly on
+    # clusters that enforce Pod Security Admission (Kubernetes >= 1.25).
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
+
+---
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    app: nudgebee-node-agent
+  name: nudgebee-node-agent
+  namespace: nudgebee
+spec:
+  selector:
+    matchLabels:
+      app: nudgebee-node-agent
+  template:
+    metadata:
+      labels:
+        app: nudgebee-node-agent
+      annotations:
+        prometheus.io/scrape: 'true'
+        prometheus.io/port: '80'
+    spec:
+      tolerations:
+        - operator: Exists
+      hostPID: true
+      containers:
+        - name: nudgebee-node-agent
+          # Pinning to a major-version tag keeps deploys deterministic
+          # within a compatible range. For production, pin to a fully
+          # qualified semver tag (e.g. :1.2.3).
+          image: ghcr.io/nudgebee/node-agent:1
+          imagePullPolicy: IfNotPresent
+          args: ["--cgroupfs-root", "/host/sys/fs/cgroup"]
+          ports:
+            - containerPort: 80
+              name: http
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - mountPath: /host/sys/fs/cgroup
+              name: cgroupfs
+              readOnly: true
+            - mountPath: /sys/kernel/debug
+              name: debugfs
+              readOnly: false
+      volumes:
+        - hostPath:
+            path: /sys/fs/cgroup
+          name: cgroupfs
+        - hostPath:
+            path: /sys/kernel/debug
+          name: debugfs

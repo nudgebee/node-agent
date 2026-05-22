@@ -62,7 +62,7 @@ func StartAgent(reg *prometheus.Registry, machineId, systemUuid string) error {
 		url: *flags.MetricsEndpoint,
 		labels: map[string]string{
 			model.InstanceLabel: instance,
-			model.JobLabel:      "coroot-node-agent",
+			model.JobLabel:      "nudgebee-node-agent",
 		},
 		httpClient: http.Client{
 			Timeout: RemoteWriteTimeout,
@@ -143,7 +143,7 @@ func (a *Agent) send(fPath string) error {
 	for k, v := range common.AuthHeaders() {
 		req.Header.Set(k, v)
 	}
-	req.Header.Set("User-Agent", "coroot-node-agent")
+	req.Header.Set("User-Agent", "nudgebee-node-agent")
 	req.Header.Set("Content-Type", "application/x-protobuf")
 	req.Header.Set("Content-Encoding", "snappy")
 	req.Header.Set("X-Prometheus-Remote-Write-Version", "0.1.0")

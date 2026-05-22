@@ -1,0 +1,21 @@
+# Default reviewers for the whole repo.
+# Add or change owners as the team grows; nearest match wins.
+
+*       @nudgebee/engineering
+
+# eBPF probes need a closer eye — kernel quirks, license boundaries.
+/ebpftracer/                    @nudgebee/engineering
+/ebpftracer/ebpf/               @nudgebee/engineering
+
+# Release surface — CI, manifests, install script, Dockerfiles.
+/.github/workflows/             @nudgebee/engineering
+/manifests/                     @nudgebee/engineering
+/install.sh                     @nudgebee/engineering
+/Dockerfile                     @nudgebee/engineering
+/Dockerfile.alpine              @nudgebee/engineering
+
+# Legal / governance — changes here should be deliberate.
+/LICENSE                        @nudgebee/engineering
+/NOTICE                         @nudgebee/engineering
+/SECURITY.md                    @nudgebee/engineering
+/CODE_OF_CONDUCT.md             @nudgebee/engineering
