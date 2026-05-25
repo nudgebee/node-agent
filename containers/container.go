@@ -361,12 +361,17 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 
 	if disks, err := node.GetDisks(); err == nil {
 		ioStat := c.cgroup.IOStat()
+		seenVolumes := map[string]struct{}{}
 		for majorMinor, mounts := range c.getMounts() {
 			var device string
 			if dev := disks.GetParentBlockDevice(majorMinor); dev != nil {
 				device = dev.Name
 			}
 			for mountPoint, fsStat := range mounts {
+				if _, ok := seenVolumes[mountPoint+":"+device]; ok {
+					continue
+				}
+				seenVolumes[mountPoint+":"+device] = struct{}{}
 				dls := []string{mountPoint, device, c.metadata.volumes[mountPoint]}
 				ch <- c.gauge(metrics.DiskSize, float64(fsStat.CapacityBytes), dls...)
 				ch <- c.gauge(metrics.DiskUsed, float64(fsStat.UsedBytes), dls...)
@@ -1749,19 +1754,45 @@ func (c *Container) updatePythonStats(s PythonStatsUpdate) {
 }
 
 func (c *Container) getMounts() map[string]map[string]*proc.FSStat {
+	// c.processes and c.mounts are mutated by the handleEvents goroutine
+	// (onFileOpen), so both are read and updated under c.lock.
+	c.lock.RLock()
 	if len(c.mounts) == 0 {
+		c.lock.RUnlock()
 		return nil
 	}
-	// Copy pids under read lock — c.processes is mutated by handleEvents goroutine
-	c.lock.RLock()
 	pids := make([]uint32, 0, len(c.processes))
 	for pid := range c.processes {
 		pids = append(pids, pid)
 	}
 	c.lock.RUnlock()
 
-	res := map[string]map[string]*proc.FSStat{}
+	// Drop mounts that are gone from the container's mount namespace, so a
+	// remounted volume is not reported twice (stale + current entry).
+	var current map[string]proc.MountInfo
+	for _, pid := range pids {
+		if current = proc.GetMountInfo(pid); current != nil {
+			break
+		}
+	}
+	c.lock.Lock()
+	if len(current) > 0 {
+		for mntId := range c.mounts {
+			if mi, ok := current[mntId]; ok {
+				c.mounts[mntId] = mi
+			} else {
+				delete(c.mounts, mntId)
+			}
+		}
+	}
+	mounts := make([]proc.MountInfo, 0, len(c.mounts))
 	for _, mi := range c.mounts {
+		mounts = append(mounts, mi)
+	}
+	c.lock.Unlock()
+
+	res := map[string]map[string]*proc.FSStat{}
+	for _, mi := range mounts {
 		var stat *proc.FSStat
 		for _, pid := range pids {
 			s, err := proc.StatFS(proc.Path(pid, "root", mi.MountPoint))
