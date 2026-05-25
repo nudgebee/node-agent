@@ -69,7 +69,7 @@ jobs:
           docker cp arm64:/usr/bin/nudgebee-node-agent /tmp/nudgebee-node-agent-${{ steps.meta.outputs.version }}-arm64
 
       - name: Create GitHub release with binaries
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
