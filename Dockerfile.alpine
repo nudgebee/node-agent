@@ -20,7 +20,7 @@ ARG VERSION=unknown
 RUN CGO_ENABLED=1 go build -mod=readonly -ldflags "-extldflags='-Wl,-z,lazy' -X 'github.com/coroot/coroot-node-agent/flags.Version=${VERSION}'" -o nudgebee-node-agent .
 
 # Runtime stage
-FROM alpine:3.22 AS release-stage
+FROM alpine:3.23 AS release-stage
 
 # Install SSL/TLS libraries for HTTPS LLM API tracing
 RUN apk add --no-cache openssl libssl3 ca-certificates
