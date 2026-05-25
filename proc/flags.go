@@ -29,15 +29,18 @@ func GetFlags(pid uint32) (Flags, error) {
 		if len(kv) != 2 {
 			continue
 		}
-		if !strings.HasPrefix(kv[0], "COROOT_") {
+		// COROOT_* env vars are accepted for backwards compatibility with
+		// users migrating from coroot/coroot-node-agent. NUDGEBEE_* is the
+		// canonical prefix going forward.
+		if !strings.HasPrefix(kv[0], "NUDGEBEE_") && !strings.HasPrefix(kv[0], "COROOT_") {
 			continue
 		}
 		switch kv[0] {
-		case "COROOT_EBPF_PROFILING":
+		case "NUDGEBEE_EBPF_PROFILING", "COROOT_EBPF_PROFILING":
 			flags.EbpfProfilingDisabled = strings.Contains(kv[1], "disabled")
-		case "COROOT_LOG_MONITORING":
+		case "NUDGEBEE_LOG_MONITORING", "COROOT_LOG_MONITORING":
 			flags.LogMonitoringDisabled = strings.Contains(kv[1], "disabled")
-		case "COROOT_EBPF_TRACES":
+		case "NUDGEBEE_EBPF_TRACES", "COROOT_EBPF_TRACES":
 			flags.EbpfTracesDisabled = strings.Contains(kv[1], "disabled")
 		}
 	}

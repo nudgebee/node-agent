@@ -1,0 +1,21 @@
+# gitleaks config — extends the default ruleset.
+# Run locally with: gitleaks detect --config .gitleaks.toml
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Synthetic placeholders used in test fixtures"
+regexes = [
+  # AWS's documented example access key, used in ebpftracer/l7/l7_test.go
+  '''AKIAIOSFODNN7EXAMPLE''',
+  # Synthetic redaction markers, not real credentials
+  '''EXAMPLE_SESSION_TOKEN_REDACTED''',
+  '''EXAMPLE_COOKIE_REDACTED''',
+  '''EXAMPLE_REMOTE_WRITE_BODY_REDACTED''',
+  '''EXAMPLE\.JWT\.TOKEN_REDACTED''',
+]
+paths = [
+  # GPL-2.0 text contains nothing secret but does include the FSF
+  # postal address regexp may flag certain text patterns
+  '''LICENSES/GPL-2\.0\.txt''',
+]

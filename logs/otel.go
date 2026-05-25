@@ -50,14 +50,14 @@ func Init(machineId, hostname, version string) {
 		sdk.WithResource(
 			resource.NewWithAttributes(
 				semconv.SchemaURL,
-				semconv.ServiceName("coroot-node-agent"),
+				semconv.ServiceName("nudgebee-node-agent"),
 				semconv.HostName(hostname),
 				semconv.HostID(machineId),
 			),
 		),
 	)
 	otel.SetLoggerProvider(loggerProvider)
-	otelLogger = loggerProvider.Logger("coroot-node-agent", otelLogs.WithInstrumentationVersion(version))
+	otelLogger = loggerProvider.Logger("nudgebee-node-agent", otelLogs.WithInstrumentationVersion(version))
 }
 
 func OtelLogEmitter(containerId string) logparser.OnMsgCallbackF {

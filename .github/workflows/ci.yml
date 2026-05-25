@@ -6,8 +6,12 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
-  GO:
+  go:
+    name: Go (build, vet, test)
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -25,5 +29,47 @@ jobs:
           go install golang.org/x/tools/cmd/goimports@latest
           files=$(goimports -l .); if [[ -n "$files" ]]; then echo "$files"; exit 1; fi
       - run: go vet ./...
+      # /containers transitively imports github.com/NVIDIA/go-nvml. The
+      # bindings register NVML symbols (including some only present in
+      # very recent libnvidia-ml.so versions, e.g.
+      # nvmlDeviceSetMemClkVfOffset) at process start via dlsym, which
+      # fails on a runner without a matching NVIDIA driver and aborts
+      # the test binary before any of our tests run. Skip until either
+      # GPU code moves behind a build tag or the runner ships a newer
+      # libnvidia-ml.so.
       - run: go test $(go list ./... | grep -v '/containers$')
       - run: go build -mod=readonly .
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Run the gitleaks CLI directly (BSD-licensed, free for orgs).
+      # gitleaks/gitleaks-action requires a paid licence when run on an
+      # org-owned repository, which we don't need for this use case.
+      - name: Install gitleaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+      # Scan only the commits introduced by this event:
+      #   - PR: base..HEAD
+      #   - push: before..after
+      # Pre-existing secrets in history are tracked separately and will
+      # be purged by a one-time git-filter-repo pass before the repo
+      # goes public.
+      - name: Scan PR commits
+        if: github.event_name == 'pull_request'
+        run: |
+          gitleaks detect --no-banner --config .gitleaks.toml \
+            --redact --verbose --exit-code 1 \
+            --log-opts="${{ github.event.pull_request.base.sha }}..HEAD"
+      - name: Scan pushed commits
+        if: github.event_name == 'push'
+        run: |
+          gitleaks detect --no-banner --config .gitleaks.toml \
+            --redact --verbose --exit-code 1 \
+            --log-opts="${{ github.event.before }}..${{ github.event.after }}"

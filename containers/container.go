@@ -1771,7 +1771,7 @@ func (c *Container) runLogParser(logPath string) {
 
 	for _, p := range c.processes {
 		if p.Flags.LogMonitoringDisabled {
-			klog.InfoS("skipping log monitoring due to COROOT_LOG_MONITORING=disabled", "cg", c.cgroup.Id)
+			klog.InfoS("skipping log monitoring due to NUDGEBEE_LOG_MONITORING=disabled", "cg", c.cgroup.Id)
 			return
 		}
 	}
