@@ -65,3 +65,7 @@ main Dockerfile only runs `go build` and will not rebuild eBPF for you.
 By submitting a contribution you agree to license your changes under
 the same terms as the project: Apache-2.0 for Go code, GPL-2.0 for
 eBPF C code.
+
+No Developer Certificate of Origin (DCO) sign-off or Contributor
+License Agreement (CLA) is required — opening a pull request is taken
+as acceptance of the above.
