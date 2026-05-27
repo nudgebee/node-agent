@@ -13,5 +13,11 @@ The eBPF C code under ebpftracer/ebpf/ is distributed under the
 GNU General Public License, Version 2.0. See LICENSES/GPL-2.0.txt for
 the full text.
 
+Portions of the eBPF C code under ebpftracer/ebpf/ (socket-info
+extraction and Go TLS/gRPC file-descriptor discovery) were informed by
+techniques from the DeepFlow project
+(https://github.com/deepflowio/deepflow), Copyright Yunshan Networks,
+licensed under the Apache License, Version 2.0.
+
 This product includes software developed by third parties; see go.sum
 for the complete list of Go module dependencies and their licenses.
