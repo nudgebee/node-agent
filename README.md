@@ -1,7 +1,7 @@
 # Nudgebee Node Agent
 
 [![Continuous Integration](https://github.com/nudgebee/node-agent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/nudgebee/node-agent/actions/workflows/ci.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/coroot/coroot-node-agent)](https://goreportcard.com/report/github.com/coroot/coroot-node-agent)
+[![Go Report Card](https://goreportcard.com/badge/github.com/nudgebee/node-agent)](https://goreportcard.com/report/github.com/nudgebee/node-agent)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 A per-node observability agent for Kubernetes and Linux hosts. The agent
