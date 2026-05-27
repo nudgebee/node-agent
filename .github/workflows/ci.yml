@@ -14,7 +14,7 @@ jobs:
     name: Go (build, vet, test)
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25.0'
@@ -44,7 +44,7 @@ jobs:
     name: Secret scan
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       # Run the gitleaks CLI directly (BSD-licensed, free for orgs).
