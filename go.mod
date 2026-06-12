@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/ClickHouse/ch-go v0.65.0
-	github.com/NVIDIA/go-nvml v0.12.4-1
+	github.com/NVIDIA/go-nvml v0.13.1-0
 	github.com/agoda-com/opentelemetry-logs-go v0.4.1
 	github.com/cilium/cilium v1.17.15
 	github.com/cilium/ebpf v0.20.0
