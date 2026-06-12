@@ -6,7 +6,7 @@ require (
 	github.com/ClickHouse/ch-go v0.65.0
 	github.com/NVIDIA/go-nvml v0.12.4-1
 	github.com/agoda-com/opentelemetry-logs-go v0.4.1
-	github.com/cilium/cilium v1.17.14
+	github.com/cilium/cilium v1.17.15
 	github.com/cilium/ebpf v0.20.0
 	github.com/containerd/cgroups v1.1.0
 	github.com/containerd/containerd v1.7.29
@@ -24,7 +24,7 @@ require (
 	github.com/nudgebee/logparser v0.0.0-20260406040008-c408d0a5c69c
 	github.com/opencontainers/runtime-spec v1.1.0
 	github.com/prometheus/client_golang v1.20.5
-	github.com/prometheus/client_model v0.6.1
+	github.com/prometheus/client_model v0.6.2
 	github.com/prometheus/common v0.61.0
 	github.com/prometheus/prometheus v0.51.2
 	github.com/pyroscope-io/dotnetdiag v1.2.1
@@ -119,7 +119,7 @@ require (
 	github.com/google/pprof v0.0.0-20241029153458-d1b30febd7db // indirect
 	github.com/gopacket/gopacket v1.3.1 // indirect
 	github.com/grafana/regexp v0.0.0-20221123153739-15dc172cd2db // indirect
-	github.com/grpc-ecosystem/grpc-gateway/v2 v2.25.1 // indirect
+	github.com/grpc-ecosystem/grpc-gateway/v2 v2.27.1 // indirect
 	github.com/hashicorp/hcl v1.0.1-vault-5 // indirect
 	github.com/ianlancetaylor/demangle v0.0.0-20240312041847-bd984b5ce465 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
@@ -180,7 +180,7 @@ require (
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.61.0 // indirect
 	go.opentelemetry.io/otel/metric v1.43.0 // indirect
-	go.opentelemetry.io/proto/otlp v1.5.0 // indirect
+	go.opentelemetry.io/proto/otlp v1.7.1 // indirect
 	go.uber.org/dig v1.17.1 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
@@ -204,7 +204,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	k8s.io/apiextensions-apiserver v0.32.13 // indirect
 	k8s.io/kube-openapi v0.0.0-20241105132330-32ad38e42d3f // indirect
-	k8s.io/utils v0.0.0-20260210185600-b8788abfbbc2 // indirect
+	k8s.io/utils v0.0.0-20260319190234-28399d86e0b5 // indirect
 	sigs.k8s.io/controller-runtime v0.20.4 // indirect
 	sigs.k8s.io/gateway-api v1.2.1 // indirect
 	sigs.k8s.io/json v0.0.0-20241010143419-9aa6b5e7a4b3 // indirect
