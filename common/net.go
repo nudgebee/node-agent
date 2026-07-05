@@ -215,8 +215,10 @@ func (dk DestinationKey) ActualDestinationLabelValue() string {
 // workload identity (namespace/name), which stays stable across pod-IP changes.
 // The *_workload_* labels already carry this identity, and backend queries key on
 // them rather than the raw destination, so this is transparent to consumers.
-// If the workload is unresolved (no name), we fall back to the bare IP (no port)
-// to at least drop the port dimension.
+// When the workload is resolved to a real name (not just the IP echoed back),
+// we use its identity. Otherwise we fall back per destination type: private
+// (internal) IPs drop the churning port dimension; external IPs keep IP:port
+// since their cardinality is low and the port is useful.
 func destinationLabelValue(hp HostPort, wl Workload) string {
 	// FQDN destinations (external, resolved by DNS) have no IP set — keep them.
 	if hp.ip.IsZero() {
@@ -225,14 +227,20 @@ func destinationLabelValue(hp HostPort, wl Workload) string {
 	if flags.CollapseInternalDestinations == nil || !*flags.CollapseInternalDestinations {
 		return hp.String()
 	}
-	if wl.Name != "" {
+	// Resolved workload identity (guard against the IP-echoed-back fallback that
+	// ResolveIP returns for unresolved endpoints).
+	if wl.Name != "" && wl.Name != hp.ip.String() {
 		if wl.Namespace != "" {
 			return wl.Namespace + "/" + wl.Name
 		}
 		return wl.Name
 	}
-	// Unresolved internal endpoint: drop the churning port dimension.
-	return hp.ip.String()
+	if IsIpPrivate(hp.ip) {
+		// Unresolved internal endpoint: drop the churning port dimension.
+		return hp.ip.String()
+	}
+	// Unresolved external endpoint: low cardinality, keep the port.
+	return hp.String()
 }
 
 // DestinationIPLabelValue collapses a raw destination IP to the resolved workload

@@ -89,9 +89,11 @@ func TestNormalizeFQDN(t *testing.T) {
 func TestDestinationLabelValue(t *testing.T) {
 	fqdn := HostPortWithEmptyIP("api.openai.com", 443)
 	internal := internalHP("10.64.3.17", 8080)
+	external := internalHP("1.1.1.1", 443)
 	resolved := Workload{Name: "api-server", Namespace: "nudgebee", Kind: "Deployment"}
 	noNamespace := Workload{Name: "kube-dns"}
-	unresolved := Workload{} // ResolveIP fell through, no name
+	unresolved := Workload{}                                                        // ResolveIP fell through, no name
+	ipEcho := Workload{Name: "10.64.3.17", Namespace: "external", Kind: "external"} // ResolveIP echoed the IP back
 
 	t.Run("collapse on", func(t *testing.T) {
 		setCollapse(t, true)
@@ -101,8 +103,13 @@ func TestDestinationLabelValue(t *testing.T) {
 		assert.Equal(t, "nudgebee/api-server", destinationLabelValue(internal, resolved))
 		// Internal resolved without namespace -> bare name.
 		assert.Equal(t, "kube-dns", destinationLabelValue(internal, noNamespace))
-		// Internal unresolved -> bare IP, port dimension dropped.
+		// Internal unresolved (no name) -> bare IP, port dimension dropped.
 		assert.Equal(t, "10.64.3.17", destinationLabelValue(internal, unresolved))
+		// Internal unresolved where ResolveIP echoed the IP back as the name ->
+		// treated as unresolved (not "external/10.64.3.17"), port dropped.
+		assert.Equal(t, "10.64.3.17", destinationLabelValue(internal, ipEcho))
+		// External unresolved -> low cardinality, keep the port.
+		assert.Equal(t, "1.1.1.1:443", destinationLabelValue(external, unresolved))
 	})
 
 	t.Run("collapse off", func(t *testing.T) {
