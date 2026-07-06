@@ -4,12 +4,12 @@ go 1.25.0
 
 require (
 	github.com/ClickHouse/ch-go v0.65.0
-	github.com/NVIDIA/go-nvml v0.12.4-1
+	github.com/NVIDIA/go-nvml v0.13.3-0
 	github.com/agoda-com/opentelemetry-logs-go v0.4.1
 	github.com/cilium/cilium v1.17.15
 	github.com/cilium/ebpf v0.20.0
 	github.com/containerd/cgroups v1.1.0
-	github.com/containerd/containerd v1.7.29
+	github.com/containerd/containerd v1.7.33
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/docker/docker v28.0.0+incompatible
 	github.com/florianl/go-conntrack v0.3.0
@@ -41,7 +41,7 @@ require (
 	golang.org/x/arch v0.4.0
 	golang.org/x/exp v0.0.0-20240808152545-0cdaa3abc0fa
 	golang.org/x/net v0.55.0
-	golang.org/x/sys v0.45.0
+	golang.org/x/sys v0.46.0
 	golang.org/x/time v0.14.0
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
 	gopkg.in/yaml.v2 v2.4.0
@@ -150,7 +150,7 @@ require (
 	github.com/oklog/ulid v1.3.1 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.1 // indirect
-	github.com/opencontainers/selinux v1.13.0 // indirect
+	github.com/opencontainers/selinux v1.13.1 // indirect
 	github.com/opentracing/opentracing-go v1.2.1-0.20220228012449-10b1cf09e00b // indirect
 	github.com/pelletier/go-toml/v2 v2.2.2 // indirect
 	github.com/petermattis/goid v0.0.0-20240813172612-4fcff4a6cae7 // indirect
