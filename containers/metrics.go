@@ -37,15 +37,11 @@ var metrics = struct {
 	DiskWriteOps   *prometheus.Desc
 	DiskWriteBytes *prometheus.Desc
 
-	NetListenInfo            *prometheus.Desc
-	NetConnectionsSuccessful *prometheus.Desc
-	NetConnectionsTotalTime  *prometheus.Desc
-	NetConnectionsFailed     *prometheus.Desc
-	NetConnectionsActive     *prometheus.Desc
-	NetRetransmits           *prometheus.Desc
-	NetLatency               *prometheus.Desc
-	NetBytesSent             *prometheus.Desc
-	NetBytesReceived         *prometheus.Desc
+	NetListenInfo *prometheus.Desc
+	NetLatency    *prometheus.Desc
+	// container_net_tcp_* connection/byte metrics are emitted directly from the
+	// pre-registered CounterVecs in tcp_metrics.go (TCPMetrics.collect); the Desc
+	// forms previously declared here were dead code and have been removed.
 
 	LogMessages          *prometheus.Desc
 	SensitiveLogMessages *prometheus.Desc
@@ -94,15 +90,8 @@ var metrics = struct {
 	DiskWriteOps:   metric("container_resources_disk_writes_total", "Total number of writes completed successfully by the container", "mount_point", "device", "volume"),
 	DiskWriteBytes: metric("container_resources_disk_written_bytes_total", "Total number of bytes written to the disk by the container", "mount_point", "device", "volume"),
 
-	NetListenInfo:            metric("container_net_tcp_listen_info", "Listen address of the container", "listen_addr", "proxy"),
-	NetConnectionsSuccessful: metric("container_net_tcp_successful_connects_total", "Total number of successful TCP connects", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
-	NetConnectionsTotalTime:  metric("container_net_tcp_connection_time_seconds_total", "Time spent on TCP connections", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
-	NetConnectionsFailed:     metric("container_net_tcp_failed_connects_total", "Total number of failed TCP connects", "destination", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
-	NetConnectionsActive:     metric("container_net_tcp_active_connections", "Number of active outbound connections used by the container", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
-	NetRetransmits:           metric("container_net_tcp_retransmits_total", "Total number of retransmitted TCP segments", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
-	NetLatency:               metric("container_net_latency_seconds", "Round-trip time between the container and a remote IP", "destination_ip", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind"),
-	NetBytesSent:             metric("container_net_tcp_bytes_sent_total", "Total number of bytes sent to the peer", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
-	NetBytesReceived:         metric("container_net_tcp_bytes_received_total", "Total number of bytes received from the peer", "destination", "actual_destination", "src_workload_name", "src_workload_namespace", "src_workload_kind", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind", "actual_destination_workload_name", "actual_destination_workload_namespace", "actual_destination_workload_kind"),
+	NetListenInfo: metric("container_net_tcp_listen_info", "Listen address of the container", "listen_addr", "proxy"),
+	NetLatency:    metric("container_net_latency_seconds", "Round-trip time between the container and a remote IP", "destination_ip", "destination_workload_name", "destination_workload_namespace", "destination_workload_kind"),
 
 	LogMessages:          metric("container_log_messages_total", "Number of messages grouped by the automatically extracted repeated pattern", "source", "level", "pattern_hash", "sample"),
 	SensitiveLogMessages: metric("container_sensitive_log_messages_total", "Number of messages that contain sensitive information", "source", "pattern", "sample", "regex", "name", "pattern_hash"),
