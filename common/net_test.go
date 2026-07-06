@@ -3,9 +3,22 @@ package common
 import (
 	"testing"
 
+	"github.com/coroot/coroot-node-agent/flags"
 	"github.com/stretchr/testify/assert"
 	"inet.af/netaddr"
 )
+
+// setCollapse sets the CollapseInternalDestinations flag for the duration of a
+// test and restores the previous value afterwards.
+func setCollapse(t *testing.T, v bool) {
+	prev := *flags.CollapseInternalDestinations
+	*flags.CollapseInternalDestinations = v
+	t.Cleanup(func() { *flags.CollapseInternalDestinations = prev })
+}
+
+func internalHP(ip string, port uint16) HostPort {
+	return HostPortFromIPPort(netaddr.IPPortFrom(netaddr.MustParseIP(ip), port))
+}
 
 func TestConnectionFilter(t *testing.T) {
 	f := connectionFilter{whitelist: map[string]netaddr.IPPrefix{}}
@@ -71,6 +84,63 @@ func TestNormalizeFQDN(t *testing.T) {
 	assert.Equal(t, "example.net.search_path_suffix", NormalizeFQDN("example.net.svc.default.cluster.local", "TypeA"))
 	assert.Equal(t, "example.org.search_path_suffix", NormalizeFQDN("example.org.svc.default.cluster.local", "TypeA"))
 	assert.Equal(t, "example.io.search_path_suffix", NormalizeFQDN("example.io.svc.default.cluster.local", "TypeA"))
+}
+
+func TestDestinationLabelValue(t *testing.T) {
+	fqdn := HostPortWithEmptyIP("api.openai.com", 443)
+	internal := internalHP("10.64.3.17", 8080)
+	external := internalHP("1.1.1.1", 443)
+	resolved := Workload{Name: "api-server", Namespace: "nudgebee", Kind: "Deployment"}
+	noNamespace := Workload{Name: "kube-dns"}
+	unresolved := Workload{}                                                        // ResolveIP fell through, no name
+	ipEcho := Workload{Name: "10.64.3.17", Namespace: "external", Kind: "external"} // ResolveIP echoed the IP back
+
+	t.Run("collapse on", func(t *testing.T) {
+		setCollapse(t, true)
+		// External FQDN destinations are kept as-is regardless of workload.
+		assert.Equal(t, "api.openai.com:443", destinationLabelValue(fqdn, unresolved))
+		// Internal resolved -> stable workload identity (no churning IP:port).
+		assert.Equal(t, "nudgebee/api-server", destinationLabelValue(internal, resolved))
+		// Internal resolved without namespace -> bare name.
+		assert.Equal(t, "kube-dns", destinationLabelValue(internal, noNamespace))
+		// Internal unresolved (no name) -> bare IP, port dimension dropped.
+		assert.Equal(t, "10.64.3.17", destinationLabelValue(internal, unresolved))
+		// Internal unresolved where ResolveIP echoed the IP back as the name ->
+		// treated as unresolved (not "external/10.64.3.17"), port dropped.
+		assert.Equal(t, "10.64.3.17", destinationLabelValue(internal, ipEcho))
+		// External unresolved -> low cardinality, keep the port.
+		assert.Equal(t, "1.1.1.1:443", destinationLabelValue(external, unresolved))
+	})
+
+	t.Run("collapse off", func(t *testing.T) {
+		setCollapse(t, false)
+		// Legacy behaviour: raw IP:port for internal, FQDN untouched.
+		assert.Equal(t, "10.64.3.17:8080", destinationLabelValue(internal, resolved))
+		assert.Equal(t, "api.openai.com:443", destinationLabelValue(fqdn, resolved))
+	})
+}
+
+func TestDestinationIPLabelValue(t *testing.T) {
+	private := netaddr.MustParseIP("10.64.3.17")
+	public := netaddr.MustParseIP("1.1.1.1")
+	resolved := Workload{Name: "api-server", Namespace: "nudgebee", Kind: "Deployment"}
+
+	t.Run("collapse on", func(t *testing.T) {
+		setCollapse(t, true)
+		// Private + resolved -> workload identity.
+		assert.Equal(t, "nudgebee/api-server", DestinationIPLabelValue(private, resolved))
+		// Private but unresolved (workload name == the IP) -> keep the IP.
+		assert.Equal(t, "10.64.3.17", DestinationIPLabelValue(private, Workload{Name: "10.64.3.17"}))
+		// Private with empty workload -> keep the IP.
+		assert.Equal(t, "10.64.3.17", DestinationIPLabelValue(private, Workload{}))
+		// Public IP -> never collapsed.
+		assert.Equal(t, "1.1.1.1", DestinationIPLabelValue(public, Workload{Name: "api.openai.com", Namespace: "external"}))
+	})
+
+	t.Run("collapse off", func(t *testing.T) {
+		setCollapse(t, false)
+		assert.Equal(t, "10.64.3.17", DestinationIPLabelValue(private, resolved))
+	})
 }
 
 func BenchmarkNormalizeFQDN(b *testing.B) {
