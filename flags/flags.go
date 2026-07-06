@@ -71,6 +71,16 @@ var (
 
 	AggregateEphemeralWorkloads = kingpin.Flag("aggregate-ephemeral-workloads", "Aggregate metrics for bare pods and standalone Jobs using standard labels to reduce series cardinality").Default("true").Envar("AGGREGATE_EPHEMERAL_WORKLOADS").Bool()
 
+	// CollapseInternalDestinations replaces the raw IP:port value of the
+	// destination/actual_destination labels with the resolved workload identity
+	// (namespace/name) for internal (non-FQDN) destinations. Pod IPs churn and
+	// recycle constantly (especially on spot nodes), so raw IP:port creates a new
+	// series on every reconnect — the dominant source of TSDB churn. Collapsing to
+	// workload identity keeps series stable across pod-IP changes. External FQDN
+	// destinations are unaffected. Backend queries key on the *_workload_* labels,
+	// not the raw destination, so this is transparent to consumers.
+	CollapseInternalDestinations = kingpin.Flag("collapse-internal-destinations", "Use workload identity instead of raw IP:port for internal destination/actual_destination labels to reduce series cardinality").Default("true").Envar("COLLAPSE_INTERNAL_DESTINATIONS").Bool()
+
 	agentVersion = kingpin.Flag("version", "Print version and exit").Default("false").Bool()
 	Version      = "unknown"
 )

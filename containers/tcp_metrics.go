@@ -166,11 +166,22 @@ func (t *TCPMetrics) ObserveTraffic(key common.DestinationKey, src common.Worklo
 
 // resetAndSetActive replaces all active connection gauge values.
 // Called from the event handler goroutine periodically.
+//
+// Uses Add (not Set) after Reset so that multiple entries which collapse to the
+// same label set — e.g. connections to several pods of one workload once
+// destination labels are collapsed to workload identity (CollapseInternalDestinations)
+// — sum instead of overwriting each other. With unique labels Add-from-zero is
+// equivalent to Set.
 func (t *TCPMetrics) resetAndSetActive(entries []activeEntry) {
 	t.ensureInitialized()
+	// Hold the write lock across Reset + rebuild so a concurrent collect()
+	// (which holds RLock) never observes a partially-rebuilt or empty gauge,
+	// which would show up as transient dips in container_net_tcp_active_connections.
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.active.Reset()
 	for _, e := range entries {
-		t.active.WithLabelValues(e.labels...).Set(float64(e.count))
+		t.active.WithLabelValues(e.labels...).Add(float64(e.count))
 	}
 }
 

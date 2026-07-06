@@ -196,11 +196,69 @@ func (dk DestinationKey) ActualDestinationIfKnown() HostPort {
 }
 
 func (dk DestinationKey) DestinationLabelValue() string {
-	return dk.destination.String()
+	return destinationLabelValue(dk.destination, dk.destinationWorkload)
 }
 
 func (dk DestinationKey) ActualDestinationLabelValue() string {
-	return dk.actualDestination.String()
+	return destinationLabelValue(dk.actualDestination, dk.actualDestinationWorkload)
+}
+
+// destinationLabelValue produces the destination/actual_destination label value.
+//
+// External destinations resolved to an FQDN (host set, no IP) are returned as-is
+// — they are already bounded and meaningful.
+//
+// Internal destinations carry a raw IP:port. Pod IPs churn and recycle
+// constantly, so emitting IP:port creates a brand-new series on every reconnect,
+// which is the dominant driver of TSDB churn/cardinality. When
+// CollapseInternalDestinations is enabled (default), we substitute the resolved
+// workload identity (namespace/name), which stays stable across pod-IP changes.
+// The *_workload_* labels already carry this identity, and backend queries key on
+// them rather than the raw destination, so this is transparent to consumers.
+// When the workload is resolved to a real name (not just the IP echoed back),
+// we use its identity. Otherwise we fall back per destination type: private
+// (internal) IPs drop the churning port dimension; external IPs keep IP:port
+// since their cardinality is low and the port is useful.
+func destinationLabelValue(hp HostPort, wl Workload) string {
+	// FQDN destinations (external, resolved by DNS) have no IP set — keep them.
+	if hp.ip.IsZero() {
+		return hp.String()
+	}
+	if flags.CollapseInternalDestinations == nil || !*flags.CollapseInternalDestinations {
+		return hp.String()
+	}
+	// Resolved workload identity (guard against the IP-echoed-back fallback that
+	// ResolveIP returns for unresolved endpoints).
+	if wl.Name != "" && wl.Name != hp.ip.String() {
+		if wl.Namespace != "" {
+			return wl.Namespace + "/" + wl.Name
+		}
+		return wl.Name
+	}
+	if IsIpPrivate(hp.ip) {
+		// Unresolved internal endpoint: drop the churning port dimension.
+		return hp.ip.String()
+	}
+	// Unresolved external endpoint: low cardinality, keep the port.
+	return hp.String()
+}
+
+// DestinationIPLabelValue collapses a raw destination IP to the resolved workload
+// identity for the container_net_latency_seconds destination_ip label, mirroring
+// destinationLabelValue. The pinger works with bare IPs (no port), so this variant
+// takes a netaddr.IP. Internal pod IPs churn/recycle; keying the RTT series on
+// workload identity keeps it stable. External and unresolved IPs are kept as-is.
+func DestinationIPLabelValue(ip netaddr.IP, wl Workload) string {
+	if flags.CollapseInternalDestinations == nil || !*flags.CollapseInternalDestinations {
+		return ip.String()
+	}
+	if IsIpPrivate(ip) && wl.Name != "" && wl.Name != ip.String() {
+		if wl.Namespace != "" {
+			return wl.Namespace + "/" + wl.Name
+		}
+		return wl.Name
+	}
+	return ip.String()
 }
 
 func (dk DestinationKey) String() string {

@@ -505,7 +505,8 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	if !*flags.DisablePinger {
 		for ip, rtt := range c.ping() {
 			destination_workload := c.ip_resolver.ResolveIP(ip.String())
-			ch <- c.gauge(metrics.NetLatency, rtt, ip.String(), destination_workload.Name, destination_workload.Namespace, destination_workload.Kind)
+			destIP := common.DestinationIPLabelValue(ip, destination_workload)
+			ch <- c.gauge(metrics.NetLatency, rtt, destIP, destination_workload.Name, destination_workload.Namespace, destination_workload.Kind)
 		}
 	}
 
