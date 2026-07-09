@@ -5,7 +5,7 @@ FROM debian:bullseye AS builder
 RUN apt-get update && apt-get install -y \
     curl git build-essential pkg-config libsystemd-dev
 
-ARG GO_VERSION=1.25.0
+ARG GO_VERSION=1.25.11
 RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz -o go.tar.gz && \
     tar -C /usr/local -xzf go.tar.gz && rm go.tar.gz
 ENV PATH="/usr/local/go/bin:${PATH}"
@@ -22,8 +22,12 @@ FROM registry.access.redhat.com/ubi9/ubi-minimal AS runtime
 
 ARG VERSION=unknown
 
-# Install SSL/TLS libraries for HTTPS LLM API tracing
-RUN microdnf install -y openssl-libs
+# Patch the UBI9 base to the latest package set, then install SSL/TLS libraries
+# for HTTPS LLM API tracing. microdnf update clears the fixable RedHat OS CVEs
+# (gnutls, openssl-libs, glibc, krb5-libs, ...) the pinned ubi-minimal ships stale.
+RUN microdnf update -y && \
+    microdnf install -y openssl-libs && \
+    microdnf clean all
 
 COPY --from=builder /tmp/src/nudgebee-node-agent /usr/bin/nudgebee-node-agent
 
