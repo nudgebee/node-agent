@@ -6,7 +6,7 @@ require (
 	github.com/ClickHouse/ch-go v0.65.0
 	github.com/NVIDIA/go-nvml v0.13.3-0
 	github.com/agoda-com/opentelemetry-logs-go v0.6.0
-	github.com/cilium/cilium v1.17.15
+	github.com/cilium/cilium v1.17.16
 	github.com/cilium/ebpf v0.20.0
 	github.com/containerd/cgroups v1.1.0
 	github.com/containerd/containerd v1.7.33
@@ -172,7 +172,7 @@ require (
 	github.com/spf13/pflag v1.0.7 // indirect
 	github.com/spf13/viper v1.19.0 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
-	github.com/ulikunitz/xz v0.5.14 // indirect
+	github.com/ulikunitz/xz v0.5.15 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	go.etcd.io/etcd/api/v3 v3.5.17 // indirect
 	go.etcd.io/etcd/client/pkg/v3 v3.5.17 // indirect
