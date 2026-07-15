@@ -716,6 +716,11 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 // updateEbpfStatsAndActiveConns reads eBPF maps and updates container stats
 // directly from the event handler goroutine. Also refreshes active connection gauges.
 func (r *Registry) updateEbpfStatsAndActiveConns() {
+	// handleEvents starts before tracer.Run has loaded the eBPF collection;
+	// iterating its maps before then panics on a nil dereference.
+	if !r.tracer.Ready() {
+		return
+	}
 	// Traffic stats from eBPF maps
 	iter := r.tracer.ActiveConnectionsIterator()
 	cid := ebpftracer.ConnectionId{}

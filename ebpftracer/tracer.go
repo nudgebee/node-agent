@@ -104,6 +104,12 @@ type Tracer struct {
 	ringbufReader *ringbuf.Reader // Ring buffer reader for l7_events
 	links         []link.Link
 	uprobes       map[string]*ebpf.Program
+
+	// ready is set once Run has loaded the eBPF collection and completed the
+	// initial process scan. Consumers running before Run completes (e.g. the
+	// registry event-handler goroutine) must check it before touching
+	// collection maps.
+	ready atomic.Bool
 }
 
 func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool) *Tracer {
@@ -130,7 +136,14 @@ func (t *Tracer) Run(events chan<- Event) error {
 	if err := t.init(events); err != nil {
 		return err
 	}
+	t.ready.Store(true)
 	return nil
+}
+
+// Ready reports whether Run has loaded the eBPF collection and finished the
+// initial process scan. Map iterators must not be used until this returns true.
+func (t *Tracer) Ready() bool {
+	return t.ready.Load()
 }
 
 func (t *Tracer) Close() {
