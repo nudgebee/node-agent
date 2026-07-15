@@ -37,10 +37,11 @@ func Init(machineId, hostname, version string) {
 		otlplogshttp.WithEndpoint(endpointUrl.Host),
 		otlplogshttp.WithURLPath(path),
 		otlplogshttp.WithHeaders(common.AuthHeaders()),
-		otlplogshttp.WithTLSClientConfig(&tls.Config{InsecureSkipVerify: *flags.InsecureSkipVerify}),
 	}
 	if endpointUrl.Scheme != "https" {
 		opts = append(opts, otlplogshttp.WithInsecure())
+	} else {
+		opts = append(opts, otlplogshttp.WithTLSClientConfig(&tls.Config{InsecureSkipVerify: *flags.InsecureSkipVerify}))
 	}
 	client := otlplogshttp.NewClient(opts...)
 	exporter, _ := otlplogs.NewExporter(context.Background(), otlplogs.WithClient(client))
