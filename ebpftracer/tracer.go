@@ -105,9 +105,10 @@ type Tracer struct {
 	links         []link.Link
 	uprobes       map[string]*ebpf.Program
 
-	// ready is set once Run has loaded the eBPF collection. Consumers running
-	// before Run completes (e.g. the registry event-handler goroutine) must
-	// check it before touching collection maps.
+	// ready is set once Run has loaded the eBPF collection and completed the
+	// initial process scan. Consumers running before Run completes (e.g. the
+	// registry event-handler goroutine) must check it before touching
+	// collection maps.
 	ready atomic.Bool
 }
 
@@ -132,15 +133,15 @@ func (t *Tracer) Run(events chan<- Event) error {
 	if err := t.ebpf(events); err != nil {
 		return err
 	}
-	t.ready.Store(true)
 	if err := t.init(events); err != nil {
 		return err
 	}
+	t.ready.Store(true)
 	return nil
 }
 
-// Ready reports whether the eBPF collection has been loaded. Map iterators
-// must not be used until this returns true.
+// Ready reports whether Run has loaded the eBPF collection and finished the
+// initial process scan. Map iterators must not be used until this returns true.
 func (t *Tracer) Ready() bool {
 	return t.ready.Load()
 }
