@@ -15,7 +15,7 @@ require (
 	github.com/florianl/go-conntrack v0.3.0
 	github.com/go-kit/log v0.2.1
 	github.com/godbus/dbus/v5 v5.2.2
-	github.com/golang/snappy v0.0.4
+	github.com/golang/snappy v1.0.0
 	github.com/google/uuid v1.6.0
 	github.com/grafana/pyroscope/ebpf v0.4.9
 	github.com/hashicorp/golang-lru/v2 v2.0.7
