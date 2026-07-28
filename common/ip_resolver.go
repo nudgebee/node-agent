@@ -2,8 +2,11 @@ package common
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -804,6 +807,20 @@ func getControllerOwnerRef(refs []metav1.OwnerReference) *metav1.OwnerReference 
 	return nil
 }
 
+// errOwnerNotCached means the owner object exists in the cluster but is not in
+// our informer snapshot yet (informers still syncing), or was garbage-collected
+// while its pods linger. This is TRANSIENT: the same lookup may succeed later,
+// so callers must not memoize an identity derived from this failure.
+//
+// errUnsupportedOwnerKind means the owner is a kind we do not track (e.g. a
+// custom controller like Argo Rollouts). This is TERMINAL: retrying will never
+// help, so the identity we already have is the best available and is safe to
+// cache.
+var (
+	errOwnerNotCached       = errors.New("owner not in informer cache")
+	errUnsupportedOwnerKind = errors.New("unsupported owner kind")
+)
+
 func (resolver *K8sIPResolver) getControllerOfOwner(owner *metav1.OwnerReference) (*metav1.OwnerReference, error) {
 	var m *sync.Map
 	switch owner.Kind {
@@ -820,14 +837,40 @@ func (resolver *K8sIPResolver) getControllerOfOwner(owner *metav1.OwnerReference
 	case "CronJob":
 		m = &resolver.snapshot.CronJobs
 	default:
-		return nil, fmt.Errorf("unsupported kind: %s", owner.Kind)
+		return nil, fmt.Errorf("%w: %s", errUnsupportedOwnerKind, owner.Kind)
 	}
 	val, ok := m.Load(owner.UID)
 	if !ok {
-		return nil, fmt.Errorf("missing %s for UID %s", owner.Kind, owner.UID)
+		return nil, fmt.Errorf("%w: %s %s", errOwnerNotCached, owner.Kind, owner.UID)
 	}
 	info := val.(MinimalOwnerInfo)
 	return getControllerOwnerRef(info.OwnerReferences), nil
+}
+
+// podTemplateHashRe matches the suffix the Deployment controller appends when
+// it names a ReplicaSet: the pod-template-hash. Kubernetes encodes that hash
+// with an alphanumeric alphabet that excludes vowels (to avoid generating
+// words), giving 6-11 character segments in practice.
+var podTemplateHashRe = regexp.MustCompile(`^[bcdfghjklmnpqrstvwxz2456789]{6,11}$`)
+
+// stripPodTemplateHash turns a Deployment-generated ReplicaSet name
+// ("llm-server-779f867dc9") into its Deployment name ("llm-server").
+//
+// It returns ok=false when the name does not carry a pod-template-hash suffix
+// — a ReplicaSet created directly rather than by a Deployment ("my-app") — so
+// that a bare ReplicaSet is never silently renamed to a Deployment that does
+// not exist. A Deployment whose own name ends in a hash-shaped segment is
+// unaffected: only the final segment is removed, e.g.
+// "foo-2456789-7d9f8bcdfg" -> "foo-2456789".
+func stripPodTemplateHash(name string) (string, bool) {
+	i := strings.LastIndex(name, "-")
+	if i <= 0 || i == len(name)-1 {
+		return name, false
+	}
+	if !podTemplateHashRe.MatchString(name[i+1:]) {
+		return name, false
+	}
+	return name[:i], true
 }
 
 // workloadIdentityLabels defines the priority order for finding a stable
@@ -859,32 +902,63 @@ func (resolver *K8sIPResolver) resolvePodDescriptor(pod *MinimalPod) Workload {
 			return result
 		}
 	}
-	var err error
 	name := pod.Name
 	namespace := pod.Namespace
 	kind := "pod"
 
+	// cacheable stays true only while every step of the ownership climb either
+	// succeeded or failed terminally. A TRANSIENT failure (owner not yet in the
+	// informer cache) must not be memoized: doing so pins the pod to an
+	// intermediate identity — typically the ReplicaSet — for its entire
+	// lifetime, which is what produced duplicate `<deploy>` / `<deploy>-<hash>`
+	// series with kind=Deployment and kind=ReplicaSet for the same workload.
+	cacheable := true
+
 	// Resolve owner hierarchy using OwnerReferences from MinimalPod
 	if len(pod.OwnerReferences) > 0 {
 		// Find the controller owner reference
-		for _, owner := range pod.OwnerReferences {
-			if owner.Controller != nil && *owner.Controller {
-				name = owner.Name
-				kind = owner.Kind
-				// Try to climb up the ownership hierarchy
-				if owner, err := resolver.getControllerOfOwner(&owner); err == nil && owner != nil {
-					for owner != nil {
-						name = owner.Name
-						kind = owner.Kind
-						owner, err = resolver.getControllerOfOwner(owner)
-						if err != nil {
-							klog.V(5).Infof("couldn't retrieve owner of %v - %v", name, err)
-							break
-						}
-					}
-				}
-				break
+		for _, ownerRef := range pod.OwnerReferences {
+			if ownerRef.Controller == nil || !*ownerRef.Controller {
+				continue
 			}
+			name = ownerRef.Name
+			kind = ownerRef.Kind
+			// Climb to the top of the ownership chain (e.g. Pod -> ReplicaSet ->
+			// Deployment). NOTE: `current` and `err` are deliberately declared in
+			// this scope. The previous implementation used `:=` inside an `if`
+			// statement, which shadowed the outer error and left it permanently
+			// nil, so a failed climb was still treated as a success and cached.
+			current := ownerRef.DeepCopy()
+			for {
+				next, err := resolver.getControllerOfOwner(current)
+				if err != nil {
+					if errors.Is(err, errOwnerNotCached) {
+						cacheable = false
+					}
+					klog.V(5).Infof("couldn't retrieve owner of %s/%s (%s): %v", namespace, name, kind, err)
+					break
+				}
+				if next == nil {
+					// Reached the top of the chain — this is the real workload.
+					break
+				}
+				name = next.Name
+				kind = next.Kind
+				current = next
+			}
+			break
+		}
+	}
+
+	// Fallback for an unresolvable ReplicaSet: its owning Deployment was not in
+	// the cache, so derive the Deployment name from the ReplicaSet's pod-template
+	// hash suffix rather than publishing a name that churns on every rollout.
+	// Only applied to the `<name>-<hash>` form that Deployments generate; a bare
+	// ReplicaSet (created directly, no hash suffix) is left untouched.
+	if kind == "ReplicaSet" {
+		if stripped, ok := stripPodTemplateHash(name); ok {
+			name = stripped
+			kind = "Deployment"
 		}
 	}
 
@@ -922,7 +996,10 @@ func (resolver *K8sIPResolver) resolvePodDescriptor(pod *MinimalPod) Workload {
 		Zone:      zone,
 		Instance:  pod.NodeName,
 	}
-	if err == nil {
+	// Only memoize a fully-resolved identity. If an owner was missing from the
+	// informer cache we return the best-effort value for this scrape but leave
+	// the descriptor uncached, so the next call retries once informers sync.
+	if cacheable {
 		resolver.snapshot.PodDescriptors.Store(pod.UID, result)
 	}
 	return result
@@ -942,10 +1019,17 @@ func (resolver *K8sIPResolver) ResolvePodOwner(podName string, podNamespace stri
 		return Workload{
 			Name:      podName,
 			Namespace: podNamespace,
-			Kind:      "Pod",
-			Region:    "",
-			Zone:      "",
-			Instance:  "",
+			// Lowercase "pod" to match resolvePodDescriptor's default. This path
+			// previously returned "Pod", so an unowned pod got a different kind
+			// depending on which code path resolved it, splitting one workload
+			// across two series. The lowercase spelling is the one already
+			// present in the TSDB, and it keeps the convention that non-k8s-owner
+			// sentinels ("pod", "node", "external") are lowercase while real
+			// owner Kinds ("Deployment", "StatefulSet") keep their k8s casing.
+			Kind:     "pod",
+			Region:   "",
+			Zone:     "",
+			Instance: "",
 		}
 	}
 	minPod := &MinimalPod{
