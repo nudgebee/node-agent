@@ -281,10 +281,31 @@ func NewDomain(fqdn string, ips []netaddr.IP) *Domain {
 	return d
 }
 
+// isKubernetesResolved reports whether a Workload carries a real in-cluster
+// identity rather than the "external" placeholder the resolvers return for IPs
+// they could not map to a pod, service or node. Empty Kind means unresolved.
+func isKubernetesResolved(w Workload) bool {
+	return w.Kind != "" && w.Kind != "external"
+}
+
 func NewDestinationKey(dst, actualDst netaddr.IPPort, domain *Domain, dstWorkload Workload, actualDestWorkload Workload) DestinationKey {
 	if IsIpExternal(actualDst.IP()) && domain != nil && !domain.SpecifyIP {
-		dstWorkload.Name = domain.FQDN
-		actualDestWorkload.Name = domain.FQDN
+		// Substitute the FQDN for the workload name ONLY when we have no better,
+		// k8s-resolved identity. A cluster-internal Service reached via a route
+		// whose actual destination looks external still resolves to a real
+		// workload (kind=Deployment/StatefulSet, real namespace); overwriting its
+		// name with the FQDN produced mixed-provenance labels such as
+		//   destination_workload_name      = "temporal-frontend.nudgebee.svc.cluster.local"
+		//   destination_workload_namespace = "nudgebee"
+		//   destination_workload_kind      = "Deployment"
+		// which splits one workload into an extra series that no query matches.
+		// The FQDN is still carried by the `destination` label, so nothing is lost.
+		if !isKubernetesResolved(dstWorkload) {
+			dstWorkload.Name = domain.FQDN
+		}
+		if !isKubernetesResolved(actualDestWorkload) {
+			actualDestWorkload.Name = domain.FQDN
+		}
 		return DestinationKey{
 			destination:               HostPortWithEmptyIP(domain.FQDN, dst.Port()),
 			actualDestination:         HostPortFromIPPort(actualDst),
