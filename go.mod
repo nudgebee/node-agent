@@ -12,7 +12,7 @@ require (
 	github.com/containerd/containerd v1.7.33
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/docker/docker v28.5.2+incompatible
-	github.com/florianl/go-conntrack v0.3.0
+	github.com/florianl/go-conntrack v0.7.0
 	github.com/go-kit/log v0.2.1
 	github.com/godbus/dbus/v5 v5.2.2
 	github.com/golang/snappy v1.0.0
