@@ -807,6 +807,12 @@ func getControllerOwnerRef(refs []metav1.OwnerReference) *metav1.OwnerReference 
 	return nil
 }
 
+// maxOwnerChainDepth bounds the Pod -> ... -> top-level-controller climb.
+// Genuine Kubernetes chains are at most two hops (Pod -> ReplicaSet ->
+// Deployment, Pod -> Job -> CronJob); the headroom covers nested custom
+// controllers while still terminating on a circular ownerReference.
+const maxOwnerChainDepth = 10
+
 // errOwnerNotCached means the owner object exists in the cluster but is not in
 // our informer snapshot yet (informers still syncing), or was garbage-collected
 // while its pods linger. This is TRANSIENT: the same lookup may succeed later,
@@ -929,7 +935,21 @@ func (resolver *K8sIPResolver) resolvePodDescriptor(pod *MinimalPod) Workload {
 			// statement, which shadowed the outer error and left it permanently
 			// nil, so a failed climb was still treated as a success and cached.
 			current := ownerRef.DeepCopy()
-			for {
+			// The climb is depth-bounded. OwnerReferences are client-settable, so
+			// a circular chain (buggy controller, hand-edited ownerRef) would
+			// otherwise loop forever and wedge the collector goroutine, stalling
+			// every metric this resolver feeds. Real chains are at most two hops
+			// (Pod -> ReplicaSet -> Deployment, Pod -> Job -> CronJob).
+			for depth := 0; ; depth++ {
+				if depth >= maxOwnerChainDepth {
+					// Exhausting the bound means the chain is malformed. Treat it
+					// as terminal rather than transient: re-walking it on every
+					// scrape would burn CPU forever, and retrying cannot fix a
+					// cycle. Keep the identity resolved so far.
+					klog.Warningf("owner chain for pod %s/%s exceeded max depth %d at %s/%s — possible circular ownerReferences",
+						namespace, pod.Name, maxOwnerChainDepth, kind, name)
+					break
+				}
 				next, err := resolver.getControllerOfOwner(current)
 				if err != nil {
 					if errors.Is(err, errOwnerNotCached) {
