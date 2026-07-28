@@ -2,6 +2,7 @@ package common
 
 import (
 	"testing"
+	"time"
 
 	"github.com/coroot/coroot-node-agent/flags"
 	"github.com/google/uuid"
@@ -173,6 +174,47 @@ func TestResolvePodDescriptor_UnsupportedOwnerKindIsCached(t *testing.T) {
 
 	_, cached := r.snapshot.PodDescriptors.Load(podUID)
 	assert.True(t, cached, "terminal (unsupported kind) resolution should be memoized")
+}
+
+// OwnerReferences are client-settable, so a circular chain is possible via a
+// buggy controller or a hand-edited ref. Without a depth bound the climb loops
+// forever and wedges the collector goroutine. This test deadlocks on timeout if
+// the bound is ever removed.
+func TestResolvePodDescriptor_CircularOwnerChainTerminates(t *testing.T) {
+	disableEphemeralAggregation(t)
+
+	aUID := types.UID(uuid.NewString())
+	bUID := types.UID(uuid.NewString())
+	podUID := types.UID(uuid.NewString())
+
+	r := &K8sIPResolver{}
+	// A is owned by B, B is owned by A.
+	r.snapshot.ReplicaSets.Store(aUID, MinimalOwnerInfo{
+		OwnerReferences: []metav1.OwnerReference{controllerRef("b", bUID, "Deployment")},
+	})
+	r.snapshot.Deployments.Store(bUID, MinimalOwnerInfo{
+		OwnerReferences: []metav1.OwnerReference{controllerRef("a", aUID, "ReplicaSet")},
+	})
+
+	pod := &MinimalPod{
+		UID:             podUID,
+		Name:            "cyclic-pod",
+		Namespace:       "nudgebee",
+		OwnerReferences: []metav1.OwnerReference{controllerRef("a", aUID, "ReplicaSet")},
+	}
+
+	done := make(chan Workload, 1)
+	go func() { done <- r.resolvePodDescriptor(pod) }()
+
+	select {
+	case got := <-done:
+		// Terminates with whichever identity the bounded climb reached.
+		assert.Contains(t, []string{"a", "b"}, got.Name)
+		_, cached := r.snapshot.PodDescriptors.Load(podUID)
+		assert.True(t, cached, "a malformed chain is terminal and should be cached, not re-walked every scrape")
+	case <-time.After(5 * time.Second):
+		t.Fatal("resolvePodDescriptor did not terminate on a circular owner chain")
+	}
 }
 
 // A bare ReplicaSet with no pod-template-hash must keep its own name; inventing
