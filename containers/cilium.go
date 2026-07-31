@@ -113,7 +113,7 @@ func lookupCilium4(src, dst netaddr.IPPort) *netaddr.IPPort {
 	}
 	e := v.(*ctmap.CtEntry)
 
-	backendKey := lbmap.NewBackend4KeyV3(loadbalancer.BackendID(e.BackendID))
+	backendKey := lbmap.NewBackend4KeyV3(loadbalancer.BackendID(e.Union0[1]))
 	b, err := backends4Map.Lookup(backendKey)
 	if err != nil || b == nil {
 		return nil
@@ -125,7 +125,7 @@ func lookupCilium4(src, dst netaddr.IPPort) *netaddr.IPPort {
 	default:
 		return nil
 	}
-	backendIP, _ := netaddr.FromStdIP(backend.GetAddress())
+	backendIP, _ := netaddr.FromStdIP(backend.GetAddress().AsNetIP())
 	res := netaddr.IPPortFrom(backendIP, backend.GetPort())
 	return &res
 }
@@ -151,7 +151,7 @@ func lookupCilium6(src, dst netaddr.IPPort) *netaddr.IPPort {
 		return nil
 	}
 	e := v.(*ctmap.CtEntry)
-	backendKey := lbmap.NewBackend6KeyV3(loadbalancer.BackendID(e.BackendID))
+	backendKey := lbmap.NewBackend6KeyV3(loadbalancer.BackendID(e.Union0[1]))
 	b, err := backends6Map.Lookup(backendKey)
 	if err != nil || b == nil {
 		return nil
@@ -163,7 +163,7 @@ func lookupCilium6(src, dst netaddr.IPPort) *netaddr.IPPort {
 	default:
 		return nil
 	}
-	backendIP, _ := netaddr.FromStdIP(backend.GetAddress())
+	backendIP, _ := netaddr.FromStdIP(backend.GetAddress().AsNetIP())
 	res := netaddr.IPPortFrom(backendIP, backend.GetPort())
 	return &res
 }
