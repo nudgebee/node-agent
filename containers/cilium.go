@@ -6,8 +6,8 @@ import (
 	"github.com/cilium/cilium/pkg/bpf"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/loadbalancer"
+	lbmap "github.com/cilium/cilium/pkg/loadbalancer/maps"
 	"github.com/cilium/cilium/pkg/maps/ctmap"
-	"github.com/cilium/cilium/pkg/maps/lbmap"
 	"github.com/cilium/cilium/pkg/tuple"
 	"github.com/cilium/cilium/pkg/u8proto"
 	"github.com/coroot/coroot-node-agent/proc"
@@ -27,10 +27,11 @@ type ciliumMapDefinition struct {
 	value bpf.MapValue
 }
 
+// SPIKE NOTE: cilium 1.19 deleted the V2 backend value types
+// (lbmap.Backend4Value / Backend6Value) along with pkg/maps/lbmap itself.
+// Only the V3 layout survives, so the V2 entries are dropped here.
 var ciliumMaps = map[string]ciliumMapDefinition{
-	lbmap.Backend4MapV2Name: {key: &lbmap.Backend4KeyV3{}, value: &lbmap.Backend4Value{}},
 	lbmap.Backend4MapV3Name: {key: &lbmap.Backend4KeyV3{}, value: &lbmap.Backend4ValueV3{}},
-	lbmap.Backend6MapV2Name: {key: &lbmap.Backend6KeyV3{}, value: &lbmap.Backend6Value{}},
 	lbmap.Backend6MapV3Name: {key: &lbmap.Backend6KeyV3{}, value: &lbmap.Backend6ValueV3{}},
 }
 
@@ -57,7 +58,7 @@ func init() {
 	} else {
 		klog.Infoln("found cilium ebpf-map:", ctmap.MapNameTCP6Global)
 	}
-	for _, n := range []string{lbmap.Backend4MapV2Name, lbmap.Backend4MapV3Name} {
+	for _, n := range []string{lbmap.Backend4MapV3Name} {
 		def := ciliumMaps[n]
 		backends4Map, err = bpf.OpenMap(proc.HostPath(filepath.Join(defaults.BPFFSRoot, defaults.TCGlobalsPath, n)), def.key, def.value)
 		if err != nil {
@@ -67,7 +68,7 @@ func init() {
 			break
 		}
 	}
-	for _, n := range []string{lbmap.Backend6MapV2Name, lbmap.Backend6MapV3Name} {
+	for _, n := range []string{lbmap.Backend6MapV3Name} {
 		def := ciliumMaps[n]
 		backends6Map, err = bpf.OpenMap(proc.HostPath(filepath.Join(defaults.BPFFSRoot, defaults.TCGlobalsPath, n)), def.key, def.value)
 		if err != nil {
@@ -119,8 +120,6 @@ func lookupCilium4(src, dst netaddr.IPPort) *netaddr.IPPort {
 	}
 	var backend lbmap.BackendValue
 	switch bv := b.(type) {
-	case *lbmap.Backend4Value:
-		backend = bv.ToHost()
 	case *lbmap.Backend4ValueV3:
 		backend = bv.ToHost()
 	default:
@@ -159,8 +158,6 @@ func lookupCilium6(src, dst netaddr.IPPort) *netaddr.IPPort {
 	}
 	var backend lbmap.BackendValue
 	switch bv := b.(type) {
-	case *lbmap.Backend6Value:
-		backend = bv.ToHost()
 	case *lbmap.Backend6ValueV3:
 		backend = bv.ToHost()
 	default:
