@@ -22,7 +22,7 @@ require (
 	github.com/jpillora/backoff v1.0.0
 	github.com/mdlayher/taskstats v0.0.0-20230712191918-387b3d561d14
 	github.com/nudgebee/logparser v0.0.0-20260406040008-c408d0a5c69c
-	github.com/opencontainers/runtime-spec v1.3.0
+	github.com/opencontainers/runtime-spec v1.1.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	github.com/prometheus/common v0.67.5
@@ -53,7 +53,7 @@ require (
 )
 
 require (
-	github.com/containerd/cgroups/v3 v3.1.3
+	github.com/containerd/cgroups/v3 v3.0.3
 	github.com/gobwas/glob v0.2.3
 	gotest.tools v2.2.0+incompatible
 )
