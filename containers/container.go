@@ -2211,7 +2211,10 @@ const tlsExeRecheckInterval = 10 * time.Second
 // connection (onConnectionOpen ignores unknown pids) and left a short-lived
 // process's first TLS calls, often all of them, unprobed.
 func (c *Container) ensureProcess(pid uint32) *Process {
-	if p := c.processes[pid]; p != nil {
+	c.lock.RLock()
+	p := c.processes[pid]
+	c.lock.RUnlock()
+	if p != nil {
 		return p
 	}
 	return c.onProcessStart(pid)

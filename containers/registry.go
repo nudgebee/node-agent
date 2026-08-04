@@ -331,6 +331,8 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 					}
 				}
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
+					// onProcessStart, not ensureProcess: it also replaces a
+					// registered process whose pid was reused.
 					p := c.onProcessStart(e.Pid)
 					if r.processInfoCh != nil && p != nil {
 						r.processInfoCh <- ProcessInfo{Pid: p.Pid, ContainerId: c.id, StartedAt: p.StartedAt, Flags: p.Flags}
@@ -613,6 +615,10 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		r.containerLock.Lock()
 		r.containersByPid[pid] = c
 		r.containerLock.Unlock()
+		// The pid may have been mapped without its start event (e.g. a unit's
+		// new main process after a restart); register it so the container
+		// does not go zombie while the process is alive.
+		c.ensureProcess(pid)
 		return c
 	}
 	r.containerLock.RUnlock()
@@ -688,6 +694,7 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	}
 	if c := r.containersByCgroupId[cg.Id]; c != nil {
 		r.containersByPid[pid] = c
+		c.ensureProcess(pid)
 		return c
 	}
 	if c := r.containersById[id]; c != nil {
@@ -718,6 +725,7 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	r.containersByPid[pid] = c
 	r.containersByCgroupId[cg.Id] = c
 	r.containersById[id] = c
+	c.ensureProcess(pid)
 	return c
 }
 
