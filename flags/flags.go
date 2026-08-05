@@ -40,7 +40,7 @@ var (
 					Envar("TRACK_PUBLIC_NETWORK").
 					Default("0.0.0.0/0").
 					Strings()
-	EphemeralPortRange = kingpin.Flag("ephemeral-port-range", "Destination and Listen TCP ports from this range will be skipped").Default("32768-60999").Envar("EPHEMERAL_PORT_RANGE").String()
+	EphemeralPortRange = kingpin.Flag("ephemeral-port-range", `Destination and Listen TCP ports from these ranges will be skipped, e.g. "32768-60999" or "1024-23768 30000-65535"`).Default("32768-60999").Envar("EPHEMERAL_PORT_RANGE").String()
 
 	Provider                = kingpin.Flag("provider", "`provider` label for `node_cloud_info` metric").Envar("PROVIDER").String()
 	Region                  = kingpin.Flag("region", "`region` label for `node_cloud_info` metric").Envar("REGION").String()
