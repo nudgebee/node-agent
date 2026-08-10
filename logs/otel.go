@@ -17,10 +17,21 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.18.0"
 	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/time/rate"
 	"k8s.io/klog/v2"
 )
 
 var otelLogger otelLogs.Logger
+
+// PatternExtractionRateLimiter caps, per container, how many warning and
+// error messages per second get a log pattern extracted (nil: unlimited).
+func PatternExtractionRateLimiter() *rate.Limiter {
+	limit := *flags.LogPatternExtractionLimit
+	if limit <= 0 {
+		return nil
+	}
+	return rate.NewLimiter(rate.Limit(limit), int(limit*10))
+}
 
 func Init(machineId, hostname, version string) {
 	endpointUrl := *flags.LogsEndpoint
