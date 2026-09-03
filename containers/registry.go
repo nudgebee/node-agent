@@ -76,8 +76,7 @@ type Registry struct {
 	containersByPid        map[uint32]*Container
 	containersByPidIgnored map[uint32]*time.Time
 	containerLock          sync.RWMutex // Protects container maps and registration
-	ip2fqdn                map[netaddr.IP]*common.Domain
-	ip2fqdnLock            sync.RWMutex
+	ip2fqdn                *common.FQDNCache
 
 	processInfoCh chan<- ProcessInfo
 	ip_resolver   IPResolver
@@ -151,7 +150,7 @@ func NewRegistry(reg prometheus.Registerer, rawReg prometheus.Registerer, proces
 		containersByCgroupId:   map[string]*Container{},
 		containersByPid:        map[uint32]*Container{},
 		containersByPidIgnored: map[uint32]*time.Time{},
-		ip2fqdn:                map[netaddr.IP]*common.Domain{},
+		ip2fqdn:                common.NewFQDNCache(),
 
 		processInfoCh: processInfoCh,
 		ip_resolver:   ip_resolver,
@@ -186,11 +185,9 @@ func (r *Registry) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (r *Registry) Collect(ch chan<- prometheus.Metric) {
-	r.ip2fqdnLock.RLock()
-	defer r.ip2fqdnLock.RUnlock()
-	for ip, domain := range r.ip2fqdn {
+	r.ip2fqdn.ForEach(func(ip netaddr.IP, domain *common.Domain) {
 		ch <- prometheus.MustNewConstMetric(metrics.Ip2Fqdn, prometheus.GaugeValue, 1, ip.String(), domain.FQDN)
-	}
+	})
 }
 
 // containerCollector is registered on the raw Prometheus registry and collects
@@ -252,15 +249,11 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				}
 			}
 			r.containersByPidIgnored = map[uint32]*time.Time{}
-			activeIPs := map[netaddr.IP]struct{}{}
 			deadContainers := []*Container{}
 
-			// First pass: collect active IPs and identify dead containers with read lock
+			// First pass: identify dead containers with read lock
 			r.containerLock.RLock()
 			for _, c := range r.containersById {
-				for dst := range c.lastConnectionAttempts {
-					activeIPs[dst.IP()] = struct{}{}
-				}
 				if c.Dead(now) {
 					deadContainers = append(deadContainers, c)
 				}
@@ -293,13 +286,11 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				}
 				r.containerLock.Unlock()
 			}
-			r.ip2fqdnLock.Lock()
-			for ip := range r.ip2fqdn {
-				if _, ok := activeIPs[ip]; !ok {
-					delete(r.ip2fqdn, ip)
-				}
-			}
-			r.ip2fqdnLock.Unlock()
+			// Expire stale IP→FQDN mappings on their own TTL. They are
+			// deliberately not tied to live connections: applications cache DNS
+			// themselves, so a reconnect to an IP whose mapping was dropped
+			// emits no DNS packet and the destination degrades to a bare IP.
+			r.ip2fqdn.GC()
 			if r.llmDetector != nil {
 				r.llmDetector.GC(llmDetectorMaxIPCache)
 			}
@@ -413,8 +404,6 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 }
 
 // processL7Event handles an L7 event, queueing it for retry if the connection isn't found yet
-const maxIP2FQDNEntries = 10000
-
 func (r *Registry) processL7Event(e ebpftracer.Event) {
 	defer func() {
 		if p := recover(); p != nil {
@@ -431,14 +420,10 @@ func (r *Registry) processL7Event(e ebpftracer.Event) {
 			r.queueL7EventForRetry(e)
 			return
 		}
-		r.ip2fqdnLock.Lock()
 		for ip, domain := range ip2fqdn {
-			if len(r.ip2fqdn) < maxIP2FQDNEntries {
-				r.ip2fqdn[ip] = domain
-			}
+			r.ip2fqdn.Put(ip, domain)
 			r.ip_resolver.CacheDNS(ip.String(), domain.FQDN)
 		}
-		r.ip2fqdnLock.Unlock()
 		// Feed DNS resolutions to LLM detector for connection-level detection
 		r.feedDNSToLLMDetector(ip2fqdn)
 	} else if e.L7Request.Protocol == l7.ProtocolTLSClientHello {
@@ -452,14 +437,10 @@ func (r *Registry) processL7Event(e ebpftracer.Event) {
 	} else if e.L7Request.Protocol == l7.ProtocolDNS {
 		// Handle DNS queries from non-monitored processes for global ip2fqdn mapping
 		ip2fqdn := r.handleHostDNSRequest(e.L7Request)
-		r.ip2fqdnLock.Lock()
 		for ip, domain := range ip2fqdn {
-			if len(r.ip2fqdn) < maxIP2FQDNEntries {
-				r.ip2fqdn[ip] = domain
-			}
+			r.ip2fqdn.Put(ip, domain)
 			r.ip_resolver.CacheDNS(ip.String(), domain.FQDN)
 		}
-		r.ip2fqdnLock.Unlock()
 		r.feedDNSToLLMDetector(ip2fqdn)
 	}
 }
@@ -537,12 +518,10 @@ func (r *Registry) processPendingL7Events() {
 
 		// Successfully processed
 		klog.V(3).Infof("L7_EVENT_RETRY_SUCCESS: pid=%d fd=%d retries=%d", p.event.Pid, p.event.Fd, p.retryCount)
-		r.ip2fqdnLock.Lock()
 		for ip, domain := range ip2fqdn {
-			r.ip2fqdn[ip] = domain
+			r.ip2fqdn.Put(ip, domain)
 			r.ip_resolver.CacheDNS(ip.String(), domain.FQDN)
 		}
-		r.ip2fqdnLock.Unlock()
 	}
 
 	// Re-queue still pending events
@@ -803,9 +782,7 @@ func (r *Registry) evictStaleCounterLabels() {
 }
 
 func (r *Registry) getDomain(ip netaddr.IP) *common.Domain {
-	r.ip2fqdnLock.RLock()
-	defer r.ip2fqdnLock.RUnlock()
-	return r.ip2fqdn[ip]
+	return r.ip2fqdn.Get(ip)
 }
 
 // feedDNSToLLMDetector notifies the LLM detector about DNS resolutions.

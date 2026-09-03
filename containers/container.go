@@ -1026,12 +1026,19 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		}
 	}
 
-	// Create trace — migrateConnectionKeyIfNeeded already enriched the key with FQDN
+	// Create the trace late-bound to conn.DestinationKey. migrateConnectionKeyIfNeeded
+	// above resolves the key from the DNS cache, but the Host header (ProtocolHTTP) and
+	// the :authority pseudo-header (ProtocolHTTP2) are only parsed further down — after
+	// this point and before the span is emitted. Reading the key when the span is
+	// emitted rather than here lets those late resolutions reach the span, which is
+	// what l7Stats.observe already gets by running after the migration.
 	var trace *tracing.Trace
 	if !ebpfTracesDisabled {
-		destWorkload := conn.DestinationKey.GetDestinationWorkload()
-		actualDestWorkload := conn.DestinationKey.GetActualDestinationWorkload()
-		trace = c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown(), conn.srcWorkload, destWorkload, actualDestWorkload)
+		trace = c.tracer.NewTraceLateBound(conn.srcWorkload, func() (common.HostPort, common.Workload, common.Workload) {
+			return conn.DestinationKey.ActualDestinationIfKnown(),
+				conn.DestinationKey.GetDestinationWorkload(),
+				conn.DestinationKey.GetActualDestinationWorkload()
+		})
 	}
 
 	// Protocol reclassification: if previous parse attempts failed repeatedly,

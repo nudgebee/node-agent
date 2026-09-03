@@ -144,41 +144,79 @@ func GetContainerTracer(containerId string) *Tracer {
 	return &Tracer{otel: provider.Tracer("nudgebee-node-agent", trace.WithInstrumentationVersion(agentVersion))}
 }
 
+// DestinationProvider returns the destination identity of a trace at the moment
+// it is called.
+//
+// Destination identity is not always known when a trace is created. A connection
+// to an external endpoint starts out with a bare IP and is resolved to an FQDN
+// later — from the DNS cache, the HTTP Host header, or the HTTP/2 :authority
+// pseudo-header — after the trace object already exists but before its span is
+// emitted. Snapshotting the identity at construction time therefore stamps the
+// bare IP on the span while the metrics observed a few lines later in the same
+// call carry the resolved name, for the same request.
+type DestinationProvider func() (destination common.HostPort, dstWorkload, actualDstWorkload common.Workload)
+
 func (t *Tracer) NewTrace(destination common.HostPort, srcWorkload common.Workload, dstWorkload common.Workload, actualDstWorkload common.Workload) *Trace {
-	region := ""
-	zone := ""
-	node := ""
-	if actualDstWorkload.Zone != "" {
-		zone = actualDstWorkload.Zone
+	return &Trace{
+		tracer:            t,
+		srcWorkload:       srcWorkload,
+		destination:       destination,
+		dstWorkload:       dstWorkload,
+		actualDstWorkload: actualDstWorkload,
 	}
-	if actualDstWorkload.Region != "" {
-		region = actualDstWorkload.Region
+}
+
+// NewTraceLateBound creates a trace whose destination identity is read from
+// provider when each span is emitted rather than now. See DestinationProvider.
+func (t *Tracer) NewTraceLateBound(srcWorkload common.Workload, provider DestinationProvider) *Trace {
+	return &Trace{tracer: t, srcWorkload: srcWorkload, provider: provider}
+}
+
+type Trace struct {
+	tracer      *Tracer
+	srcWorkload common.Workload
+
+	// Identity snapshot, used when provider is nil.
+	destination       common.HostPort
+	dstWorkload       common.Workload
+	actualDstWorkload common.Workload
+
+	provider DestinationProvider
+}
+
+// identity returns the destination identity to stamp on a span, re-reading it
+// from provider when the trace is late-bound.
+func (t *Trace) identity() (common.HostPort, common.Workload, common.Workload) {
+	if t.provider != nil {
+		return t.provider()
 	}
-	if actualDstWorkload.Instance != "" {
-		node = actualDstWorkload.Instance
-	}
-	return &Trace{tracer: t, destination: destination, commonAttrs: []attribute.KeyValue{
+	return t.destination, t.dstWorkload, t.actualDstWorkload
+}
+
+// dest returns the current destination host:port.
+func (t *Trace) dest() common.HostPort {
+	destination, _, _ := t.identity()
+	return destination
+}
+
+func (t *Trace) commonAttrs() []attribute.KeyValue {
+	destination, dstWorkload, actualDstWorkload := t.identity()
+	return []attribute.KeyValue{
 		semconv.NetPeerName(sanitizeUTF8(destination.Host())),
 		semconv.NetPeerPort(int(destination.Port())),
 		attribute.Key("destination.workload_name").String(sanitizeUTF8(dstWorkload.Name)),
 		attribute.Key("destination.workload_namespace").String(sanitizeUTF8(dstWorkload.Namespace)),
 		attribute.Key("destination.workload_kind").String(sanitizeUTF8(dstWorkload.Kind)),
-		attribute.Key("source.workload_name").String(sanitizeUTF8(srcWorkload.Name)),
-		attribute.Key("source.workload_namespace").String(sanitizeUTF8(srcWorkload.Namespace)),
-		attribute.Key("source.workload_kind").String(sanitizeUTF8(srcWorkload.Kind)),
+		attribute.Key("source.workload_name").String(sanitizeUTF8(t.srcWorkload.Name)),
+		attribute.Key("source.workload_namespace").String(sanitizeUTF8(t.srcWorkload.Namespace)),
+		attribute.Key("source.workload_kind").String(sanitizeUTF8(t.srcWorkload.Kind)),
 		attribute.Key("destination.name").String(sanitizeUTF8(actualDstWorkload.Name)),
 		attribute.Key("destination.namespace").String(sanitizeUTF8(actualDstWorkload.Namespace)),
 		attribute.Key("destination.kind").String(sanitizeUTF8(actualDstWorkload.Kind)),
-		attribute.Key("destination.cloud.availablity_zone").String(sanitizeUTF8(zone)),
-		attribute.Key("destination.cloud.region").String(sanitizeUTF8(region)),
-		attribute.Key("destination.node").String(sanitizeUTF8(node)),
-	}}
-}
-
-type Trace struct {
-	tracer      *Tracer
-	destination common.HostPort
-	commonAttrs []attribute.KeyValue
+		attribute.Key("destination.cloud.availablity_zone").String(sanitizeUTF8(actualDstWorkload.Zone)),
+		attribute.Key("destination.cloud.region").String(sanitizeUTF8(actualDstWorkload.Region)),
+		attribute.Key("destination.node").String(sanitizeUTF8(actualDstWorkload.Instance)),
+	}
 }
 
 func (t *Trace) createSpan(name string, duration time.Duration, error bool, traceId string, attrs ...attribute.KeyValue) {
@@ -210,7 +248,7 @@ func (t *Trace) createSpan(name string, duration time.Duration, error bool, trac
 
 	_, span := t.tracer.otel.Start(ctx, name, trace.WithTimestamp(start), trace.WithSpanKind(trace.SpanKindClient))
 	span.SetAttributes(attrs...)
-	span.SetAttributes(t.commonAttrs...)
+	span.SetAttributes(t.commonAttrs()...)
 	if error {
 		span.SetStatus(codes.Error, "")
 	}
@@ -251,12 +289,14 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 		return
 	}
 
+	dest := t.dest()
+
 	// Use destination hostname for external services, fallback to provided host
 	requestHost := sanitizeUTF8(host)
 	if host == "" || isIPAddress(host) {
 		// Use destination hostname if host is empty or an IP address
-		if t.destination.Port() != 0 {
-			requestHost = sanitizeUTF8(t.destination.String())
+		if dest.Port() != 0 {
+			requestHost = sanitizeUTF8(dest.String())
 		}
 	}
 
@@ -271,7 +311,7 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 
 	// Determine protocol based on port or known LLM APIs
 	protocol := "http"
-	if isHTTPSService(requestHost) || t.destination.Port() == 443 {
+	if isHTTPSService(requestHost) || dest.Port() == 443 {
 		protocol = "https"
 	}
 
@@ -304,7 +344,7 @@ func (t *Trace) Http2Request(method, path, scheme string, status, grpcStatus l7.
 	}
 
 	attrs := []attribute.KeyValue{
-		semconv.HTTPURL(fmt.Sprintf("%s://%s%s", scheme, t.destination.String(), path)),
+		semconv.HTTPURL(fmt.Sprintf("%s://%s%s", scheme, t.dest().String(), path)),
 		semconv.HTTPMethod(method),
 		semconv.HTTPStatusCode(int(status)),
 	}
@@ -567,7 +607,7 @@ func (t *Trace) LLMRequest(info LLMStreamInfo) {
 
 	// Set all attributes
 	span.SetAttributes(attrs...)
-	span.SetAttributes(t.commonAttrs...)
+	span.SetAttributes(t.commonAttrs()...)
 
 	// Stream completion event
 	span.AddEvent("gen_ai.stream_complete",
