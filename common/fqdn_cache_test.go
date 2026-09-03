@@ -148,6 +148,31 @@ func TestFQDNCacheEvictsWhenFullRatherThanDroppingInserts(t *testing.T) {
 	}
 }
 
+// Eviction must drop a bounded batch, not the whole cache. Recency is tracked
+// only to the minute, so a cache filled in one burst has every entry sharing a
+// timestamp; evicting everything at or before the LRU cutoff would then clear
+// the cache wholesale and re-create the mass mapping loss this cache exists to
+// prevent.
+func TestFQDNCacheEvictionIsBoundedWhenTimestampsTie(t *testing.T) {
+	c, _ := testCache(t)
+
+	// Mock clock never advances, so all entries share one lastUsed value.
+	for i := 0; i < FQDNCacheMaxEntries; i++ {
+		c.Put(ip(fmt.Sprintf("10.%d.%d.%d", i/65536%256, i/256%256, i%256)), &Domain{FQDN: "filler"})
+	}
+	c.Put(ip("203.0.113.7"), &Domain{FQDN: "late.example.com"})
+
+	batch := FQDNCacheMaxEntries / 10
+	wantMin := FQDNCacheMaxEntries - batch // one batch evicted, plus the new entry
+	if got := c.Len(); got < wantMin {
+		t.Fatalf("eviction dropped %d entries, want at most one batch (%d); cache left with %d",
+			FQDNCacheMaxEntries+1-got, batch, got)
+	}
+	if got := c.Len(); got > FQDNCacheMaxEntries {
+		t.Fatalf("cache grew past its cap: %d", got)
+	}
+}
+
 func TestFQDNCacheEvictsExpiredBeforeLive(t *testing.T) {
 	c, advance := testCache(t)
 

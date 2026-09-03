@@ -1,6 +1,7 @@
 package common
 
 import (
+	"slices"
 	"sync"
 	"time"
 
@@ -103,31 +104,37 @@ func (c *FQDNCache) evictLocked(now time.Time) {
 	if len(c.entries) < FQDNCacheMaxEntries {
 		return
 	}
-	// Nothing expired — drop the oldest batch by last use. A batch keeps this
-	// O(n) scan rare rather than running it on every insert once full.
+	// Nothing expired — drop the least recently used tenth. Evicting a batch
+	// rather than a single entry keeps this pass rare: it runs once per `batch`
+	// inserts, not on every insert once full.
+	//
+	// The cutoff comes from a sorted copy of the timestamps, then one delete
+	// pass. That is O(n log n); repeatedly rescanning for the next-oldest entry
+	// is O(n*batch), which measured ~18ms on a full cache — far too long to hold
+	// the write lock on the L7 event path.
 	batch := FQDNCacheMaxEntries / 10
 	if batch < 1 {
 		batch = 1
 	}
-	type aged struct {
-		ip       netaddr.IP
-		lastUsed time.Time
+	times := make([]time.Time, 0, len(c.entries))
+	for _, e := range c.entries {
+		times = append(times, e.lastUsed)
 	}
-	all := make([]aged, 0, len(c.entries))
+	slices.SortFunc(times, func(a, b time.Time) int { return a.Compare(b) })
+	cutoff := times[batch-1]
+
+	// Stop at `batch` deletions. Recency is only tracked to the minute, so many
+	// entries share a timestamp and deleting everything at or before the cutoff
+	// would evict far more than intended — at worst the whole cache.
+	deleted := 0
 	for ip, e := range c.entries {
-		all = append(all, aged{ip: ip, lastUsed: e.lastUsed})
-	}
-	// Partial selection of the oldest `batch` entries; a full sort would be
-	// wasted work since only that many are needed.
-	for i := 0; i < batch && i < len(all); i++ {
-		oldest := i
-		for j := i + 1; j < len(all); j++ {
-			if all[j].lastUsed.Before(all[oldest].lastUsed) {
-				oldest = j
-			}
+		if deleted == batch {
+			break
 		}
-		all[i], all[oldest] = all[oldest], all[i]
-		delete(c.entries, all[i].ip)
+		if !e.lastUsed.After(cutoff) {
+			delete(c.entries, ip)
+			deleted++
+		}
 	}
 }
 
