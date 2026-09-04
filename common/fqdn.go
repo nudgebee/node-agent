@@ -5,21 +5,20 @@ import (
 	"strings"
 )
 
-// StripPort removes a trailing :port from a host, handling the bracketed IPv6
-// form ("[::1]:8080" -> "::1").
+// StripPort removes a trailing :port from a host.
+//
+// net.SplitHostPort does the work, including bracketed IPv6 ("[::1]:8080" ->
+// "::1") and rejecting bare IPv6, which has no port to strip. The bracketed
+// form without a port ("[::1]") is not a valid host:port, so it is unwrapped
+// separately. Anything else malformed is returned untouched rather than
+// repaired — a half-bracketed "[::1" should stay unparseable, not quietly
+// become a valid address.
 func StripPort(hostPort string) string {
-	if strings.HasPrefix(hostPort, "[") {
-		if idx := strings.LastIndex(hostPort, "]:"); idx != -1 {
-			return hostPort[1:idx]
-		}
-		return strings.Trim(hostPort, "[]")
+	if host, _, err := net.SplitHostPort(hostPort); err == nil {
+		return host
 	}
-	// Bare IPv6 without brackets has several colons and carries no port.
-	if strings.Count(hostPort, ":") > 1 {
-		return hostPort
-	}
-	if idx := strings.LastIndex(hostPort, ":"); idx != -1 {
-		return hostPort[:idx]
+	if strings.HasPrefix(hostPort, "[") && strings.HasSuffix(hostPort, "]") {
+		return hostPort[1 : len(hostPort)-1]
 	}
 	return hostPort
 }

@@ -13,6 +13,15 @@ func TestStripPort(t *testing.T) {
 		{"::1", "::1"},
 		{"2001:db8::1", "2001:db8::1"},
 		{"", ""},
+		// Bracketed IPv6 with no port is not a valid host:port; unwrap it.
+		{"[::1]", "::1"},
+		{"[2001:db8::1]", "2001:db8::1"},
+		{"::", "::"},
+		{"fe80::1%eth0", "fe80::1%eth0"},
+		// Malformed input is returned untouched, not repaired. A half-bracketed
+		// address must stay unparseable so IsIPAddress rejects it rather than
+		// accepting a value that was never a valid address.
+		{"[::1", "[::1"},
 	} {
 		if got := StripPort(tc.in); got != tc.want {
 			t.Errorf("StripPort(%q) = %q, want %q", tc.in, got, tc.want)
@@ -32,6 +41,8 @@ func TestIsIPAddress(t *testing.T) {
 		{"monitoring.googleapis.com", false},
 		{"monitoring.googleapis.com:443", false},
 		{"", false},
+		{"[::1]", true},
+		{"[::1", false}, // malformed, not silently accepted as an address
 	} {
 		if got := IsIPAddress(tc.in); got != tc.want {
 			t.Errorf("IsIPAddress(%q) = %v, want %v", tc.in, got, tc.want)
