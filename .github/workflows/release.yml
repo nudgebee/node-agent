@@ -4,6 +4,18 @@ on:
   push:
     tags:
       - 'v*'
+  # Build a throwaway image from any branch, without cutting a release.
+  # Diagnostic work previously had to push a v* tag for every iteration, which
+  # created real releases and, because the deploy workflow in nudgebee-infra
+  # resolves the newest version-shaped tag, made prereleases eligible for
+  # automatic deployment. Branch builds are tagged dev-<branch>-<sha>, which
+  # matches neither ^[0-9]+\.[0-9]+\.[0-9]+ nor the semver patterns below, so
+  # they are invisible to that resolver and never move latest/0.1/0.
+  #
+  # type=ref/type=sha are used rather than a raw value because branch names
+  # contain "/" (diag/http2-frame-direction), which is not legal in a Docker
+  # tag; metadata-action sanitises it.
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
@@ -22,6 +34,7 @@ jobs:
           fetch-depth: 0
 
       - name: Verify tag is on main
+        if: github.event_name == 'push'
         run: |
           git fetch origin main
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
@@ -47,6 +60,8 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
+            type=ref,event=branch,prefix=dev-,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=sha,format=short,prefix=dev-,enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - uses: docker/build-push-action@v7
         with:
@@ -69,6 +84,10 @@ jobs:
           docker cp arm64:/usr/bin/nudgebee-node-agent /tmp/nudgebee-node-agent-${{ steps.meta.outputs.version }}-arm64
 
       - name: Create GitHub release with binaries
+        # Only for real tag pushes. On workflow_dispatch github.ref_name is a
+        # branch, so this would publish a GitHub release named after the branch
+        # and, with make_latest, mark it as the latest release.
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
