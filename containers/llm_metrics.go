@@ -234,6 +234,31 @@ var (
 		[]string{"type", "destination"},
 	)
 
+	// Http2PayloadSizeTotal buckets the delivered payload length of HTTP/2
+	// events, by destination class and frame direction.
+	//
+	// 96% of external HTTP/2 events yield no parseable frame (8,881 frames from
+	// ~221k events) against 44% internally. Parse() can only produce nothing for
+	// three reasons: an empty payload, fewer than 9 bytes (shorter than a frame
+	// header), or a first frame header that fails validation — and the third is
+	// already counted as type="invalid" in Http2FramesTotal. So the answer is in
+	// the size distribution.
+	//
+	// The "9-16" bucket is the one to watch. A correct HTTP/2 reader does
+	// io.ReadFull(header[:9]) and then reads the frame payload separately, so
+	// SSL_read returns header-sized and payload-only chunks rather than whole
+	// frames. The parser assumes each event begins on a frame boundary and
+	// contains complete frames; if external reads are predominantly 9 bytes,
+	// that assumption is the bug and the parser needs to treat the connection as
+	// a continuous byte stream instead.
+	Http2PayloadSizeTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "node_agent_http2_payload_size_total",
+			Help: "HTTP/2 event payload sizes delivered to the parser, bucketed",
+		},
+		[]string{"bucket", "destination", "direction"},
+	)
+
 	// ContainerLLMCachedTokensTotal counts input tokens served from the
 	// provider's prompt cache. Already counted in token_usage_total{type=input};
 	// this is a separate metric to make cache-hit rate computable.
@@ -304,6 +329,7 @@ func RegisterLLMMetrics(reg prometheus.Registerer) {
 		Http2ParserStaleReuseTotal,
 		Http2StageTotal,
 		Http2FramesTotal,
+		Http2PayloadSizeTotal,
 		ContainerLLMCachedTokensTotal,
 		ContainerLLMToolCallsTotal,
 		ContainerLLMCostUSDTotal,

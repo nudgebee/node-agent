@@ -902,6 +902,26 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	return ip2fqdn
 }
 
+// payloadSizeBucket groups a delivered payload length. The boundaries are the
+// ones that matter to the frame parser: 0 and <9 produce no frame at all, and
+// 9-16 is a bare frame header with little or no payload attached — the shape a
+// reader doing io.ReadFull(header[:9]) then a separate payload read produces.
+func payloadSizeBucket(n int) string {
+	switch {
+	case n == 0:
+		return "0"
+	case n < 9:
+		return "1-8"
+	case n < 17:
+		return "9-16"
+	case n < 257:
+		return "17-256"
+	case n < 4096:
+		return "257-4095"
+	}
+	return "4096+"
+}
+
 // frameDirection labels an HTTP/2 event by which side's frames it carries.
 // Other protocols report "-" rather than inventing a direction for them.
 func frameDirection(m l7.Method) string {
@@ -1080,6 +1100,12 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		L7EventsTotal.WithLabelValues(proto, destClass, frameDirection(r.Method)).Inc()
 		if r.PayloadSize > uint64(len(r.Payload)) {
 			L7PayloadTruncatedTotal.WithLabelValues(proto, destClass).Inc()
+		}
+		// Scoped to HTTP/2: this exists to explain why external HTTP/2 events
+		// so rarely yield a parseable frame, and keeps label cardinality small.
+		if r.Protocol == l7.ProtocolHTTP2 {
+			Http2PayloadSizeTotal.WithLabelValues(
+				payloadSizeBucket(len(r.Payload)), destClass, frameDirection(r.Method)).Inc()
 		}
 	}
 
