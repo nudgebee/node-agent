@@ -1221,8 +1221,19 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		// Parsers are keyed by pid+fd alone, so a recycled fd can hand this
 		// connection a parser whose HPACK dynamic table belongs to the previous
 		// one. Count that rather than assume it does or does not happen.
-		if parser.ConnTimestamp != conn.Timestamp {
-			Http2ParserStaleReuseTotal.WithLabelValues(h2DestClass).Inc()
+		//
+		// Only comparable when both sides carry a real timestamp. A parser created
+		// on the connectionless path (processHTTP2WithoutConnection) has none, and
+		// createConnectionFromSocketInfo sets Timestamp: 0 because the socket tuple
+		// carries no timestamp. Comparing either against a real value would report
+		// a reuse that never happened, in both directions. The cost is that reuse
+		// is undetectable for socket-info-derived connections — undercounting is
+		// the right failure here, since this counter exists to decide whether the
+		// mechanism matters at all.
+		if conn.Timestamp != 0 {
+			if parser.ConnTimestamp != 0 && parser.ConnTimestamp != conn.Timestamp {
+				Http2ParserStaleReuseTotal.WithLabelValues(h2DestClass).Inc()
+			}
 			parser.ConnTimestamp = conn.Timestamp
 			parser.DestClass = h2DestClass
 		}
