@@ -902,6 +902,18 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	return ip2fqdn
 }
 
+// frameDirection labels an HTTP/2 event by which side's frames it carries.
+// Other protocols report "-" rather than inventing a direction for them.
+func frameDirection(m l7.Method) string {
+	switch m {
+	case l7.MethodHttp2ClientFrames:
+		return "client"
+	case l7.MethodHttp2ServerFrames:
+		return "server"
+	}
+	return "-"
+}
+
 // protocolLabel renders a protocol for use as a metric label. Protocol.String()
 // falls back to "UNKNOWN:<n>" for unrecognised values, which would be unbounded
 // cardinality on a label, so those collapse to a single bucket.
@@ -1065,7 +1077,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			destClass = "external"
 		}
 		proto := protocolLabel(r.Protocol)
-		L7EventsTotal.WithLabelValues(proto, destClass).Inc()
+		L7EventsTotal.WithLabelValues(proto, destClass, frameDirection(r.Method)).Inc()
 		if r.PayloadSize > uint64(len(r.Payload)) {
 			L7PayloadTruncatedTotal.WithLabelValues(proto, destClass).Inc()
 		}
