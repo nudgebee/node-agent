@@ -184,6 +184,26 @@ var (
 		[]string{"destination"},
 	)
 
+	// Http2StageTotal counts HTTP/2 requests reaching each stage of the parser
+	// pipeline, so the point where they stop can be read directly instead of
+	// inferred. Stages, in order:
+	//
+	//   stream_created   client HEADERS decoded, request object created
+	//   response_status  :status seen on the response
+	//   end_stream       END_STREAM flag seen (a frame flag, not HPACK)
+	//   completed        both of the above -> request emitted
+	//   hpack_error      HPACK block failed to decode; decoder reset
+	//
+	// A request is only emitted with BOTH response_status and end_stream, so
+	// whichever stage drops to zero is the blocker.
+	Http2StageTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "node_agent_http2_stage_total",
+			Help: "HTTP/2 requests reaching each stage of the parser pipeline",
+		},
+		[]string{"stage", "destination"},
+	)
+
 	// ContainerLLMCachedTokensTotal counts input tokens served from the
 	// provider's prompt cache. Already counted in token_usage_total{type=input};
 	// this is a separate metric to make cache-hit rate computable.
@@ -252,6 +272,7 @@ func RegisterLLMMetrics(reg prometheus.Registerer) {
 		L7PayloadTruncatedTotal,
 		Http2ParserCapDropsTotal,
 		Http2ParserStaleReuseTotal,
+		Http2StageTotal,
 		ContainerLLMCachedTokensTotal,
 		ContainerLLMToolCallsTotal,
 		ContainerLLMCostUSDTotal,
@@ -259,6 +280,12 @@ func RegisterLLMMetrics(reg prometheus.Registerer) {
 	// Hook the HTTP/2 parser's HPACK error path so we get a counter without
 	// l7 having to import prometheus.
 	l7.OnHPACKDecodeError = func() { LLMHPACKDecodeErrorsTotal.Inc() }
+	l7.OnHttp2Stage = func(stage, dest string) {
+		if dest == "" {
+			dest = "unknown"
+		}
+		Http2StageTotal.WithLabelValues(stage, dest).Inc()
+	}
 }
 
 // RecordLLMEvent is the single entry point for recording LLM metrics.

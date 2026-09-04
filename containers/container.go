@@ -1214,6 +1214,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			p.Lightweight = true
 			p.LLMHostChecker = isLLMRelevantHost
 			p.ConnTimestamp = conn.Timestamp
+			p.DestClass = h2DestClass
 			c.googleHTTP2Parsers[pidFd] = p
 		}
 		parser := c.googleHTTP2Parsers[pidFd]
@@ -1223,6 +1224,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		if parser.ConnTimestamp != conn.Timestamp {
 			Http2ParserStaleReuseTotal.WithLabelValues(h2DestClass).Inc()
 			parser.ConnTimestamp = conn.Timestamp
+			parser.DestClass = h2DestClass
 		}
 		conn.http2Parser = parser // Keep reference on connection for compatibility
 		requests := parser.Parse(r.Method, r.Payload, uint64(r.Duration), r.PayloadSize > uint64(len(r.Payload)))
