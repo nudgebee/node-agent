@@ -143,11 +143,14 @@ func isLoopbackIP(ip string) bool {
 }
 
 func (resolver *K8sIPResolver) ResolveActualIP(ip string) Workload {
-	if isLoopbackIP(ip) {
-		return LoopbackWorkload()
-	}
 	if val, ok := resolver.podIpsMap.Get(ip); ok {
 		return val
+	}
+	// Checked only after the lookups miss, so resolvable addresses never pay for
+	// the parse on this hot path. Loopback is never in those maps, so it always
+	// reaches here.
+	if isLoopbackIP(ip) {
+		return LoopbackWorkload()
 	}
 	host := ip
 
@@ -169,9 +172,6 @@ func (resolver *K8sIPResolver) ResolveActualIP(ip string) Workload {
 }
 
 func (resolver *K8sIPResolver) ResolveIP(ip string) Workload {
-	if isLoopbackIP(ip) {
-		return LoopbackWorkload()
-	}
 	if val, ok := resolver.ipsMap.Load(ip); ok {
 		entry, ok := val.(Workload)
 		if ok {
@@ -182,6 +182,11 @@ func (resolver *K8sIPResolver) ResolveIP(ip string) Workload {
 
 	if val, ok := resolver.podIpsMap.Get(ip); ok {
 		return val
+	}
+	// See ResolveActualIP: checked after the lookups so resolvable addresses
+	// never pay for the parse.
+	if isLoopbackIP(ip) {
+		return LoopbackWorkload()
 	}
 	host := ip
 

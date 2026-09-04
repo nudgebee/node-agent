@@ -16,6 +16,11 @@ func TestIsLoopbackIP(t *testing.T) {
 		{"127.1.2.3", true}, // all of 127.0.0.0/8 is loopback
 		{"::1", true},
 		{"[::1]:8080", true},
+		// Non-canonical IPv6 forms. A HasPrefix("::1") style shortcut reports
+		// these as non-loopback; the address has to actually be parsed.
+		{"[::1]", true},
+		{"0:0:0:0:0:0:0:1", true},
+		{"[0:0:0:0:0:0:0:1]:80", true},
 		{"10.0.0.1", false},
 		{"142.250.115.95", false},
 		{"192.168.1.1", false},
