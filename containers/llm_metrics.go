@@ -124,6 +124,34 @@ var (
 		},
 	)
 
+	// L7EventsTotal counts L7 events reaching userspace, and
+	// L7PayloadTruncatedTotal counts the subset whose payload exceeded
+	// MAX_PAYLOAD_SIZE and was therefore cut short in the kernel (the tail is
+	// discarded, not delivered in a later event).
+	//
+	// The pair exists to make the truncation rate measurable per protocol and
+	// per destination class. It matters most for HTTP/2: HPACK is stateful, so
+	// a truncated frame cannot simply be skipped the way a truncated HTTP/1.1
+	// request can. Compare
+	//   rate(node_agent_l7_payload_truncated_total{protocol="http2",destination="external"}[5m])
+	// against the same labels on node_agent_l7_events_total to see what share of
+	// external HTTP/2 traffic is arriving incomplete.
+	L7EventsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "node_agent_l7_events_total",
+			Help: "L7 events processed, by protocol and destination class",
+		},
+		[]string{"protocol", "destination"},
+	)
+
+	L7PayloadTruncatedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "node_agent_l7_payload_truncated_total",
+			Help: "L7 events whose payload exceeded MAX_PAYLOAD_SIZE and was truncated in the kernel",
+		},
+		[]string{"protocol", "destination"},
+	)
+
 	// ContainerLLMCachedTokensTotal counts input tokens served from the
 	// provider's prompt cache. Already counted in token_usage_total{type=input};
 	// this is a separate metric to make cache-hit rate computable.
@@ -188,6 +216,8 @@ func RegisterLLMMetrics(reg prometheus.Registerer) {
 		ContainerLLMErrorsTotal,
 		LLMSNITagsTotal,
 		LLMHPACKDecodeErrorsTotal,
+		L7EventsTotal,
+		L7PayloadTruncatedTotal,
 		ContainerLLMCachedTokensTotal,
 		ContainerLLMToolCallsTotal,
 		ContainerLLMCostUSDTotal,
