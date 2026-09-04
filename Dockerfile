@@ -2,8 +2,17 @@ FROM debian:bullseye AS builder
 # Using Debian instead of the official Golang image because it’s based on newer OS versions
 # with newer glibc, which causes compatibility issues.
 
-RUN apt-get update && apt-get install -y \
-    curl git build-essential pkg-config libsystemd-dev
+# The base image ships a package index that can reference .debs the mirror has
+# already pruned after a point release, which fails the build with a 404 on a
+# specific version (seen 2026-09-04: libperl5.32 5.32.1-4+deb11u5). Dropping the
+# cached lists forces a genuinely fresh index rather than a conditional-GET that
+# may be answered from CDN cache, and Acquire::Retries rides out single-node
+# staleness. bullseye is oldstable, so this will recur as the archive rotates.
+RUN rm -rf /var/lib/apt/lists/* \
+    && apt-get update -o Acquire::Retries=5 \
+    && apt-get install -y --no-install-recommends -o Acquire::Retries=5 \
+        curl git build-essential pkg-config libsystemd-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 ARG GO_VERSION=1.26.5
 RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz -o go.tar.gz && \
