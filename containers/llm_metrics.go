@@ -204,6 +204,28 @@ var (
 		[]string{"stage", "destination"},
 	)
 
+	// Http2FramesTotal counts HTTP/2 frame headers the parser walks, by type.
+	//
+	// External HTTP/2 delivers ~44k client-frame events per 5 minutes but only
+	// ~71 streams, against ~161k events and ~10.8k streams internally — 86x
+	// worse. Either those events contain almost no HEADERS frames, or they are
+	// not HTTP/2 at all. Frame type distinguishes the two directly: "invalid"
+	// dominating means the bytes are not HTTP/2 and the eBPF port heuristic is
+	// over-matching; DATA/WINDOW_UPDATE dominating with no HEADERS means the
+	// request headers are being lost before the parser sees them.
+	//
+	// Deliberately structural. These events carry decrypted application
+	// traffic, so dumping payloads to diagnose this would put Authorization
+	// headers and request bodies into agent logs; frame type, and the counts
+	// alone, disclose nothing.
+	Http2FramesTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "node_agent_http2_frames_total",
+			Help: "HTTP/2 frame headers parsed, by frame type and destination class",
+		},
+		[]string{"type", "destination"},
+	)
+
 	// ContainerLLMCachedTokensTotal counts input tokens served from the
 	// provider's prompt cache. Already counted in token_usage_total{type=input};
 	// this is a separate metric to make cache-hit rate computable.
@@ -273,6 +295,7 @@ func RegisterLLMMetrics(reg prometheus.Registerer) {
 		Http2ParserCapDropsTotal,
 		Http2ParserStaleReuseTotal,
 		Http2StageTotal,
+		Http2FramesTotal,
 		ContainerLLMCachedTokensTotal,
 		ContainerLLMToolCallsTotal,
 		ContainerLLMCostUSDTotal,
@@ -280,6 +303,12 @@ func RegisterLLMMetrics(reg prometheus.Registerer) {
 	// Hook the HTTP/2 parser's HPACK error path so we get a counter without
 	// l7 having to import prometheus.
 	l7.OnHPACKDecodeError = func() { LLMHPACKDecodeErrorsTotal.Inc() }
+	l7.OnHttp2Frame = func(frameType, dest string) {
+		if dest == "" {
+			dest = "unknown"
+		}
+		Http2FramesTotal.WithLabelValues(frameType, dest).Inc()
+	}
 	l7.OnHttp2Stage = func(stage, dest string) {
 		if dest == "" {
 			dest = "unknown"

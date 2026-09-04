@@ -29,6 +29,50 @@ var OnHPACKDecodeError func()
 // the axis the failure splits on.
 var OnHttp2Stage func(stage, dest string)
 
+// OnHttp2Frame, if set, is invoked for each frame header the parser walks, and
+// once with "invalid" when a header fails the type/length sanity check.
+//
+// This answers "are these bytes actually HTTP/2, and do they contain HEADERS?"
+// without logging any payload. That distinction matters: these events carry
+// decrypted application traffic, so a raw dump would put Authorization headers
+// and request bodies into agent logs. Frame type, flags and length are
+// structural metadata and disclose nothing.
+var OnHttp2Frame func(frameType, dest string)
+
+// http2FrameTypeName keeps the metric label bounded to the ten defined frame
+// types plus "invalid"; h.Type is already range-checked by the caller.
+func http2FrameTypeName(t http2.FrameType) string {
+	switch t {
+	case http2.FrameData:
+		return "DATA"
+	case http2.FrameHeaders:
+		return "HEADERS"
+	case http2.FramePriority:
+		return "PRIORITY"
+	case http2.FrameRSTStream:
+		return "RST_STREAM"
+	case http2.FrameSettings:
+		return "SETTINGS"
+	case http2.FramePushPromise:
+		return "PUSH_PROMISE"
+	case http2.FramePing:
+		return "PING"
+	case http2.FrameGoAway:
+		return "GOAWAY"
+	case http2.FrameWindowUpdate:
+		return "WINDOW_UPDATE"
+	case http2.FrameContinuation:
+		return "CONTINUATION"
+	}
+	return "invalid"
+}
+
+func (p *Http2Parser) frame(name string) {
+	if OnHttp2Frame != nil {
+		OnHttp2Frame(name, p.DestClass)
+	}
+}
+
 func (p *Http2Parser) stage(name string) {
 	if OnHttp2Stage != nil {
 		OnHttp2Stage(name, p.DestClass)
@@ -487,8 +531,10 @@ frameLoop:
 		// If we see clearly invalid values, this isn't valid HTTP/2 - skip remaining data
 		if h.Length > 16*1024*1024 || h.Type > 9 {
 			// Invalid frame - don't save as partial, just discard
+			p.frame("invalid")
 			break
 		}
+		p.frame(http2FrameTypeName(h.Type))
 
 		offset += http2FrameHeaderLength
 
