@@ -377,7 +377,14 @@ func (p *Http2Parser) decodeHeaderBlock(
 	}
 }
 
-func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64) []Http2Request {
+// Parse consumes one L7 event's worth of HTTP/2 frames.
+//
+// truncated reports that the kernel captured only a prefix of the original
+// write: eBPF clamps each event to MAX_PAYLOAD_SIZE and drops the tail, so the
+// caller must pass PayloadSize > len(payload). It matters because a partial
+// frame at the end of a truncated payload is unrecoverable and must not be
+// carried into the next call — see the save site at the end of this function.
+func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64, truncated bool) []Http2Request {
 	if method == MethodHttp2ClientFrames {
 		l := len(http2.ClientPreface)
 		if len(payload) >= l && string(payload[:l]) == http2.ClientPreface {
@@ -578,9 +585,28 @@ frameLoop:
 		}
 	}
 
-	// Save any unconsumed data as partial frame for next Parse() call
-	// This handles HTTP/2 frames split across multiple S2A/TLS Read() calls
-	if offset < len(payload) {
+	// Save any unconsumed data as partial frame for next Parse() call.
+	// This handles HTTP/2 frames split across multiple TLS Read()/Write() calls.
+	//
+	// Never do this for a truncated payload. eBPF caps each event at
+	// MAX_PAYLOAD_SIZE (4096) and DISCARDS the remainder rather than chunking it,
+	// so the bytes that would complete this frame do not exist and never will.
+	// Buffering the fragment splices it onto the front of the next, unrelated
+	// write: every frame header after that point is read at the wrong offset, and
+	// the resulting garbage is fed to the persistent HPACK decoder. Because HPACK
+	// is stateful, that corrupts the dynamic table for the remaining life of the
+	// connection — one oversized write silently kills decoding for all subsequent
+	// requests on it. Dropping the fragment loses that one frame instead.
+	//
+	// This is why large-header HTTPS/2 endpoints decode nothing while small
+	// internal h2c (frames well under 4KB) works: only the former truncates.
+	if truncated {
+		*partialFrame = nil
+		// A header block interrupted by truncation can never be completed by a
+		// CONTINUATION frame, and feeding its fragments to the decoder later
+		// would desync the dynamic table just as badly.
+		*pendingHeaders = nil
+	} else if offset < len(payload) {
 		remaining := payload[offset:]
 		// Only save if it looks like start of a valid frame (has at least some bytes)
 		// and isn't too large (sanity check - max HTTP/2 frame is 16MB)

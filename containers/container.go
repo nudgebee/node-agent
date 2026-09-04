@@ -1183,7 +1183,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		}
 		parser := c.googleHTTP2Parsers[pidFd]
 		conn.http2Parser = parser // Keep reference on connection for compatibility
-		requests := parser.Parse(r.Method, r.Payload, uint64(r.Duration))
+		requests := parser.Parse(r.Method, r.Payload, uint64(r.Duration), r.PayloadSize > uint64(len(r.Payload)))
 		activeCount := parser.ActiveRequestCount()
 		if activeCount > 0 {
 			klog.V(3).Infof("HTTP2_PARSE_RESULT: pid=%d fd=%d completed=%d active=%d",
@@ -1425,7 +1425,7 @@ func (c *Container) processHTTP2WithoutConnection(pid uint32, fd uint64, r *l7.R
 		c.googleHTTP2Parsers[pidFd] = parser
 	}
 
-	requests := parser.Parse(r.Method, r.Payload, uint64(r.Duration))
+	requests := parser.Parse(r.Method, r.Payload, uint64(r.Duration), r.PayloadSize > uint64(len(r.Payload)))
 
 	// Late-tag from :authority header if not yet tagged
 	if llmTag == nil {
