@@ -152,6 +152,38 @@ var (
 		[]string{"protocol", "destination"},
 	)
 
+	// Http2ParserCapDropsTotal counts HTTP/2 events discarded because the
+	// per-container parser map was already at maxHTTP2ParsersPerContainer.
+	//
+	// gc() only reclaims a parser whose connection is gone if the parser also
+	// looks idle (no active requests, no partial data). A parser holding
+	// requests that never completed therefore survives its connection
+	// indefinitely, so a container with connection churn can fill the cap and
+	// then silently drop every subsequent HTTP/2 connection. Non-zero here means
+	// events are being lost before any parsing is attempted.
+	Http2ParserCapDropsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "node_agent_http2_parser_cap_drops_total",
+			Help: "HTTP/2 events dropped because the per-container parser cap was reached",
+		},
+		[]string{"destination"},
+	)
+
+	// Http2ParserStaleReuseTotal counts times a parser was found for a pid/fd
+	// but had been created for a different connection (the fd was recycled).
+	//
+	// Parsers are keyed by pid+fd only. A recycled fd therefore hands the new
+	// connection a parser whose HPACK dynamic table belongs to the previous one,
+	// which desynchronises decoding immediately. Non-zero here is a direct
+	// source of node_agent_hpack_decode_errors_total.
+	Http2ParserStaleReuseTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "node_agent_http2_parser_stale_reuse_total",
+			Help: "HTTP/2 parsers reused across different connections on a recycled fd",
+		},
+		[]string{"destination"},
+	)
+
 	// ContainerLLMCachedTokensTotal counts input tokens served from the
 	// provider's prompt cache. Already counted in token_usage_total{type=input};
 	// this is a separate metric to make cache-hit rate computable.
@@ -218,6 +250,8 @@ func RegisterLLMMetrics(reg prometheus.Registerer) {
 		LLMHPACKDecodeErrorsTotal,
 		L7EventsTotal,
 		L7PayloadTruncatedTotal,
+		Http2ParserCapDropsTotal,
+		Http2ParserStaleReuseTotal,
 		ContainerLLMCachedTokensTotal,
 		ContainerLLMToolCallsTotal,
 		ContainerLLMCostUSDTotal,

@@ -101,6 +101,12 @@ type pendingHeaderBlock struct {
 }
 
 type Http2Parser struct {
+	// ConnTimestamp records which connection this parser was created for.
+	// Callers key parsers by pid+fd, which a recycled fd can collide on; this
+	// lets them detect that case instead of silently decoding a new connection
+	// with the previous one's HPACK dynamic table.
+	ConnTimestamp uint64
+
 	clientDecoder  *hpack.Decoder
 	serverDecoder  *hpack.Decoder
 	activeRequests map[uint32]*Http2Request

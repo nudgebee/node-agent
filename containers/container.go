@@ -1201,16 +1201,29 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			c.googleHTTP2Parsers = make(map[PidFd]*l7.Http2Parser)
 		}
 		pidFd := PidFd{Pid: pid, Fd: fd}
+		h2DestClass := "internal"
+		if common.IsIpExternal(conn.DestinationKey.ActualDestinationIfKnown().IP()) {
+			h2DestClass = "external"
+		}
 		if c.googleHTTP2Parsers[pidFd] == nil {
 			if len(c.googleHTTP2Parsers) >= maxHTTP2ParsersPerContainer {
+				Http2ParserCapDropsTotal.WithLabelValues(h2DestClass).Inc()
 				return nil, L7RequestProcessed
 			}
 			p := l7.NewHttp2Parser()
 			p.Lightweight = true
 			p.LLMHostChecker = isLLMRelevantHost
+			p.ConnTimestamp = conn.Timestamp
 			c.googleHTTP2Parsers[pidFd] = p
 		}
 		parser := c.googleHTTP2Parsers[pidFd]
+		// Parsers are keyed by pid+fd alone, so a recycled fd can hand this
+		// connection a parser whose HPACK dynamic table belongs to the previous
+		// one. Count that rather than assume it does or does not happen.
+		if parser.ConnTimestamp != conn.Timestamp {
+			Http2ParserStaleReuseTotal.WithLabelValues(h2DestClass).Inc()
+			parser.ConnTimestamp = conn.Timestamp
+		}
 		conn.http2Parser = parser // Keep reference on connection for compatibility
 		requests := parser.Parse(r.Method, r.Payload, uint64(r.Duration), r.PayloadSize > uint64(len(r.Payload)))
 		activeCount := parser.ActiveRequestCount()
