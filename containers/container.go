@@ -1125,6 +1125,18 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			}
 		}
 
+		// --exclude-http-requests-by-path is documented as skipping metrics and
+		// traces, but was only ever applied on the HTTP/2 path below, so it
+		// silently did nothing for HTTP/1.1. Apply it here too. The FQDN
+		// migration above still runs: an excluded path is not a reason to stop
+		// learning the destination's name for the requests we do keep.
+		if common.HttpFilter.ShouldBeSkipped(httpCtx.Path) {
+			if ip2fqdn != nil {
+				return ip2fqdn, L7RequestProcessed
+			}
+			return nil, L7RequestProcessed
+		}
+
 		// Update stats with extracted trace ID (uses resolved key if migrated above)
 		c.l7Stats.observe(r.Protocol, r.Status.Http(), httpCtx.Method, httpCtx.Path, r.Duration, conn.DestinationKey, conn.srcWorkload, r, httpCtx.TraceID)
 
