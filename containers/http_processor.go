@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"inet.af/netaddr"
 )
@@ -243,6 +244,13 @@ func stripPort(hostPort string) string {
 func isIPAddress(host string) bool {
 	host = stripPort(host)
 	return net.ParseIP(host) != nil
+}
+
+// needsFQDN reports whether a destination workload name still lacks a usable
+// hostname and should be replaced when one is observed. See common.NeedsFQDN,
+// which carries the rationale and the tests (this package is excluded from CI).
+func needsFQDN(name string) bool {
+	return common.NeedsFQDN(name)
 }
 
 // extractHTTPBody extracts the body from an HTTP message (after \r\n\r\n).

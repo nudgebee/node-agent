@@ -910,7 +910,7 @@ func (c *Container) enrichDestinationKey(key common.DestinationKey) common.Desti
 	if !common.IsIpExternal(ip) {
 		return key
 	}
-	if isIPAddress(key.GetDestinationWorkload().Name) {
+	if needsFQDN(key.GetDestinationWorkload().Name) {
 		if domain := c.registry.getDomain(ip); domain != nil {
 			return key.WithResolvedDomain(domain.FQDN)
 		}
@@ -932,7 +932,7 @@ func (c *Container) migrateConnectionKeyIfNeeded(conn *ActiveConnection) {
 	if conn == nil {
 		return
 	}
-	if !isIPAddress(conn.DestinationKey.GetDestinationWorkload().Name) {
+	if !needsFQDN(conn.DestinationKey.GetDestinationWorkload().Name) {
 		return
 	}
 	ip := conn.DestinationKey.ActualDestinationIfKnown().IP()
@@ -960,19 +960,44 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	// here so we don't lose the only signal that survives mid-stream-join
 	// HPACK failure on long-lived HTTP/2 connections.
 	if r.Protocol == l7.ProtocolTLSClientHello {
-		if c.llmDetector != nil {
-			if host, err := l7.ParseSNI(r.Payload); err == nil && host != "" {
-				pidFd := PidFd{Pid: pid, Fd: fd}
-				destIP := netaddr.IP{}
-				if conn := c.connectionsByPidFd[pidFd]; conn != nil {
-					destIP = conn.DestinationKey.ActualDestinationIfKnown().IP()
-				}
-				if tag := c.llmDetector.LateTag(pidFd, host, destIP); tag != nil {
-					LLMSNITagsTotal.WithLabelValues(string(tag.Provider)).Inc()
-					klog.V(2).Infof("LLM_SNI_TAG: pid=%d fd=%d sni=%s provider=%s",
-						pid, fd, host, tag.Provider)
-				}
+		host, err := l7.ParseSNI(r.Payload)
+		if err != nil || host == "" {
+			return nil, L7RequestProcessed
+		}
+		pidFd := PidFd{Pid: pid, Fd: fd}
+		conn := c.connectionsByPidFd[pidFd]
+		destIP := netaddr.IP{}
+		if conn != nil {
+			destIP = conn.DestinationKey.ActualDestinationIfKnown().IP()
+		}
+		// The conn lookup fails often enough on Go TLS (see above) that the
+		// socket tuple eBPF read off the fd is the only IP we get.
+		if destIP.IsZero() && socketInfo != nil && socketInfo.Valid {
+			if ip, err := netaddr.ParseIP(socketInfo.DstIP); err == nil {
+				destIP = ip
 			}
+		}
+		if c.llmDetector != nil {
+			if tag := c.llmDetector.LateTag(pidFd, host, destIP); tag != nil {
+				LLMSNITagsTotal.WithLabelValues(string(tag.Provider)).Inc()
+				klog.V(2).Infof("LLM_SNI_TAG: pid=%d fd=%d sni=%s provider=%s",
+					pid, fd, host, tag.Provider)
+			}
+		}
+
+		// Publish SNI as the destination FQDN. The ClientHello is the first
+		// thing on the wire, so this lands before any request on the connection
+		// — which is the only way to name a destination whose IP we have never
+		// seen a DNS answer for. Applications cache DNS themselves, so for a
+		// reconnect to a new CDN/anycast edge IP no DNS packet is emitted at
+		// all and the Host header arrives too late to help the first request.
+		if !destIP.IsZero() && common.IsIpExternal(destIP) && !isIPAddress(host) {
+			if conn != nil && needsFQDN(conn.DestinationKey.GetDestinationWorkload().Name) {
+				c.migrateConnectionKeyToFQDN(conn, host)
+			}
+			return map[netaddr.IP]*common.Domain{
+				destIP: common.NewDomain(host, []netaddr.IP{destIP}),
+			}, L7RequestProcessed
 		}
 		return nil, L7RequestProcessed
 	}
@@ -1090,7 +1115,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		// If DestinationKey still has a raw IP but the HTTP Host header has an FQDN,
 		// use it to update the connection key and populate ip_to_fqdn.
 		var ip2fqdn map[netaddr.IP]*common.Domain
-		if isIPAddress(conn.DestinationKey.GetDestinationWorkload().Name) &&
+		if needsFQDN(conn.DestinationKey.GetDestinationWorkload().Name) &&
 			httpCtx.Host != "" && !isIPAddress(httpCtx.Host) {
 			ip := conn.DestinationKey.ActualDestinationIfKnown().IP()
 			if common.IsIpExternal(ip) {
@@ -1154,7 +1179,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		}
 
 		// If DestinationKey still has a raw IP, try to resolve from :authority header
-		if isIPAddress(conn.DestinationKey.GetDestinationWorkload().Name) {
+		if needsFQDN(conn.DestinationKey.GetDestinationWorkload().Name) {
 			for _, req := range requests {
 				authority := stripPort(req.Authority)
 				if authority != "" && !isIPAddress(authority) {
