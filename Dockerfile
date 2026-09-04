@@ -8,10 +8,14 @@ FROM debian:bullseye AS builder
 # cached lists forces a genuinely fresh index rather than a conditional-GET that
 # may be answered from CDN cache, and Acquire::Retries rides out single-node
 # staleness. bullseye is oldstable, so this will recur as the archive rotates.
+#
+# ca-certificates is listed explicitly: it is only a *recommended* dependency of
+# curl, so --no-install-recommends drops it, and the Go download below then
+# fails TLS verification with curl exit 77.
 RUN rm -rf /var/lib/apt/lists/* \
     && apt-get update -o Acquire::Retries=5 \
     && apt-get install -y --no-install-recommends -o Acquire::Retries=5 \
-        curl git build-essential pkg-config libsystemd-dev \
+        ca-certificates curl git build-essential pkg-config libsystemd-dev \
     && rm -rf /var/lib/apt/lists/*
 
 ARG GO_VERSION=1.26.5
