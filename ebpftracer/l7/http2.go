@@ -18,6 +18,23 @@ import (
 // observable without needing to read agent logs.
 var OnHPACKDecodeError func()
 
+// OnHttp2Stage, if set, is invoked as a request advances through the parser.
+// It exists so the pipeline can be measured stage by stage without l7 importing
+// prometheus (same reason as OnHPACKDecodeError).
+//
+// External HTTP/2 enters at ~1.5M events per 10 minutes and leaves as zero
+// completed requests; every step between those two numbers was previously
+// unobservable, which meant diagnosing it one hypothesis and one deploy at a
+// time. dest is the destination class ("external"/"internal") because that is
+// the axis the failure splits on.
+var OnHttp2Stage func(stage, dest string)
+
+func (p *Http2Parser) stage(name string) {
+	if OnHttp2Stage != nil {
+		OnHttp2Stage(name, p.DestClass)
+	}
+}
+
 // safeKernelDuration computes the duration between two kernel timestamps,
 // returning 0 if the result would underflow or exceed 1 hour.
 func safeKernelDuration(end, start uint64) time.Duration {
@@ -101,6 +118,15 @@ type pendingHeaderBlock struct {
 }
 
 type Http2Parser struct {
+	// ConnTimestamp records which connection this parser was created for.
+	// Callers key parsers by pid+fd, which a recycled fd can collide on; this
+	// lets them detect that case instead of silently decoding a new connection
+	// with the previous one's HPACK dynamic table.
+	ConnTimestamp uint64
+
+	// DestClass labels stage counters ("external"/"internal"); set by the caller.
+	DestClass string
+
 	clientDecoder  *hpack.Decoder
 	serverDecoder  *hpack.Decoder
 	activeRequests map[uint32]*Http2Request
@@ -282,6 +308,7 @@ func (p *Http2Parser) decodeHeaderBlock(
 				req.RequestHeaders = make(map[string]string)
 			}
 			p.activeRequests[streamId] = req
+			p.stage("stream_created")
 		}
 		decoder.SetEmitFunc(func(hf hpack.HeaderField) {
 			// Store all headers for trace correlation (full mode only)
@@ -334,6 +361,9 @@ func (p *Http2Parser) decodeHeaderBlock(
 				s, _ := strconv.Atoi(hf.Value)
 				if req != nil {
 					req.Status = Status(s)
+					if !req.hasResponseStatus {
+						p.stage("response_status")
+					}
 					req.hasResponseStatus = true
 				}
 				statuses[streamId] = Status(s)
@@ -347,6 +377,9 @@ func (p *Http2Parser) decodeHeaderBlock(
 		})
 		// Check for END_STREAM flag on HEADERS (no body response)
 		if req != nil && endStream {
+			if !req.responseEndStream {
+				p.stage("end_stream")
+			}
 			req.responseEndStream = true
 		}
 	}
@@ -363,6 +396,7 @@ func (p *Http2Parser) decodeHeaderBlock(
 		if OnHPACKDecodeError != nil {
 			OnHPACKDecodeError()
 		}
+		p.stage("hpack_error")
 
 		// Mark the request as having partial headers so downstream can apply fallbacks
 		if req := p.activeRequests[streamId]; req != nil {
@@ -469,6 +503,9 @@ frameLoop:
 			// Track END_STREAM on server DATA frames unconditionally (needed for both modes)
 			if method == MethodHttp2ServerFrames && h.Flags&http2FlagEndStream != 0 {
 				if req := p.activeRequests[h.StreamId]; req != nil {
+					if !req.responseEndStream {
+						p.stage("end_stream")
+					}
 					req.responseEndStream = true
 				}
 			}
@@ -637,6 +674,7 @@ frameLoop:
 			}
 			r.Duration = safeKernelDuration(kernelTime, r.kernelTime)
 			res = append(res, *r)
+			p.stage("completed")
 			delete(p.activeRequests, streamId)
 		}
 	}
