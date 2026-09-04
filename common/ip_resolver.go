@@ -12,6 +12,7 @@ import (
 
 	"github.com/coroot/coroot-node-agent/flags"
 	lrucache "github.com/hashicorp/golang-lru/v2"
+	"inet.af/netaddr"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
@@ -124,7 +125,27 @@ func NewK8sIPResolver(clientset kubernetes.Interface, resolveDns bool) (*K8sIPRe
 	}, nil
 }
 
+// LoopbackWorkload is the identity used for 127.0.0.0/8 and ::1.
+//
+// Loopback is the least external destination there is — IsIpExternal already
+// says so — but the resolvers cannot map it to a pod, service or node, so it
+// used to fall through to the "external" placeholder. That put self-directed
+// traffic (health probes in the host netns, where loopback is deliberately not
+// skipped) into every external-destination view as a 127.0.0.1 -> 127.0.0.1
+// self-loop.
+func LoopbackWorkload() Workload {
+	return Workload{Name: "localhost", Namespace: "localhost", Kind: "localhost"}
+}
+
+func isLoopbackIP(ip string) bool {
+	parsed, err := netaddr.ParseIP(StripPort(ip))
+	return err == nil && parsed.IsLoopback()
+}
+
 func (resolver *K8sIPResolver) ResolveActualIP(ip string) Workload {
+	if isLoopbackIP(ip) {
+		return LoopbackWorkload()
+	}
 	if val, ok := resolver.podIpsMap.Get(ip); ok {
 		return val
 	}
@@ -148,6 +169,9 @@ func (resolver *K8sIPResolver) ResolveActualIP(ip string) Workload {
 }
 
 func (resolver *K8sIPResolver) ResolveIP(ip string) Workload {
+	if isLoopbackIP(ip) {
+		return LoopbackWorkload()
+	}
 	if val, ok := resolver.ipsMap.Load(ip); ok {
 		entry, ok := val.(Workload)
 		if ok {
