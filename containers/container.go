@@ -902,6 +902,17 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	return ip2fqdn
 }
 
+// protocolLabel renders a protocol for use as a metric label. Protocol.String()
+// falls back to "UNKNOWN:<n>" for unrecognised values, which would be unbounded
+// cardinality on a label, so those collapse to a single bucket.
+func protocolLabel(p l7.Protocol) string {
+	s := p.String()
+	if strings.HasPrefix(s, "UNKNOWN:") {
+		return "unknown"
+	}
+	return s
+}
+
 // enrichDestinationKey checks if the DestinationKey has an IP-based workload name
 // and attempts to resolve it to an FQDN using the DNS cache. Returns the original
 // key if no resolution is needed or available.
@@ -1041,6 +1052,24 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	// Migrate connection key from IP to FQDN if DNS is now available
 	// (fixes race condition where DNS wasn't cached at connection open time)
 	c.migrateConnectionKeyIfNeeded(conn)
+
+	// Record whether the kernel had to cut this event's payload short. eBPF caps
+	// each event at MAX_PAYLOAD_SIZE and discards the remainder, so PayloadSize
+	// exceeding the delivered length means data was lost outright rather than
+	// continued in a later event. Tracked per protocol and destination class
+	// because the consequence differs sharply: HTTP/1.1 loses trailing headers,
+	// HTTP/2 loses frame alignment.
+	{
+		destClass := "internal"
+		if common.IsIpExternal(conn.DestinationKey.ActualDestinationIfKnown().IP()) {
+			destClass = "external"
+		}
+		proto := protocolLabel(r.Protocol)
+		L7EventsTotal.WithLabelValues(proto, destClass).Inc()
+		if r.PayloadSize > uint64(len(r.Payload)) {
+			L7PayloadTruncatedTotal.WithLabelValues(proto, destClass).Inc()
+		}
+	}
 
 	// Check if eBPF traces are disabled (upstream feature)
 	ebpfTracesDisabled := false
