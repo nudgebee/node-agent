@@ -544,7 +544,11 @@ frameLoop:
 		// If we see clearly invalid values, this isn't valid HTTP/2 - skip remaining data
 		if h.Length > 16*1024*1024 {
 			// Length beyond the 16MB maximum: this is not a frame header.
+			// Consume the rest: leaving offset at frameStart would let the
+			// partial-frame save at the end of this function buffer the garbage
+			// and prepend it to every subsequent call, re-parsing it forever.
 			p.frame("invalid")
+			offset = len(payload)
 			break
 		}
 		// RFC 9113 4.1: an unknown frame type MUST be ignored and discarded,
@@ -569,7 +573,10 @@ frameLoop:
 			continue
 		}
 		if h.Type > 0x10 {
+			// No registered frame type above 0x10; consume the rest for the
+			// same reason as the oversized-length case above.
 			p.frame("invalid")
+			offset = len(payload)
 			break
 		}
 		p.frame(http2FrameTypeName(h.Type))

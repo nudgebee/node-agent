@@ -97,3 +97,21 @@ func TestHttp2SawValidFrameDistinguishesGarbage(t *testing.T) {
 		t.Error("empty payload reported as containing a valid frame")
 	}
 }
+
+// Garbage must be consumed, not buffered. Leaving offset at the frame start
+// lets the partial-frame save at the end of Parse retain the invalid bytes and
+// prepend them to every later call, so a misdetected connection would re-parse
+// the same garbage indefinitely — burning CPU and never draining.
+func TestHttp2InvalidFrameDoesNotAccumulate(t *testing.T) {
+	p := NewHttp2Parser()
+	p.Lightweight = true
+
+	// Type 0x5a is not a registered frame type.
+	garbage := []byte{0x00, 0x00, 0x10, 0x5a, 0x00, 0x00, 0x00, 0x00, 0x01,
+		0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04, 0x05}
+	p.Parse(MethodHttp2ClientFrames, garbage, 1, false)
+
+	if n := len(p.clientPartialFrame); n != 0 {
+		t.Errorf("buffered %d bytes of invalid data for replay; want 0", n)
+	}
+}
