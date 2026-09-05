@@ -542,8 +542,33 @@ frameLoop:
 
 		// Sanity check: HTTP/2 max frame size is 16MB (2^24-1), and frame types are 0-9
 		// If we see clearly invalid values, this isn't valid HTTP/2 - skip remaining data
-		if h.Length > 16*1024*1024 || h.Type > 9 {
-			// Invalid frame - don't save as partial, just discard
+		if h.Length > 16*1024*1024 {
+			// Length beyond the 16MB maximum: this is not a frame header.
+			p.frame("invalid")
+			break
+		}
+		// RFC 9113 4.1: an unknown frame type MUST be ignored and discarded,
+		// not treated as an error. ALTSVC (0x0a), ORIGIN (0x0c) and
+		// PRIORITY_UPDATE (0x10) are standard extensions that GitHub and Google
+		// both send. Breaking here would drop the rest of the payload, and
+		// because callers reclassify connections that yield no valid frame, a
+		// connection whose payload merely leads with an extension frame could be
+		// dropped as if it were misdetected. Skip it and keep parsing.
+		// Registered types run to 0x10 (PRIORITY_UPDATE). Anything beyond that
+		// is not a plausible extension, and treating it as one would let
+		// misdetected binary traffic masquerade as valid HTTP/2 forever.
+		if h.Type > 9 && h.Type <= 0x10 {
+			p.frame("extension")
+			p.sawValidFrame = true
+			// offset still points at the frame header here; skip header+payload.
+			if len(payload)-offset < http2FrameHeaderLength+h.Length {
+				offset = frameStart
+				break frameLoop
+			}
+			offset += http2FrameHeaderLength + h.Length
+			continue
+		}
+		if h.Type > 0x10 {
 			p.frame("invalid")
 			break
 		}

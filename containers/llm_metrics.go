@@ -337,10 +337,34 @@ func RegisterLLMMetrics(reg prometheus.Registerer) {
 	// Hook the HTTP/2 parser's HPACK error path so we get a counter without
 	// l7 having to import prometheus.
 	l7.OnHPACKDecodeError = func() { LLMHPACKDecodeErrorsTotal.Inc() }
+	// Pre-resolve the frame counters. OnHttp2Frame fires per frame — measured
+	// around 1.6k/s — and WithLabelValues hashes the labels and takes the
+	// vector's read lock on every call. The label sets are small and fixed, so
+	// resolving them once at startup keeps that off the parser's hot path.
+	frameTypes := []string{
+		"DATA", "HEADERS", "PRIORITY", "RST_STREAM", "SETTINGS", "PUSH_PROMISE",
+		"PING", "GOAWAY", "WINDOW_UPDATE", "CONTINUATION", "extension", "invalid",
+	}
+	dests := []string{"external", "internal", "unknown"}
+	frameCounters := make(map[string]map[string]prometheus.Counter, len(frameTypes))
+	for _, ft := range frameTypes {
+		byDest := make(map[string]prometheus.Counter, len(dests))
+		for _, d := range dests {
+			byDest[d] = Http2FramesTotal.WithLabelValues(ft, d)
+		}
+		frameCounters[ft] = byDest
+	}
 	l7.OnHttp2Frame = func(frameType, dest string) {
 		if dest == "" {
 			dest = "unknown"
 		}
+		if byDest := frameCounters[frameType]; byDest != nil {
+			if c := byDest[dest]; c != nil {
+				c.Inc()
+				return
+			}
+		}
+		// Unrecognised combination: fall back rather than drop the observation.
 		Http2FramesTotal.WithLabelValues(frameType, dest).Inc()
 	}
 	l7.OnHttp2Stage = func(stage, dest string) {

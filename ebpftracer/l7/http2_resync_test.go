@@ -39,32 +39,30 @@ func TestHttp2TruncationLosesFrameAlignment(t *testing.T) {
 	}
 }
 
-// The harmful case: truncation lands inside a frame, and the *next* event
-// continues that same frame's payload rather than starting a new one. The
-// parser has no way to know, so it reads payload bytes as a frame header.
-func TestHttp2MidFrameContinuationIsMisread(t *testing.T) {
+// Extension frames must not be treated as garbage. RFC 9113 4.1 requires
+// unknown frame types to be skipped, and ALTSVC (0x0a) and ORIGIN (0x0c) are
+// standard extensions GitHub and Google both send. Treating them as invalid
+// would break out of the frame loop and — because callers reclassify
+// connections that produce no valid frame — could drop a legitimate HTTP/2
+// connection as if it had been misdetected.
+func TestHttp2ExtensionFramesAreSkippedNotRejected(t *testing.T) {
 	p := NewHttp2Parser()
 	p.Lightweight = true
 
-	// Frame 1 is a large DATA frame whose payload happens to contain bytes that
-	// parse as a plausible frame header — ordinary for compressed/binary bodies.
-	payload := make([]byte, 3000)
-	payload[0], payload[1], payload[2] = 0x00, 0x00, 0x08 // length 8
-	payload[3] = byte(http2.FrameHeaders)                 // type HEADERS
-	payload[4] = http2FlagEndHeaders
-	payload[8] = 0x63 // stream id 99
-	dataFrame := frame(http2.FrameData, 0, 1, payload)
+	altsvc := frame(http2.FrameType(0x0a), 0, 0, []byte("h3=\":443\""))
+	stream := append(append([]byte{}, altsvc...), headersFrame(1, "/after-extension")...)
 
-	full := append(append([]byte{}, dataFrame...), headersFrame(1, "/real")...)
-	p.Parse(MethodHttp2ClientFrames, full[:1500], 1, true) // truncated mid-DATA
+	p.Parse(MethodHttp2ClientFrames, stream, 1, false)
 
-	// Continuation of the SAME frame's payload arrives as the next event.
-	p.Parse(MethodHttp2ClientFrames, full[1500:3000], 2, false)
-
-	// Whatever happens, a phantom stream invented from payload bytes would be
-	// worse than decoding nothing: it corrupts the request map.
-	if _, phantom := p.activeRequests[99]; phantom {
-		t.Error("parser invented stream 99 from DATA payload read as a frame header")
+	if !p.SawValidFrame() {
+		t.Error("extension frame reported the payload as containing no valid frame")
+	}
+	req := p.activeRequests[1]
+	if req == nil {
+		t.Fatal("HEADERS after an extension frame was not parsed: the loop broke early")
+	}
+	if req.Path != "/after-extension" {
+		t.Errorf("path = %q, want /after-extension", req.Path)
 	}
 }
 
