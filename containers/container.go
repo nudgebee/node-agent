@@ -902,6 +902,26 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	return ip2fqdn
 }
 
+// payloadSizeBucket groups a delivered payload length. The boundaries are the
+// ones that matter to the frame parser: 0 and <9 produce no frame at all, and
+// 9-16 is a bare frame header with little or no payload attached — the shape a
+// reader doing io.ReadFull(header[:9]) then a separate payload read produces.
+func payloadSizeBucket(n int) string {
+	switch {
+	case n == 0:
+		return "0"
+	case n < 9:
+		return "1-8"
+	case n < 17:
+		return "9-16"
+	case n < 257:
+		return "17-256"
+	case n < 4096:
+		return "257-4095"
+	}
+	return "4096+"
+}
+
 // frameDirection labels an HTTP/2 event by which side's frames it carries.
 // Other protocols report "-" rather than inventing a direction for them.
 func frameDirection(m l7.Method) string {
@@ -1081,6 +1101,12 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		if r.PayloadSize > uint64(len(r.Payload)) {
 			L7PayloadTruncatedTotal.WithLabelValues(proto, destClass).Inc()
 		}
+		// Scoped to HTTP/2: this exists to explain why external HTTP/2 events
+		// so rarely yield a parseable frame, and keeps label cardinality small.
+		if r.Protocol == l7.ProtocolHTTP2 {
+			Http2PayloadSizeTotal.WithLabelValues(
+				payloadSizeBucket(len(r.Payload)), destClass, frameDirection(r.Method)).Inc()
+		}
 	}
 
 	// Check if eBPF traces are disabled (upstream feature)
@@ -1251,6 +1277,27 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		}
 		conn.http2Parser = parser // Keep reference on connection for compatibility
 		requests := parser.Parse(r.Method, r.Payload, uint64(r.Duration), r.PayloadSize > uint64(len(r.Payload)))
+
+		// HTTP/2 has the weakest detection heuristic of any protocol here — it
+		// accepts arbitrary binary as a frame roughly once every 9k buffers —
+		// and eBPF caches the verdict for the connection's lifetime, so one
+		// false positive turns every later event on that connection into
+		// garbage. trackParseFail already exists for exactly this ("eBPF
+		// protocol misidentification where weak heuristics tag a connection
+		// permanently") and is wired for Postgres, ClickHouse and Zookeeper,
+		// but never was for HTTP/2. A connection yielding no structurally valid
+		// frame is either mistagged or unrecoverable; either way, further
+		// parsing only produces HPACK noise.
+		//
+		// Empty payloads are normal and are not counted as failures.
+		if len(r.Payload) > 0 {
+			if parser.SawValidFrame() {
+				conn.parseFailCount = 0
+			} else {
+				c.trackParseFail(conn, pid, fd, r.Protocol)
+			}
+		}
+
 		activeCount := parser.ActiveRequestCount()
 		if activeCount > 0 {
 			klog.V(3).Infof("HTTP2_PARSE_RESULT: pid=%d fd=%d completed=%d active=%d",

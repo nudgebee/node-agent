@@ -2,8 +2,31 @@ FROM debian:bullseye AS builder
 # Using Debian instead of the official Golang image because it’s based on newer OS versions
 # with newer glibc, which causes compatibility issues.
 
-RUN apt-get update && apt-get install -y \
-    curl git build-essential pkg-config libsystemd-dev
+# deb.debian.org publishes a bullseye-security index that can advertise .debs
+# already pruned from the pool after a point release, so the build fails with a
+# 404 on an exact version (seen 2026-09-05: git 1:2.30.2-1+deb11u5). It is a
+# mirror-side inconsistency, so clearing local lists and retrying do not help —
+# both were tried and both still failed on every attempt.
+#
+# snapshot.debian.org serves index and pool as a matched pair at a point in
+# time, which makes this build reproducible and immune to archive rotation.
+# Check-Valid-Until is disabled because a pinned snapshot's Release file is
+# intentionally older than apt's freshness window.
+#
+# bullseye is oldstable and its archive keeps rotating; without this pin the
+# failure recurs and blocks every build in the repo, releases included.
+ARG DEBIAN_SNAPSHOT=20260801T000000Z
+RUN set -eux; \
+    printf '%s\n' \
+      "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bullseye main" \
+      "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bullseye-security main" \
+      "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bullseye-updates main" \
+      > /etc/apt/sources.list; \
+    rm -rf /var/lib/apt/lists/*; \
+    apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 update; \
+    apt-get install -y --no-install-recommends -o Acquire::Retries=5 \
+        ca-certificates curl git build-essential pkg-config libsystemd-dev; \
+    rm -rf /var/lib/apt/lists/*
 
 ARG GO_VERSION=1.26.5
 RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz -o go.tar.gz && \

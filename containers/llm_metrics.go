@@ -212,6 +212,53 @@ var (
 		[]string{"stage", "destination"},
 	)
 
+	// Http2FramesTotal counts HTTP/2 frame headers the parser walks, by type.
+	//
+	// External HTTP/2 delivers ~44k client-frame events per 5 minutes but only
+	// ~71 streams, against ~161k events and ~10.8k streams internally — 86x
+	// worse. Either those events contain almost no HEADERS frames, or they are
+	// not HTTP/2 at all. Frame type distinguishes the two directly: "invalid"
+	// dominating means the bytes are not HTTP/2 and the eBPF port heuristic is
+	// over-matching; DATA/WINDOW_UPDATE dominating with no HEADERS means the
+	// request headers are being lost before the parser sees them.
+	//
+	// Deliberately structural. These events carry decrypted application
+	// traffic, so dumping payloads to diagnose this would put Authorization
+	// headers and request bodies into agent logs; frame type, and the counts
+	// alone, disclose nothing.
+	Http2FramesTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "node_agent_http2_frames_total",
+			Help: "HTTP/2 frame headers parsed, by frame type and destination class",
+		},
+		[]string{"type", "destination"},
+	)
+
+	// Http2PayloadSizeTotal buckets the delivered payload length of HTTP/2
+	// events, by destination class and frame direction.
+	//
+	// 96% of external HTTP/2 events yield no parseable frame (8,881 frames from
+	// ~221k events) against 44% internally. Parse() can only produce nothing for
+	// three reasons: an empty payload, fewer than 9 bytes (shorter than a frame
+	// header), or a first frame header that fails validation — and the third is
+	// already counted as type="invalid" in Http2FramesTotal. So the answer is in
+	// the size distribution.
+	//
+	// The "9-16" bucket is the one to watch. A correct HTTP/2 reader does
+	// io.ReadFull(header[:9]) and then reads the frame payload separately, so
+	// SSL_read returns header-sized and payload-only chunks rather than whole
+	// frames. The parser assumes each event begins on a frame boundary and
+	// contains complete frames; if external reads are predominantly 9 bytes,
+	// that assumption is the bug and the parser needs to treat the connection as
+	// a continuous byte stream instead.
+	Http2PayloadSizeTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "node_agent_http2_payload_size_total",
+			Help: "HTTP/2 event payload sizes delivered to the parser, bucketed",
+		},
+		[]string{"bucket", "destination", "direction"},
+	)
+
 	// ContainerLLMCachedTokensTotal counts input tokens served from the
 	// provider's prompt cache. Already counted in token_usage_total{type=input};
 	// this is a separate metric to make cache-hit rate computable.
@@ -281,6 +328,8 @@ func RegisterLLMMetrics(reg prometheus.Registerer) {
 		Http2ParserCapDropsTotal,
 		Http2ParserStaleReuseTotal,
 		Http2StageTotal,
+		Http2FramesTotal,
+		Http2PayloadSizeTotal,
 		ContainerLLMCachedTokensTotal,
 		ContainerLLMToolCallsTotal,
 		ContainerLLMCostUSDTotal,
@@ -288,6 +337,36 @@ func RegisterLLMMetrics(reg prometheus.Registerer) {
 	// Hook the HTTP/2 parser's HPACK error path so we get a counter without
 	// l7 having to import prometheus.
 	l7.OnHPACKDecodeError = func() { LLMHPACKDecodeErrorsTotal.Inc() }
+	// Pre-resolve the frame counters. OnHttp2Frame fires per frame — measured
+	// around 1.6k/s — and WithLabelValues hashes the labels and takes the
+	// vector's read lock on every call. The label sets are small and fixed, so
+	// resolving them once at startup keeps that off the parser's hot path.
+	frameTypes := []string{
+		"DATA", "HEADERS", "PRIORITY", "RST_STREAM", "SETTINGS", "PUSH_PROMISE",
+		"PING", "GOAWAY", "WINDOW_UPDATE", "CONTINUATION", "extension", "invalid",
+	}
+	dests := []string{"external", "internal", "unknown"}
+	frameCounters := make(map[string]map[string]prometheus.Counter, len(frameTypes))
+	for _, ft := range frameTypes {
+		byDest := make(map[string]prometheus.Counter, len(dests))
+		for _, d := range dests {
+			byDest[d] = Http2FramesTotal.WithLabelValues(ft, d)
+		}
+		frameCounters[ft] = byDest
+	}
+	l7.OnHttp2Frame = func(frameType, dest string) {
+		if dest == "" {
+			dest = "unknown"
+		}
+		if byDest := frameCounters[frameType]; byDest != nil {
+			if c := byDest[dest]; c != nil {
+				c.Inc()
+				return
+			}
+		}
+		// Unrecognised combination: fall back rather than drop the observation.
+		Http2FramesTotal.WithLabelValues(frameType, dest).Inc()
+	}
 	l7.OnHttp2Stage = func(stage, dest string) {
 		if dest == "" {
 			dest = "unknown"

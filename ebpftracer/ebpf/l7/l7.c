@@ -241,6 +241,35 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
     return size;
 }
 
+// http2_detection_window bounds where the weak frame-shape heuristic may run.
+//
+// looks_like_http2_frame accepts arbitrary binary data as HTTP/2 roughly once
+// every 9k buffers: it requires only frame_type <= 9, a clear reserved bit, a
+// HEADERS type byte and one HPACK byte with static index 1-14. That rate is
+// survivable on its own, but conn->protocol is cached for the life of the
+// connection, so a single false positive converts every later event on that
+// connection into an HTTP/2 event permanently.
+//
+// A large binary transfer over HTTPS/1.1 (image layers, S3 objects) performs
+// tens of thousands of reads, making a false positive near-certain, which is
+// how HTTP/1.1 connections end up feeding garbage to the HPACK decoder.
+//
+// Real HTTP/2 announces itself immediately — client preface, then SETTINGS on
+// stream 0 — so the heuristic only needs to run early. Past this many bytes a
+// connection that has not already been identified is left alone. Connections
+// joined mid-stream are lost either way: their HPACK dynamic table state is
+// unrecoverable, so today they are "detected" only to produce undecodable
+// garbage.
+#define HTTP2_DETECTION_WINDOW_BYTES 65536
+
+static inline __attribute__((__always_inline__))
+int http2_detection_allowed(struct connection *conn) {
+    if (!conn) {
+        return 0;
+    }
+    return (conn->bytes_sent + conn->bytes_received) < HTTP2_DETECTION_WINDOW_BYTES;
+}
+
 static inline __attribute__((__always_inline__))
 int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, __u64 iovlen) {
     __u64 id = bpf_get_current_pid_tgid();
@@ -365,7 +394,7 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
         // Port-based HTTP/2 hint: Try HTTP/2 detection first for HTTPS traffic (port 443/8443)
         // Most modern HTTPS traffic uses HTTP/2, and this helps detect gRPC DATA frames
         // that don't have the connection preface
-        if (conn->dport != 53 && is_likely_http2_port(conn->dport) && looks_like_http2_frame(payload, size, METHOD_HTTP2_CLIENT_FRAMES)) {
+        if (conn->dport != 53 && http2_detection_allowed(conn) && is_likely_http2_port(conn->dport) && looks_like_http2_frame(payload, size, METHOD_HTTP2_CLIENT_FRAMES)) {
             conn->protocol = PROTOCOL_HTTP2; // Cache for subsequent frames
             struct l7_event *e = reserve_l7_event();
             if (!e) { return 0; }
@@ -408,7 +437,7 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
             req->protocol = PROTOCOL_CASSANDRA;
         } else if (is_dns_request(payload, size, &k.stream_id)) {
             req->protocol = PROTOCOL_DNS;
-        } else if (looks_like_http2_frame(payload, size, METHOD_HTTP2_CLIENT_FRAMES)) {
+        } else if (http2_detection_allowed(conn) && looks_like_http2_frame(payload, size, METHOD_HTTP2_CLIENT_FRAMES)) {
             // HTTP/2 detected on non-standard port
             conn->protocol = PROTOCOL_HTTP2; // Cache for subsequent frames
             struct l7_event *e = reserve_l7_event();
@@ -614,7 +643,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
                 return 0;
             }
             response = 1;
-        } else if (looks_like_http2_frame(payload, ret, METHOD_HTTP2_SERVER_FRAMES)) {
+        } else if (http2_detection_allowed(conn) && looks_like_http2_frame(payload, ret, METHOD_HTTP2_SERVER_FRAMES)) {
             // HTTP/2 detected - cache protocol for subsequent frames
             conn->protocol = PROTOCOL_HTTP2;
             e->protocol = PROTOCOL_HTTP2;

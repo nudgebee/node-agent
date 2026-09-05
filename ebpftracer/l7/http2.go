@@ -29,6 +29,50 @@ var OnHPACKDecodeError func()
 // the axis the failure splits on.
 var OnHttp2Stage func(stage, dest string)
 
+// OnHttp2Frame, if set, is invoked for each frame header the parser walks, and
+// once with "invalid" when a header fails the type/length sanity check.
+//
+// This answers "are these bytes actually HTTP/2, and do they contain HEADERS?"
+// without logging any payload. That distinction matters: these events carry
+// decrypted application traffic, so a raw dump would put Authorization headers
+// and request bodies into agent logs. Frame type, flags and length are
+// structural metadata and disclose nothing.
+var OnHttp2Frame func(frameType, dest string)
+
+// http2FrameTypeName keeps the metric label bounded to the ten defined frame
+// types plus "invalid"; h.Type is already range-checked by the caller.
+func http2FrameTypeName(t http2.FrameType) string {
+	switch t {
+	case http2.FrameData:
+		return "DATA"
+	case http2.FrameHeaders:
+		return "HEADERS"
+	case http2.FramePriority:
+		return "PRIORITY"
+	case http2.FrameRSTStream:
+		return "RST_STREAM"
+	case http2.FrameSettings:
+		return "SETTINGS"
+	case http2.FramePushPromise:
+		return "PUSH_PROMISE"
+	case http2.FramePing:
+		return "PING"
+	case http2.FrameGoAway:
+		return "GOAWAY"
+	case http2.FrameWindowUpdate:
+		return "WINDOW_UPDATE"
+	case http2.FrameContinuation:
+		return "CONTINUATION"
+	}
+	return "invalid"
+}
+
+func (p *Http2Parser) frame(name string) {
+	if OnHttp2Frame != nil {
+		OnHttp2Frame(name, p.DestClass)
+	}
+}
+
 func (p *Http2Parser) stage(name string) {
 	if OnHttp2Stage != nil {
 		OnHttp2Stage(name, p.DestClass)
@@ -127,6 +171,12 @@ type Http2Parser struct {
 	// DestClass labels stage counters ("external"/"internal"); set by the caller.
 	DestClass string
 
+	// sawValidFrame reports whether the most recent Parse call decoded at least
+	// one structurally valid frame header. Callers use it to detect connections
+	// the eBPF heuristic mistagged as HTTP/2: those yield nothing but invalid
+	// frames, indefinitely, because the protocol is cached per connection.
+	sawValidFrame bool
+
 	clientDecoder  *hpack.Decoder
 	serverDecoder  *hpack.Decoder
 	activeRequests map[uint32]*Http2Request
@@ -186,6 +236,12 @@ func (p *Http2Parser) resetDecoder(method Method) {
 		p.serverDecoder = hpack.NewDecoder(4096, nil)
 		p.serverDecoderDegraded = true
 	}
+}
+
+// SawValidFrame reports whether the last Parse call decoded at least one
+// structurally valid frame header.
+func (p *Http2Parser) SawValidFrame() bool {
+	return p.sawValidFrame
 }
 
 // ActiveRequestCount returns the number of HTTP/2 requests currently being tracked
@@ -425,6 +481,7 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64, tr
 			payload = payload[l:]
 		}
 	}
+	p.sawValidFrame = false
 	if len(payload) == 0 {
 		return nil
 	}
@@ -485,10 +542,45 @@ frameLoop:
 
 		// Sanity check: HTTP/2 max frame size is 16MB (2^24-1), and frame types are 0-9
 		// If we see clearly invalid values, this isn't valid HTTP/2 - skip remaining data
-		if h.Length > 16*1024*1024 || h.Type > 9 {
-			// Invalid frame - don't save as partial, just discard
+		if h.Length > 16*1024*1024 {
+			// Length beyond the 16MB maximum: this is not a frame header.
+			// Consume the rest: leaving offset at frameStart would let the
+			// partial-frame save at the end of this function buffer the garbage
+			// and prepend it to every subsequent call, re-parsing it forever.
+			p.frame("invalid")
+			offset = len(payload)
 			break
 		}
+		// RFC 9113 4.1: an unknown frame type MUST be ignored and discarded,
+		// not treated as an error. ALTSVC (0x0a), ORIGIN (0x0c) and
+		// PRIORITY_UPDATE (0x10) are standard extensions that GitHub and Google
+		// both send. Breaking here would drop the rest of the payload, and
+		// because callers reclassify connections that yield no valid frame, a
+		// connection whose payload merely leads with an extension frame could be
+		// dropped as if it were misdetected. Skip it and keep parsing.
+		// Registered types run to 0x10 (PRIORITY_UPDATE). Anything beyond that
+		// is not a plausible extension, and treating it as one would let
+		// misdetected binary traffic masquerade as valid HTTP/2 forever.
+		if h.Type > 9 && h.Type <= 0x10 {
+			p.frame("extension")
+			p.sawValidFrame = true
+			// offset still points at the frame header here; skip header+payload.
+			if len(payload)-offset < http2FrameHeaderLength+h.Length {
+				offset = frameStart
+				break frameLoop
+			}
+			offset += http2FrameHeaderLength + h.Length
+			continue
+		}
+		if h.Type > 0x10 {
+			// No registered frame type above 0x10; consume the rest for the
+			// same reason as the oversized-length case above.
+			p.frame("invalid")
+			offset = len(payload)
+			break
+		}
+		p.frame(http2FrameTypeName(h.Type))
+		p.sawValidFrame = true
 
 		offset += http2FrameHeaderLength
 
