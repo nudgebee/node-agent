@@ -1277,6 +1277,27 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		}
 		conn.http2Parser = parser // Keep reference on connection for compatibility
 		requests := parser.Parse(r.Method, r.Payload, uint64(r.Duration), r.PayloadSize > uint64(len(r.Payload)))
+
+		// HTTP/2 has the weakest detection heuristic of any protocol here — it
+		// accepts arbitrary binary as a frame roughly once every 9k buffers —
+		// and eBPF caches the verdict for the connection's lifetime, so one
+		// false positive turns every later event on that connection into
+		// garbage. trackParseFail already exists for exactly this ("eBPF
+		// protocol misidentification where weak heuristics tag a connection
+		// permanently") and is wired for Postgres, ClickHouse and Zookeeper,
+		// but never was for HTTP/2. A connection yielding no structurally valid
+		// frame is either mistagged or unrecoverable; either way, further
+		// parsing only produces HPACK noise.
+		//
+		// Empty payloads are normal and are not counted as failures.
+		if len(r.Payload) > 0 {
+			if parser.SawValidFrame() {
+				conn.parseFailCount = 0
+			} else {
+				c.trackParseFail(conn, pid, fd, r.Protocol)
+			}
+		}
+
 		activeCount := parser.ActiveRequestCount()
 		if activeCount > 0 {
 			klog.V(3).Infof("HTTP2_PARSE_RESULT: pid=%d fd=%d completed=%d active=%d",

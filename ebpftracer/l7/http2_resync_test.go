@@ -67,3 +67,35 @@ func TestHttp2MidFrameContinuationIsMisread(t *testing.T) {
 		t.Error("parser invented stream 99 from DATA payload read as a frame header")
 	}
 }
+
+// A connection the eBPF heuristic mistagged as HTTP/2 yields no structurally
+// valid frame. SawValidFrame is what lets the caller notice and reclassify it,
+// instead of feeding the HPACK decoder garbage for the connection's lifetime.
+func TestHttp2SawValidFrameDistinguishesGarbage(t *testing.T) {
+	p := NewHttp2Parser()
+	p.Lightweight = true
+
+	// Real frames set it.
+	p.Parse(MethodHttp2ClientFrames, headersFrame(1, "/real"), 1, false)
+	if !p.SawValidFrame() {
+		t.Fatal("valid HEADERS frame not reported as valid")
+	}
+
+	// Binary that is not HTTP/2: frame type byte is out of range (>9), which is
+	// what the parser rejects. Mirrors an HTTPS/1.1 body misdetected upstream.
+	garbage := []byte{0x00, 0x00, 0x10, 0x5a, 0x00, 0x00, 0x00, 0x00, 0x01, 0xde, 0xad, 0xbe, 0xef}
+	p2 := NewHttp2Parser()
+	p2.Lightweight = true
+	p2.Parse(MethodHttp2ClientFrames, garbage, 1, false)
+	if p2.SawValidFrame() {
+		t.Error("non-HTTP/2 binary reported as containing a valid frame")
+	}
+
+	// An empty payload must not look like garbage — callers skip those.
+	p3 := NewHttp2Parser()
+	p3.Lightweight = true
+	p3.Parse(MethodHttp2ClientFrames, nil, 1, false)
+	if p3.SawValidFrame() {
+		t.Error("empty payload reported as containing a valid frame")
+	}
+}

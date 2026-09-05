@@ -171,6 +171,12 @@ type Http2Parser struct {
 	// DestClass labels stage counters ("external"/"internal"); set by the caller.
 	DestClass string
 
+	// sawValidFrame reports whether the most recent Parse call decoded at least
+	// one structurally valid frame header. Callers use it to detect connections
+	// the eBPF heuristic mistagged as HTTP/2: those yield nothing but invalid
+	// frames, indefinitely, because the protocol is cached per connection.
+	sawValidFrame bool
+
 	clientDecoder  *hpack.Decoder
 	serverDecoder  *hpack.Decoder
 	activeRequests map[uint32]*Http2Request
@@ -230,6 +236,12 @@ func (p *Http2Parser) resetDecoder(method Method) {
 		p.serverDecoder = hpack.NewDecoder(4096, nil)
 		p.serverDecoderDegraded = true
 	}
+}
+
+// SawValidFrame reports whether the last Parse call decoded at least one
+// structurally valid frame header.
+func (p *Http2Parser) SawValidFrame() bool {
+	return p.sawValidFrame
 }
 
 // ActiveRequestCount returns the number of HTTP/2 requests currently being tracked
@@ -469,6 +481,7 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64, tr
 			payload = payload[l:]
 		}
 	}
+	p.sawValidFrame = false
 	if len(payload) == 0 {
 		return nil
 	}
@@ -535,6 +548,7 @@ frameLoop:
 			break
 		}
 		p.frame(http2FrameTypeName(h.Type))
+		p.sawValidFrame = true
 
 		offset += http2FrameHeaderLength
 
