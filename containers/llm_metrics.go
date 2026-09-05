@@ -136,12 +136,20 @@ var (
 	//   rate(node_agent_l7_payload_truncated_total{protocol="http2",destination="external"}[5m])
 	// against the same labels on node_agent_l7_events_total to see what share of
 	// external HTTP/2 traffic is arriving incomplete.
+	// direction is "client"/"server" for HTTP/2 (which frames the event carries)
+	// and "-" for protocols where the distinction does not apply.
+	//
+	// External HTTP/2 delivers ~22,000 events per stream created, against ~105
+	// internally. Splitting by direction separates the two explanations for
+	// that: if server-frame events are scarce, responses never reach the parser;
+	// if they are plentiful, the bytes being fed to it are not HTTP/2 at all and
+	// the port-based detection heuristic is over-matching.
 	L7EventsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "node_agent_l7_events_total",
-			Help: "L7 events processed, by protocol and destination class",
+			Help: "L7 events processed, by protocol, destination class and frame direction",
 		},
-		[]string{"protocol", "destination"},
+		[]string{"protocol", "destination", "direction"},
 	)
 
 	L7PayloadTruncatedTotal = prometheus.NewCounterVec(
