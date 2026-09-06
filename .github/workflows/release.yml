@@ -92,7 +92,13 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
-          make_latest: true
+          # A prerelease must not become the repository's latest release, and
+          # must be flagged as one. v0.1.6-rc.1..rc.5 were all published with
+          # make_latest: true, so an RC has been presented as the latest release
+          # since. contains() on the tag is the check: v1.2.3 is a release,
+          # v1.2.3-rc.1 is not.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
           files: |
             /tmp/nudgebee-node-agent-${{ steps.meta.outputs.version }}-amd64
             /tmp/nudgebee-node-agent-${{ steps.meta.outputs.version }}-arm64
