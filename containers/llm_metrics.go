@@ -259,6 +259,38 @@ var (
 		[]string{"bucket", "destination", "direction"},
 	)
 
+	// ProtocolReclassifiedTotal counts connections given up on after
+	// parseFailThreshold consecutive parse failures, and ConnectionsParsedTotal
+	// counts connections that produced at least one successful parse. Together
+	// they give a per-protocol misdetection rate.
+	//
+	// Detection accuracy was previously only observable for HTTP/2, via the
+	// invalid-frame ratio, and only because that ratio was instrumented while
+	// chasing a specific bug. Every protocol here is detected by a byte-pattern
+	// heuristic of similar strength — the ClickHouse check is three bytes — and
+	// each one caches its verdict on the connection, so the same failure mode
+	// that made HTTP/2 misclassify HTTPS/1.1 traffic is possible elsewhere and
+	// currently unmeasured.
+	//
+	// A reclassification is a definitive misdetection: the protocol was decided
+	// by eBPF and then contradicted by the parser refusing the payload
+	// repeatedly. Rate = reclassified / (reclassified + parsed).
+	ProtocolReclassifiedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "node_agent_protocol_reclassified_total",
+			Help: "Connections reclassified after repeated parse failures, by protocol",
+		},
+		[]string{"protocol"},
+	)
+
+	ConnectionsParsedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "node_agent_connections_parsed_total",
+			Help: "Connections that produced at least one successful parse, by protocol",
+		},
+		[]string{"protocol"},
+	)
+
 	// ContainerLLMCachedTokensTotal counts input tokens served from the
 	// provider's prompt cache. Already counted in token_usage_total{type=input};
 	// this is a separate metric to make cache-hit rate computable.
@@ -330,6 +362,8 @@ func RegisterLLMMetrics(reg prometheus.Registerer) {
 		Http2StageTotal,
 		Http2FramesTotal,
 		Http2PayloadSizeTotal,
+		ProtocolReclassifiedTotal,
+		ConnectionsParsedTotal,
 		ContainerLLMCachedTokensTotal,
 		ContainerLLMToolCallsTotal,
 		ContainerLLMCostUSDTotal,

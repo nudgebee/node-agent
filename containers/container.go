@@ -103,6 +103,7 @@ type ActiveConnection struct {
 
 	parseFailCount   int
 	protocolOverride l7.Protocol // non-zero = override eBPF-detected protocol
+	parseSucceeded   bool        // at least one successful parse seen on this connection
 }
 
 type ListenDetails struct {
@@ -1292,7 +1293,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		// Empty payloads are normal and are not counted as failures.
 		if len(r.Payload) > 0 {
 			if parser.SawValidFrame() {
-				conn.parseFailCount = 0
+				c.trackParseOK(conn, r.Protocol)
 			} else {
 				c.trackParseFail(conn, pid, fd, r.Protocol)
 			}
@@ -1402,7 +1403,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		if query == "" && r.Method != l7.MethodStatementClose {
 			c.trackParseFail(conn, pid, fd, r.Protocol)
 		} else {
-			conn.parseFailCount = 0
+			c.trackParseOK(conn, r.Protocol)
 		}
 		if trace != nil {
 			trace.PostgresQuery(query, r.Status.Error(), r.Duration)
@@ -1456,7 +1457,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		if query == "" {
 			c.trackParseFail(conn, pid, fd, r.Protocol)
 		} else {
-			conn.parseFailCount = 0
+			c.trackParseOK(conn, r.Protocol)
 		}
 		if trace != nil {
 			trace.ClickhouseQuery(query, r.Status.Error(), r.Duration)
@@ -1468,7 +1469,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		if op == "" {
 			c.trackParseFail(conn, pid, fd, r.Protocol)
 		} else {
-			conn.parseFailCount = 0
+			c.trackParseOK(conn, r.Protocol)
 		}
 		if trace != nil {
 			trace.ZookeeperRequest(op, arg, r.Status, r.Duration)
@@ -1497,9 +1498,23 @@ func (c *Container) trackParseFail(conn *ActiveConnection, pid uint32, fd uint64
 	conn.parseFailCount++
 	if conn.parseFailCount == parseFailThreshold {
 		conn.protocolOverride = protocolReclassified
+		// Counted once per connection, at the threshold, so the metric is a
+		// count of connections given up on rather than of failed parses.
+		ProtocolReclassifiedTotal.WithLabelValues(protocolLabel(proto)).Inc()
 		klog.Warningf("reclassified connection pid=%d fd=%d from %s to unknown after %d consecutive parse failures",
 			pid, fd, proto, conn.parseFailCount)
 	}
+}
+
+// trackParseOK records the denominator for the misdetection rate: the first
+// successful parse on a connection. Counted once, so both sides of the ratio
+// are per-connection rather than per-event.
+func (c *Container) trackParseOK(conn *ActiveConnection, proto l7.Protocol) {
+	if !conn.parseSucceeded {
+		conn.parseSucceeded = true
+		ConnectionsParsedTotal.WithLabelValues(protocolLabel(proto)).Inc()
+	}
+	conn.parseFailCount = 0
 }
 
 // processHTTP2WithoutConnection handles HTTP/2 events when TCP connection tracking failed.
