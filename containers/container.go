@@ -1515,6 +1515,16 @@ func (c *Container) trackParseFail(conn *ActiveConnection, pid uint32, fd uint64
 	conn.parseFailCount++
 	if conn.parseFailCount == parseFailThreshold {
 		conn.protocolOverride = protocolReclassified
+		// Release the parsers now rather than at connection close. Reclassifying
+		// means this connection will never be parsed again, so anything they hold
+		// — HPACK decoders, partial frame buffers, prepared-statement maps — is
+		// dead weight. gc() only reclaims parsers once the connection is gone,
+		// and the connections that get here are the long-lived ones (Postgres,
+		// egress proxies), so that could be hours.
+		delete(c.googleHTTP2Parsers, PidFd{Pid: pid, Fd: fd})
+		conn.http2Parser = nil
+		conn.postgresParser = nil
+		conn.mysqlParser = nil
 		klog.Warningf("reclassified connection pid=%d fd=%d from %s to unknown after %d consecutive parse failures",
 			pid, fd, proto, conn.parseFailCount)
 	}
