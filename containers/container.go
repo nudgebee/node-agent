@@ -1476,8 +1476,26 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	case l7.ProtocolFoundationDB:
 		// Update stats for FoundationDB
 		c.l7Stats.observe(r.Protocol, r.Status.String(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+	case protocolReclassified:
+		// Deliberately emits nothing. Reaching here means the parser refused this
+		// connection's payload repeatedly and we concluded eBPF misidentified it,
+		// so we no longer know what protocol it is.
+		//
+		// The default branch below used to catch this, and passed r.Protocol —
+		// the original, wrong protocol — with a literal "unknown" status and zero
+		// duration. observe() maps HTTP2 to HTTP, so a Postgres connection
+		// misdetected as HTTP/2 kept incrementing container_http_requests_total
+		// on every subsequent event for the life of the connection. Measured on
+		// dev: 1.24M external "HTTP requests" per hour, 99.7% of them
+		// status="unknown", 97% originating from three private IPs that are
+		// actually Postgres and an egress proxy. Real external HTTP traffic was
+		// buried roughly 400:1.
+		//
+		// Giving up on a connection has to mean giving up on reporting it.
 	default:
-		// For all other protocols, update stats
+		// Genuinely unhandled protocols: count them under their own protocol.
+		// r.Protocol is correct here precisely because this is not the
+		// reclassification sentinel.
 		c.l7Stats.observe(r.Protocol, "unknown", "", "", 0, conn.DestinationKey, conn.srcWorkload, r, "")
 	}
 	return nil, L7RequestProcessed
@@ -1497,6 +1515,16 @@ func (c *Container) trackParseFail(conn *ActiveConnection, pid uint32, fd uint64
 	conn.parseFailCount++
 	if conn.parseFailCount == parseFailThreshold {
 		conn.protocolOverride = protocolReclassified
+		// Release the parsers now rather than at connection close. Reclassifying
+		// means this connection will never be parsed again, so anything they hold
+		// — HPACK decoders, partial frame buffers, prepared-statement maps — is
+		// dead weight. gc() only reclaims parsers once the connection is gone,
+		// and the connections that get here are the long-lived ones (Postgres,
+		// egress proxies), so that could be hours.
+		delete(c.googleHTTP2Parsers, PidFd{Pid: pid, Fd: fd})
+		conn.http2Parser = nil
+		conn.postgresParser = nil
+		conn.mysqlParser = nil
 		klog.Warningf("reclassified connection pid=%d fd=%d from %s to unknown after %d consecutive parse failures",
 			pid, fd, proto, conn.parseFailCount)
 	}
