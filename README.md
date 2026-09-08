@@ -9,6 +9,7 @@ gathers container and host metrics, logs, and L7 traffic using eBPF and
 exposes them in Prometheus format.
 
 Minimum Linux kernel: **5.8** (L7 events use a BPF ring buffer).
+The kernel must also be built with `CONFIG_BPF_EVENTS=y` (kprobe and tracepoint BPF programs); some embedded and vendor kernels disable it.
 
 > This project is a fork of
 > [coroot/coroot-node-agent](https://github.com/coroot/coroot-node-agent)
