@@ -1,0 +1,31 @@
+version: "2"
+
+# Deliberately narrow. This config exists to gate one class of defect, not to
+# impose a style regime on an existing codebase — a linter that fails on
+# hundreds of pre-existing findings gets disabled instead of fixed.
+#
+# forcetypeassert: an unchecked type assertion panics on an unexpected type.
+# In this agent that is not a recoverable error: informer handlers run on
+# client-go's shared goroutine, where a panic reaches apimachinery's runtime
+# handler and terminates the process. A customer cluster crashlooped node-agent
+# 14 times in 12 hours on exactly one such assertion — a cache.DeletedFinalState
+# Unknown tombstone asserted straight to *v1.Pod. go vet does not catch this.
+linters:
+  default: none
+  enable:
+    - forcetypeassert
+
+  exclusions:
+    generated: lax
+    rules:
+      # Test code asserting on values it just constructed is not a production
+      # crash risk, and failing a test is already a visible outcome.
+      - path: _test\.go$
+        linters:
+          - forcetypeassert
+
+issues:
+  # Every finding is a potential process-killing panic; do not collapse
+  # repeats of the same one.
+  max-issues-per-linter: 0
+  max-same-issues: 0

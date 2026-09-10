@@ -110,7 +110,13 @@ func lookupCilium4(src, dst netaddr.IPPort) *netaddr.IPPort {
 	if err != nil || v == nil {
 		return nil
 	}
-	e := v.(*ctmap.CtEntry)
+	// Cilium BPF structs are decoded from bpffs, so a Cilium version whose
+	// layout differs from the one we build against can yield an unexpected
+	// type here. Degrade to "unresolved" rather than panicking the agent.
+	e, ok := v.(*ctmap.CtEntry)
+	if !ok {
+		return nil
+	}
 
 	backendKey := lbmap.NewBackend4KeyV3(loadbalancer.BackendID(e.BackendID))
 	b, err := backends4Map.Lookup(backendKey)
@@ -151,7 +157,13 @@ func lookupCilium6(src, dst netaddr.IPPort) *netaddr.IPPort {
 	if err != nil || v == nil {
 		return nil
 	}
-	e := v.(*ctmap.CtEntry)
+	// Cilium BPF structs are decoded from bpffs, so a Cilium version whose
+	// layout differs from the one we build against can yield an unexpected
+	// type here. Degrade to "unresolved" rather than panicking the agent.
+	e, ok := v.(*ctmap.CtEntry)
+	if !ok {
+		return nil
+	}
 	backendKey := lbmap.NewBackend6KeyV3(loadbalancer.BackendID(e.BackendID))
 	b, err := backends6Map.Lookup(backendKey)
 	if err != nil || b == nil {
