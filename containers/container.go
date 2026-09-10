@@ -416,7 +416,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		for _, ctr := range p.parser.GetCounters() {
 			if ctr.Level == logparser.LevelCritical || ctr.Level == logparser.LevelError {
 				sample, _ := c.logSamples.LoadOrStore(ctr.Hash, common.TruncateUtf8(ctr.Sample, *flags.MaxLabelLength))
-				ch <- c.counter(metrics.LogMessages, float64(ctr.Messages), source, ctr.Level.String(), ctr.Hash, sample.(string))
+				ch <- c.counter(metrics.LogMessages, float64(ctr.Messages), source, ctr.Level.String(), ctr.Hash, sampleString(sample))
 			}
 		}
 		for _, sc := range p.parser.GetSensitiveCounters() {
@@ -2305,4 +2305,16 @@ func (c *Container) gauge(desc *prometheus.Desc, value float64, labelValues ...s
 	allLabels = append(allLabels, c.constLabels...)
 	allLabels = append(allLabels, labelValues...)
 	return prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, value, allLabels...)
+}
+
+// sampleValue renders a log sample stored in c.logSamples as a metric label.
+//
+// The map only ever holds strings, but this is a metric-collection path that
+// runs on every scrape: a type confusion here should degrade the label, not
+// take the agent down.
+func sampleString(v interface{}) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
 }

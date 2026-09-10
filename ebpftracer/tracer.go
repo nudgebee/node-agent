@@ -448,7 +448,13 @@ func getLostSamplesTracker(name string) *lostSamplesTracker {
 	if !ok {
 		tracker, _ = lostSamplesTrackers.LoadOrStore(name, &lostSamplesTracker{interval: 10})
 	}
-	return tracker.(*lostSamplesTracker)
+	t, ok := tracker.(*lostSamplesTracker)
+	if !ok {
+		// Only this function ever writes the map, so this is unreachable; return a
+		// throwaway rather than panicking in a metrics path.
+		return &lostSamplesTracker{interval: 10}
+	}
+	return t
 }
 
 // safeDuration converts a uint64 nanosecond value from eBPF to time.Duration.

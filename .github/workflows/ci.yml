@@ -29,6 +29,16 @@ jobs:
           go install golang.org/x/tools/cmd/goimports@latest
           files=$(goimports -l .); if [[ -n "$files" ]]; then echo "$files"; exit 1; fi
       - run: go vet ./...
+      # go vet has no unchecked-type-assertion check. See .golangci.yml: an
+      # unchecked assertion in an informer handler is fatal, not recoverable.
+      # Must be built with Go >= the go directive in go.mod, otherwise it
+      # refuses to load the config ("the Go language version used to build
+      # golangci-lint is lower than the targeted Go version").
+      - name: golangci-lint (forcetypeassert)
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.13.2
+          args: --timeout=8m
       # /containers transitively imports github.com/NVIDIA/go-nvml. The
       # bindings register NVML symbols (including some only present in
       # very recent libnvidia-ml.so versions, e.g.

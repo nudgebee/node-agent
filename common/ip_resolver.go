@@ -376,13 +376,19 @@ func (resolver *K8sIPResolver) StartWatching() error {
 func (resolve *K8sIPResolver) addReplicaSetHandlers(replicaSetInformer cache.SharedIndexInformer) {
 	replicaSetInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			rs := obj.(*appsv1.ReplicaSet)
+			rs, ok := objectAs[*appsv1.ReplicaSet](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.ReplicaSets.Store(rs.UID, MinimalOwnerInfo{
 				OwnerReferences: rs.OwnerReferences,
 			})
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			rs := newObj.(*appsv1.ReplicaSet)
+			rs, ok := objectAs[*appsv1.ReplicaSet](newObj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.ReplicaSets.Store(rs.UID, MinimalOwnerInfo{
 				OwnerReferences: rs.OwnerReferences,
 			})
@@ -427,16 +433,43 @@ func deletedObject[T any](obj interface{}) (T, bool) {
 	return zero, false
 }
 
+// objectAs asserts an add/update informer payload to T without panicking.
+//
+// Add and update never carry a tombstone, so unlike deletedObject there is
+// nothing to unwrap — but the assertion is still on the shared informer's
+// goroutine, where a panic reaches apimachinery's runtime handler and kills the
+// process. The informers here also register transform functions (stripPod,
+// stripNode, stripService) that return the object unchanged when their own
+// assertion fails, so an unexpected type can reach a handler rather than being
+// filtered out.
+//
+// Skipping the event is the right failure mode: the resolver loses one object
+// until the next resync, instead of taking the agent down.
+func objectAs[T any](obj interface{}) (T, bool) {
+	if o, ok := obj.(T); ok {
+		return o, true
+	}
+	var zero T
+	klog.V(2).Infof("ignoring event with unexpected payload %T", obj)
+	return zero, false
+}
+
 func (resolve *K8sIPResolver) addDaemonSetHandlers(daemonSetInformer cache.SharedIndexInformer) {
 	daemonSetInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			ds := obj.(*appsv1.DaemonSet)
+			ds, ok := objectAs[*appsv1.DaemonSet](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.DaemonSets.Store(ds.UID, MinimalOwnerInfo{
 				OwnerReferences: ds.OwnerReferences,
 			})
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			ds := newObj.(*appsv1.DaemonSet)
+			ds, ok := objectAs[*appsv1.DaemonSet](newObj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.DaemonSets.Store(ds.UID, MinimalOwnerInfo{
 				OwnerReferences: ds.OwnerReferences,
 			})
@@ -454,13 +487,19 @@ func (resolve *K8sIPResolver) addDaemonSetHandlers(daemonSetInformer cache.Share
 func (resolve *K8sIPResolver) addStatefulSetHandlers(statefulSetInformer cache.SharedIndexInformer) {
 	statefulSetInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			ss := obj.(*appsv1.StatefulSet)
+			ss, ok := objectAs[*appsv1.StatefulSet](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.StatefulSets.Store(ss.UID, MinimalOwnerInfo{
 				OwnerReferences: ss.OwnerReferences,
 			})
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			ss := newObj.(*appsv1.StatefulSet)
+			ss, ok := objectAs[*appsv1.StatefulSet](newObj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.StatefulSets.Store(ss.UID, MinimalOwnerInfo{
 				OwnerReferences: ss.OwnerReferences,
 			})
@@ -478,13 +517,19 @@ func (resolve *K8sIPResolver) addStatefulSetHandlers(statefulSetInformer cache.S
 func (resolve *K8sIPResolver) addJobHandlers(jobInformer cache.SharedIndexInformer) {
 	jobInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			job := obj.(*batchv1.Job)
+			job, ok := objectAs[*batchv1.Job](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.Jobs.Store(job.UID, MinimalOwnerInfo{
 				OwnerReferences: job.OwnerReferences,
 			})
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			job := newObj.(*batchv1.Job)
+			job, ok := objectAs[*batchv1.Job](newObj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.Jobs.Store(job.UID, MinimalOwnerInfo{
 				OwnerReferences: job.OwnerReferences,
 			})
@@ -502,13 +547,19 @@ func (resolve *K8sIPResolver) addJobHandlers(jobInformer cache.SharedIndexInform
 func (resolve *K8sIPResolver) addCronJobHandlers(cronJobInformer cache.SharedIndexInformer) {
 	cronJobInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			cronJob := obj.(*batchv1.CronJob)
+			cronJob, ok := objectAs[*batchv1.CronJob](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.CronJobs.Store(cronJob.UID, MinimalOwnerInfo{
 				OwnerReferences: cronJob.OwnerReferences,
 			})
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			cronJob := newObj.(*batchv1.CronJob)
+			cronJob, ok := objectAs[*batchv1.CronJob](newObj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.CronJobs.Store(cronJob.UID, MinimalOwnerInfo{
 				OwnerReferences: cronJob.OwnerReferences,
 			})
@@ -526,7 +577,10 @@ func (resolve *K8sIPResolver) addCronJobHandlers(cronJobInformer cache.SharedInd
 func (resolve *K8sIPResolver) addServiceHandlers(serviceInformer cache.SharedIndexInformer) {
 	serviceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			service := obj.(*v1.Service)
+			service, ok := objectAs[*v1.Service](obj)
+			if !ok {
+				return
+			}
 			minSvc := MinimalService{
 				Name:       service.Name,
 				Namespace:  service.Namespace,
@@ -542,8 +596,14 @@ func (resolve *K8sIPResolver) addServiceHandlers(serviceInformer cache.SharedInd
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			oldService := oldObj.(*v1.Service)
-			service := newObj.(*v1.Service)
+			oldService, ok := objectAs[*v1.Service](oldObj)
+			if !ok {
+				return
+			}
+			service, ok := objectAs[*v1.Service](newObj)
+			if !ok {
+				return
+			}
 			minSvc := MinimalService{
 				Name:       service.Name,
 				Namespace:  service.Namespace,
@@ -586,13 +646,19 @@ func (resolve *K8sIPResolver) addServiceHandlers(serviceInformer cache.SharedInd
 func (resolve *K8sIPResolver) addDeploymentHandlers(deploymentInformer cache.SharedIndexInformer) {
 	deploymentInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			deployment := obj.(*appsv1.Deployment)
+			deployment, ok := objectAs[*appsv1.Deployment](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.Deployments.Store(deployment.UID, MinimalOwnerInfo{
 				OwnerReferences: deployment.OwnerReferences,
 			})
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			deployment := newObj.(*appsv1.Deployment)
+			deployment, ok := objectAs[*appsv1.Deployment](newObj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.Deployments.Store(deployment.UID, MinimalOwnerInfo{
 				OwnerReferences: deployment.OwnerReferences,
 			})
@@ -610,12 +676,21 @@ func (resolve *K8sIPResolver) addDeploymentHandlers(deploymentInformer cache.Sha
 func (resolver *K8sIPResolver) addPodHandlers(podInformer cache.SharedIndexInformer) {
 	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			pod := obj.(*v1.Pod)
+			pod, ok := objectAs[*v1.Pod](obj)
+			if !ok {
+				return
+			}
 			resolver.handlePodAdd(pod)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			oldPod := oldObj.(*v1.Pod)
-			newPod := newObj.(*v1.Pod)
+			oldPod, ok := objectAs[*v1.Pod](oldObj)
+			if !ok {
+				return
+			}
+			newPod, ok := objectAs[*v1.Pod](newObj)
+			if !ok {
+				return
+			}
 			// Clean old IPs that are no longer present
 			newIPs := make(map[string]bool, len(newPod.Status.PodIPs))
 			for _, ip := range newPod.Status.PodIPs {
@@ -686,14 +761,20 @@ func (resolver *K8sIPResolver) handlePodAdd(pod *v1.Pod) bool {
 func (resolver *K8sIPResolver) addNodeHandlers(nodeInformer cache.SharedIndexInformer) {
 	nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			node := obj.(*v1.Node)
+			node, ok := objectAs[*v1.Node](obj)
+			if !ok {
+				return
+			}
 			shouldReturn := resolver.handleNodeEvent(node)
 			if shouldReturn {
 				return
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			node := newObj.(*v1.Node)
+			node, ok := objectAs[*v1.Node](newObj)
+			if !ok {
+				return
+			}
 			shouldReturn := resolver.handleNodeEvent(node)
 			if shouldReturn {
 				return
@@ -935,7 +1016,11 @@ func (resolver *K8sIPResolver) getControllerOfOwner(owner *metav1.OwnerReference
 	if !ok {
 		return nil, fmt.Errorf("%w: %s %s", errOwnerNotCached, owner.Kind, owner.UID)
 	}
-	info := val.(MinimalOwnerInfo)
+	info, ok := val.(MinimalOwnerInfo)
+	if !ok {
+		klog.V(5).Infof("type confusion in owner cache for %s %s", owner.Kind, owner.UID)
+		return nil, fmt.Errorf("%w: %s %s", errOwnerNotCached, owner.Kind, owner.UID)
+	}
 	return getControllerOwnerRef(info.OwnerReferences), nil
 }
 
@@ -1113,8 +1198,17 @@ func (resolver *K8sIPResolver) resolvePodDescriptor(pod *MinimalPod) Workload {
 
 func (resolver *K8sIPResolver) ResolvePodOwner(podName string, podNamespace string) Workload {
 	if uidVal, ok := resolver.snapshot.PodNameIndex.Load(podNamespace + "/" + podName); ok {
-		if podVal, ok := resolver.snapshot.Pods.Load(uidVal.(types.UID)); ok {
-			pod := podVal.(MinimalPod)
+		uid, ok := uidVal.(types.UID)
+		if !ok {
+			klog.V(5).Infof("type confusion in PodNameIndex for %s/%s", podNamespace, podName)
+			return Workload{}
+		}
+		if podVal, ok := resolver.snapshot.Pods.Load(uid); ok {
+			pod, ok := podVal.(MinimalPod)
+			if !ok {
+				klog.V(5).Infof("type confusion in Pods cache for %s/%s", podNamespace, podName)
+				return Workload{}
+			}
 			return resolver.resolvePodDescriptor(&pod)
 		}
 	}
