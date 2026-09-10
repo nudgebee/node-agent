@@ -99,6 +99,26 @@ jobs:
           # v1.2.3-rc.1 is not.
           prerelease: ${{ contains(github.ref_name, '-') }}
           make_latest: ${{ !contains(github.ref_name, '-') }}
+          # Immutable releases reject asset uploads after publication, and a
+          # prerelease is published the moment it is created — so uploading the
+          # binaries failed outright on v0.1.7-rc.1:
+          #
+          #   Cannot upload asset nudgebee-node-agent-0.1.7-rc.1-arm64 to an
+          #   immutable release.
+          #
+          # Creating prereleases as a draft keeps them writable long enough for
+          # the upload; the next step publishes. Full releases are unaffected
+          # and stay non-draft, which is why this only ever broke RCs.
+          draft: ${{ contains(github.ref_name, '-') }}
           files: |
             /tmp/nudgebee-node-agent-${{ steps.meta.outputs.version }}-amd64
             /tmp/nudgebee-node-agent-${{ steps.meta.outputs.version }}-arm64
+
+      # Publishing from the draft is what makes the assets stick. Downstream
+      # consumers should watch release.published, which fires here for both
+      # prereleases and full releases.
+      - name: Publish prerelease draft
+        if: github.event_name == 'push' && contains(github.ref_name, '-')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ github.ref_name }}" --draft=false --repo "${{ github.repository }}"
