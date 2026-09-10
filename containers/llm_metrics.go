@@ -177,6 +177,35 @@ var (
 		[]string{"destination"},
 	)
 
+	// ConnectionsReclaimedTotal counts connectionsByPidFd entries freed by gc().
+	//
+	// Entries created by createConnectionFromSocketInfo (the Go-TLS fallback) are
+	// not registered in activeConnections, so before the gc sweep that reclaims
+	// them nothing ever freed them. "dead_pid" is the dominant reason — the
+	// process owning the pid+fd is gone; "closed" is a connection that was seen
+	// closing and has aged past gcInterval.
+	ConnectionsReclaimedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "node_agent_connections_reclaimed_total",
+			Help: "Connection tracking entries reclaimed by gc, by reason",
+		},
+		[]string{"reason"},
+	)
+
+	// ConnectionCapDropsTotal counts connections not tracked because the
+	// per-container connectionsByPidFd map was already at
+	// maxConnectionsPerContainer.
+	//
+	// Legitimate entries are bounded by the container's open socket fds, so this
+	// should stay zero. Non-zero means gc reclamation is not keeping up and L7
+	// events are being dropped for want of a connection record.
+	ConnectionCapDropsTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "node_agent_connection_cap_drops_total",
+			Help: "Connections dropped because the per-container connection cap was reached",
+		},
+	)
+
 	// Http2ParserStaleReuseTotal counts times a parser was found for a pid/fd
 	// but had been created for a different connection (the fd was recycled).
 	//
@@ -326,6 +355,8 @@ func RegisterLLMMetrics(reg prometheus.Registerer) {
 		L7EventsTotal,
 		L7PayloadTruncatedTotal,
 		Http2ParserCapDropsTotal,
+		ConnectionsReclaimedTotal,
+		ConnectionCapDropsTotal,
 		Http2ParserStaleReuseTotal,
 		Http2StageTotal,
 		Http2FramesTotal,

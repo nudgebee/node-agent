@@ -40,6 +40,14 @@ const (
 	// Max per-connection HTTP/2 parsers per container.
 	// Each parser holds HPACK decoders and active request state.
 	maxHTTP2ParsersPerContainer = 50
+
+	// Max connectionsByPidFd entries per container.
+	//
+	// The map is keyed by pid+fd, so the number of entries that can legitimately
+	// be live is bounded by the container's open socket fds — hundreds in
+	// practice. This is a backstop against runaway growth between gc() runs, not
+	// a working limit; hitting it means reclamation is not keeping up.
+	maxConnectionsPerContainer = 8192
 )
 
 type ContainerID string
@@ -782,12 +790,60 @@ func (c *Container) createConnectionFromSocketInfo(pid uint32, fd uint64, socket
 
 	// Store in connectionsByPidFd for future L7 events on same connection
 	k := PidFd{Pid: pid, Fd: fd}
+	if !c.canTrackConnection(k) {
+		ConnectionCapDropsTotal.Inc()
+		return nil
+	}
 	c.connectionsByPidFd[k] = connection
 
 	klog.V(3).Infof("L7_CONN_CREATED_FROM_SOCKET: pid=%d fd=%d src=%s dst=%s domain=%v",
 		pid, fd, src, dst, domain)
 
 	return connection
+}
+
+// canTrackConnection reports whether pid+fd k may be added to
+// connectionsByPidFd. It is a backstop against runaway growth if gc() cannot
+// keep up, not a working limit: legitimate entries are bounded by the
+// container's open socket fds. Replacing a key already present is always
+// allowed, since that frees the previous entry rather than growing the map.
+//
+// Caller must hold c.lock.
+func (c *Container) canTrackConnection(k PidFd) bool {
+	if _, exists := c.connectionsByPidFd[k]; exists {
+		return true
+	}
+	return len(c.connectionsByPidFd) < maxConnectionsPerContainer
+}
+
+// reclaimStaleConnections frees connectionsByPidFd entries that the
+// activeConnections sweep in gc() cannot reach.
+//
+// That sweep only visits connections registered in activeConnections, but
+// createConnectionFromSocketInfo — the fallback used when TCP connection
+// tracking misses, which is routine for Go TLS — registers a connection in
+// connectionsByPidFd and never in activeConnections. onConnectionClose only
+// stamps Closed, it does not delete. Those entries were therefore unreachable by
+// every reclamation path and survived until the container died, and because the
+// parser sweep treats "present in connectionsByPidFd" as "connection still
+// alive", they pinned their HTTP/2 parsers alive too.
+//
+// Measured across three clusters before this fix: up to 498k live entries
+// against 666 open socket fds on the node (~750x), 260MB of a 340MB heap.
+//
+// Caller must hold c.lock.
+func (c *Container) reclaimStaleConnections(now time.Time) {
+	for pidFd, conn := range c.connectionsByPidFd {
+		if _, alive := c.processes[pidFd.Pid]; !alive {
+			delete(c.connectionsByPidFd, pidFd)
+			ConnectionsReclaimedTotal.WithLabelValues("dead_pid").Inc()
+			continue
+		}
+		if conn != nil && !conn.Closed.IsZero() && now.Sub(conn.Closed) > gcInterval {
+			delete(c.connectionsByPidFd, pidFd)
+			ConnectionsReclaimedTotal.WithLabelValues("closed").Inc()
+		}
+	}
 }
 
 func (c *Container) onConnectionClose(e ebpftracer.Event) {
@@ -2072,6 +2128,11 @@ func (c *Container) gc(now time.Time) {
 			}
 		}
 	}
+
+	// Must run before the parser sweep below, which treats an entry's presence in
+	// connectionsByPidFd as proof its connection is still alive.
+	c.reclaimStaleConnections(now)
+
 	// Clean up HTTP/2 parsers for closed/dead connections.
 	// Parsers hold HPACK decoders, partial frame buffers, and active request maps
 	// that accumulate memory over time if not cleaned up.
