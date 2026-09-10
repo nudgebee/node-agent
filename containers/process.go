@@ -126,6 +126,11 @@ func (p *Process) instrumentPython(cmdline []byte, tracer *ebpftracer.Tracer) {
 }
 
 func (p *Process) instrumentNodejs(exe string, tracer *ebpftracer.Tracer) {
+	// Checked before nodejsChecked so enabling the flag on a restart still
+	// instruments processes that were skipped while it was off.
+	if !*flags.EnableNodejsTracing {
+		return
+	}
 	if p.nodejsChecked {
 		return
 	}
