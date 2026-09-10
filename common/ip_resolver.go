@@ -388,10 +388,43 @@ func (resolve *K8sIPResolver) addReplicaSetHandlers(replicaSetInformer cache.Sha
 			})
 		},
 		DeleteFunc: func(obj interface{}) {
-			rs := obj.(*appsv1.ReplicaSet)
+			rs, ok := deletedObject[*appsv1.ReplicaSet](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.ReplicaSets.Delete(rs.UID)
 		},
 	})
+}
+
+// deletedObject extracts the deleted object from an informer DeleteFunc payload.
+//
+// client-go does not always deliver the object itself on a delete. When the
+// watch is interrupted and the final delete event is missed, the informer
+// resyncs and delivers a cache.DeletedFinalStateUnknown tombstone wrapping the
+// last known state. Asserting the payload directly panics on that tombstone,
+// and because these handlers run on the shared informer's goroutine the panic
+// reaches k8s.io/apimachinery's runtime handler, which is fatal — the whole
+// agent exits and the pod restarts.
+//
+// Reported from a customer cluster where node-agent crashlooped 15 times:
+//
+//	panic: interface conversion: interface {} is cache.DeletedFinalStateUnknown, not *v1.Pod
+//
+// A tombstone whose payload is the wrong type, or nil, is not recoverable — the
+// caller skips that delete rather than dying.
+func deletedObject[T any](obj interface{}) (T, bool) {
+	if o, ok := obj.(T); ok {
+		return o, true
+	}
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		if o, ok := tombstone.Obj.(T); ok {
+			return o, true
+		}
+	}
+	var zero T
+	klog.V(2).Infof("ignoring delete event with unexpected payload %T", obj)
+	return zero, false
 }
 
 func (resolve *K8sIPResolver) addDaemonSetHandlers(daemonSetInformer cache.SharedIndexInformer) {
@@ -409,7 +442,10 @@ func (resolve *K8sIPResolver) addDaemonSetHandlers(daemonSetInformer cache.Share
 			})
 		},
 		DeleteFunc: func(obj interface{}) {
-			ds := obj.(*appsv1.DaemonSet)
+			ds, ok := deletedObject[*appsv1.DaemonSet](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.DaemonSets.Delete(ds.UID)
 		},
 	})
@@ -430,7 +466,10 @@ func (resolve *K8sIPResolver) addStatefulSetHandlers(statefulSetInformer cache.S
 			})
 		},
 		DeleteFunc: func(obj interface{}) {
-			ss := obj.(*appsv1.StatefulSet)
+			ss, ok := deletedObject[*appsv1.StatefulSet](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.StatefulSets.Delete(ss.UID)
 		},
 	})
@@ -451,7 +490,10 @@ func (resolve *K8sIPResolver) addJobHandlers(jobInformer cache.SharedIndexInform
 			})
 		},
 		DeleteFunc: func(obj interface{}) {
-			job := obj.(*batchv1.Job)
+			job, ok := deletedObject[*batchv1.Job](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.Jobs.Delete(job.UID)
 		},
 	})
@@ -472,7 +514,10 @@ func (resolve *K8sIPResolver) addCronJobHandlers(cronJobInformer cache.SharedInd
 			})
 		},
 		DeleteFunc: func(obj interface{}) {
-			cronJob := obj.(*batchv1.CronJob)
+			cronJob, ok := deletedObject[*batchv1.CronJob](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.CronJobs.Delete(cronJob.UID)
 		},
 	})
@@ -524,7 +569,10 @@ func (resolve *K8sIPResolver) addServiceHandlers(serviceInformer cache.SharedInd
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			service := obj.(*v1.Service)
+			service, ok := deletedObject[*v1.Service](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.Services.Delete(service.UID)
 			for _, clusterIp := range service.Spec.ClusterIPs {
 				if clusterIp != "None" {
@@ -550,7 +598,10 @@ func (resolve *K8sIPResolver) addDeploymentHandlers(deploymentInformer cache.Sha
 			})
 		},
 		DeleteFunc: func(obj interface{}) {
-			deployment := obj.(*appsv1.Deployment)
+			deployment, ok := deletedObject[*appsv1.Deployment](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.Deployments.Delete(deployment.UID)
 		},
 	})
@@ -578,7 +629,10 @@ func (resolver *K8sIPResolver) addPodHandlers(podInformer cache.SharedIndexInfor
 			resolver.handlePodAdd(newPod)
 		},
 		DeleteFunc: func(obj interface{}) {
-			pod := obj.(*v1.Pod)
+			pod, ok := deletedObject[*v1.Pod](obj)
+			if !ok {
+				return
+			}
 			resolver.snapshot.Pods.Delete(pod.UID)
 			resolver.snapshot.PodDescriptors.Delete(pod.UID)
 			resolver.snapshot.PodNameIndex.Delete(pod.Namespace + "/" + pod.Name)
@@ -646,7 +700,10 @@ func (resolver *K8sIPResolver) addNodeHandlers(nodeInformer cache.SharedIndexInf
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			node := obj.(*v1.Node)
+			node, ok := deletedObject[*v1.Node](obj)
+			if !ok {
+				return
+			}
 			resolver.snapshot.Nodes.Delete(node.UID)
 			resolver.instanceMetaMap.Delete(node.Name)
 		},
