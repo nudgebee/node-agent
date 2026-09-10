@@ -7,7 +7,7 @@ require (
 	github.com/NVIDIA/go-nvml v0.13.3-0
 	github.com/agoda-com/opentelemetry-logs-go v0.6.0
 	github.com/cilium/cilium v1.17.16
-	github.com/cilium/ebpf v0.20.0
+	github.com/cilium/ebpf v0.22.0
 	github.com/containerd/cgroups v1.1.0
 	github.com/containerd/containerd v1.7.33
 	github.com/coreos/go-systemd/v22 v22.7.0
@@ -166,12 +166,12 @@ require (
 	github.com/samber/lo v1.38.1 // indirect
 	github.com/sasha-s/go-deadlock v0.3.5 // indirect
 	github.com/segmentio/asm v1.2.0 // indirect
-	github.com/sirupsen/logrus v1.9.3 // indirect
+	github.com/sirupsen/logrus v1.9.4 // indirect
 	github.com/sourcegraph/conc v0.3.0 // indirect
 	github.com/spf13/afero v1.11.0 // indirect
 	github.com/spf13/cast v1.7.0 // indirect
-	github.com/spf13/cobra v1.9.1 // indirect
-	github.com/spf13/pflag v1.0.7 // indirect
+	github.com/spf13/cobra v1.10.2 // indirect
+	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/spf13/viper v1.19.0 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
 	github.com/ulikunitz/xz v0.5.15 // indirect
