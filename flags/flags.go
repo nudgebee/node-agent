@@ -75,6 +75,17 @@ var (
 
 	HttpPathNormalizationRules = kingpin.Flag("http-path-normalization-rules", "Custom HTTP path normalization rules in format 'pattern1:replacement1,pattern2:replacement2'").Envar("HTTP_PATH_NORMALIZATION_RULES").String()
 
+	// MaxHttpPathsPerContainer bounds the number of distinct `path` label values a
+	// single container may contribute to container_http_requests_total. Path is the
+	// only L7 label an outside party controls: an internet-facing ingress gets probed
+	// for vulnerabilities around the clock, and every unique junk path (/axds.php,
+	// /HNAP1, ...) becomes a permanent series that normalization cannot collapse
+	// because the paths are genuinely distinct literals. Past the cap, further unseen
+	// paths collapse to "{other}" so the request count stays correct while the series
+	// count stops growing. Real applications serve far fewer than the default; the
+	// cap should only ever engage on scanner traffic.
+	MaxHttpPathsPerContainer = kingpin.Flag("max-http-paths-per-container", "Max distinct HTTP path label values per container, excess collapses to {other} (0 = unlimited)").Default("1000").Envar("MAX_HTTP_PATHS_PER_CONTAINER").Int()
+
 	AggregateEphemeralWorkloads = kingpin.Flag("aggregate-ephemeral-workloads", "Aggregate metrics for bare pods and standalone Jobs using standard labels to reduce series cardinality").Default("true").Envar("AGGREGATE_EPHEMERAL_WORKLOADS").Bool()
 
 	// CollapseInternalDestinations replaces the raw IP:port value of the
@@ -94,6 +105,13 @@ var (
 func GetString(fl *string) string {
 	if fl == nil {
 		return ""
+	}
+	return *fl
+}
+
+func GetInt(fl *int) int {
+	if fl == nil {
+		return 0
 	}
 	return *fl
 }

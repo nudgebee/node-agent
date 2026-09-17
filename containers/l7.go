@@ -106,6 +106,11 @@ type L7Stats struct {
 	latency         map[l7.Protocol]*prometheus.HistogramVec
 	initialized     map[l7.Protocol]bool
 	promConstLabels prometheus.Labels // container_id, app_id, machine_id, system_uuid, az, region
+
+	// pathLimiter caps the distinct `path` label values this container can emit.
+	// Scanner traffic against a public ingress otherwise grows the series count
+	// without bound; see common.PathLimiter.
+	pathLimiter *common.PathLimiter
 }
 
 func NewL7Stats(constLabels prometheus.Labels) L7Stats {
@@ -114,6 +119,7 @@ func NewL7Stats(constLabels prometheus.Labels) L7Stats {
 		latency:         make(map[l7.Protocol]*prometheus.HistogramVec),
 		initialized:     make(map[l7.Protocol]bool),
 		promConstLabels: constLabels,
+		pathLimiter:     common.NewPathLimiter(constLabels["container_id"]),
 	}
 }
 
@@ -155,7 +161,7 @@ func (s *L7Stats) observe(protocol l7.Protocol, status, method, path string, dur
 		counterLabelValues = append(counterLabelValues, labelInterner.intern(method))
 	case l7.ProtocolHTTP:
 		if ValidUtf8([]byte(path)) {
-			counterLabelValues = append(counterLabelValues, labelInterner.intern(normalizeHttpPath(path)))
+			counterLabelValues = append(counterLabelValues, labelInterner.intern(s.pathLimiter.Limit(normalizeHttpPath(path))))
 		} else {
 			counterLabelValues = append(counterLabelValues, "")
 		}
