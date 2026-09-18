@@ -352,10 +352,17 @@ func NormalizeFQDN(fqdn string, requestType string) string {
 	return fqdn
 }
 
+// WithResolvedDomain swaps an IP-named destination for its DNS name. As in
+// NewDestinationKey, a side that already resolved to a k8s workload keeps its
+// own name; the FQDN is still carried by the `destination` label.
 func (dk DestinationKey) WithResolvedDomain(fqdn string) DestinationKey {
 	dk.destination = HostPortWithEmptyIP(fqdn, dk.destination.Port())
-	dk.destinationWorkload.Name = fqdn
-	dk.actualDestinationWorkload.Name = fqdn
+	if !isKubernetesResolved(dk.destinationWorkload) {
+		dk.destinationWorkload.Name = fqdn
+	}
+	if !isKubernetesResolved(dk.actualDestinationWorkload) {
+		dk.actualDestinationWorkload.Name = fqdn
+	}
 	return dk
 }
 

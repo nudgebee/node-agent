@@ -85,3 +85,40 @@ func TestIsKubernetesResolved(t *testing.T) {
 	assert.True(t, isKubernetesResolved(Workload{Kind: "pod"}))
 	assert.True(t, isKubernetesResolved(Workload{Kind: "node"}))
 }
+
+// Regression: WithResolvedDomain is the late path that swaps an IP-named
+// destination for its DNS name once the DNS cache fills. It must apply the
+// same rule as NewDestinationKey. Here the destination (a ClusterIP) was not
+// resolved yet, but the actual destination is a known StatefulSet pod.
+// Renaming the pod side produced labels such as
+// name="rabbitmq.rabbit.svc.cluster.local", kind="StatefulSet", which the
+// service map reports as a second copy of the StatefulSet.
+func TestWithResolvedDomain_ResolvedWorkloadKeepsItsName(t *testing.T) {
+	d := netaddr.IPPortFrom(netaddr.MustParseIP("34.118.0.10"), 5672)
+	ad := netaddr.IPPortFrom(netaddr.MustParseIP("100.128.0.7"), 5672)
+
+	unresolved := Workload{Name: "34.118.0.10", Namespace: "external", Kind: "external"}
+	resolved := Workload{Name: "rabbitmq", Namespace: "rabbit", Kind: "StatefulSet"}
+
+	key := NewDestinationKey(d, ad, nil, unresolved, resolved).
+		WithResolvedDomain("rabbitmq.rabbit.svc.cluster.local")
+
+	assert.Equal(t, "rabbitmq.rabbit.svc.cluster.local", key.destinationWorkload.Name,
+		"the unresolved side still takes the FQDN")
+	assert.Equal(t, "rabbitmq", key.actualDestinationWorkload.Name,
+		"a k8s-resolved workload must keep its own name")
+	assert.Equal(t, "StatefulSet", key.actualDestinationWorkload.Kind)
+	assert.Equal(t, "rabbitmq.rabbit.svc.cluster.local:5672", key.Destination().String())
+}
+
+// A genuinely external destination on both sides still takes the FQDN.
+func TestWithResolvedDomain_ExternalTakesFQDN(t *testing.T) {
+	d := netaddr.IPPortFrom(netaddr.MustParseIP("52.0.0.1"), 443)
+	external := Workload{Name: "52.0.0.1", Namespace: "external", Kind: "external"}
+
+	key := NewDestinationKey(d, d, nil, external, external).
+		WithResolvedDomain("kms.us-east-1.amazonaws.com")
+
+	assert.Equal(t, "kms.us-east-1.amazonaws.com", key.destinationWorkload.Name)
+	assert.Equal(t, "kms.us-east-1.amazonaws.com", key.actualDestinationWorkload.Name)
+}
