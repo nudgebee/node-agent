@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -31,6 +32,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sys/unix"
 	"golang.org/x/time/rate"
+	"inet.af/netaddr"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -114,17 +116,55 @@ func whitelistNodeExternalNetworks() {
 	}
 }
 
-func getClientSet() (*kubernetes.Clientset, error) {
+// kubernetesConfig returns the API client config when the agent runs in a
+// cluster, or outside one with KUBECONFIG set explicitly. It returns nil when
+// neither holds, which means the agent is on a standalone host.
+//
+// A kubeconfig at the default path is deliberately not picked up: a VM used
+// as an admin box often has /root/.kube/config, and silently resolving that
+// VM's traffic against some unrelated cluster would mislabel all of it.
+func kubernetesConfig() (*rest.Config, error) {
 	config, err := rest.InClusterConfig()
+	if err == nil {
+		return config, nil
+	}
+	if !errors.Is(err, rest.ErrNotInCluster) {
+		return nil, err
+	}
+	if kubeconfig := os.Getenv("KUBECONFIG"); kubeconfig != "" {
+		return clientcmd.BuildConfigFromFlags("", kubeconfig)
+	}
+	return nil, nil
+}
+
+func localIPs() ([]netaddr.IP, error) {
+	netdevs, err := node.NetDevices()
 	if err != nil {
-		kubeconfig :=
-			clientcmd.NewDefaultClientConfigLoadingRules().GetDefaultFilename()
-		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
-		if err != nil {
-			return nil, err
+		return nil, err
+	}
+	var ips []netaddr.IP
+	for _, iface := range netdevs {
+		for _, p := range iface.IPPrefixes {
+			ips = append(ips, p.IP())
 		}
 	}
-	return kubernetes.NewForConfig(config)
+	return ips, nil
+}
+
+func newIPResolver(hostname string) (containers.IPResolver, error) {
+	config, err := kubernetesConfig()
+	if err != nil {
+		return nil, fmt.Errorf("kubernetes config: %w", err)
+	}
+	if config == nil {
+		klog.Infoln("no kubernetes API found, running in standalone host mode")
+		return common.NewVMIPResolver(hostname, localIPs, *flags.ResolveDns)
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("kubernetes clientset: %w", err)
+	}
+	return common.NewK8sIPResolver(clientset, *flags.ResolveDns)
 }
 
 func main() {
@@ -152,20 +192,6 @@ func main() {
 
 	klog.Infoln("agent version:", version)
 
-	clientset, err := getClientSet()
-	if err != nil {
-		log.Fatalf("Error getting kubernetes clientset: %v", err)
-	}
-	resolver, err := common.NewK8sIPResolver(clientset, *flags.ResolveDns)
-	if err != nil {
-		log.Fatalf("Error creating resolver: %v", err)
-	}
-	err = resolver.StartWatching()
-	if err != nil {
-		klog.Errorf("Error starting resolver: %v", err)
-	}
-	defer resolver.StopWatching()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
@@ -190,6 +216,16 @@ func main() {
 	if !common.GetKernelVersion().GreaterOrEqual(common.NewVersion(4, 16, 0)) {
 		klog.Exitln("the minimum Linux kernel version required is 4.16 or later")
 	}
+
+	resolver, err := newIPResolver(hostname)
+	if err != nil {
+		log.Fatalf("Error creating resolver: %v", err)
+	}
+	err = resolver.StartWatching()
+	if err != nil {
+		klog.Errorf("Error starting resolver: %v", err)
+	}
+	defer resolver.StopWatching()
 
 	whitelistNodeExternalNetworks()
 

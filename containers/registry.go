@@ -47,6 +47,9 @@ type ProcessInfo struct {
 type IPResolver interface {
 	ResolveIP(string) common.Workload
 	ResolveActualIP(string) common.Workload
+	// ResolveSource names the source of a connection from its IP and the
+	// workload of the container that opened it.
+	ResolveSource(ip string, container common.Workload) common.Workload
 	CacheDNS(string, string) common.Workload
 	StartWatching() error
 	StopWatching()
@@ -105,7 +108,7 @@ type pendingL7Event struct {
 	retryCount int
 }
 
-func NewRegistry(reg prometheus.Registerer, rawReg prometheus.Registerer, processInfoCh chan<- ProcessInfo, ip_resolver *common.K8sIPResolver, gpuProcessUsageSampleChan chan gpu.ProcessUsageSample, machineId, systemUuid, az, region string) (*Registry, error) {
+func NewRegistry(reg prometheus.Registerer, rawReg prometheus.Registerer, processInfoCh chan<- ProcessInfo, ip_resolver IPResolver, gpuProcessUsageSampleChan chan gpu.ProcessUsageSample, machineId, systemUuid, az, region string) (*Registry, error) {
 	ns, err := proc.GetSelfNetNs()
 	if err != nil {
 		return nil, err

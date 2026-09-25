@@ -203,7 +203,10 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 	} else {
 		// Non-k8s containers (docker, systemd, swarm, nomad): use container name as workload
 		name := ""
-		if len(split) > 0 {
+		if strings.HasPrefix(idStr, "/swarm/") && len(split) >= 4 {
+			// /swarm/namespace/service/slot: the slot number is not a name
+			name = split[3]
+		} else if len(split) > 0 {
 			name = split[len(split)-1]
 		}
 		src_workload = common.Workload{Name: name, Kind: "container"}
@@ -697,7 +700,7 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 		}
 	}
 
-	srcWorkload := c.ip_resolver.ResolveIP(src.IP().String())
+	srcWorkload := c.ip_resolver.ResolveSource(src.IP().String(), c.srcWorkload)
 	if ignoreControlPlane(srcWorkload.Name) {
 		return
 	}
@@ -769,7 +772,7 @@ func (c *Container) createConnectionFromSocketInfo(pid uint32, fd uint64, socket
 	src := netaddr.IPPortFrom(srcIP, socketInfo.SrcPort)
 
 	// Resolve workloads
-	srcWorkload := c.ip_resolver.ResolveIP(src.IP().String())
+	srcWorkload := c.ip_resolver.ResolveSource(src.IP().String(), c.srcWorkload)
 	dstWorkload := c.ip_resolver.ResolveIP(dst.IP().String())
 	actualDstWorkload := c.ip_resolver.ResolveActualIP(dst.IP().String())
 
