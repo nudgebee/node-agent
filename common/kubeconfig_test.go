@@ -1,4 +1,4 @@
-package main
+package common
 
 import (
 	"os"
@@ -40,7 +40,7 @@ func TestKubernetesConfig(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		config, err := kubernetesConfig()
+		config, err := KubernetesConfig()
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -58,7 +58,7 @@ func TestKubernetesConfig(t *testing.T) {
 		}
 		t.Setenv("KUBECONFIG", path)
 
-		config, err := kubernetesConfig()
+		config, err := KubernetesConfig()
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -72,7 +72,7 @@ func TestKubernetesConfig(t *testing.T) {
 		t.Setenv("KUBERNETES_SERVICE_PORT", "")
 		t.Setenv("KUBECONFIG", filepath.Join(t.TempDir(), "missing"))
 
-		if _, err := kubernetesConfig(); err == nil {
+		if _, err := KubernetesConfig(); err == nil {
 			t.Fatal("expected an error for a KUBECONFIG that does not exist")
 		}
 	})
@@ -88,7 +88,7 @@ func TestKubernetesConfig(t *testing.T) {
 		t.Setenv("KUBERNETES_SERVICE_PORT", "443")
 		t.Setenv("KUBECONFIG", "")
 
-		if _, err := kubernetesConfig(); err == nil {
+		if _, err := KubernetesConfig(); err == nil {
 			t.Fatal("expected an error when in-cluster config is incomplete")
 		}
 	})
