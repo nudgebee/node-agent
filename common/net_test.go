@@ -110,6 +110,12 @@ func TestDestinationLabelValue(t *testing.T) {
 		assert.Equal(t, "10.64.3.17", destinationLabelValue(internal, ipEcho))
 		// External unresolved -> low cardinality, keep the port.
 		assert.Equal(t, "1.1.1.1:443", destinationLabelValue(external, unresolved))
+		// Standalone hosts: IP:port is kept, even when a DNS name is known,
+		// because it is what matches the destination to a host and service.
+		host := Workload{Name: "vm-1", Namespace: "vm-1", Kind: VMWorkloadKind}
+		assert.Equal(t, "10.64.3.17:8080", destinationLabelValue(internal, host))
+		private := Workload{Name: "db.internal", Namespace: PrivateWorkloadKind, Kind: PrivateWorkloadKind}
+		assert.Equal(t, "10.64.3.17:8080", destinationLabelValue(internal, private))
 	})
 
 	t.Run("collapse off", func(t *testing.T) {
@@ -135,6 +141,8 @@ func TestDestinationIPLabelValue(t *testing.T) {
 		assert.Equal(t, "10.64.3.17", DestinationIPLabelValue(private, Workload{}))
 		// Public IP -> never collapsed.
 		assert.Equal(t, "1.1.1.1", DestinationIPLabelValue(public, Workload{Name: "api.openai.com", Namespace: "external"}))
+		// Standalone-host kinds keep the IP.
+		assert.Equal(t, "10.64.3.17", DestinationIPLabelValue(private, Workload{Name: "db.internal", Namespace: PrivateWorkloadKind, Kind: PrivateWorkloadKind}))
 	})
 
 	t.Run("collapse off", func(t *testing.T) {

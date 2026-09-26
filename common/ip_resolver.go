@@ -207,6 +207,14 @@ func (resolver *K8sIPResolver) ResolveIP(ip string) Workload {
 	}
 }
 
+// ResolveSource resolves the source of a connection by its IP, which maps a
+// pod's address to its owning workload. The container argument is unused:
+// in a cluster the address is the more specific identity (a hostNetwork pod
+// resolves to its node, not to the container).
+func (resolver *K8sIPResolver) ResolveSource(ip string, _ Workload) Workload {
+	return resolver.ResolveIP(ip)
+}
+
 func (resolver *K8sIPResolver) CacheDNS(ip string, dns string) Workload {
 	resolver.dnsResolvedIps.Add(ip, dns)
 	return Workload{

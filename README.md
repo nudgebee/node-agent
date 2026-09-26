@@ -74,6 +74,11 @@ Pass `-v vX.Y.Z` to pin to a specific release. The script writes a
 systemd unit at `/etc/systemd/system/nudgebee-node-agent.service` and
 starts it.
 
+Kubernetes is not required. With no Kubernetes API available, the agent
+names connections by systemd unit, container, host and DNS name instead
+of by pod and service; see
+[standalone hosts](docs/ip-fqdn-resolver.md#standalone-hosts-no-kubernetes).
+
 ### Container image
 
 Multi-arch images (linux/amd64, linux/arm64) are published to GHCR on

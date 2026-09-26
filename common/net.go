@@ -203,6 +203,15 @@ func (dk DestinationKey) ActualDestinationLabelValue() string {
 	return destinationLabelValue(dk.actualDestination, dk.actualDestinationWorkload)
 }
 
+// isHostDestination reports whether wl is a standalone host or an address
+// the standalone-host resolver could not attribute (kinds only VMIPResolver
+// produces). Collapsing exists for churning pod IPs; host IPs are stable, and
+// the IP:port is the only thing that lets a consumer match the destination to
+// the host and the service listening on that port.
+func isHostDestination(wl Workload) bool {
+	return wl.Kind == VMWorkloadKind || wl.Kind == PrivateWorkloadKind
+}
+
 // destinationLabelValue produces the destination/actual_destination label value.
 //
 // External destinations resolved to an FQDN (host set, no IP) are returned as-is
@@ -224,7 +233,7 @@ func destinationLabelValue(hp HostPort, wl Workload) string {
 	if hp.ip.IsZero() {
 		return hp.String()
 	}
-	if flags.CollapseInternalDestinations == nil || !*flags.CollapseInternalDestinations {
+	if flags.CollapseInternalDestinations == nil || !*flags.CollapseInternalDestinations || isHostDestination(wl) {
 		return hp.String()
 	}
 	// Resolved workload identity (guard against the IP-echoed-back fallback that
@@ -249,7 +258,7 @@ func destinationLabelValue(hp HostPort, wl Workload) string {
 // takes a netaddr.IP. Internal pod IPs churn/recycle; keying the RTT series on
 // workload identity keeps it stable. External and unresolved IPs are kept as-is.
 func DestinationIPLabelValue(ip netaddr.IP, wl Workload) string {
-	if flags.CollapseInternalDestinations == nil || !*flags.CollapseInternalDestinations {
+	if flags.CollapseInternalDestinations == nil || !*flags.CollapseInternalDestinations || isHostDestination(wl) {
 		return ip.String()
 	}
 	if IsIpPrivate(ip) && wl.Name != "" && wl.Name != ip.String() {
