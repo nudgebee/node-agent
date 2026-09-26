@@ -1,0 +1,69 @@
+# Storage for node-agents running on standalone hosts: one machine that
+# receives metrics, traces and logs from every agent on the network.
+#
+#   agents ──► gateway :8080 (checks X-Api-Key)
+#                ├─ /v1/metrics ─► victoriametrics  (Prometheus remote-write)
+#                ├─ /v1/traces  ─► otel-collector ─► clickhouse
+#                └─ /v1/logs    ─► otel-collector ─► clickhouse
+#
+# Queries go straight to victoriametrics :8428 (PromQL, basic auth) and
+# clickhouse :8123 (SQL, password). See README.md.
+
+services:
+  gateway:
+    image: nginx:1.29-alpine
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      API_KEY: ${API_KEY:?set API_KEY in .env}
+      # Writes from the gateway to victoriametrics use its query credentials.
+      VM_BASIC_AUTH: ${VM_BASIC_AUTH:?run ./setup.sh to generate .env}
+    volumes:
+      - ./gateway.conf.template:/etc/nginx/templates/default.conf.template:ro
+    depends_on:
+      - victoriametrics
+      - otel-collector
+
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.152.0
+    restart: unless-stopped
+    command:
+      - -storageDataPath=/storage
+      - -retentionPeriod=${METRICS_RETENTION:-15d}
+      - -httpAuth.username=${VM_USER:-nudgebee}
+      - -httpAuth.password=${VM_PASSWORD:?run ./setup.sh to generate .env}
+    ports:
+      - "8428:8428"
+    volumes:
+      - vm-data:/storage
+
+  otel-collector:
+    image: ghcr.io/nudgebee/opentelemetry-collector-contrib:0.157.0
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    environment:
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?run ./setup.sh to generate .env}
+      TRACES_RETENTION: ${TRACES_RETENTION:-168h}
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    depends_on:
+      - clickhouse
+
+  clickhouse:
+    # Same image and version as the Kubernetes chart, so the tables the
+    # collector creates have the same schema and the same queries work.
+    image: ghcr.io/nudgebee/clickhouse:24.12.4-debian-12-r0-nb-3
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_ADMIN_USER: default
+      CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_PASSWORD:?run ./setup.sh to generate .env}
+    ports:
+      - "8123:8123"
+    volumes:
+      - clickhouse-data:/bitnami/clickhouse
+      - ./clickhouse-logging.xml:/bitnami/clickhouse/etc/conf.d/logging.xml:ro
+
+volumes:
+  vm-data:
+  clickhouse-data:

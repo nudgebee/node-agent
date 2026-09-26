@@ -1,0 +1,69 @@
+# Receives traces and logs from node-agents (via the gateway) and writes them
+# to ClickHouse. The exporter settings match the Kubernetes chart so the
+# tables have the same names and schema.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 400
+    spike_limit_mib: 100
+  # Health checks and scrapes are the bulk of spans on most hosts and are
+  # never worth keeping. No sampling here: the agent already samples
+  # (TRACES_SAMPLING), and sampling twice would compound.
+  filter/drop_health_check:
+    error_mode: ignore
+    traces:
+      span:
+        - attributes["http.route"] == "/health"
+        - attributes["http.route"] == "/healthz"
+        - attributes["http.route"] == "/live"
+        - attributes["http.route"] == "/ready"
+        - attributes["http.route"] == "/metrics"
+        - attributes["http.target"] == "/health"
+        - attributes["http.target"] == "/healthz"
+        - attributes["http.target"] == "/live"
+        - attributes["http.target"] == "/ready"
+        - attributes["http.target"] == "/metrics"
+        - attributes["url.path"] == "/health"
+        - attributes["url.path"] == "/healthz"
+        - attributes["url.path"] == "/live"
+        - attributes["url.path"] == "/ready"
+        - attributes["url.path"] == "/metrics"
+  batch:
+    timeout: 5s
+    send_batch_size: 25000
+
+exporters:
+  clickhouse:
+    endpoint: "tcp://clickhouse:9000?dial_timeout=10s&compress=lz4"
+    database: default
+    ttl: ${env:TRACES_RETENTION}
+    username: default
+    password: ${env:CLICKHOUSE_PASSWORD}
+    logs_table_name: otel_logs
+    traces_table_name: otel_traces
+    timeout: 5s
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      queue_size: 1000
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/drop_health_check, batch]
+      exporters: [clickhouse]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [clickhouse]

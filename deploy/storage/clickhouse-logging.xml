@@ -1,0 +1,13 @@
+<!-- Same as the Kubernetes chart: turn off ClickHouse's own system log tables,
+     which otherwise grow on disk without being used. -->
+<clickhouse>
+  <asynchronous_metric_log remove="1"/>
+  <metric_log remove="1"/>
+  <query_log remove="1"/>
+  <query_thread_log remove="1"/>
+  <query_views_log remove="1"/>
+  <part_log remove="1"/>
+  <text_log remove="1"/>
+  <trace_log remove="1"/>
+  <opentelemetry_span_log remove="1"/>
+</clickhouse>
