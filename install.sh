@@ -223,10 +223,10 @@ read_existing_env() {
     EXISTING_ENV=$($SUDO cat ${FILE_ENV} 2>/dev/null || true)
     # Resource limits: set now > previous install > default.
     if [ -z "${MEMORY_MAX}" ]; then
-        MEMORY_MAX=$(sed -n 's/^MemoryMax=//p' ${FILE_SERVICE} 2>/dev/null || true)
+        MEMORY_MAX=$(sed -n 's/^MemoryMax=//p' ${FILE_SERVICE} 2>/dev/null | head -n 1 || true)
     fi
     if [ -z "${CPU_QUOTA}" ]; then
-        CPU_QUOTA=$(sed -n 's/^CPUQuota=//p' ${FILE_SERVICE} 2>/dev/null || true)
+        CPU_QUOTA=$(sed -n 's/^CPUQuota=//p' ${FILE_SERVICE} 2>/dev/null | head -n 1 || true)
     fi
     MEMORY_MAX=${MEMORY_MAX:-${DEFAULT_MEMORY_MAX}}
     CPU_QUOTA=${CPU_QUOTA:-${DEFAULT_CPU_QUOTA}}
@@ -234,7 +234,10 @@ read_existing_env() {
 
 create_env_file() {
     info "env: Creating environment file ${FILE_ENV}"
-    NEW_ENV=$(sh -c export | while read x v; do echo $v; done | grep -E "${ENV_VARS}" || true)
+    # Double-quote each value, escaping \ and ", which systemd's EnvironmentFile
+    # parser unescapes back. Regex settings such as HTTP_PATH_NORMALIZATION_RULES
+    # contain backslashes that an unquoted value, or "read" without -r, loses.
+    NEW_ENV=$(env | grep -E "${ENV_VARS}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/=/="/' -e 's/$/"/' || true)
     $SUDO touch ${FILE_ENV}
     $SUDO chmod 0600 ${FILE_ENV}
     # Variables set now win; the rest are carried over from the previous install.
