@@ -70,9 +70,28 @@ exposes `/metrics` on port 80.
 curl -fsSL https://raw.githubusercontent.com/nudgebee/node-agent/main/install.sh | sudo sh -
 ```
 
-Pass `-v vX.Y.Z` to pin to a specific release. The script writes a
-systemd unit at `/etc/systemd/system/nudgebee-node-agent.service` and
-starts it.
+Pass `-v vX.Y.Z` to pin to a specific release, or `-b PATH` to install a
+binary you downloaded yourself (for hosts without access to GitHub). The
+script writes a systemd unit at
+`/etc/systemd/system/nudgebee-node-agent.service` and starts it.
+
+Agent settings are read from the environment. Put them after `sudo`, since
+`sudo` does not pass the caller's environment through:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nudgebee/node-agent/main/install.sh \
+  | sudo COLLECTOR_ENDPOINT=https://collector.example.com API_KEY=... sh -
+```
+
+Settings are stored in
+`/etc/systemd/system/nudgebee-node-agent.service.env` and kept when the
+script is run again, so upgrading needs no variables; set one again to
+change it. The unit defaults to `TRACES_SAMPLING=0.1`, serves `/metrics` on
+`LISTEN=127.0.0.1:10300` (set `LISTEN=0.0.0.0:10300` to let a remote
+Prometheus scrape it), and keeps its
+buffered data in `/var/lib/nudgebee-node-agent`. It is limited to
+`MEMORY_MAX=1G` and `CPU_QUOTA=100%` (one core); pass either variable to
+change the limit.
 
 Kubernetes is not required. With no Kubernetes API available, the agent
 names connections by systemd unit, container, host and DNS name instead
