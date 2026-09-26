@@ -86,7 +86,9 @@ curl -fsSL https://raw.githubusercontent.com/nudgebee/node-agent/main/install.sh
 Settings are stored in
 `/etc/systemd/system/nudgebee-node-agent.service.env` and kept when the
 script is run again, so upgrading needs no variables; set one again to
-change it. The unit defaults to `TRACES_SAMPLING=0.1` and keeps its
+change it. The unit defaults to `TRACES_SAMPLING=0.1`, serves `/metrics` on
+`LISTEN=127.0.0.1:10300` (set `LISTEN=0.0.0.0:10300` to let a remote
+Prometheus scrape it), and keeps its
 buffered data in `/var/lib/nudgebee-node-agent`. It is limited to
 `MEMORY_MAX=1G` and `CPU_QUOTA=100%` (one core); pass either variable to
 change the limit.

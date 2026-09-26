@@ -264,6 +264,10 @@ Environment=WAL_DIR=${STATE_DIR}
 # Hosts outside Kubernetes run many chatty local services; sample traces
 # instead of exporting every request.
 Environment=TRACES_SAMPLING=0.1
+# The agent's built-in default is 0.0.0.0:80, which clashes with any web server
+# on the host and also exposes /debug/pprof. Bind to localhost on a high port;
+# set LISTEN=0.0.0.0:10300 to let a remote Prometheus scrape it.
+Environment=LISTEN=127.0.0.1:10300
 StateDirectory=${SYSTEM_NAME}
 MemoryMax=${MEMORY_MAX}
 CPUQuota=${CPU_QUOTA}
