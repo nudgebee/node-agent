@@ -35,7 +35,7 @@ jobs:
       # refuses to load the config ("the Go language version used to build
       # golangci-lint is lower than the targeted Go version").
       - name: golangci-lint (forcetypeassert)
-        uses: golangci/golangci-lint-action@v8
+        uses: golangci/golangci-lint-action@v9
         with:
           version: v2.13.2
           args: --timeout=8m
