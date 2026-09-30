@@ -682,7 +682,8 @@ func (c *Container) onFileOpen(pid uint32, fd uint64, mnt uint64, log bool) {
 			return
 		}
 	}
-	mntId, logPath := resolveFd(pid, fd)
+	info := proc.GetFdInfo(pid, fd)
+	mntId, logPath := resolveFd(info)
 	func() {
 		if mntId == "" {
 			return
@@ -706,8 +707,17 @@ func (c *Container) onFileOpen(pid uint32, fd uint64, mnt uint64, log bool) {
 			c.lock.Unlock()
 		}
 	}()
-	if logPath != "" {
-		if *flags.EnableDynamicLogTailing {
+	if *flags.EnableDynamicLogTailing {
+		var logPaths []string
+		switch {
+		case logPath != "":
+			logPaths = []string{logPath}
+		case log && (info == nil || !strings.HasPrefix(info.Dest, "/var/log/")):
+			// The kernel saw a /var/log/ file opened, but the fd now points
+			// elsewhere (freopen): find the log files the process holds.
+			logPaths = findLogFiles(pid)
+		}
+		for _, logPath := range logPaths {
 			c.lock.Lock()
 			c.runLogParser(logPath)
 			c.lock.Unlock()
@@ -2445,8 +2455,7 @@ func countTLSAttach(lib string, result ebpftracer.TLSAttachResult) {
 	}
 }
 
-func resolveFd(pid uint32, fd uint64) (mntId string, logPath string) {
-	info := proc.GetFdInfo(pid, fd)
+func resolveFd(info *proc.FdInfo) (mntId string, logPath string) {
 	if info == nil {
 		return
 	}
@@ -2497,4 +2506,21 @@ func sampleString(v interface{}) string {
 		return s
 	}
 	return ""
+}
+
+func findLogFiles(pid uint32) []string {
+	fds, err := proc.ReadFds(pid)
+	if err != nil {
+		return nil
+	}
+	var res []string
+	for _, fd := range fds {
+		if !strings.HasPrefix(fd.Dest, "/var/log/") {
+			continue
+		}
+		if _, logPath := resolveFd(proc.GetFdInfo(pid, fd.Fd)); logPath != "" {
+			res = append(res, logPath)
+		}
+	}
+	return res
 }
