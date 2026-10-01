@@ -361,6 +361,8 @@ void mark_tls(struct connection *conn) {
     conn->protocol = PROTOCOL_UNKNOWN;
 }
 
+#include "llm_capture.c"
+
 static inline __attribute__((__always_inline__))
 int http2_detection_allowed(struct connection *conn) {
     if (!conn) {
@@ -450,6 +452,10 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
             count_ciphertext_skip(0);
             return 0;
         }
+    }
+
+    if (conn != &conn_on_stack && llm_capture(&cid, conn, 0, payload, size, total_size)) {
+        return 0;
     }
 
     struct l7_request *req = bpf_map_lookup_elem(&l7_request_heap, &zero);
@@ -704,6 +710,10 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
         mark_tls(conn);
     } else if (conn->tls) {
         count_ciphertext_skip(1);
+        return 0;
+    }
+
+    if (conn != &conn_on_stack && llm_capture(&cid, conn, 1, payload, total_size, total_size)) {
         return 0;
     }
 

@@ -202,7 +202,11 @@ type RequestData struct {
 	Method   Method
 	// TLS reports that the payload came from a TLS library hook (Go
 	// crypto/tls, OpenSSL) and is therefore decrypted plaintext.
-	TLS          bool
+	TLS bool
+	// KernelTime is the raw kernel timestamp (bpf_ktime_get_ns) that HTTP/2
+	// and ClientHello events carry in place of a duration. Duration cannot
+	// hold it: it is clamped to under an hour, which a kernel uptime exceeds.
+	KernelTime   uint64
 	StatementId  uint32
 	Payload      []byte
 	PayloadSize  uint64

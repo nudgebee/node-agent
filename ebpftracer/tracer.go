@@ -55,6 +55,7 @@ const (
 	EventTypeTCPRetransmit    EventType = 9
 	EventTypeL7Request        EventType = 10
 	EventTypePythonThreadLock EventType = 11
+	EventTypeLLMData          EventType = 12
 
 	EventReasonNone    EventReason = 0
 	EventReasonOOMKill EventReason = 1
@@ -82,6 +83,19 @@ type Event struct {
 	// Socket info extracted directly from fd in eBPF (for L7 events)
 	// This enables processing L7 events even when TCP connection tracking failed
 	SocketInfo *SocketInfo
+	// LLMData is one chunk of a connection marked for LLM capture.
+	LLMData *LLMData
+}
+
+// LLMData is a chunk of the byte stream of a connection marked with
+// TagLLMConnection. Event.Timestamp is the connection's timestamp.
+type LLMData struct {
+	Ingress bool   // read by the application, rather than written
+	Time    uint64 // kernel time of the read or write, in ns
+	Data    []byte
+	// SkipAfter is the number of bytes of the same read or write that were
+	// not captured, and follow Data.
+	SkipAfter uint64
 }
 
 type perfMapType uint8
@@ -167,25 +181,53 @@ func (t *Tracer) Close() {
 // kernel dropped because a TLS hook already delivers that connection's
 // plaintext. ok is false until the eBPF collection is loaded.
 func (t *Tracer) TLSCiphertextSkipped() (writes, reads uint64, ok bool) {
-	if t.collection == nil {
-		return 0, 0, false
-	}
-	m := t.collection.Maps["tls_ciphertext_skipped"]
+	m := t.readyMap("tls_ciphertext_skipped")
 	if m == nil {
 		return 0, 0, false
 	}
-	sum := func(key uint32) uint64 {
-		var perCPU []uint64
-		if err := m.Lookup(key, &perCPU); err != nil {
-			return 0
-		}
-		var total uint64
-		for _, v := range perCPU {
-			total += v
-		}
-		return total
+	return sumPerCPU(m, 0), sumPerCPU(m, 1), true
+}
+
+// LLMCaptureDrops returns how many LLM capture chunks the kernel lost because
+// the llm_events ring buffer was full.
+func (t *Tracer) LLMCaptureDrops() (uint64, bool) {
+	m := t.readyMap("llm_capture_drops")
+	if m == nil {
+		return 0, false
 	}
-	return sum(0), sum(1), true
+	return sumPerCPU(m, 0), true
+}
+
+// TagLLMConnection marks a connection for LLM capture: from now on the kernel
+// copies all of its reads and writes to the llm_events ring buffer instead of
+// the generic L7 path. connTimestamp is the connection's timestamp from its L7
+// events, which keeps the mark from applying to a later connection reusing the
+// fd. The kernel removes the mark when the fd is closed.
+func (t *Tracer) TagLLMConnection(pid uint32, fd uint64, connTimestamp uint64) error {
+	m := t.readyMap("llm_conns")
+	if m == nil {
+		return errors.New("ebpf collection not loaded")
+	}
+	return m.Update(ConnectionId{FD: fd, PID: pid}, connTimestamp, ebpf.UpdateAny)
+}
+
+func (t *Tracer) readyMap(name string) *ebpf.Map {
+	if !t.ready.Load() || t.collection == nil {
+		return nil
+	}
+	return t.collection.Maps[name]
+}
+
+func sumPerCPU(m *ebpf.Map, key uint32) uint64 {
+	var perCPU []uint64
+	if err := m.Lookup(key, &perCPU); err != nil {
+		return 0
+	}
+	var total uint64
+	for _, v := range perCPU {
+		total += v
+	}
+	return total
 }
 
 func (t *Tracer) ActiveConnectionsIterator() *ebpf.MapIterator {
@@ -279,6 +321,13 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		return fmt.Errorf("failed to load collection spec: %w", err)
 	}
 	_ = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY})
+	if heap, ok := collectionSpec.Maps["llm_event_heap"]; ok {
+		cpus, err := ebpf.PossibleCPU()
+		if err != nil {
+			return fmt.Errorf("failed to count possible CPUs: %w", err)
+		}
+		heap.MaxEntries = uint32(cpus)
+	}
 	c, err := ebpf.NewCollectionWithOptions(collectionSpec, ebpf.CollectionOptions{
 		//Programs: ebpf.ProgramOptions{LogLevel: 2, LogSize: 20 * 1024 * 1024},
 	})
@@ -563,6 +612,7 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 				Protocol:     l7.Protocol(data[32]),
 				Method:       l7.Method(data[33]),
 				TLS:          data[34] != 0,
+				KernelTime:   binary.LittleEndian.Uint64(data[24:32]),
 				Status:       l7.Status(int32(binary.LittleEndian.Uint32(data[20:24]))),
 				Duration:     safeDuration(binary.LittleEndian.Uint64(data[24:32])),
 				StatementId:  binary.LittleEndian.Uint32(data[36:40]),
@@ -648,6 +698,12 @@ func runRingbufEventsReader(name string, r *ringbuf.Reader, ch chan<- Event) {
 		}
 
 		data := rec.RawSample
+		if len(data) > l7EventProtocolByte && data[l7EventProtocolByte] == protocolLLMCapture {
+			if ev, ok := decodeLLMEvent(data); ok {
+				ch <- ev
+			}
+			continue
+		}
 		if len(data) < l7EventHeaderSize {
 			klog.Warningln("invalid l7 event from ring buffer, size:", len(data))
 			continue
@@ -673,6 +729,7 @@ func runRingbufEventsReader(name string, r *ringbuf.Reader, ch chan<- Event) {
 			Protocol:     l7.Protocol(data[32]),
 			Method:       l7.Method(data[33]),
 			TLS:          data[34] != 0,
+			KernelTime:   binary.LittleEndian.Uint64(data[24:32]),
 			Status:       l7.Status(int32(binary.LittleEndian.Uint32(data[20:24]))),
 			Duration:     safeDuration(binary.LittleEndian.Uint64(data[24:32])),
 			StatementId:  binary.LittleEndian.Uint32(data[36:40]),
@@ -710,6 +767,36 @@ func runRingbufEventsReader(name string, r *ringbuf.Reader, ch chan<- Event) {
 
 		ch <- event
 	}
+}
+
+// llmEventHeaderSize is the size of struct llm_event before its data, and
+// protocolLLMCapture marks one in l7_events (PROTOCOL_LLM_CAPTURE).
+const (
+	llmEventHeaderSize  = 48
+	protocolLLMCapture  = 0xFE
+	l7EventProtocolByte = 32
+)
+
+func decodeLLMEvent(d []byte) (Event, bool) {
+	if len(d) < llmEventHeaderSize {
+		return Event{}, false
+	}
+	n := int(binary.LittleEndian.Uint32(d[20:24]))
+	if llmEventHeaderSize+n > len(d) {
+		return Event{}, false
+	}
+	return Event{
+		Type:      EventTypeLLMData,
+		Fd:        binary.LittleEndian.Uint64(d[0:8]),
+		Timestamp: binary.LittleEndian.Uint64(d[8:16]),
+		Pid:       binary.LittleEndian.Uint32(d[16:20]),
+		LLMData: &LLMData{
+			Time:      binary.LittleEndian.Uint64(d[24:32]),
+			Ingress:   d[33] == 1,
+			SkipAfter: binary.LittleEndian.Uint64(d[40:48]),
+			Data:      append([]byte(nil), d[llmEventHeaderSize:llmEventHeaderSize+n]...),
+		},
+	}, true
 }
 
 func ipPort(ip []byte, port uint16) netaddr.IPPort {

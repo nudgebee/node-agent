@@ -105,12 +105,6 @@ const (
 	// Max accumulated header block size (64KB) to prevent unbounded growth
 	maxPendingHeaderBlockSize = 64 * 1024
 
-	// Max accumulated DATA payload size per stream (128KB).
-	// Prevents unbounded memory growth on high-throughput HTTP/2 connections.
-	// Payloads are only used for LLM provider detection and trace spans,
-	// which need at most a few KB of data.
-	maxDataPayloadSize = 128 * 1024
-
 	// Max concurrent HTTP/2 streams tracked per connection.
 	// Prevents unbounded memory growth when responses never complete (orphan streams).
 	maxActiveRequests = 100
@@ -133,19 +127,11 @@ type Http2Request struct {
 	GrpcStatus  Status
 	Duration    time.Duration
 
-	RequestPayload  []byte
-	ResponsePayload []byte
-	kernelTime      uint64
-
-	// Headers for trace correlation
-	RequestHeaders map[string]string // All request headers including traceparent
+	kernelTime uint64
 
 	// Internal state for tracking stream completion
 	hasResponseStatus bool // true when we've received :status in response HEADERS
 	responseEndStream bool // true when we've received END_STREAM on response
-
-	// Timing for TTFT calculation
-	firstResponseTime uint64 // Kernel time when first response data received
 
 	// PartialHeaders indicates HPACK decoding had errors (e.g., mid-stream join)
 	// and some headers may be missing. Static table headers are still reliable.
@@ -200,17 +186,6 @@ type Http2Parser struct {
 	// Static table headers still work; dynamic table rebuilds over time.
 	clientDecoderDegraded bool
 	serverDecoderDegraded bool
-
-	// Lightweight mode skips DATA payload accumulation and RequestHeaders map.
-	// Used for non-LLM HTTP/2 traffic (gRPC, K8s API, etc.) where only status
-	// codes are needed for L7 metrics. Auto-upgrades to full mode when an
-	// LLM-relevant :authority header is detected.
-	Lightweight bool
-
-	// LLMHostChecker is called with :authority values to determine if this
-	// connection serves LLM traffic. When it returns true, Lightweight is
-	// set to false and full payload capture begins.
-	LLMHostChecker func(host string) bool
 }
 
 func NewHttp2Parser() *Http2Parser {
@@ -255,51 +230,6 @@ func (p *Http2Parser) ActiveRequestCount() int {
 func (p *Http2Parser) HasPartialData() bool {
 	return len(p.clientPartialFrame) > 0 || len(p.serverPartialFrame) > 0 ||
 		p.clientPendingHeaders != nil || p.serverPendingHeaders != nil
-}
-
-// Http2StreamUpdate contains information about an active HTTP/2 stream
-// Used for notifying LLM stream tracker about streaming responses
-type Http2StreamUpdate struct {
-	StreamId          uint32
-	Path              string
-	Method            string
-	Authority         string
-	Scheme            string
-	Status            Status
-	RequestHeaders    map[string]string
-	ResponsePayload   []byte
-	HasResponseStatus bool
-	KernelTime        uint64
-	FirstResponseTime uint64
-}
-
-// GetActiveStreamsForLLM returns info about active streams that may be LLM requests
-// This allows the LLM stream tracker to detect SSE completion markers
-func (p *Http2Parser) GetActiveStreamsForLLM() []Http2StreamUpdate {
-	var updates []Http2StreamUpdate
-	for streamId, req := range p.activeRequests {
-		if req == nil {
-			continue
-		}
-		// Only return streams that have received response status (response started)
-		// and have response payload (data to analyze for SSE markers)
-		if req.hasResponseStatus && len(req.ResponsePayload) > 0 {
-			updates = append(updates, Http2StreamUpdate{
-				StreamId:          streamId,
-				Path:              req.Path,
-				Method:            req.Method,
-				Authority:         req.Authority,
-				Scheme:            req.Scheme,
-				Status:            req.Status,
-				RequestHeaders:    req.RequestHeaders,
-				ResponsePayload:   req.ResponsePayload,
-				HasResponseStatus: req.hasResponseStatus,
-				KernelTime:        req.kernelTime,
-				FirstResponseTime: req.firstResponseTime,
-			})
-		}
-	}
-	return updates
 }
 
 // extractHeaderBlockFragment extracts the HPACK data from a HEADERS frame payload,
@@ -360,18 +290,10 @@ func (p *Http2Parser) decodeHeaderBlock(
 			req = &Http2Request{
 				kernelTime: kernelTime,
 			}
-			if !p.Lightweight {
-				req.RequestHeaders = make(map[string]string)
-			}
 			p.activeRequests[streamId] = req
 			p.stage("stream_created")
 		}
 		decoder.SetEmitFunc(func(hf hpack.HeaderField) {
-			// Store all headers for trace correlation (full mode only)
-			if req.RequestHeaders != nil {
-				req.RequestHeaders[hf.Name] = hf.Value
-			}
-
 			switch hf.Name {
 			case ":method":
 				if req.Method == "" && isHttpMethod(hf.Value) {
@@ -388,13 +310,6 @@ func (p *Http2Parser) decodeHeaderBlock(
 			case ":authority":
 				if req.Authority == "" && hf.Value != "" {
 					req.Authority = hf.Value
-					// Auto-upgrade: if authority matches an LLM host, switch to full mode
-					if p.Lightweight && p.LLMHostChecker != nil && p.LLMHostChecker(hf.Value) {
-						p.Lightweight = false
-						if req.RequestHeaders == nil {
-							req.RequestHeaders = make(map[string]string)
-						}
-					}
 				}
 			case "content-type":
 				if req.ContentType == "" && hf.Value != "" {
@@ -602,36 +517,6 @@ frameLoop:
 				}
 			}
 
-			// Payload accumulation only in full mode
-			if !p.Lightweight {
-				dataPayload := payload[offset : offset+h.Length]
-				switch method {
-				case MethodHttp2ClientFrames:
-					req := p.activeRequests[h.StreamId]
-					if req != nil && len(req.RequestPayload) < maxDataPayloadSize {
-						remaining := maxDataPayloadSize - len(req.RequestPayload)
-						if len(dataPayload) > remaining {
-							dataPayload = dataPayload[:remaining]
-						}
-						req.RequestPayload = append(req.RequestPayload, dataPayload...)
-					}
-				case MethodHttp2ServerFrames:
-					req := p.activeRequests[h.StreamId]
-					if req != nil {
-						if req.firstResponseTime == 0 && len(dataPayload) > 0 {
-							req.firstResponseTime = kernelTime
-						}
-						// Ring-buffer accumulate: keep the LAST maxDataPayloadSize
-						// bytes. SSE-style LLM responses (Gemini, Anthropic, OpenAI)
-						// carry finishReason/modelVersion/usageMetadata in trailing
-						// chunks; first-N capping loses them on long responses.
-						req.ResponsePayload = append(req.ResponsePayload, dataPayload...)
-						if len(req.ResponsePayload) > maxDataPayloadSize {
-							req.ResponsePayload = req.ResponsePayload[len(req.ResponsePayload)-maxDataPayloadSize:]
-						}
-					}
-				}
-			}
 			offset += h.Length
 
 		case http2.FrameHeaders:

@@ -41,7 +41,6 @@ func headersFrame(streamID uint32, path string) []byte {
 // while small internal h2c worked.
 func TestHttp2TruncatedPayloadDoesNotCorruptFollowingParses(t *testing.T) {
 	p := NewHttp2Parser()
-	p.Lightweight = true
 
 	// Write 1: a valid HEADERS frame, then a second frame the kernel cut short.
 	complete := headersFrame(1, "/repos/nudgebee/node-agent")
@@ -71,7 +70,6 @@ func TestHttp2TruncatedPayloadDoesNotCorruptFollowingParses(t *testing.T) {
 // the bytes that would complete it were discarded in the kernel and never arrive.
 func TestHttp2TruncatedPayloadDropsPartialFrame(t *testing.T) {
 	p := NewHttp2Parser()
-	p.Lightweight = true
 
 	cutShort := frame(http2.FrameData, 0, 1, make([]byte, 4000))
 	cutShort = cutShort[:len(cutShort)-3000]
@@ -89,7 +87,6 @@ func TestHttp2TruncatedPayloadDropsPartialFrame(t *testing.T) {
 // must still reassemble. Only truncation drops the fragment.
 func TestHttp2NonTruncatedSplitStillReassembles(t *testing.T) {
 	p := NewHttp2Parser()
-	p.Lightweight = true
 
 	h := headersFrame(1, "/split/path")
 	split := len(h) - 5
