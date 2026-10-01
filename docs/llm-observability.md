@@ -87,6 +87,7 @@ not captured:
 | `unrecoverable` | the protocol framing was lost                                           |
 | `overflow`      | the parser fell behind the capture                                      |
 | `capacity`      | a container had too many captured connections                           |
+| `abandoned`     | a captured connection carried a request but never completed one          |
 
 `node_agent_l7_tls_ciphertext_skipped_total` counts the encrypted socket
 events the kernel skipped on TLS connections it already sees in plaintext,

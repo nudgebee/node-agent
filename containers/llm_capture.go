@@ -3,6 +3,7 @@ package containers
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/coroot/coroot-node-agent/common"
@@ -15,7 +16,12 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// llmAbandonedLogs rate-limits the log line describing a captured
+// connection that never completed a request.
+var llmAbandonedLogs atomic.Int64
+
 const (
+	maxLLMAbandonedLogs = 50
 	// Close events arrive on a different buffer than captured data, so the
 	// last chunks of a connection can be processed after its close.
 	llmCaptureGrace = 5 * time.Second
@@ -61,10 +67,19 @@ func (c *Container) startLLMCapture(pid uint32, fd uint64, ts uint64, tag llm.Ta
 func (c *Container) newLLMCapture(pid uint32, fd uint64, ts uint64, tag llm.Tag) {
 	pidFd := PidFd{Pid: pid, Fd: fd}
 	lc := &llmCapture{ts: ts, lastData: time.Now()}
-	lc.conn = llm.NewConn(tag,
+	var conn *llm.Conn
+	conn = llm.NewConn(tag,
 		func(e *llm.Exchange) { c.onLLMExchange(pidFd, e) },
-		func(o llm.Outcome) { LLMCaptureTotal.WithLabelValues(string(o)).Inc() },
+		func(o llm.Outcome) {
+			LLMCaptureTotal.WithLabelValues(string(o)).Inc()
+			if o == llm.OutcomeAbandoned && llmAbandonedLogs.Add(1) <= maxLLMAbandonedLogs {
+				st := conn.Stats()
+				klog.Infof("LLM capture abandoned: container=%s pid=%d fd=%d host=%s state=%s first_ingress=%v bytes(out/in)=%d/%d head_out=%q head_in=%q",
+					c.id, pid, fd, tag.Host, st.State, st.FirstIngress, st.Bytes[llm.Egress], st.Bytes[llm.Ingress], st.Head[llm.Egress], st.Head[llm.Ingress])
+			}
+		},
 	)
+	lc.conn = conn
 	c.llmCaptures[pidFd] = lc
 }
 

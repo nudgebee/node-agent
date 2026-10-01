@@ -38,6 +38,7 @@ const (
 	OutcomeMissedStart   Outcome = "missed_start"  // capture began mid-connection
 	OutcomeUnrecoverable Outcome = "unrecoverable" // the parser lost the protocol framing
 	OutcomeOverflow      Outcome = "overflow"      // the parser fell too far behind the capture
+	OutcomeAbandoned     Outcome = "abandoned"     // data was captured but no request ever completed
 )
 
 const (
@@ -129,6 +130,30 @@ type Conn struct {
 	requests chan *request
 	// HTTP/2: streams by id.
 	streams map[uint32]*h2stream
+
+	// What the connection has seen, for diagnosing captures that never
+	// complete a request.
+	stats Stats
+}
+
+// Stats describes what a Conn has seen.
+type Stats struct {
+	FirstIngress bool   // the first chunk fed was a response, not a request
+	Bytes        [2]int // fed per Direction
+	Head         [2][]byte
+	Exchanges    int
+	State        string
+}
+
+const statsHeadLen = 96
+
+// Stats returns a snapshot of what the connection has seen.
+func (c *Conn) Stats() Stats {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	st := c.stats
+	st.State = [...]string{"new", "http1", "http2", "dead"}[c.state]
+	return st
 }
 
 type request struct {
@@ -151,6 +176,13 @@ func NewConn(tag Tag, onExchange func(*Exchange), onOutcome func(Outcome)) *Conn
 func (c *Conn) Feed(dir Direction, data []byte, ts uint64, skipped uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.stats.Bytes[Egress] == 0 && c.stats.Bytes[Ingress] == 0 && len(data) > 0 {
+		c.stats.FirstIngress = dir == Ingress
+	}
+	c.stats.Bytes[dir] += len(data)
+	if n := statsHeadLen - len(c.stats.Head[dir]); n > 0 && len(data) > 0 {
+		c.stats.Head[dir] = append(c.stats.Head[dir], data[:min(n, len(data))]...)
+	}
 	switch c.state {
 	case stateDead:
 		return
@@ -205,15 +237,19 @@ func (c *Conn) Feed(dir Direction, data []byte, ts uint64, skipped uint64) {
 	}
 }
 
-// Close releases the connection's goroutines.
+// Close releases the connection's goroutines. A connection that carried
+// requests and never completed one is reported as abandoned.
 func (c *Conn) Close() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.state != stateDead {
-		c.state = stateDead
-	}
+	abandoned := c.state != stateDead && c.state != stateNew && c.stats.Exchanges == 0 && c.stats.Bytes[Egress] > 0
+	c.state = stateDead
 	c.egress.close()
 	c.ingress.close()
+	c.mu.Unlock()
+	// Reported outside the lock: the callback may ask for Stats.
+	if abandoned {
+		c.report(OutcomeAbandoned)
+	}
 }
 
 func (c *Conn) fail(o Outcome) {
@@ -572,6 +608,9 @@ func (c *Conn) finish(req *request, status int, header http.Header, body []byte,
 			e.Outcome = OutcomeCompleted
 		}
 	}
+	c.mu.Lock()
+	c.stats.Exchanges++
+	c.mu.Unlock()
 	if c.onExchange != nil {
 		c.onExchange(e)
 	}

@@ -531,3 +531,70 @@ func TestReplayHTTP2ClientCancel(t *testing.T) {
 		t.Errorf("model=%q outcome=%s", e.Model, e.Outcome)
 	}
 }
+
+// A plaintext gateway client: HTTP/1.1 over plain TCP, a 38KB request, a
+// large SSE response streamed in many small writes, recorded at the socket.
+func TestReplayPlaintextGatewayLargeStream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		for i := 0; i < 600; i++ {
+			_, _ = fmt.Fprintf(w, "data: {\"model\":\"qwen-test\",\"choices\":[{\"delta\":{\"content\":%q}}],\"usage\":null}\n\n", strings.Repeat("t", 350))
+			if i%20 == 0 {
+				w.(http.Flusher).Flush()
+			}
+		}
+		_, _ = io.WriteString(w, `data: {"model":"qwen-test","choices":[],"usage":{"prompt_tokens":9000,"completion_tokens":600,"total_tokens":9600}}`+"\n\ndata: [DONE]\n\n")
+	}))
+	defer srv.Close()
+	for _, keepAlive := range []bool{true, false} {
+		rec := &recorder{}
+		client := &http.Client{Transport: &http.Transport{
+			DisableKeepAlives: !keepAlive,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				c, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				return &recConn{Conn: c, r: rec}, nil
+			},
+		}}
+		resp, err := client.Post(srv.URL+"/v1/chat/completions", "application/json",
+			strings.NewReader(`{"model":"qwen-test","stream":true,"messages":[{"content":"`+strings.Repeat("q", 38000)+`"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		client.CloseIdleConnections()
+		exchanges, outcomes := replay(t, rec, 65535, 0)
+		if len(exchanges) != 1 || len(outcomes) != 0 {
+			t.Fatalf("keepAlive=%v: exchanges=%d outcomes=%v chunks=%d", keepAlive, len(exchanges), outcomes, len(rec.chunks))
+		}
+		if e := exchanges[0]; e.Outcome != OutcomeCompleted || e.Usage.Input != 9000 || e.Usage.Output != 600 {
+			t.Errorf("keepAlive=%v: outcome=%s usage=%+v", keepAlive, e.Outcome, e.Usage)
+		}
+	}
+}
+
+// A connection closed with a request in flight is reported as abandoned, and
+// the outcome callback may inspect the connection's stats without deadlock.
+func TestAbandonedReportsStats(t *testing.T) {
+	var c *Conn
+	got := make(chan Stats, 1)
+	c = NewConn(Tag{}, nil, func(o Outcome) {
+		if o == OutcomeAbandoned {
+			got <- c.Stats()
+		}
+	})
+	c.Feed(Egress, []byte("POST /v1/chat/completions HTTP/1.1\r\nHost: gw\r\nContent-Length: 2\r\n\r\n{}"), 1, 0)
+	c.Close()
+	select {
+	case st := <-got:
+		if st.FirstIngress || st.Bytes[Egress] == 0 || !bytes.HasPrefix(st.Head[Egress], []byte("POST ")) {
+			t.Errorf("stats=%+v", st)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no abandoned outcome (or deadlock)")
+	}
+}
