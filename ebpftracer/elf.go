@@ -11,25 +11,29 @@ import (
 	"golang.org/x/arch/x86/x86asm"
 )
 
+// Symbol is a function in an ELF file: its virtual address (value) and size,
+// from the ELF symbol tables or, for a stripped Go binary, from .gopclntab.
 type Symbol struct {
-	s       *elf.Symbol
+	name    string
+	value   uint64
+	size    uint64
 	f       *ELFFile
 	address uint64
 }
 
 func (s *Symbol) Name() string {
-	return s.s.Name
+	return s.name
 }
 
 func (s *Symbol) Address() uint64 {
 	if s.address == 0 {
-		s.address = s.s.Value
+		s.address = s.value
 		for _, p := range s.f.elf.Progs {
 			if p.Type != elf.PT_LOAD || (p.Flags&elf.PF_X) == 0 {
 				continue
 			}
-			if p.Vaddr <= s.s.Value && s.s.Value < (p.Vaddr+p.Memsz) {
-				s.address = s.s.Value - p.Vaddr + p.Off
+			if p.Vaddr <= s.value && s.value < (p.Vaddr+p.Memsz) {
+				s.address = s.value - p.Vaddr + p.Off
 				break
 			}
 		}
@@ -43,12 +47,12 @@ func (s *Symbol) ReturnOffsets() ([]int, error) {
 		return nil, err
 	}
 
-	sStart := s.s.Value - text.Addr
+	sStart := s.value - text.Addr
 	_, err = reader.Seek(int64(sStart), io.SeekStart)
 	if err != nil {
 		return nil, err
 	}
-	sBytes := make([]byte, s.s.Size)
+	sBytes := make([]byte, s.size)
 	_, err = reader.Read(sBytes)
 	if err != nil {
 		return nil, err
@@ -82,10 +86,13 @@ func (s *Symbol) AttachUretprobes(exe *link.Executable, prog *ebpf.Program, pid 
 }
 
 type ELFFile struct {
+	path              string
 	elf               *elf.File
 	symbols           []elf.Symbol
 	textSection       *elf.Section
 	textSectionReader io.ReadSeeker
+	goFuncs           *goFuncTable
+	goFuncsErr        error
 }
 
 func OpenELFFile(path string) (*ELFFile, error) {
@@ -93,10 +100,13 @@ func OpenELFFile(path string) (*ELFFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &ELFFile{elf: file}, nil
+	return &ELFFile{path: path, elf: file}, nil
 }
 
 func (f *ELFFile) readSymbols() error {
+	if f.symbols != nil {
+		return nil
+	}
 	symbols, _ := f.elf.Symbols()
 	dyn, _ := f.elf.DynamicSymbols()
 
@@ -107,26 +117,38 @@ func (f *ELFFile) readSymbols() error {
 	return nil
 }
 
+// GetSymbol finds a function by name in the ELF symbol tables and, failing
+// that, in a Go binary's .gopclntab. The fallback covers Go binaries built
+// with -ldflags="-s -w": a statically linked one has no symbol table at all,
+// and a cgo one keeps only .dynsym, which never lists Go functions.
 func (f *ELFFile) GetSymbol(name string) (*Symbol, error) {
-	if f.symbols == nil {
-		if err := f.readSymbols(); err != nil {
-			return nil, err
+	err := f.readSymbols()
+	if err == nil {
+		for _, s := range f.symbols {
+			if elf.ST_TYPE(s.Info) != elf.STT_FUNC || s.Size == 0 || s.Value == 0 {
+				continue
+			}
+			if s.Name == name && s.VersionIndex&0x8000 == 0 {
+				return &Symbol{name: s.Name, value: s.Value, size: s.Size, f: f}, nil
+			}
+		}
+		err = fmt.Errorf("symbol %s not found", name)
+	}
+	if t := f.goFuncTable(); t != nil {
+		if entry, size, ok := t.lookup(name); ok {
+			return &Symbol{name: name, value: entry, size: size, f: f}, nil
 		}
 	}
-	var es *elf.Symbol
-	for _, s := range f.symbols {
-		if elf.ST_TYPE(s.Info) != elf.STT_FUNC || s.Size == 0 || s.Value == 0 {
-			continue
-		}
-		if s.Name == name && s.VersionIndex&0x8000 == 0 {
-			es = &s
-			break
-		}
+	return nil, err
+}
+
+// goFuncTable opens .gopclntab on first use; nil if the file has none or it
+// cannot be read.
+func (f *ELFFile) goFuncTable() *goFuncTable {
+	if f.goFuncs == nil && f.goFuncsErr == nil {
+		f.goFuncs, f.goFuncsErr = openGoFuncTable(f.path, f.elf)
 	}
-	if es == nil {
-		return nil, fmt.Errorf("symbol %s not found", name)
-	}
-	return &Symbol{s: es, f: f}, nil
+	return f.goFuncs
 }
 
 func (f *ELFFile) getTextSectionAndReader() (*elf.Section, io.ReadSeeker, error) {
@@ -141,6 +163,9 @@ func (f *ELFFile) getTextSectionAndReader() (*elf.Section, io.ReadSeeker, error)
 }
 
 func (f *ELFFile) Close() error {
+	if f.goFuncs != nil {
+		f.goFuncs.close()
+	}
 	return f.elf.Close()
 }
 
