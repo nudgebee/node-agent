@@ -47,13 +47,18 @@ func (s *Symbol) ReturnOffsets() ([]int, error) {
 		return nil, err
 	}
 
+	// The address and size come from the binary; never read (or allocate)
+	// past the end of .text on the strength of them.
+	if s.value < text.Addr || s.size > text.Size || s.value-text.Addr > text.Size-s.size {
+		return nil, fmt.Errorf("symbol %s [%#x, +%d) is outside .text", s.name, s.value, s.size)
+	}
 	sStart := s.value - text.Addr
 	_, err = reader.Seek(int64(sStart), io.SeekStart)
 	if err != nil {
 		return nil, err
 	}
 	sBytes := make([]byte, s.size)
-	_, err = reader.Read(sBytes)
+	_, err = io.ReadFull(reader, sBytes)
 	if err != nil {
 		return nil, err
 	}

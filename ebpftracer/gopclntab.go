@@ -36,6 +36,7 @@ type goFuncTable struct {
 	order     binary.ByteOrder
 	ptrSize   int
 	textStart uint64 // runtime.text: base of the function entry offsets
+	textEnd   uint64 // end of .text; a function must lie in [textStart, textEnd)
 }
 
 func openGoFuncTable(path string, ef *elf.File) (*goFuncTable, error) {
@@ -83,7 +84,13 @@ func openGoFuncTable(path string, ef *elf.File) (*goFuncTable, error) {
 		t.close()
 		return nil, fmt.Errorf("unexpected pointer size %d", t.ptrSize)
 	}
+	text := ef.Section(".text")
+	if text == nil {
+		t.close()
+		return nil, fmt.Errorf("no .text")
+	}
 	t.textStart = goTextStart(ef, mapping, sec.Addr, t.order, t.ptrSize)
+	t.textEnd = text.Addr + text.Size
 	return t, nil
 }
 
@@ -177,7 +184,10 @@ func (t *goFuncTable) lookup(name string) (entry, size uint64, ok bool) {
 		}
 		start := uint64(t.order.Uint32(pclntable[i*8:]))
 		end := uint64(t.order.Uint32(pclntable[(i+1)*8:]))
-		if end <= start {
+		// A uprobe is attached at the entry, and one placed anywhere but an
+		// instruction boundary of this binary's code corrupts the traced
+		// process: reject any range that does not lie within .text.
+		if end <= start || t.textStart+end > t.textEnd {
 			return 0, 0, false
 		}
 		return t.textStart + start, end - start, true

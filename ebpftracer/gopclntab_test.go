@@ -205,9 +205,39 @@ func TestGoFuncTable_CorruptTableDoesNotPanic(t *testing.T) {
 			corrupt[rng.Intn(min(len(corrupt), 4096))] = byte(rng.Intn(256))
 		}
 		corrupt = corrupt[:8+rng.Intn(len(corrupt)-8)]
-		c := &goFuncTable{pcln: corrupt, order: tab.order, ptrSize: tab.ptrSize, textStart: tab.textStart}
+		c := &goFuncTable{pcln: corrupt, order: tab.order, ptrSize: tab.ptrSize, textStart: tab.textStart, textEnd: tab.textEnd}
 		for _, name := range tlsFuncs {
-			c.lookup(name)
+			if entry, size, ok := c.lookup(name); ok && (entry < c.textStart || entry+size > c.textEnd) {
+				t.Fatalf("%s resolved outside .text: [%#x, +%d)", name, entry, size)
+			}
+		}
+	}
+}
+
+// ReturnOffsets reads the function's code from .text; a symbol whose range
+// runs outside it must be refused rather than read or allocated for.
+func TestReturnOffsets_RejectsSymbolOutsideText(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Skip(err)
+	}
+	ef, err := OpenELFFile(exe)
+	if err != nil {
+		t.Skip(err)
+	}
+	defer ef.Close()
+	text := ef.elf.Section(".text")
+	if text == nil {
+		t.Skip("no .text")
+	}
+	for _, s := range []*Symbol{
+		{name: "before", value: text.Addr - 1, size: 16, f: ef},
+		{name: "past-end", value: text.Addr + text.Size - 8, size: 16, f: ef},
+		{name: "huge", value: text.Addr, size: 1 << 40, f: ef},
+		{name: "wraps", value: ^uint64(0) - 4, size: 16, f: ef},
+	} {
+		if _, err := s.ReturnOffsets(); err == nil {
+			t.Errorf("%s: ReturnOffsets should fail for [%#x, +%d)", s.name, s.value, s.size)
 		}
 	}
 }
