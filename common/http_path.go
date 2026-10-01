@@ -36,11 +36,11 @@ func NormalizeHTTPPath(path string) string {
 			parts[i] = "{id}"
 			continue
 		}
-		if hexRegex.MatchString(p) && len(p) >= 8 {
+		if len(p) >= 8 && hexRegex.MatchString(p) {
 			parts[i] = "{hex}"
 			continue
 		}
-		if alphaNumericMix.MatchString(p) && len(p) >= 10 {
+		if len(p) >= 10 && alphaNumericMix.MatchString(p) {
 			parts[i] = "{id}"
 			continue
 		}
