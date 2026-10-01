@@ -212,6 +212,9 @@ int ensure_connection_tracked(__u32 pid, __u64 fd) {
     struct connection *conn = bpf_map_lookup_elem(&active_connections, &cid);
     if (conn) {
         bpf_printk("go_tls: connection already tracked pid=%u fd=%llu", pid, fd);
+        // Mark before the socket read inside this TLS call, so its ciphertext
+        // is skipped rather than parsed.
+        mark_tls(conn);
         return 1;  // Connection already tracked
     }
 
@@ -219,6 +222,7 @@ int ensure_connection_tracked(__u32 pid, __u64 fd) {
     struct connection new_conn = {};
     new_conn.timestamp = bpf_ktime_get_ns();
     new_conn.protocol = PROTOCOL_UNKNOWN;
+    new_conn.tls = 1;
     // TODO: Extract actual destination port from socket instead of hardcoding
     // This requires reading socket info via bpf_get_socket_cookie or similar
     new_conn.dport = 443;  // Assume HTTPS for Go TLS

@@ -163,6 +163,31 @@ func (t *Tracer) Close() {
 	t.collection.Close()
 }
 
+// TLSCiphertextSkipped returns how many socket-level writes and reads the
+// kernel dropped because a TLS hook already delivers that connection's
+// plaintext. ok is false until the eBPF collection is loaded.
+func (t *Tracer) TLSCiphertextSkipped() (writes, reads uint64, ok bool) {
+	if t.collection == nil {
+		return 0, 0, false
+	}
+	m := t.collection.Maps["tls_ciphertext_skipped"]
+	if m == nil {
+		return 0, 0, false
+	}
+	sum := func(key uint32) uint64 {
+		var perCPU []uint64
+		if err := m.Lookup(key, &perCPU); err != nil {
+			return 0
+		}
+		var total uint64
+		for _, v := range perCPU {
+			total += v
+		}
+		return total
+	}
+	return sum(0), sum(1), true
+}
+
 func (t *Tracer) ActiveConnectionsIterator() *ebpf.MapIterator {
 	return t.collection.Maps["active_connections"].Iterate()
 }
@@ -537,6 +562,7 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 			req := &l7.RequestData{
 				Protocol:     l7.Protocol(data[32]),
 				Method:       l7.Method(data[33]),
+				TLS:          data[34] != 0,
 				Status:       l7.Status(int32(binary.LittleEndian.Uint32(data[20:24]))),
 				Duration:     safeDuration(binary.LittleEndian.Uint64(data[24:32])),
 				StatementId:  binary.LittleEndian.Uint32(data[36:40]),
@@ -646,6 +672,7 @@ func runRingbufEventsReader(name string, r *ringbuf.Reader, ch chan<- Event) {
 		req := &l7.RequestData{
 			Protocol:     l7.Protocol(data[32]),
 			Method:       l7.Method(data[33]),
+			TLS:          data[34] != 0,
 			Status:       l7.Status(int32(binary.LittleEndian.Uint32(data[20:24]))),
 			Duration:     safeDuration(binary.LittleEndian.Uint64(data[24:32])),
 			StatementId:  binary.LittleEndian.Uint32(data[36:40]),

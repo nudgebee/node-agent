@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1156,7 +1157,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			destClass = "external"
 		}
 		proto := protocolLabel(r.Protocol)
-		L7EventsTotal.WithLabelValues(proto, destClass, frameDirection(r.Method)).Inc()
+		L7EventsTotal.WithLabelValues(proto, destClass, frameDirection(r.Method), strconv.FormatBool(r.TLS)).Inc()
 		if r.PayloadSize > uint64(len(r.Payload)) {
 			L7PayloadTruncatedTotal.WithLabelValues(proto, destClass).Inc()
 		}

@@ -165,6 +165,9 @@ func NewRegistry(reg prometheus.Registerer, rawReg prometheus.Registerer, proces
 	}
 	// Register LLM metrics with the same registerer used for other container metrics
 	RegisterLLMMetrics(reg)
+	if err = reg.Register(tlsSkipCollector{tracer: r.tracer}); err != nil {
+		return nil, err
+	}
 	if err = reg.Register(r); err != nil {
 		return nil, err
 	}

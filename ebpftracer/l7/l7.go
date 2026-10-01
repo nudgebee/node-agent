@@ -196,10 +196,13 @@ func (s Status) Error() bool {
 }
 
 type RequestData struct {
-	Protocol     Protocol
-	Status       Status
-	Duration     time.Duration
-	Method       Method
+	Protocol Protocol
+	Status   Status
+	Duration time.Duration
+	Method   Method
+	// TLS reports that the payload came from a TLS library hook (Go
+	// crypto/tls, OpenSSL) and is therefore decrypted plaintext.
+	TLS          bool
 	StatementId  uint32
 	Payload      []byte
 	PayloadSize  uint64

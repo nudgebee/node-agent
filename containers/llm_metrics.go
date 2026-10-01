@@ -147,9 +147,9 @@ var (
 	L7EventsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "node_agent_l7_events_total",
-			Help: "L7 events processed, by protocol, destination class and frame direction",
+			Help: "L7 events processed, by protocol, destination class, frame direction and whether the payload is TLS plaintext",
 		},
-		[]string{"protocol", "destination", "direction"},
+		[]string{"protocol", "destination", "direction", "tls"},
 	)
 
 	L7PayloadTruncatedTotal = prometheus.NewCounterVec(

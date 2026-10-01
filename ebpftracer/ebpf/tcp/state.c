@@ -75,6 +75,10 @@ struct connection {
     __u64 bytes_received;
     __u64 timestamp;
     __u8 protocol;
+    // tls is set once a TLS library hook (Go crypto/tls, OpenSSL) has handled
+    // this connection. From then on the socket-level read/write path only sees
+    // ciphertext for it; see mark_tls in l7/l7.c.
+    __u8 tls;
     __u16 dport;  // Destination port for protocol detection
 };
 
