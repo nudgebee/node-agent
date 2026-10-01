@@ -131,6 +131,59 @@ struct {
     __uint(max_entries, 10240);
 } active_reads SEC(".maps");
 
+// OpenSSL plaintext is tied to its connection by the socket syscalls made on
+// the same thread, never by reading the fd out of the SSL/BIO structs. That
+// only ever worked for a socket BIO, at struct offsets that differ between
+// OpenSSL releases, so it silently lost every OpenSSL 3.0/3.1 process, curl
+// (its own BIO, num=0) and .NET (memory BIOs, num=-1).
+//
+// SSL_write/SSL_read park their arguments in ssl_write_pending/ssl_read_pending
+// keyed by thread; the next socket write/read on that thread supplies the fd,
+// which is then remembered per SSL object in ssl_fds. A memory BIO application
+// reads ciphertext itself *before* calling SSL_read, so its reads can only be
+// resolved through ssl_fds, learned from the request it wrote first.
+struct ssl_args {
+    char *buf;
+    __u64 size;
+    __u64 *ret;  // SSL_read_ex: out-param holding the bytes read
+    __u64 ssl;   // SSL*, keys ssl_fds
+    __u64 fd;    // reads: the socket read inside SSL_read, 0 if none
+    __u64 ns;    // writes: when SSL_write was entered
+};
+
+struct ssl_key {
+    __u64 ssl;
+    __u32 pid;
+    __u32 pad;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(key_size, sizeof(__u64));
+    __uint(value_size, sizeof(struct ssl_args));
+    __uint(max_entries, 10240);
+} ssl_write_pending SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(key_size, sizeof(__u64));
+    __uint(value_size, sizeof(struct ssl_args));
+    __uint(max_entries, 10240);
+} ssl_read_pending SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(key_size, sizeof(struct ssl_key));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, 32768);
+} ssl_fds SEC(".maps");
+
+// A pending SSL_write is claimed by a socket write on the same thread within
+// this window. With a socket BIO that write happens inside SSL_write; with a
+// memory BIO the application sends the ciphertext right after SSL_write
+// returns. Anything later is too weak a correlation to attribute plaintext on.
+#define SSL_PENDING_WRITE_TTL_NS 100000000ULL
+
 struct {
      __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
      __type(key, int);
@@ -721,14 +774,93 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     return 0;
 }
 
+// ssl_socket_fd reports whether fd is a socket worth attributing TLS to: a
+// tracked connection, or a socket the TCP tracking missed (connections that
+// predate the agent). It keeps a log write that lands between SSL_write and
+// the application's send() from claiming the plaintext.
+static inline __attribute__((__always_inline__))
+int ssl_socket_fd(__u32 pid, __u64 fd) {
+    if (fd <= 2) {
+        return 0;
+    }
+    struct connection_id cid = {};
+    cid.pid = pid;
+    cid.fd = fd;
+    if (bpf_map_lookup_elem(&active_connections, &cid)) {
+        return 1;
+    }
+    struct socket_tuple tuple = {};
+    return get_socket_tuple_from_fd((__u32)fd, &tuple);
+}
+
+static inline __attribute__((__always_inline__))
+void ssl_remember_fd(__u32 pid, __u64 ssl, __u64 fd) {
+    struct ssl_key k = {};
+    k.ssl = ssl;
+    k.pid = pid;
+    bpf_map_update_elem(&ssl_fds, &k, &fd, BPF_ANY);
+}
+
+// ssl_claim_write hands the plaintext of a pending SSL_write to the socket
+// write that carries it. Returns 1 when this write is that socket.
+static inline __attribute__((__always_inline__))
+int ssl_claim_write(__u64 tid, __u64 fd, char **buf, __u64 *size) {
+    struct ssl_args *args = bpf_map_lookup_elem(&ssl_write_pending, &tid);
+    if (!args) {
+        return 0;
+    }
+    if (bpf_ktime_get_ns() - args->ns > SSL_PENDING_WRITE_TTL_NS) {
+        bpf_map_delete_elem(&ssl_write_pending, &tid);
+        return 0;
+    }
+    __u32 pid = tid >> 32;
+    if (!ssl_socket_fd(pid, fd)) {
+        return 0;
+    }
+    *buf = args->buf;
+    *size = args->size;
+    ssl_remember_fd(pid, args->ssl, fd);
+    bpf_map_delete_elem(&ssl_write_pending, &tid);
+    return 1;
+}
+
+// ssl_note_read_fd records the socket a pending SSL_read pulls ciphertext from.
+static inline __attribute__((__always_inline__))
+void ssl_note_read_fd(__u64 tid, __u64 fd) {
+    struct ssl_args *args = bpf_map_lookup_elem(&ssl_read_pending, &tid);
+    if (!args || args->fd) {
+        return;
+    }
+    __u32 pid = tid >> 32;
+    if (!ssl_socket_fd(pid, fd)) {
+        return;
+    }
+    args->fd = fd;
+    ssl_remember_fd(pid, args->ssl, fd);
+}
+
+// The write handlers make a single trace_enter_write call with either the TLS
+// plaintext or the raw buffer, rather than one call each: the function is
+// inlined, and a second copy would double programs that are already ~6k
+// instructions.
 SEC("tracepoint/syscalls/sys_enter_write")
 int sys_enter_write(struct trace_event_raw_sys_enter_rw__stub* ctx) {
-    return trace_enter_write(ctx, ctx->fd, 0, ctx->buf, ctx->size, 0);
+    char *buf = ctx->buf;
+    __u64 size = ctx->size;
+    __u16 is_tls = ssl_claim_write(bpf_get_current_pid_tgid(), ctx->fd, &buf, &size);
+    return trace_enter_write(ctx, ctx->fd, is_tls, buf, size, 0);
 }
 
 SEC("tracepoint/syscalls/sys_enter_writev")
 int sys_enter_writev(struct trace_event_raw_sys_enter_rw__stub* ctx) {
-    return trace_enter_write(ctx, ctx->fd, 0, ctx->buf, 0, ctx->size);
+    char *buf = ctx->buf;
+    __u64 size = 0;
+    __u64 iovlen = ctx->size;
+    __u16 is_tls = ssl_claim_write(bpf_get_current_pid_tgid(), ctx->fd, &buf, &size);
+    if (is_tls) {
+        iovlen = 0;
+    }
+    return trace_enter_write(ctx, ctx->fd, is_tls, buf, size, iovlen);
 }
 
 SEC("tracepoint/syscalls/sys_enter_sendmsg")
@@ -737,7 +869,14 @@ int sys_enter_sendmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     if (bpf_probe_read(&msghdr, sizeof(msghdr), (void *)ctx->buf)) {
         return 0;
     }
-    return trace_enter_write(ctx, ctx->fd, 0, (char*)msghdr.msg_iov, 0, msghdr.msg_iovlen);
+    char *buf = (char*)msghdr.msg_iov;
+    __u64 size = 0;
+    __u64 iovlen = msghdr.msg_iovlen;
+    __u16 is_tls = ssl_claim_write(bpf_get_current_pid_tgid(), ctx->fd, &buf, &size);
+    if (is_tls) {
+        iovlen = 0;
+    }
+    return trace_enter_write(ctx, ctx->fd, is_tls, buf, size, iovlen);
 }
 
 struct mmsghdr {
@@ -759,13 +898,17 @@ int sys_enter_sendmmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
 
 SEC("tracepoint/syscalls/sys_enter_sendto")
 int sys_enter_sendto(struct trace_event_raw_sys_enter_rw__stub* ctx) {
-    return trace_enter_write(ctx, ctx->fd, 0, ctx->buf, ctx->size, 0);
+    char *buf = ctx->buf;
+    __u64 size = ctx->size;
+    __u16 is_tls = ssl_claim_write(bpf_get_current_pid_tgid(), ctx->fd, &buf, &size);
+    return trace_enter_write(ctx, ctx->fd, is_tls, buf, size, 0);
 }
 
 SEC("tracepoint/syscalls/sys_enter_read")
 int sys_enter_read(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     __u64 id = bpf_get_current_pid_tgid();
     __u32 pid = id >> 32;
+    ssl_note_read_fd(id, ctx->fd);
     return trace_enter_read(id, pid, ctx->fd, ctx->buf, 0, 0);
 }
 
@@ -773,6 +916,7 @@ SEC("tracepoint/syscalls/sys_enter_readv")
 int sys_enter_readv(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     __u64 id = bpf_get_current_pid_tgid();
     __u32 pid = id >> 32;
+    ssl_note_read_fd(id, ctx->fd);
     return trace_enter_read(id, pid, ctx->fd, ctx->buf, 0, ctx->size);
 }
 
@@ -784,6 +928,7 @@ int sys_enter_recvmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
         return 0;
     }
     __u32 pid = id >> 32;
+    ssl_note_read_fd(id, ctx->fd);
     return trace_enter_read(id, pid, ctx->fd, (char*)msghdr.msg_iov, 0, msghdr.msg_iovlen);
 }
 
@@ -791,6 +936,7 @@ SEC("tracepoint/syscalls/sys_enter_recvfrom")
 int sys_enter_recvfrom(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     __u64 id = bpf_get_current_pid_tgid();
     __u32 pid = id >> 32;
+    ssl_note_read_fd(id, ctx->fd);
     return trace_enter_read(id, pid, ctx->fd, ctx->buf, 0, 0);
 }
 

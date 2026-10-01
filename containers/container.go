@@ -2250,15 +2250,26 @@ func (c *Container) revalidateListens(now time.Time, actualListens map[netaddr.I
 	}
 }
 
+// libssl is not always mapped by a process's first connection: .NET dlopen()s
+// it on first TLS use, and `sh -c '...; exec curl'` keeps the pid across the
+// exec. A miss is retried while the process has connections (new connects and
+// the periodic active-connection walk) instead of being final.
+const (
+	openSslMaxChecks       = 5
+	openSslRecheckInterval = 10 * time.Second
+)
+
 func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32) {
 	p := c.processes[pid]
 	if p == nil {
 		return
 	}
-	if !p.openSslUprobesChecked {
+	if !p.openSslUprobesChecked && time.Since(p.openSslLastCheck) >= openSslRecheckInterval {
+		p.openSslLastCheck = time.Now()
+		p.openSslChecks++
 		openSslUprobes := tracer.AttachOpenSslUprobes(pid)
 		p.uprobes = append(p.uprobes, openSslUprobes...)
-		p.openSslUprobesChecked = true
+		p.openSslUprobesChecked = len(openSslUprobes) > 0 || p.openSslChecks >= openSslMaxChecks
 	}
 	if !p.goTlsUprobesChecked {
 		uprobes, isGolangApp := tracer.AttachGoTlsUprobes(pid)
