@@ -94,6 +94,10 @@ type Registry struct {
 	// This handles the race condition between ring buffer (L7 events) and perf buffer (TCP events)
 	pendingL7Events     []pendingL7Event
 	pendingL7EventsLock sync.Mutex
+
+	// llmDestinations are the endpoints already marked in the kernel as LLM
+	// API destinations (Container.detectLLMEndpoint), keyed by "ip:port".
+	llmDestinations sync.Map
 }
 
 // pendingL7Event stores an L7 event that's waiting for its connection to be established

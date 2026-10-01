@@ -77,7 +77,8 @@ not captured:
 
 | Outcome         | Meaning                                                                 |
 | --------------- | ----------------------------------------------------------------------- |
-| `tagged`        | a connection was identified and marked for capture                      |
+| `tagged`        | a connection was identified (TLS SNI or API path) and marked for capture |
+| `tagged_destination` | a new connection to a known LLM endpoint was captured from its first write |
 | `completed`     | a request's usage was extracted                                         |
 | `no_usage`      | the response carried no usage (an error, or a stream without it)        |
 | `undecodable`   | the response used an unsupported content encoding (for example `br`)    |
@@ -88,7 +89,9 @@ not captured:
 | `capacity`      | a container had too many captured connections                           |
 
 `node_agent_l7_tls_ciphertext_skipped_total` counts the encrypted socket
-events the kernel skipped on TLS connections it already sees in plaintext.
+events the kernel skipped on TLS connections it already sees in plaintext,
+and `node_agent_llm_capture_drops_total` the capture chunks lost because the
+ring buffer was full.
 
 ## Sample queries
 

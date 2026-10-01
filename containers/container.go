@@ -1051,6 +1051,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	if c.feedLLMCaptureFromL7(pid, fd, timestamp, r) {
 		return nil, L7RequestProcessed
 	}
+	c.detectLLMEndpoint(pid, fd, timestamp, r, socketInfo)
 
 	conn := c.connectionsByPidFd[PidFd{Pid: pid, Fd: fd}]
 	if conn == nil {
@@ -1204,16 +1205,6 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 
 		// Update stats with extracted trace ID (uses resolved key if migrated above)
 		c.l7Stats.observe(r.Protocol, r.Status.Http(), httpCtx.Method, httpCtx.Path, r.Duration, conn.DestinationKey, conn.srcWorkload, r, httpCtx.TraceID)
-
-		// An LLM API request on a connection that was not identified by its
-		// TLS ClientHello: a gateway or self-hosted model server reached over
-		// plain HTTP, or a keep-alive connection opened before the agent
-		// started. This request has already gone by; capture the rest.
-		if llm.IsAPIPath(httpCtx.Path) {
-			provider, _ := llm.ProviderForHost(httpCtx.Host)
-			c.startLLMCapture(pid, fd, timestamp, llm.Tag{Provider: provider, Host: stripPort(httpCtx.Host)})
-			c.tagLLMDestination(socketInfo)
-		}
 
 		// Create trace with processed context
 		if trace != nil {

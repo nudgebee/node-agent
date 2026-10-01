@@ -466,3 +466,27 @@ func TestReplayHTTP1MidStreamRecovers(t *testing.T) {
 		}
 	}
 }
+
+// A client that opens a connection per request (Connection: close) to a
+// streaming endpoint: the shape of an in-cluster gateway client.
+func TestReplayHTTP1ConnectionClosePerRequest(t *testing.T) {
+	srv := newServer(t, openAIChat)
+	for i := 0; i < 3; i++ {
+		rec := &recorder{}
+		client := &http.Client{Transport: &http.Transport{DialTLSContext: dialRecorded(srv, rec, "http/1.1"), DisableKeepAlives: true}}
+		resp, err := client.Post(srv.URL+"/v1/chat/completions", "application/json",
+			strings.NewReader(`{"model":"gpt-test","stream":true,"stream_options":{"include_usage":true},"messages":[{"content":"`+strings.Repeat("q", 38000)+`"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		exchanges, outcomes := replay(t, rec, 64<<10, 0)
+		if len(exchanges) != 1 || len(outcomes) != 0 {
+			t.Fatalf("exchanges=%d outcomes=%v", len(exchanges), outcomes)
+		}
+		if e := exchanges[0]; e.Outcome != OutcomeCompleted || e.Usage.Output != 7 {
+			t.Errorf("outcome=%s usage=%+v", e.Outcome, e.Usage)
+		}
+	}
+}

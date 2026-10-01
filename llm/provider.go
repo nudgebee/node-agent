@@ -4,6 +4,7 @@
 package llm
 
 import (
+	"bytes"
 	"net"
 	"net/url"
 	"regexp"
@@ -190,4 +191,28 @@ func bedrockModel(segment string) string {
 		}
 	}
 	return segment
+}
+
+// RequestPathAndHost reads the target and Host header of an HTTP/1.x
+// request from the start of its bytes.
+func RequestPathAndHost(b []byte) (path, host string) {
+	end := bytes.Index(b, []byte("\r\n"))
+	if end < 0 {
+		return "", ""
+	}
+	parts := bytes.SplitN(b[:end], []byte(" "), 3)
+	if len(parts) != 3 {
+		return "", ""
+	}
+	path = string(parts[1])
+	for _, line := range bytes.Split(b[end+2:], []byte("\r\n")) {
+		if len(line) == 0 {
+			break
+		}
+		if k, v, ok := bytes.Cut(line, []byte(":")); ok && strings.EqualFold(string(k), "host") {
+			host = strings.TrimSpace(string(v))
+			break
+		}
+	}
+	return path, host
 }

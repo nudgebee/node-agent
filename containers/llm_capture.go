@@ -1,6 +1,7 @@
 package containers
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -51,6 +52,7 @@ func (c *Container) startLLMCapture(pid uint32, fd uint64, ts uint64, tag llm.Ta
 		return
 	}
 	c.newLLMCapture(pid, fd, ts, tag)
+	LLMCaptureTotal.WithLabelValues("tagged").Inc()
 	klog.V(2).Infof("LLM capture started: pid=%d fd=%d host=%s provider=%s", pid, fd, tag.Host, tag.Provider)
 }
 
@@ -64,7 +66,6 @@ func (c *Container) newLLMCapture(pid uint32, fd uint64, ts uint64, tag llm.Tag)
 		func(o llm.Outcome) { LLMCaptureTotal.WithLabelValues(string(o)).Inc() },
 	)
 	c.llmCaptures[pidFd] = lc
-	LLMCaptureTotal.WithLabelValues("tagged").Inc()
 }
 
 // feedLLMCapture hands a chunk of a captured connection to its parser, and
@@ -115,23 +116,49 @@ func (c *Container) onLLMData(e ebpftracer.Event) {
 			return
 		}
 		c.newLLMCapture(e.Pid, e.Fd, e.Timestamp, llm.Tag{})
+		LLMCaptureTotal.WithLabelValues("tagged_destination").Inc()
 	}
 	c.feedLLMCapture(e.Pid, e.Fd, e.Timestamp, d.Ingress, d.Data, d.Time, d.SkipAfter)
 }
 
-// tagLLMDestination has the kernel capture every new connection to the
-// destination of an LLM API request seen on an unmarked connection.
-func (c *Container) tagLLMDestination(si *ebpftracer.SocketInfo) {
-	if si == nil || !si.Valid {
+// detectLLMEndpoint recognises an LLM API request on a connection that was
+// not identified by its TLS ClientHello: a gateway or self-hosted model
+// server reached over plain HTTP, or a keep-alive connection opened before
+// the agent started. The request itself has gone by; the rest of the
+// connection is captured. It works from the request bytes and the socket
+// tuple alone, ahead of connection tracking, which short-lived connections
+// often outrun. Called with c.lock held.
+func (c *Container) detectLLMEndpoint(pid uint32, fd uint64, ts uint64, r *l7.RequestData, si *ebpftracer.SocketInfo) {
+	if r.Protocol != l7.ProtocolHTTP {
+		return
+	}
+	path, host := llm.RequestPathAndHost(r.Payload)
+	if !llm.IsAPIPath(path) {
+		return
+	}
+	provider, _ := llm.ProviderForHost(host)
+	c.startLLMCapture(pid, fd, ts, llm.Tag{Provider: provider, Host: stripPort(host)})
+	// Clients of gateways often open a connection per request, so the
+	// destination is marked too and the kernel captures every new connection
+	// to it from its first write. Only for plain HTTP: a TLS endpoint has a
+	// hostname of its own, and an HTTPS address can be a shared front end.
+	if r.TLS || si == nil || !si.Valid {
 		return
 	}
 	ip, err := netaddr.ParseIP(si.DstIP)
 	if err != nil {
 		return
 	}
-	if err := c.registry.tracer.TagLLMDestination(ip, si.DstPort); err != nil {
-		klog.Warningf("failed to mark %s:%d as an LLM endpoint: %v", si.DstIP, si.DstPort, err)
+	key := fmt.Sprintf("%s:%d", si.DstIP, si.DstPort)
+	if _, done := c.registry.llmDestinations.LoadOrStore(key, struct{}{}); done {
+		return
 	}
+	if err := c.registry.tracer.TagLLMDestination(ip, si.DstPort); err != nil {
+		klog.Warningf("failed to mark %s as an LLM endpoint: %v", key, err)
+		c.registry.llmDestinations.Delete(key)
+		return
+	}
+	klog.Infof("LLM endpoint detected: %s (path %s, host %s); capturing new connections to it", key, path, host)
 }
 
 // feedLLMCaptureFromL7 routes a generic L7 event of a captured connection.
@@ -171,11 +198,22 @@ func (c *Container) feedLLMCaptureFromL7(pid uint32, fd uint64, ts uint64, r *l7
 // processed after a capture of the next one has started. Called with c.lock
 // held.
 func (c *Container) closeLLMCapture(pid uint32, fd uint64, ts uint64) {
-	lc := c.llmCaptures[PidFd{Pid: pid, Fd: fd}]
+	pidFd := PidFd{Pid: pid, Fd: fd}
+	lc := c.llmCaptures[pidFd]
 	if lc == nil || !lc.closedAt.IsZero() || (lc.ts != 0 && ts != 0 && lc.ts != ts) {
 		return
 	}
 	lc.closedAt = time.Now()
+	// Released on a timer rather than at the next gc: a response delimited
+	// by the connection closing only ends when its stream does.
+	time.AfterFunc(llmCaptureGrace, func() {
+		c.lock.Lock()
+		defer c.lock.Unlock()
+		if c.llmCaptures[pidFd] == lc {
+			lc.conn.Close()
+			delete(c.llmCaptures, pidFd)
+		}
+	})
 }
 
 // gcLLMCaptures releases captures that are closed, idle, or whose process is

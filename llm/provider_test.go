@@ -52,3 +52,13 @@ func TestProviderForHost(t *testing.T) {
 		}
 	}
 }
+
+func TestRequestPathAndHost(t *testing.T) {
+	path, host := RequestPathAndHost([]byte("POST /v1/chat/completions HTTP/1.1\r\nUser-Agent: x\r\nhost: llm-gateway:8000\r\nContent-Length: 2\r\n\r\n{}"))
+	if path != "/v1/chat/completions" || host != "llm-gateway:8000" {
+		t.Errorf("got %q %q", path, host)
+	}
+	if path, _ := RequestPathAndHost([]byte("\x16\x03\x01garbage")); path != "" {
+		t.Errorf("got %q from a non-HTTP payload", path)
+	}
+}
