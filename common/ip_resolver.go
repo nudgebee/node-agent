@@ -17,6 +17,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -1079,6 +1080,47 @@ func resolveEphemeralWorkloadName(labels map[string]string, namespace string) st
 	return namespace + "-ephemeral"
 }
 
+// labelDerivedOwner names the label that carries a stable workload name, and
+// the kind to publish with it.
+type labelDerivedOwner struct {
+	nameLabel string
+	kind      string
+}
+
+// labelDerivedOwners covers custom controllers whose direct pod owner is
+// created per pod, so publishing it would mint a new workload for every pod.
+// The informer cache cannot climb these chains (the owners are CRDs we hold no
+// informer or RBAC for), so the stable workload name is read from a label the
+// controller stamps on every pod it creates.
+var labelDerivedOwners = map[schema.GroupKind]labelDerivedOwner{
+	// GitHub Actions Runner Controller (gha-runner-scale-set): Pod ->
+	// EphemeralRunner (one per job) -> EphemeralRunnerSet (renamed whenever the
+	// runner spec changes) -> AutoscalingRunnerSet.
+	{Group: "actions.github.com", Kind: "EphemeralRunner"}: {
+		nameLabel: "actions.github.com/scale-set-name",
+		kind:      "AutoscalingRunnerSet",
+	},
+}
+
+// resolveLabelDerivedOwner returns the stable workload for a pod whose
+// controller is listed in labelDerivedOwners. ok is false when the owner is not
+// listed or the pod lacks the label, leaving the caller's resolution intact.
+func resolveLabelDerivedOwner(owner metav1.OwnerReference, labels map[string]string) (name, kind string, ok bool) {
+	gv, err := schema.ParseGroupVersion(owner.APIVersion)
+	if err != nil {
+		return "", "", false
+	}
+	derived, ok := labelDerivedOwners[schema.GroupKind{Group: gv.Group, Kind: owner.Kind}]
+	if !ok {
+		return "", "", false
+	}
+	name = labels[derived.nameLabel]
+	if name == "" {
+		return "", "", false
+	}
+	return name, derived.kind, true
+}
+
 func (resolver *K8sIPResolver) resolvePodDescriptor(pod *MinimalPod) Workload {
 	existing, ok := resolver.snapshot.PodDescriptors.Load(pod.UID)
 	if ok {
@@ -1108,6 +1150,11 @@ func (resolver *K8sIPResolver) resolvePodDescriptor(pod *MinimalPod) Workload {
 			}
 			name = ownerRef.Name
 			kind = ownerRef.Kind
+			if derivedName, derivedKind, ok := resolveLabelDerivedOwner(ownerRef, pod.Labels); ok {
+				name = derivedName
+				kind = derivedKind
+				break
+			}
 			// Climb to the top of the ownership chain (e.g. Pod -> ReplicaSet ->
 			// Deployment). NOTE: `current` and `err` are deliberately declared in
 			// this scope. The previous implementation used `:=` inside an `if`
