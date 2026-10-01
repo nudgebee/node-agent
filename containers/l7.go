@@ -1,9 +1,6 @@
 package containers
 
 import (
-	"regexp"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -61,45 +58,6 @@ func (si *stringInterner) intern(s string) string {
 	return s
 }
 
-var (
-	uuidRegex       = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
-	hexRegex        = regexp.MustCompile(`[a-fA-F0-9]{8,}`)
-	numericRegex    = regexp.MustCompile(`\d`)
-	alphaNumericMix = regexp.MustCompile(`[a-zA-Z].*\d|\d.*[a-zA-Z]`)
-)
-
-func normalizeHttpPath(path string) string {
-	if i := strings.Index(path, "?"); i != -1 {
-		path = path[:i]
-	}
-	if path == "" {
-		return ""
-	}
-	parts := strings.Split(path, "/")
-	for i, p := range parts {
-		if p == "" {
-			continue
-		}
-		if uuidRegex.MatchString(p) {
-			parts[i] = "{uuid}"
-			continue
-		}
-		if _, err := strconv.Atoi(p); err == nil {
-			parts[i] = "{id}"
-			continue
-		}
-		if hexRegex.MatchString(p) && len(p) >= 8 {
-			parts[i] = "{hex}"
-			continue
-		}
-		if alphaNumericMix.MatchString(p) && len(p) >= 10 {
-			parts[i] = "{id}"
-			continue
-		}
-	}
-	return strings.Join(parts, "/")
-}
-
 type L7Stats struct {
 	mu              sync.RWMutex
 	requests        map[l7.Protocol]*prometheus.CounterVec
@@ -155,7 +113,7 @@ func (s *L7Stats) observe(protocol l7.Protocol, status, method, path string, dur
 		counterLabelValues = append(counterLabelValues, labelInterner.intern(method))
 	case l7.ProtocolHTTP:
 		if ValidUtf8([]byte(path)) {
-			counterLabelValues = append(counterLabelValues, labelInterner.intern(normalizeHttpPath(path)))
+			counterLabelValues = append(counterLabelValues, labelInterner.intern(common.NormalizeHTTPPath(path)))
 		} else {
 			counterLabelValues = append(counterLabelValues, "")
 		}
