@@ -316,17 +316,30 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 	}
 
 	traceId := sanitizeUTF8(t.ExtractTraceId(headers))
-	t.createSpan(sanitizeUTF8(method), duration, status >= 400,
-		traceId,
-		semconv.HTTPURL(fmt.Sprintf("%s://%s%s", protocol, requestHost, requestPath)),
+	attrs := httpURLAttributes(protocol, requestHost, requestPath)
+	attrs = append(attrs,
 		semconv.HTTPMethod(sanitizeUTF8(method)),
 		semconv.HTTPStatusCode(int(status)),
 		semconv.HTTPRequestContentLength(int(requestSize)),
 		attribute.Key("http.request_payload").String(sanitizeUTF8(requestPayload)),
 		attribute.Key("http.headers").String(sanitizeUTF8(requestHeaders)),
 		attribute.Key("http.response").String(sanitizeUTF8(responsePayload)),
-		attribute.Key("http.path").String(sanitizeUTF8(requestPath)),
 	)
+	t.createSpan(sanitizeUTF8(method), duration, status >= 400, traceId, attrs...)
+}
+
+// httpURLAttributes returns an HTTP span's URL attributes. http.url and
+// http.path carry the normalized path (query string dropped, ID segments
+// templated, the same rules as the HTTP metrics' path label) because trace
+// backends group on them: the raw path made one group per session or record
+// ID. The exact request URL is kept in url.full.
+func httpURLAttributes(scheme, host, path string) []attribute.KeyValue {
+	normalized := common.NormalizeHTTPPath(path)
+	return []attribute.KeyValue{
+		semconv.HTTPURL(fmt.Sprintf("%s://%s%s", scheme, host, normalized)),
+		attribute.Key("http.path").String(normalized),
+		attribute.Key("url.full").String(fmt.Sprintf("%s://%s%s", scheme, host, path)),
+	}
 }
 
 func (t *Trace) Http2Request(method, path, scheme string, status, grpcStatus l7.Status, duration time.Duration) {
@@ -343,11 +356,11 @@ func (t *Trace) Http2Request(method, path, scheme string, status, grpcStatus l7.
 		scheme = "unknown"
 	}
 
-	attrs := []attribute.KeyValue{
-		semconv.HTTPURL(fmt.Sprintf("%s://%s%s", scheme, t.dest().String(), path)),
+	attrs := httpURLAttributes(scheme, t.dest().String(), path)
+	attrs = append(attrs,
 		semconv.HTTPMethod(method),
 		semconv.HTTPStatusCode(int(status)),
-	}
+	)
 	if grpcStatus >= 0 {
 		attrs = append(attrs, semconv.RPCGRPCStatusCodeKey.Int(int(grpcStatus)))
 	}
