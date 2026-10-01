@@ -113,8 +113,11 @@ func replay(t *testing.T, rec *recorder, maxChunk int, from int) ([]*Exchange, [
 	c := NewConn(Tag{Provider: ProviderGemini, Host: "example.com"},
 		func(e *Exchange) { mu.Lock(); exchanges = append(exchanges, e); mu.Unlock() },
 		func(o Outcome) { mu.Lock(); outcomes = append(outcomes, o); mu.Unlock() })
+	rec.mu.Lock()
+	chunks := append([]chunk(nil), rec.chunks...)
+	rec.mu.Unlock()
 	var pendingSkip [2]uint64
-	for _, ch := range rec.chunks[from:] {
+	for _, ch := range chunks[from:] {
 		data := ch.data
 		skip := pendingSkip[ch.dir]
 		pendingSkip[ch.dir] = 0
@@ -488,5 +491,43 @@ func TestReplayHTTP1ConnectionClosePerRequest(t *testing.T) {
 		if e := exchanges[0]; e.Outcome != OutcomeCompleted || e.Usage.Output != 7 {
 			t.Errorf("outcome=%s usage=%+v", e.Outcome, e.Usage)
 		}
+	}
+}
+
+// A client that cancels a stream mid-response sends RST_STREAM; the server
+// never finishes it. The request must still be reported, not leak.
+func TestReplayHTTP2ClientCancel(t *testing.T) {
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		for i := 0; i < 50; i++ {
+			_, _ = io.WriteString(w, `data: {"candidates":[{"content":{"parts":[{"text":"x"}]}}]}`+"\r\n\r\n")
+			flush(w, w)
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+	})
+	rec := &recorder{}
+	client := h2Client(srv, rec)
+	ctx, cancel := context.WithCancel(context.Background())
+	req, _ := http.NewRequestWithContext(ctx, "POST", srv.URL+"/v1beta/models/gemini-test-flash:streamGenerateContent?alt=sse", strings.NewReader(`{}`))
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64)
+	_, _ = resp.Body.Read(buf)
+	cancel()
+	_ = resp.Body.Close()
+	time.Sleep(100 * time.Millisecond)
+	exchanges, _ := replay(t, rec, 0, 0)
+	if len(exchanges) != 1 {
+		t.Fatalf("got %d exchanges, want 1", len(exchanges))
+	}
+	if e := exchanges[0]; e.Model != "gemini-test-flash" || e.Outcome != OutcomeNoUsage {
+		t.Errorf("model=%q outcome=%s", e.Model, e.Outcome)
 	}
 }

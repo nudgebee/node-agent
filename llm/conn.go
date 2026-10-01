@@ -379,6 +379,17 @@ func (c *Conn) h2Egress() {
 			}
 			return
 		}
+		if rst, ok := f.(*http2.RSTStreamFrame); ok {
+			// The client gave up on the stream (a cancelled context): the
+			// server will not finish it, so it ends here.
+			c.mu.Lock()
+			if s := c.streams[rst.StreamID]; s != nil && !s.done {
+				s.done, s.end = true, c.egress.tsAt(frameStart(c.egress, rst.Header()))
+			}
+			c.mu.Unlock()
+			c.h2MaybeFinish(rst.StreamID)
+			continue
+		}
 		mh, ok := f.(*http2.MetaHeadersFrame)
 		if !ok {
 			continue
