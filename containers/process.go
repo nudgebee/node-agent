@@ -42,6 +42,8 @@ type Process struct {
 	uprobes               []link.Link
 	goTlsUprobesChecked   bool
 	openSslUprobesChecked bool
+	openSslChecks         int
+	openSslLastCheck      time.Time
 	pythonGilChecked      bool
 	nodejsChecked         bool
 	nodejsPrevStats       *ebpftracer.NodejsStats

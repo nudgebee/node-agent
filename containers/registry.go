@@ -707,6 +707,7 @@ func (r *Registry) updateEbpfStatsAndActiveConns() {
 	iter := r.tracer.ActiveConnectionsIterator()
 	cid := ebpftracer.ConnectionId{}
 	stats := ebpftracer.Connection{}
+	tlsRechecked := map[uint32]bool{}
 	for iter.Next(&cid, &stats) {
 		r.containerLock.RLock()
 		c := r.containersByPid[cid.PID]
@@ -719,6 +720,13 @@ func (r *Registry) updateEbpfStatsAndActiveConns() {
 				BytesReceived: stats.BytesReceived,
 				Protocol:      stats.Protocol,
 			})
+			// A process that keeps one connection open never produces another
+			// connect event, so a libssl miss on its first connect would
+			// otherwise never be retried.
+			if !tlsRechecked[cid.PID] {
+				tlsRechecked[cid.PID] = true
+				c.attachTlsUprobes(r.tracer, cid.PID)
+			}
 		}
 	}
 	if err := iter.Err(); err != nil {

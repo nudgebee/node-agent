@@ -1,194 +1,104 @@
-struct unused {};
-typedef long (*unused_fn)();
+// OpenSSL uprobes. Nothing here reads the SSL or BIO structs: the fd an SSL
+// object talks to is learned from the socket syscalls on the same thread (see
+// ssl_write_pending/ssl_read_pending/ssl_fds in l7.c), so the same programs
+// serve every OpenSSL release and applications that bring their own BIO.
 
-struct bio_st {
-    struct unused* method;
-    unused_fn callback;
-    char* cb_arg;
-    int init;
-    int shutdown;
-    int flags;
-    int retry_reason;
-    int num; // fd
-};
+static inline __attribute__((__always_inline__))
+__u64 ssl_known_fd(__u32 pid, __u64 ssl) {
+    struct ssl_key k = {};
+    k.ssl = ssl;
+    k.pid = pid;
+    __u64 *fd = bpf_map_lookup_elem(&ssl_fds, &k);
+    if (!fd) {
+        return 0;
+    }
+    return *fd;
+}
 
-struct bio_st_v1_1_1 {
-    struct unused* method;
-    unused_fn callback;
-    unused_fn callback_ex; // new field
-    char* cb_arg;
-    int init;
-    int shutdown;
-    int flags;
-    int retry_reason;
-    int num; // fd
-};
-
-struct bio_st_v3_0 {
-    struct unused* context; // new field
-    struct unused* method;
-    unused_fn callback;
-    unused_fn callback_ex;
-    char* cb_arg;
-    int init;
-    int shutdown;
-    int flags;
-    int retry_reason;
-    int num; // fd
-};
-
-// OpenSSL 1.x: ssl_st has rbio/wbio directly
-struct ssl_st {
-    __s32 version;
-    struct unused* method;
-    struct bio_st* rbio;  // used by SSL_read
-    struct bio_st* wbio;  // used by SSL_write
-};
-
-// OpenSSL 3.x: ssl_st is a base struct embedded in ssl_connection_st.
-// rbio/wbio moved to ssl_connection_st at offset 80/88.
-// Layout: ssl_st(64 bytes) + user_ssl(8) + version(4) + pad(4) + rbio + wbio
-#define SSL_V3_RBIO_OFFSET 80
-#define SSL_V3_WBIO_OFFSET 88
-
-#define GET_FD(ctx, bio_t, bio_rw)                                      \
-({                                                                      \
-    struct ssl_st ssl;                                                  \
-    if (bpf_probe_read(&ssl, sizeof(ssl), (void*)PT_REGS_PARM1(ctx))) { \
-        return 0;                                                       \
-    };                                                                  \
-    struct bio_t bio;                                                   \
-    if (bpf_probe_read(&bio, sizeof(bio), (void*)ssl.bio_rw)) {         \
-        return 0;                                                       \
-    };                                                                  \
-    __u32 fd = bio.num;                                                 \
-    if (fd <= 2) {                                                      \
-        return 0;                                                       \
-    }                                                                   \
-    fd;                                                                 \
-})
-
-#define GET_FD_V3(ctx, bio_rw_offset)                                       \
-({                                                                          \
-    void *bio_ptr;                                                          \
-    if (bpf_probe_read(&bio_ptr, sizeof(bio_ptr),                           \
-        (void*)PT_REGS_PARM1(ctx) + bio_rw_offset)) {                      \
-        return 0;                                                           \
-    };                                                                      \
-    struct bio_st_v3_0 bio;                                                 \
-    if (bpf_probe_read(&bio, sizeof(bio), bio_ptr)) {                       \
-        return 0;                                                           \
-    };                                                                      \
-    __u32 fd = bio.num;                                                     \
-    if (fd <= 2) {                                                          \
-        return 0;                                                           \
-    }                                                                       \
-    fd;                                                                     \
-})
-
-#define WRITE_ENTER(ctx, bio_t)                                 \
-({                                                              \
-    __u32 fd = GET_FD(ctx, bio_t, wbio);                        \
-    __u64 pid_tgid = bpf_get_current_pid_tgid();                \
-    __u32 pid = pid_tgid >> 32;                                 \
-    ensure_connection_tracked(pid, fd);                         \
-    char* buf_ptr = (char*)PT_REGS_PARM2(ctx);                  \
-    __u64 buf_size = PT_REGS_PARM3(ctx);                        \
-    return trace_enter_write(ctx, fd, 1, buf_ptr, buf_size, 0); \
-})
-
-#define READ_ENTER(ctx, bio_t)                           \
-({                                                       \
-    __u32 fd = GET_FD(ctx, bio_t, rbio);                 \
-    char* buf_ptr = (char*)PT_REGS_PARM2(ctx);           \
-    __u64 pid_tgid = bpf_get_current_pid_tgid();         \
-    __u32 pid = pid_tgid >> 32;                          \
-    ensure_connection_tracked(pid, fd);                  \
-    __u64 id = pid_tgid | IS_TLS_READ_ID;                \
-    return trace_enter_read(id, pid, fd, buf_ptr, 0, 0); \
-})
-
-#define READ_EX_ENTER(ctx, bio_t)                              \
-({                                                             \
-    __u32 fd = GET_FD(ctx, bio_t, rbio);                       \
-    char* buf_ptr = (char*)PT_REGS_PARM2(ctx);                 \
-    __u64 pid_tgid = bpf_get_current_pid_tgid();               \
-    __u32 pid = pid_tgid >> 32;                                \
-    ensure_connection_tracked(pid, fd);                        \
-    __u64 id = pid_tgid | IS_TLS_READ_ID;                      \
-    __u64* ret_ptr = (__u64*)PT_REGS_PARM4(ctx);               \
-    return trace_enter_read(id, pid, fd, buf_ptr, ret_ptr, 0); \
-})
-
+// SSL_write(ssl, buf, num) and SSL_write_ex(ssl, buf, num, written).
 SEC("uprobe/openssl_SSL_write_enter")
 int openssl_SSL_write_enter(struct pt_regs *ctx) {
-    WRITE_ENTER(ctx, bio_st);
+    __u64 tid = bpf_get_current_pid_tgid();
+    __u32 pid = tid >> 32;
+    __u64 ssl = (__u64)PT_REGS_PARM1(ctx);
+    char *buf = (char *)PT_REGS_PARM2(ctx);
+    __u64 size = PT_REGS_PARM3(ctx);
+
+    __u64 fd = ssl_known_fd(pid, ssl);
+    if (fd) {
+        ensure_connection_tracked(pid, fd);
+        return trace_enter_write(ctx, fd, 1, buf, size, 0);
+    }
+    // First write on this SSL object: the socket write that follows on this
+    // thread names the fd (sys_enter_write and friends in l7.c).
+    struct ssl_args args = {};
+    args.buf = buf;
+    args.size = size;
+    args.ssl = ssl;
+    args.ns = bpf_ktime_get_ns();
+    bpf_map_update_elem(&ssl_write_pending, &tid, &args, BPF_ANY);
+    return 0;
 }
 
-SEC("uprobe/openssl_SSL_write_enter_v1_1_1")
-int openssl_SSL_write_enter_v1_1_1(struct pt_regs *ctx) {
-    WRITE_ENTER(ctx, bio_st_v1_1_1);
+static inline __attribute__((__always_inline__))
+int ssl_read_enter(struct pt_regs *ctx, __u64 *ret) {
+    __u64 tid = bpf_get_current_pid_tgid();
+    struct ssl_args args = {};
+    args.buf = (char *)PT_REGS_PARM2(ctx);
+    args.ret = ret;
+    args.ssl = (__u64)PT_REGS_PARM1(ctx);
+    bpf_map_update_elem(&ssl_read_pending, &tid, &args, BPF_ANY);
+    return 0;
 }
 
-SEC("uprobe/openssl_SSL_write_enter_v3_0")
-int openssl_SSL_write_enter_v3_0(struct pt_regs *ctx) {
-    __u32 fd = GET_FD_V3(ctx, SSL_V3_WBIO_OFFSET);
-    __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u32 pid = pid_tgid >> 32;
-    ensure_connection_tracked(pid, fd);
-    char* buf_ptr = (char*)PT_REGS_PARM2(ctx);
-    __u64 buf_size = PT_REGS_PARM3(ctx);
-    return trace_enter_write(ctx, fd, 1, buf_ptr, buf_size, 0);
-}
-
+// SSL_read(ssl, buf, num)
 SEC("uprobe/openssl_SSL_read_enter")
 int openssl_SSL_read_enter(struct pt_regs *ctx) {
-    READ_ENTER(ctx, bio_st);
+    return ssl_read_enter(ctx, 0);
 }
 
+// SSL_read_ex(ssl, buf, num, readbytes)
 SEC("uprobe/openssl_SSL_read_ex_enter")
 int openssl_SSL_read_ex_enter(struct pt_regs *ctx) {
-    READ_EX_ENTER(ctx, bio_st);
-}
-
-SEC("uprobe/openssl_SSL_read_enter_v1_1_1")
-int openssl_SSL_read_enter_v1_1_1(struct pt_regs *ctx) {
-    READ_ENTER(ctx, bio_st_v1_1_1);
-}
-
-SEC("uprobe/openssl_SSL_read_ex_enter_v1_1_1")
-int openssl_SSL_read_ex_enter_v1_1_1(struct pt_regs *ctx) {
-    READ_EX_ENTER(ctx, bio_st_v1_1_1);
-}
-
-SEC("uprobe/openssl_SSL_read_enter_v3_0")
-int openssl_SSL_read_enter_v3_0(struct pt_regs *ctx) {
-    __u32 fd = GET_FD_V3(ctx, SSL_V3_RBIO_OFFSET);
-    char* buf_ptr = (char*)PT_REGS_PARM2(ctx);
-    __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u32 pid = pid_tgid >> 32;
-    ensure_connection_tracked(pid, fd);
-    __u64 id = pid_tgid | IS_TLS_READ_ID;
-    return trace_enter_read(id, pid, fd, buf_ptr, 0, 0);
-}
-
-SEC("uprobe/openssl_SSL_read_ex_enter_v3_0")
-int openssl_SSL_read_ex_enter_v3_0(struct pt_regs *ctx) {
-    __u32 fd = GET_FD_V3(ctx, SSL_V3_RBIO_OFFSET);
-    char* buf_ptr = (char*)PT_REGS_PARM2(ctx);
-    __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u32 pid = pid_tgid >> 32;
-    ensure_connection_tracked(pid, fd);
-    __u64 id = pid_tgid | IS_TLS_READ_ID;
-    __u64* ret_ptr = (__u64*)PT_REGS_PARM4(ctx);
-    return trace_enter_read(id, pid, fd, buf_ptr, ret_ptr, 0);
+    return ssl_read_enter(ctx, (__u64 *)PT_REGS_PARM4(ctx));
 }
 
 SEC("uprobe/openssl_SSL_read_exit")
 int openssl_SSL_read_exit(struct pt_regs *ctx) {
-    __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u64 pid = pid_tgid >> 32;
-    __u64 id = pid_tgid | IS_TLS_READ_ID;
-    int ret = (int)PT_REGS_RC(ctx);
-    return trace_exit_read(ctx, id, pid, 1, ret);
+    __u64 tid = bpf_get_current_pid_tgid();
+    __u32 pid = tid >> 32;
+    struct ssl_args *args = bpf_map_lookup_elem(&ssl_read_pending, &tid);
+    if (!args) {
+        return 0;
+    }
+    char *buf = args->buf;
+    __u64 *ret_ptr = args->ret;
+    __u64 fd = args->fd;
+    __u64 ssl = args->ssl;
+    bpf_map_delete_elem(&ssl_read_pending, &tid);
+
+    if (!fd) {
+        // No socket read inside SSL_read: either the plaintext was already
+        // buffered, or a memory BIO application (.NET) read the ciphertext
+        // itself beforehand.
+        fd = ssl_known_fd(pid, ssl);
+        if (!fd) {
+            return 0;
+        }
+    }
+    ensure_connection_tracked(pid, fd);
+    __u64 id = tid | IS_TLS_READ_ID;
+    trace_enter_read(id, pid, fd, buf, ret_ptr, 0);
+    return trace_exit_read(ctx, id, pid, 1, (int)PT_REGS_RC(ctx));
+}
+
+// SSL_free(ssl): the pointer may be reused by the next SSL_new, which must not
+// inherit this connection's fd.
+SEC("uprobe/openssl_SSL_free_enter")
+int openssl_SSL_free_enter(struct pt_regs *ctx) {
+    struct ssl_key k = {};
+    k.ssl = (__u64)PT_REGS_PARM1(ctx);
+    k.pid = bpf_get_current_pid_tgid() >> 32;
+    bpf_map_delete_elem(&ssl_fds, &k);
+    return 0;
 }

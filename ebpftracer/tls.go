@@ -101,6 +101,9 @@ func (t *Tracer) AttachOpenSslUprobes(pid uint32) []link.Link {
 			l.Close()
 		}
 	}
+	// The programs are the same for every OpenSSL release: they never read the
+	// SSL/BIO structs, whose layout is what used to differ between versions.
+	// The version only decides whether the _ex variants exist.
 	writeEnter := "openssl_SSL_write_enter"
 	readEnter := "openssl_SSL_read_enter"
 	readExEnter := "openssl_SSL_read_ex_enter"
@@ -109,16 +112,6 @@ func (t *Tracer) AttachOpenSslUprobes(pid uint32) []link.Link {
 	if err != nil {
 		log("failed to determine version", err)
 		return nil
-	}
-	switch {
-	case v.GreaterOrEqual(common.NewVersion(3, 0, 0)):
-		writeEnter = "openssl_SSL_write_enter_v3_0"
-		readEnter = "openssl_SSL_read_enter_v3_0"
-		readExEnter = "openssl_SSL_read_ex_enter_v3_0"
-	case v.GreaterOrEqual(common.NewVersion(1, 1, 1)):
-		writeEnter = "openssl_SSL_write_enter_v1_1_1"
-		readEnter = "openssl_SSL_read_enter_v1_1_1"
-		readExEnter = "openssl_SSL_read_ex_enter_v1_1_1"
 	}
 
 	type prog struct {
@@ -130,6 +123,7 @@ func (t *Tracer) AttachOpenSslUprobes(pid uint32) []link.Link {
 		{symbol: "SSL_write", uprobe: writeEnter},
 		{symbol: "SSL_read", uprobe: readEnter},
 		{symbol: "SSL_read", uretprobe: readExit},
+		{symbol: "SSL_free", uprobe: "openssl_SSL_free_enter"},
 	}
 	if v.GreaterOrEqual(common.NewVersion(1, 1, 1)) {
 		progs = append(progs, []prog{
