@@ -1266,7 +1266,11 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			parser.DestClass = h2DestClass
 		}
 		conn.http2Parser = parser // Keep reference on connection for compatibility
-		requests := parser.Parse(r.Method, r.Payload, r.KernelTime, r.PayloadSize > uint64(len(r.Payload)))
+		var missing uint64
+		if r.PayloadSize > uint64(len(r.Payload)) {
+			missing = r.PayloadSize - uint64(len(r.Payload))
+		}
+		requests := parser.Parse(r.Method, r.Payload, r.KernelTime, missing)
 
 		// HTTP/2 has the weakest detection heuristic of any protocol here — it
 		// accepts arbitrary binary as a frame roughly once every 9k buffers —

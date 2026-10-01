@@ -177,6 +177,11 @@ type Http2Parser struct {
 	clientPartialFrame []byte
 	serverPartialFrame []byte
 
+	// Bytes still to skip at the start of the next read, per direction: the
+	// rest of a frame the kernel cut short. See Parse.
+	clientSkip uint64
+	serverSkip uint64
+
 	// Pending header block fragments for HEADERS + CONTINUATION reassembly
 	// Only one pending header block can exist per direction at a time
 	clientPendingHeaders *pendingHeaderBlock
@@ -384,12 +389,16 @@ func (p *Http2Parser) decodeHeaderBlock(
 
 // Parse consumes one L7 event's worth of HTTP/2 frames.
 //
-// truncated reports that the kernel captured only a prefix of the original
-// write: eBPF clamps each event to MAX_PAYLOAD_SIZE and drops the tail, so the
-// caller must pass PayloadSize > len(payload). It matters because a partial
-// frame at the end of a truncated payload is unrecoverable and must not be
-// carried into the next call — see the save site at the end of this function.
-func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64, truncated bool) []Http2Request {
+// missing is the number of bytes of the original read or write that the
+// kernel did not capture: eBPF clamps each event to MAX_PAYLOAD_SIZE and drops
+// the tail, so the caller passes PayloadSize - len(payload). A partial frame at
+// the end of a truncated payload is unrecoverable and must not be carried into
+// the next call — see the save site at the end of this function — but when the
+// missing bytes all belong to that frame, its remainder at the start of the
+// next read is known exactly and is skipped, so framing survives the cut.
+// That is the common case: Go reads 4096 bytes and the kernel keeps 4095.
+func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64, missing uint64) []Http2Request {
+	truncated := missing > 0
 	if method == MethodHttp2ClientFrames {
 		l := len(http2.ClientPreface)
 		if len(payload) >= l && string(payload[:l]) == http2.ClientPreface {
@@ -411,17 +420,39 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64, tr
 	// This handles HTTP/2 frames split across multiple S2A/TLS Read() calls
 	var partialFrame *[]byte
 	var pendingHeaders **pendingHeaderBlock
+	var skip *uint64
 	switch method {
 	case MethodHttp2ClientFrames:
 		decoder = p.clientDecoder
 		partialFrame = &p.clientPartialFrame
 		pendingHeaders = &p.clientPendingHeaders
+		skip = &p.clientSkip
 	case MethodHttp2ServerFrames:
 		decoder = p.serverDecoder
 		partialFrame = &p.serverPartialFrame
 		pendingHeaders = &p.serverPendingHeaders
+		skip = &p.serverSkip
 	default:
 		return nil
+	}
+
+	if *skip > 0 {
+		readLen := uint64(len(payload)) + missing
+		switch {
+		case *skip >= readLen:
+			// The whole read is the inside of a frame cut short earlier.
+			*skip -= readLen
+			p.sawValidFrame = true
+			return nil
+		case *skip <= uint64(len(payload)):
+			payload = payload[*skip:]
+			*skip = 0
+		default:
+			// The frame ends inside this read's own missing tail: whatever
+			// follows it was never captured, so framing is lost.
+			*skip = 0
+			return nil
+		}
 	}
 
 	if len(*partialFrame) > 0 {
@@ -615,6 +646,15 @@ frameLoop:
 	// This is why large-header HTTPS/2 endpoints decode nothing while small
 	// internal h2c (frames well under 4KB) works: only the former truncates.
 	if truncated {
+		// If the missing tail lies entirely within the cut frame, the rest of
+		// that frame opens the next read: skip exactly that much there.
+		if rest := len(payload) - offset; rest >= http2FrameHeaderLength {
+			length := uint64(binary.BigEndian.Uint32(payload[offset:]) >> 8)
+			captured := uint64(rest - http2FrameHeaderLength)
+			if length >= captured+missing {
+				*skip = length - captured - missing
+			}
+		}
 		*partialFrame = nil
 		// A header block interrupted by truncation can never be completed by a
 		// CONTINUATION frame, and feeding its fragments to the decoder later
