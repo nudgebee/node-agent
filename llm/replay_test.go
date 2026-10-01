@@ -423,3 +423,46 @@ func TestReplayHTTP2MidStreamIsMissedStart(t *testing.T) {
 		t.Errorf("outcomes=%v, want [missed_start]", outcomes)
 	}
 }
+
+// HTTP/1.1 recovers when capture starts mid-connection: the requests after
+// the first one are reassembled in full.
+func TestReplayHTTP1MidStreamRecovers(t *testing.T) {
+	srv := newServer(t, openAIChat)
+	rec := &recorder{}
+	client := h1Client(srv, rec)
+	for i := 0; i < 3; i++ {
+		body := `{"model":"gpt-test"}`
+		if i == 0 {
+			body = `{"model":"gpt-test","messages":[{"content":"` + strings.Repeat("p", 200000) + `"}]}`
+		}
+		resp, err := client.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+	// Start in the middle of the first request's body.
+	from := -1
+	for i, ch := range rec.chunks {
+		if i > 0 && ch.dir == Egress && rec.chunks[i-1].dir == Egress {
+			from = i
+			break
+		}
+	}
+	if from < 0 {
+		t.Fatal("first request was not split across writes")
+	}
+	exchanges, outcomes := replay(t, rec, 0, from)
+	if len(outcomes) != 1 || outcomes[0] != OutcomeMissedStart {
+		t.Errorf("outcomes=%v, want [missed_start]", outcomes)
+	}
+	if len(exchanges) != 2 {
+		t.Fatalf("got %d exchanges, want 2", len(exchanges))
+	}
+	for _, e := range exchanges {
+		if e.Outcome != OutcomeCompleted || e.Usage.Output != 200 {
+			t.Errorf("outcome=%s usage=%+v", e.Outcome, e.Usage)
+		}
+	}
+}
