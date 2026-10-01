@@ -54,6 +54,40 @@ struct {
     __uint(max_entries, 1);
 } llm_capture_drops SEC(".maps");
 
+// llm_dests holds destinations (address and port, as the socket sees them)
+// that userspace has seen serve LLM API requests: gateways and self-hosted
+// model servers, which have no hostname to recognise in a ClientHello. Every
+// new connection to one is marked for capture at its first write, which is
+// the only way to capture clients that open a connection per request.
+struct llm_dest_key {
+    __u8 daddr[16];
+    __u16 dport;
+    __u8 padding[6];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(key_size, sizeof(struct llm_dest_key));
+    __uint(value_size, sizeof(__u8));
+    __uint(max_entries, 1024);
+} llm_dests SEC(".maps");
+
+static inline __attribute__((__always_inline__))
+void llm_tag_by_destination(struct connection_id *cid, struct connection *conn) {
+    struct socket_tuple tuple = {};
+    if (!get_socket_tuple_from_fd((__u32)cid->fd, &tuple)) {
+        return;
+    }
+    struct llm_dest_key k = {};
+    __builtin_memcpy(k.daddr, tuple.daddr, sizeof(k.daddr));
+    k.dport = tuple.dport;
+    if (!bpf_map_lookup_elem(&llm_dests, &k)) {
+        return;
+    }
+    __u64 ts = conn->timestamp;
+    bpf_map_update_elem(&llm_conns, cid, &ts, BPF_ANY);
+}
+
 static inline __attribute__((__always_inline__))
 void llm_emit(struct llm_event *e, char *src, __u64 len, __u64 skip_after) {
     asm volatile ("%0 &= %1" : "+r"(len) : "i"(LLM_CHUNK - 1));

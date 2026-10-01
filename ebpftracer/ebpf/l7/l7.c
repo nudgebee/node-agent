@@ -435,6 +435,9 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
         return 0;
     }
 
+    if (!is_tls && conn != &conn_on_stack && conn->bytes_sent == 0) {
+        llm_tag_by_destination(&cid, conn);
+    }
     if (!is_tls) {
         __sync_fetch_and_add(&conn->bytes_sent, total_size);
     }

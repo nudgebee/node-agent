@@ -169,6 +169,11 @@ func (c *Conn) Feed(dir Direction, data []byte, ts uint64, skipped uint64) {
 			c.requests = make(chan *request, 64)
 			go c.h1Requests()
 			go c.h1Responses()
+		case len(data) > 1 && data[0] >= 0x14 && data[0] <= 0x17 && data[1] == 0x03:
+			// TLS records: a connection marked by destination is captured
+			// from its first write, which for HTTPS is the handshake. The
+			// plaintext follows once the TLS library takes over.
+			return
 		default:
 			// Capture started mid-connection. HTTP/1.1 recovers at the next
 			// request; HTTP/2 never does, since its header compression state is

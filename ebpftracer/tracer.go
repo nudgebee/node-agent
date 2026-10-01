@@ -211,6 +211,26 @@ func (t *Tracer) TagLLMConnection(pid uint32, fd uint64, connTimestamp uint64) e
 	return m.Update(ConnectionId{FD: fd, PID: pid}, connTimestamp, ebpf.UpdateAny)
 }
 
+// TagLLMDestination marks a destination, as a socket sees it (before any
+// NAT), as an LLM API endpoint: every new connection to it is captured from
+// its first write.
+func (t *Tracer) TagLLMDestination(ip netaddr.IP, port uint16) error {
+	m := t.readyMap("llm_dests")
+	if m == nil {
+		return errors.New("ebpf collection not loaded")
+	}
+	var key [24]byte
+	if ip.Is4() {
+		a := ip.As4()
+		copy(key[0:4], a[:])
+	} else {
+		a := ip.As16()
+		copy(key[0:16], a[:])
+	}
+	binary.LittleEndian.PutUint16(key[16:18], port)
+	return m.Update(key, uint8(1), ebpf.UpdateAny)
+}
+
 func (t *Tracer) readyMap(name string) *ebpf.Map {
 	if !t.ready.Load() || t.collection == nil {
 		return nil

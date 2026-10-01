@@ -1212,6 +1212,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		if llm.IsAPIPath(httpCtx.Path) {
 			provider, _ := llm.ProviderForHost(httpCtx.Host)
 			c.startLLMCapture(pid, fd, timestamp, llm.Tag{Provider: provider, Host: stripPort(httpCtx.Host)})
+			c.tagLLMDestination(socketInfo)
 		}
 
 		// Create trace with processed context

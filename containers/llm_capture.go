@@ -10,6 +10,7 @@ import (
 	"github.com/coroot/coroot-node-agent/llm"
 	"github.com/coroot/coroot-node-agent/tracing"
 	"golang.org/x/sys/unix"
+	"inet.af/netaddr"
 	"k8s.io/klog/v2"
 )
 
@@ -49,6 +50,14 @@ func (c *Container) startLLMCapture(pid uint32, fd uint64, ts uint64, tag llm.Ta
 		klog.Warningf("failed to mark pid=%d fd=%d for LLM capture: %v", pid, fd, err)
 		return
 	}
+	c.newLLMCapture(pid, fd, ts, tag)
+	klog.V(2).Infof("LLM capture started: pid=%d fd=%d host=%s provider=%s", pid, fd, tag.Host, tag.Provider)
+}
+
+// newLLMCapture sets up userspace for a connection the kernel captures.
+// Called with c.lock held.
+func (c *Container) newLLMCapture(pid uint32, fd uint64, ts uint64, tag llm.Tag) {
+	pidFd := PidFd{Pid: pid, Fd: fd}
 	lc := &llmCapture{ts: ts, lastData: time.Now()}
 	lc.conn = llm.NewConn(tag,
 		func(e *llm.Exchange) { c.onLLMExchange(pidFd, e) },
@@ -56,7 +65,6 @@ func (c *Container) startLLMCapture(pid uint32, fd uint64, ts uint64, tag llm.Ta
 	)
 	c.llmCaptures[pidFd] = lc
 	LLMCaptureTotal.WithLabelValues("tagged").Inc()
-	klog.V(2).Infof("LLM capture started: pid=%d fd=%d host=%s provider=%s", pid, fd, tag.Host, tag.Provider)
 }
 
 // feedLLMCapture hands a chunk of a captured connection to its parser, and
@@ -88,7 +96,42 @@ func (c *Container) onLLMData(e ebpftracer.Event) {
 	d := e.LLMData
 	c.lock.Lock()
 	defer c.lock.Unlock()
+	pidFd := PidFd{Pid: e.Pid, Fd: e.Fd}
+	lc := c.llmCaptures[pidFd]
+	if lc != nil && lc.ts != 0 && e.Timestamp != 0 && lc.ts != e.Timestamp {
+		// A newer connection on a reused fd, while the old one's capture
+		// is still in its grace period. The kernel's timestamp is the
+		// authority on which connection this is.
+		lc.conn.Close()
+		delete(c.llmCaptures, pidFd)
+		lc = nil
+	}
+	if lc == nil {
+		// The kernel marked this connection itself, because its destination
+		// is a known LLM endpoint (tagLLMDestination). The provider and host
+		// come from the requests.
+		if len(c.llmCaptures) >= maxLLMCapturesPerContainer {
+			LLMCaptureTotal.WithLabelValues("capacity").Inc()
+			return
+		}
+		c.newLLMCapture(e.Pid, e.Fd, e.Timestamp, llm.Tag{})
+	}
 	c.feedLLMCapture(e.Pid, e.Fd, e.Timestamp, d.Ingress, d.Data, d.Time, d.SkipAfter)
+}
+
+// tagLLMDestination has the kernel capture every new connection to the
+// destination of an LLM API request seen on an unmarked connection.
+func (c *Container) tagLLMDestination(si *ebpftracer.SocketInfo) {
+	if si == nil || !si.Valid {
+		return
+	}
+	ip, err := netaddr.ParseIP(si.DstIP)
+	if err != nil {
+		return
+	}
+	if err := c.registry.tracer.TagLLMDestination(ip, si.DstPort); err != nil {
+		klog.Warningf("failed to mark %s:%d as an LLM endpoint: %v", si.DstIP, si.DstPort, err)
+	}
 }
 
 // feedLLMCaptureFromL7 routes a generic L7 event of a captured connection.
