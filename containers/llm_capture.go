@@ -9,6 +9,7 @@ import (
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
+	"github.com/coroot/coroot-node-agent/flags"
 	"github.com/coroot/coroot-node-agent/llm"
 	"github.com/coroot/coroot-node-agent/tracing"
 	"golang.org/x/sys/unix"
@@ -144,7 +145,7 @@ func (c *Container) onLLMData(e ebpftracer.Event) {
 // tuple alone, ahead of connection tracking, which short-lived connections
 // often outrun. Called with c.lock held.
 func (c *Container) detectLLMEndpoint(pid uint32, fd uint64, ts uint64, r *l7.RequestData, si *ebpftracer.SocketInfo) {
-	if r.Protocol != l7.ProtocolHTTP {
+	if !*flags.EnableLLMCapture || r.Protocol != l7.ProtocolHTTP {
 		return
 	}
 	path, host := llm.RequestPathAndHost(r.Payload)

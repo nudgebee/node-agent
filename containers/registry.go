@@ -156,14 +156,16 @@ func NewRegistry(reg prometheus.Registerer, rawReg prometheus.Registerer, proces
 
 		processInfoCh: processInfoCh,
 		ip_resolver:   ip_resolver,
-		tracer:        ebpftracer.NewTracer(hostNetNs, selfNetNs, *flags.DisableL7Tracing),
+		tracer:        ebpftracer.NewTracer(hostNetNs, selfNetNs, *flags.DisableL7Tracing, *flags.EnableLLMCapture),
 
 		gpuProcessUsageSampleChan: gpuProcessUsageSampleChan,
 		nodeConstLabels:           NodeConstLabels{MachineID: machineId, SystemUUID: systemUuid, AZ: az, Region: region},
 	}
 	// Register LLM metrics with the same registerer used for other container metrics
 	RegisterL7SelfMetrics(reg)
-	RegisterLLMMetrics(reg)
+	if *flags.EnableLLMCapture {
+		RegisterLLMMetrics(reg)
+	}
 	if err = reg.Register(kernelCounterCollector{tracer: r.tracer}); err != nil {
 		return nil, err
 	}

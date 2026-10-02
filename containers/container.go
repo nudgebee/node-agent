@@ -1027,7 +1027,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 				destIP = ip
 			}
 		}
-		if provider, ok := llm.ProviderForHost(host); ok {
+		if provider, ok := llm.ProviderForHost(host); ok && *flags.EnableLLMCapture {
 			c.startLLMCapture(pid, fd, timestamp, llm.Tag{Provider: provider, Host: host})
 		}
 
