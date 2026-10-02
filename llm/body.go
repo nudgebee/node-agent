@@ -32,13 +32,17 @@ func decodeBody(encoding string, body []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		defer zr.Close()
 		r = zr
 	case "deflate":
 		// RFC 9110 deflate is zlib-wrapped, but raw deflate is common enough.
 		if zr, err := zlib.NewReader(bytes.NewReader(body)); err == nil {
+			defer zr.Close()
 			r = zr
 		} else {
-			r = flate.NewReader(bytes.NewReader(body))
+			fr := flate.NewReader(bytes.NewReader(body))
+			defer fr.Close()
+			r = fr
 		}
 	case "zstd":
 		zr, err := zstd.NewReader(bytes.NewReader(body), zstd.WithDecoderConcurrency(1))

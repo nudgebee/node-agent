@@ -444,6 +444,13 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
 
     if (is_tls) {
         mark_tls(conn);
+        if (conn == &conn_on_stack) {
+            // The mark must outlive this call for the socket-level ciphertext
+            // that follows to be skipped, so the connection is tracked from
+            // here on.
+            conn_on_stack.timestamp = bpf_ktime_get_ns();
+            bpf_map_update_elem(&active_connections, &cid, &conn_on_stack, BPF_NOEXIST);
+        }
     } else if (conn->tls) {
         if (is_tls_clienthello(payload, size)) {
             // A ClientHello on a TLS-marked fd is a new session on a reused
