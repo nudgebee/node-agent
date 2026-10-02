@@ -9,6 +9,17 @@ the traffic is captured in eBPF on the node.
 This feature is specific to this fork and is not present in upstream
 `coroot/coroot-node-agent`.
 
+## Enabling
+
+LLM capture is off by default. Enable it with `--enable-llm-capture` (or
+`ENABLE_LLM_CAPTURE=true`). It requires L7 tracing, which is on unless
+`--disable-l7-tracing` is set.
+
+While it is off, the feature costs one map lookup per socket read and write
+in the kernel and nothing in userspace. While it is on, the kernel also
+checks the destination of each new connection once, and the traffic of LLM
+API connections (only those) is copied and parsed in userspace.
+
 ## How it works
 
 1. **Identification.** A connection is identified as an LLM API

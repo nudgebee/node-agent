@@ -110,6 +110,7 @@ const (
 
 type Tracer struct {
 	disableL7Tracing bool
+	enableLLMCapture bool
 	hostNetNs        netns.NsHandle
 	selfNetNs        netns.NsHandle
 
@@ -126,12 +127,18 @@ type Tracer struct {
 	ready atomic.Bool
 }
 
-func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool) *Tracer {
+func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing, enableLLMCapture bool) *Tracer {
 	if disableL7Tracing {
 		klog.Infoln("L7 tracing is disabled")
 	}
+	// LLM capture rides on the L7 programs.
+	enableLLMCapture = enableLLMCapture && !disableL7Tracing
+	if enableLLMCapture {
+		klog.Infoln("LLM capture is enabled")
+	}
 	return &Tracer{
 		disableL7Tracing: disableL7Tracing,
+		enableLLMCapture: enableLLMCapture,
 		hostNetNs:        hostNetNs,
 		selfNetNs:        selfNetNs,
 
@@ -191,6 +198,9 @@ func (t *Tracer) TLSCiphertextSkipped() (writes, reads uint64, ok bool) {
 // LLMCaptureDrops returns how many LLM capture chunks the kernel lost because
 // the llm_events ring buffer was full.
 func (t *Tracer) LLMCaptureDrops() (uint64, bool) {
+	if !t.enableLLMCapture {
+		return 0, false
+	}
 	m := t.readyMap("llm_capture_drops")
 	if m == nil {
 		return 0, false
@@ -204,6 +214,9 @@ func (t *Tracer) LLMCaptureDrops() (uint64, bool) {
 // events, which keeps the mark from applying to a later connection reusing the
 // fd. The kernel removes the mark when the fd is closed.
 func (t *Tracer) TagLLMConnection(pid uint32, fd uint64, connTimestamp uint64) error {
+	if !t.enableLLMCapture {
+		return errors.New("LLM capture is disabled")
+	}
 	m := t.readyMap("llm_conns")
 	if m == nil {
 		return errors.New("ebpf collection not loaded")
@@ -215,6 +228,9 @@ func (t *Tracer) TagLLMConnection(pid uint32, fd uint64, connTimestamp uint64) e
 // NAT), as an LLM API endpoint: every new connection to it is captured from
 // its first write.
 func (t *Tracer) TagLLMDestination(ip netaddr.IP, port uint16) error {
+	if !t.enableLLMCapture {
+		return errors.New("LLM capture is disabled")
+	}
 	m := t.readyMap("llm_dests")
 	if m == nil {
 		return errors.New("ebpf collection not loaded")
@@ -359,6 +375,12 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		return fmt.Errorf("failed to load collection: %w", err)
 	}
 	t.collection = c
+
+	if t.enableLLMCapture {
+		if err := c.Maps["llm_capture_config"].Update(uint32(0), uint32(1), ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("failed to enable LLM capture: %w", err)
+		}
+	}
 
 	// Initialize socket info offsets for direct fd->socket tuple extraction
 	// This enables L7 event processing without dependency on TCP connection tracking
