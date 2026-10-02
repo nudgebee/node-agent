@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/coroot/coroot-node-agent/cgroup"
@@ -175,9 +174,10 @@ type Container struct {
 	srcWorkload common.Workload
 	constLabels []string // [container_id, app_id, machine_id, system_uuid, az, region]
 
-	// Atomic throttling fields for lock-free access
-	collectCallCount int64
-	lastCollectTime  int64 // Unix nanoseconds
+	// collectMu serializes Collect. Several gathers can run at once (more
+	// than one scraper, or a scrape and the remote writer), and Collect
+	// updates per-container state such as the delay accounting.
+	collectMu sync.Mutex
 }
 
 func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid uint32, registry *Registry) (*Container, error) {
@@ -311,16 +311,13 @@ func (c *Container) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *Container) Collect(ch chan<- prometheus.Metric) {
+	// Every gather gets the container's full metric set; concurrent gathers
+	// wait their turn. Answering a gather that arrives soon after another
+	// with nothing makes that scraper mark every series of the container
+	// stale, which breaks rate() and increase() over the gap.
+	c.collectMu.Lock()
+	defer c.collectMu.Unlock()
 	collectStart := time.Now()
-
-	// Throttle: prevent duplicate metric emissions within 1 second
-	currentCount := atomic.AddInt64(&c.collectCallCount, 1)
-	nowNanos := time.Now().UnixNano()
-	lastCollectNanos := atomic.LoadInt64(&c.lastCollectTime)
-	if time.Duration(nowNanos-lastCollectNanos) < 1*time.Second && currentCount > 1 {
-		return
-	}
-	atomic.StoreInt64(&c.lastCollectTime, nowNanos)
 
 	if c.metadata.image != "" || !c.metadata.systemd.IsEmpty() {
 		ch <- c.gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemd.TriggeredBy, c.metadata.systemd.Type)
