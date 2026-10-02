@@ -11,25 +11,26 @@ var tlsCiphertextSkippedDesc = prometheus.NewDesc(
 	[]string{"direction"}, nil,
 )
 
-// tlsSkipCollector exports the kernel's per-CPU count of ciphertext events it
-// declined to parse. Before the kernel made that distinction, every one of
-// these reached the L7 parsers as if it were protocol data.
+// kernelCounterCollector exports counters the eBPF programs keep in per-CPU
+// maps: socket-level ciphertext events skipped on TLS connections (before the
+// kernel made that distinction, every one reached the L7 parsers as if it were
+// protocol data), and LLM capture chunks lost to a full ring buffer.
 var llmCaptureDropsDesc = prometheus.NewDesc(
 	"node_agent_llm_capture_drops_total",
 	"LLM capture chunks lost in the kernel because the L7 ring buffer was full",
 	nil, nil,
 )
 
-type tlsSkipCollector struct {
+type kernelCounterCollector struct {
 	tracer *ebpftracer.Tracer
 }
 
-func (c tlsSkipCollector) Describe(ch chan<- *prometheus.Desc) {
+func (c kernelCounterCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- tlsCiphertextSkippedDesc
 	ch <- llmCaptureDropsDesc
 }
 
-func (c tlsSkipCollector) Collect(ch chan<- prometheus.Metric) {
+func (c kernelCounterCollector) Collect(ch chan<- prometheus.Metric) {
 	writes, reads, ok := c.tracer.TLSCiphertextSkipped()
 	if !ok {
 		return
