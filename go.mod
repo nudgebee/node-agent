@@ -6,7 +6,7 @@ require (
 	github.com/ClickHouse/ch-go v0.65.0
 	github.com/NVIDIA/go-nvml v0.13.3-0
 	github.com/agoda-com/opentelemetry-logs-go v0.6.0
-	github.com/cilium/cilium v1.17.16
+	github.com/cilium/cilium v1.17.17
 	github.com/cilium/ebpf v0.20.0
 	github.com/containerd/cgroups v1.1.0
 	github.com/containerd/containerd v1.7.33
@@ -207,7 +207,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	k8s.io/apiextensions-apiserver v0.32.13 // indirect
 	k8s.io/kube-openapi v0.0.0-20241105132330-32ad38e42d3f // indirect
-	k8s.io/utils v0.0.0-20260319190234-28399d86e0b5 // indirect
+	k8s.io/utils v0.0.0-20260507154919-ff6756f316d2 // indirect
 	sigs.k8s.io/controller-runtime v0.20.4 // indirect
 	sigs.k8s.io/gateway-api v1.2.1 // indirect
 	sigs.k8s.io/json v0.0.0-20241010143419-9aa6b5e7a4b3 // indirect
