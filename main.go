@@ -260,7 +260,7 @@ func main() {
 
 	// Metrics endpoint with timeout protection
 	http.Handle("/metrics", http.TimeoutHandler(
-		promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: logger{}, Registry: registerer}),
+		promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: logger{}, Registry: registerer, ErrorHandling: promhttp.ContinueOnError}),
 		30*time.Second,
 		"Metrics collection timeout",
 	))

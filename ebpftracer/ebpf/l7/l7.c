@@ -84,7 +84,8 @@ struct l7_event {
     __u64 duration;
     __u8 protocol;
     __u8 method;
-    __u16 padding;
+    __u8 is_tls;  // payload came from a TLS library hook, i.e. it is plaintext
+    __u8 padding;
     __u32 statement_id;
     __u64 payload_size;
     __u64 response_size;
@@ -223,6 +224,9 @@ void send_event(void *ctx, struct l7_event *e, struct connection_id cid, struct 
     e->connection_timestamp = conn->timestamp;
     e->fd = cid.fd;
     e->pid = cid.pid;
+    // Socket-level events on TLS-marked connections are dropped before they
+    // get here, so on such a connection every event carries plaintext.
+    e->is_tls = conn->tls;
 
     // Extract socket info directly from fd - no dependency on TCP events
     // This fixes Go goroutine thread-switching issues where TCP connection
@@ -315,6 +319,50 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
 // garbage.
 #define HTTP2_DETECTION_WINDOW_BYTES 65536
 
+// tls_ciphertext_skipped counts socket-level events dropped by mark_tls'
+// rule, per direction (0 = write, 1 = read). Userspace exports the sum as
+// node_agent_l7_tls_ciphertext_skipped_total.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, 2);
+} tls_ciphertext_skipped SEC(".maps");
+
+static inline __attribute__((__always_inline__))
+void count_ciphertext_skip(__u32 direction) {
+    __u64 *v = bpf_map_lookup_elem(&tls_ciphertext_skipped, &direction);
+    if (v) {
+        *v += 1;
+    }
+}
+
+// mark_tls records that a TLS library hook handles this connection.
+//
+// A TLS connection is seen twice: once as plaintext by the Go crypto/tls or
+// OpenSSL uprobes, and once as ciphertext by the read/write syscalls, both
+// under the same pid+fd. The connection entry had no way to tell them apart,
+// so once plaintext identified a connection as HTTP/2 its ciphertext took the
+// same fast path into the same userspace parser. A TLS record header parses as
+// an HTTP/2 frame header whose type is the high byte of the record length and
+// whose length is 0x170303: 4KB records surfaced as "extension" frames, small
+// ones were held as a partial 1.5MB frame that swallowed the real frames after
+// them, and HPACK decoding desynchronised. Ciphertext is useless for L7, so
+// once a hook has seen the connection the socket-level path ignores it.
+//
+// Whatever protocol was detected before the first mark came from handshake
+// bytes, so it is cleared to be re-detected from plaintext.
+static inline __attribute__((__always_inline__))
+void mark_tls(struct connection *conn) {
+    if (conn->tls) {
+        return;
+    }
+    conn->tls = 1;
+    conn->protocol = PROTOCOL_UNKNOWN;
+}
+
+#include "llm_capture.c"
+
 static inline __attribute__((__always_inline__))
 int http2_detection_allowed(struct connection *conn) {
     if (!conn) {
@@ -387,8 +435,37 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
         return 0;
     }
 
+    if (!is_tls && conn != &conn_on_stack && conn->bytes_sent == 0) {
+        llm_tag_by_destination(&cid, conn);
+    }
     if (!is_tls) {
         __sync_fetch_and_add(&conn->bytes_sent, total_size);
+    }
+
+    if (is_tls) {
+        mark_tls(conn);
+        if (conn == &conn_on_stack) {
+            // The mark must outlive this call for the socket-level ciphertext
+            // that follows to be skipped, so the connection is tracked from
+            // here on.
+            conn_on_stack.timestamp = bpf_ktime_get_ns();
+            bpf_map_update_elem(&active_connections, &cid, &conn_on_stack, BPF_NOEXIST);
+        }
+    } else if (conn->tls) {
+        if (is_tls_clienthello(payload, size)) {
+            // A ClientHello on a TLS-marked fd is a new session on a reused
+            // fd whose entry was never replaced: start over so its SNI is
+            // captured below and its plaintext is detected afresh.
+            conn->tls = 0;
+            conn->protocol = PROTOCOL_UNKNOWN;
+        } else {
+            count_ciphertext_skip(0);
+            return 0;
+        }
+    }
+
+    if (conn != &conn_on_stack && llm_capture(&cid, conn, 0, payload, size, total_size)) {
+        return 0;
     }
 
     struct l7_request *req = bpf_map_lookup_elem(&l7_request_heap, &zero);
@@ -639,6 +716,17 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
         __sync_fetch_and_add(&conn->bytes_received, total_size);
     }
 
+    if (is_tls) {
+        mark_tls(conn);
+    } else if (conn->tls) {
+        count_ciphertext_skip(1);
+        return 0;
+    }
+
+    if (conn != &conn_on_stack && llm_capture(&cid, conn, 1, payload, total_size, total_size)) {
+        return 0;
+    }
+
     struct l7_event *e = reserve_l7_event();
     if (!e) {
         return 0;
@@ -837,6 +925,15 @@ void ssl_note_read_fd(__u64 tid, __u64 fd) {
     }
     args->fd = fd;
     ssl_remember_fd(pid, args->ssl, fd);
+    // This read pulls ciphertext for SSL_read: mark the connection now so the
+    // read itself is skipped, not just the ones after SSL_read returns.
+    struct connection_id cid = {};
+    cid.pid = pid;
+    cid.fd = fd;
+    struct connection *conn = bpf_map_lookup_elem(&active_connections, &cid);
+    if (conn) {
+        mark_tls(conn);
+    }
 }
 
 // The write handlers make a single trace_enter_write call with either the TLS

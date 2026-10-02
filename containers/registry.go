@@ -95,10 +95,9 @@ type Registry struct {
 	pendingL7Events     []pendingL7Event
 	pendingL7EventsLock sync.Mutex
 
-	// llmDetector provides connection-level LLM detection from DNS cache.
-	// Shared across all containers so DNS resolutions from one container
-	// benefit LLM detection in others.
-	llmDetector *LLMDetector
+	// llmDestinations are the endpoints already marked in the kernel as LLM
+	// API destinations (Container.detectLLMEndpoint), keyed by "ip:port".
+	llmDestinations sync.Map
 }
 
 // pendingL7Event stores an L7 event that's waiting for its connection to be established
@@ -161,10 +160,13 @@ func NewRegistry(reg prometheus.Registerer, rawReg prometheus.Registerer, proces
 
 		gpuProcessUsageSampleChan: gpuProcessUsageSampleChan,
 		nodeConstLabels:           NodeConstLabels{MachineID: machineId, SystemUUID: systemUuid, AZ: az, Region: region},
-		llmDetector:               NewLLMDetector(),
 	}
 	// Register LLM metrics with the same registerer used for other container metrics
+	RegisterL7SelfMetrics(reg)
 	RegisterLLMMetrics(reg)
+	if err = reg.Register(kernelCounterCollector{tracer: r.tracer}); err != nil {
+		return nil, err
+	}
 	if err = reg.Register(r); err != nil {
 		return nil, err
 	}
@@ -294,9 +296,6 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			// themselves, so a reconnect to an IP whose mapping was dropped
 			// emits no DNS packet and the destination degrades to a bare IP.
 			r.ip2fqdn.GC()
-			if r.llmDetector != nil {
-				r.llmDetector.GC(llmDetectorMaxIPCache)
-			}
 		case sample := <-r.gpuProcessUsageSampleChan:
 			r.containerLock.RLock()
 			c := r.containersByPid[sample.Pid]
@@ -399,6 +398,13 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				klog.V(5).Infof("L7_EVENT_REGISTRY: pid=%d fd=%d protocol=%d timestamp=%d",
 					e.Pid, e.Fd, e.L7Request.Protocol, e.Timestamp)
 				r.processL7Event(e)
+			case ebpftracer.EventTypeLLMData:
+				r.containerLock.RLock()
+				c := r.containersByPid[e.Pid]
+				r.containerLock.RUnlock()
+				if c != nil {
+					c.onLLMData(e)
+				}
 			}
 			// Process any pending L7 events after handling new events
 			r.processPendingL7Events()
@@ -427,8 +433,6 @@ func (r *Registry) processL7Event(e ebpftracer.Event) {
 			r.ip2fqdn.Put(ip, domain)
 			r.ip_resolver.CacheDNS(ip.String(), domain.FQDN)
 		}
-		// Feed DNS resolutions to LLM detector for connection-level detection
-		r.feedDNSToLLMDetector(ip2fqdn)
 	} else if e.L7Request.Protocol == l7.ProtocolTLSClientHello {
 		// SNI events from pids not yet tracked in containersByPid (transient
 		// processes, or the race where the main /app/services pid is sending
@@ -444,7 +448,6 @@ func (r *Registry) processL7Event(e ebpftracer.Event) {
 			r.ip2fqdn.Put(ip, domain)
 			r.ip_resolver.CacheDNS(ip.String(), domain.FQDN)
 		}
-		r.feedDNSToLLMDetector(ip2fqdn)
 	}
 }
 
@@ -794,21 +797,6 @@ func (r *Registry) evictStaleCounterLabels() {
 
 func (r *Registry) getDomain(ip netaddr.IP) *common.Domain {
 	return r.ip2fqdn.Get(ip)
-}
-
-// feedDNSToLLMDetector notifies the LLM detector about DNS resolutions.
-// This builds the IP→LLM provider cache for connection-level detection.
-func (r *Registry) feedDNSToLLMDetector(ip2fqdn map[netaddr.IP]*common.Domain) {
-	if r.llmDetector == nil || len(ip2fqdn) == 0 {
-		return
-	}
-	for ip, domain := range ip2fqdn {
-		if domain == nil || domain.FQDN == "" {
-			continue
-		}
-		// OnDNS will check if it's an LLM provider internally
-		r.llmDetector.OnDNS(domain.FQDN, []netaddr.IP{ip})
-	}
 }
 
 // handleHostDNSRequest processes DNS queries from non-monitored processes

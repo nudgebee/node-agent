@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,7 @@ import (
 	"github.com/coroot/coroot-node-agent/ebpftracer"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/coroot/coroot-node-agent/flags"
+	"github.com/coroot/coroot-node-agent/llm"
 	"github.com/coroot/coroot-node-agent/logs"
 	"github.com/coroot/coroot-node-agent/node"
 	"github.com/coroot/coroot-node-agent/pinger"
@@ -147,9 +149,9 @@ type Container struct {
 	l7Stats    L7Stats
 	tcpMetrics *TCPMetrics
 
-	// LLM observability pipeline
-	llmDetector *LLMDetector // Connection-level LLM detection (shared across containers via registry)
-	llmParser   *LLMParser   // Per-container LLM response parser
+	// Connections identified as LLM API connections, whose byte stream the
+	// kernel copies in full (see llm_capture.go).
+	llmCaptures map[PidFd]*llmCapture
 
 	gpuStats map[string]*GpuUsage
 
@@ -269,12 +271,7 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		constLabels: constLabels,
 	}
 
-	// Initialize LLM pipeline
-	c.llmDetector = registry.llmDetector
-	c.llmParser = NewLLMParser(string(id), src_workload.Name, src_workload.Namespace,
-		func(event *LLMEvent) {
-			c.onLLMEvent(event)
-		})
+	c.llmCaptures = map[PidFd]*llmCapture{}
 
 	c.runLogParser("")
 
@@ -298,10 +295,7 @@ func (c *Container) Close() {
 	for _, p := range c.logParsers {
 		p.Stop()
 	}
-	// Stop the LLM parser
-	if c.llmParser != nil {
-		c.llmParser.Stop()
-	}
+	c.closeAllLLMCaptures()
 	close(c.done)
 }
 
@@ -851,6 +845,7 @@ func (c *Container) reclaimStaleConnections(now time.Time) {
 
 func (c *Container) onConnectionClose(e ebpftracer.Event) {
 	c.lock.Lock()
+	c.closeLLMCapture(e.Pid, e.Fd, e.Timestamp)
 	conn := c.connectionsByPidFd[PidFd{Pid: e.Pid, Fd: e.Fd}]
 	if conn == nil {
 		c.lock.Unlock()
@@ -898,52 +893,6 @@ func (c *Container) updateConnectionTrafficStats(ac *ActiveConnection, sent, rec
 	ac.BytesReceived = received
 	if sentDelta > 0 || recvDelta > 0 {
 		c.tcpMetrics.ObserveTraffic(ac.DestinationKey, ac.srcWorkload, sentDelta, recvDelta)
-	}
-}
-
-// onLLMEvent is called by LLMParser when an LLM request completes (streaming or non-streaming).
-// Single code path for all LLM metrics and traces.
-func (c *Container) onLLMEvent(event *LLMEvent) {
-	if event == nil {
-		return
-	}
-
-	// Record Prometheus metrics
-	RecordLLMEvent(event)
-
-	// Emit OTel trace if tracer is available
-	if c.tracer != nil {
-		dstWorkload := common.Workload{Name: event.ServerAddress}
-		trace := c.tracer.NewTrace(
-			common.HostPortWithEmptyIP(event.ServerAddress, 443),
-			c.srcWorkload,
-			dstWorkload,
-			dstWorkload,
-		)
-		if trace != nil {
-			requestTime := time.Now().Add(-event.Duration)
-			completionTime := time.Now()
-			var firstTokenTime time.Time
-			if event.TTFT > 0 {
-				firstTokenTime = requestTime.Add(event.TTFT)
-			}
-
-			trace.LLMRequest(tracing.LLMStreamInfo{
-				Provider:       string(event.Provider),
-				Model:          event.Model,
-				Operation:      event.Operation,
-				ServerAddress:  event.ServerAddress,
-				TraceID:        event.TraceID,
-				ParentSpanID:   event.ParentSpanID,
-				RequestTime:    requestTime,
-				FirstTokenTime: firstTokenTime,
-				CompletionTime: completionTime,
-				InputTokens:    event.InputTokens,
-				OutputTokens:   event.OutputTokens,
-				StatusCode:     event.StatusCode,
-				IsError:        event.StatusCode >= 400,
-			})
-		}
 	}
 }
 
@@ -1058,9 +1007,8 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	// not a matching timestamp. The conn lookup and timestamp-equality checks
 	// downstream both reject ClientHellos: Go's crypto/tls runs the handshake
 	// on goroutines that may not be associated with the fd by tcp_connect yet,
-	// and the eBPF event timestamp rarely matches conn.Timestamp. Handle SNI
-	// here so we don't lose the only signal that survives mid-stream-join
-	// HPACK failure on long-lived HTTP/2 connections.
+	// and the eBPF event timestamp rarely matches conn.Timestamp. The SNI is
+	// what identifies an LLM API connection, before any request is sent.
 	if r.Protocol == l7.ProtocolTLSClientHello {
 		host, err := l7.ParseSNI(r.Payload)
 		if err != nil || host == "" {
@@ -1079,12 +1027,8 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 				destIP = ip
 			}
 		}
-		if c.llmDetector != nil {
-			if tag := c.llmDetector.LateTag(pidFd, host, destIP); tag != nil {
-				LLMSNITagsTotal.WithLabelValues(string(tag.Provider)).Inc()
-				klog.V(2).Infof("LLM_SNI_TAG: pid=%d fd=%d sni=%s provider=%s",
-					pid, fd, host, tag.Provider)
-			}
+		if provider, ok := llm.ProviderForHost(host); ok {
+			c.startLLMCapture(pid, fd, timestamp, llm.Tag{Provider: provider, Host: host})
 		}
 
 		// Publish SNI as the destination FQDN. The ClientHello is the first
@@ -1104,6 +1048,11 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		return nil, L7RequestProcessed
 	}
 
+	if c.feedLLMCaptureFromL7(pid, fd, timestamp, r) {
+		return nil, L7RequestProcessed
+	}
+	c.detectLLMEndpoint(pid, fd, timestamp, r, socketInfo)
+
 	conn := c.connectionsByPidFd[PidFd{Pid: pid, Fd: fd}]
 	if conn == nil {
 		// TCP connection tracking failed - common for Go TLS due to goroutine thread switching
@@ -1115,12 +1064,10 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		}
 
 		if conn == nil {
-			// For HTTP/2 TLS connections, we can still process LLM detection using
-			// the :authority header from HTTP/2 frames (fallback path)
+			// HTTP/2 frames cannot be parsed out of order, which is what a
+			// retry would deliver them as.
 			if r.Protocol == l7.ProtocolHTTP2 {
-				klog.V(3).Infof("HTTP2_CONN_NOT_FOUND: pid=%d fd=%d container=%s - attempting connectionless processing",
-					pid, fd, c.id)
-				return c.processHTTP2WithoutConnection(pid, fd, r)
+				return nil, L7RequestProcessed
 			}
 			klog.V(3).Infof("L7_EVENT_CONN_NOT_FOUND: pid=%d fd=%d container=%s num_connections=%d",
 				pid, fd, c.id, len(c.connectionsByPidFd))
@@ -1130,13 +1077,6 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	if timestamp != 0 && conn.Timestamp != timestamp {
 		klog.V(5).Infof("L7_EVENT_TIMESTAMP_MISMATCH: pid=%d fd=%d event_ts=%d conn_ts=%d protocol=%d",
 			pid, fd, timestamp, conn.Timestamp, r.Protocol)
-		// For HTTP/2, fall through to connectionless processing instead of dropping.
-		// This handles Go TLS connections (S2A, gRPC) where ensure_connection_tracked()
-		// in eBPF creates entries with different timestamps than TCP tracepoints.
-		// Pass the destination IP so DNS cache can resolve :authority when HPACK fails.
-		if r.Protocol == l7.ProtocolHTTP2 {
-			return c.processHTTP2WithoutConnection(pid, fd, r, conn.DestinationKey.ActualDestinationIfKnown().IP())
-		}
 		return nil, L7RequestTimestampMismatch
 	}
 
@@ -1156,7 +1096,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			destClass = "external"
 		}
 		proto := protocolLabel(r.Protocol)
-		L7EventsTotal.WithLabelValues(proto, destClass, frameDirection(r.Method)).Inc()
+		L7EventsTotal.WithLabelValues(proto, destClass, frameDirection(r.Method), strconv.FormatBool(r.TLS)).Inc()
 		if r.PayloadSize > uint64(len(r.Payload)) {
 			L7PayloadTruncatedTotal.WithLabelValues(proto, destClass).Inc()
 		}
@@ -1266,22 +1206,6 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		// Update stats with extracted trace ID (uses resolved key if migrated above)
 		c.l7Stats.observe(r.Protocol, r.Status.Http(), httpCtx.Method, httpCtx.Path, r.Duration, conn.DestinationKey, conn.srcWorkload, r, httpCtx.TraceID)
 
-		// LLM tracking via DNS-based connection detection
-		if c.llmParser != nil {
-			httpPidFd := PidFd{Pid: pid, Fd: fd}
-			destIP := conn.DestinationKey.ActualDestinationIfKnown().IP()
-			llmTag := c.llmDetector.IsLLMConnection(httpPidFd, destIP)
-			// Late-tag fallback from Host header
-			if llmTag == nil && httpCtx.Host != "" {
-				llmTag = c.llmDetector.LateTag(httpPidFd, httpCtx.Host, destIP)
-			}
-			if llmTag != nil {
-				c.llmParser.ParseHTTP1(llmTag, int(r.Status),
-					httpCtx.Path, extractHTTPBody(r.Payload), extractHTTPBody(r.Response),
-					r.Duration, httpCtx.TraceID)
-			}
-		}
-
 		// Create trace with processed context
 		if trace != nil {
 			trace.HttpRequest(httpCtx.Method, httpCtx.Path, r.Status, r.Duration, r.PayloadSize,
@@ -1308,8 +1232,6 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 				return nil, L7RequestProcessed
 			}
 			p := l7.NewHttp2Parser()
-			p.Lightweight = true
-			p.LLMHostChecker = isLLMRelevantHost
 			p.ConnTimestamp = conn.Timestamp
 			p.DestClass = h2DestClass
 			c.googleHTTP2Parsers[pidFd] = p
@@ -1320,7 +1242,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		// one. Count that rather than assume it does or does not happen.
 		//
 		// Only comparable when both sides carry a real timestamp. A parser created
-		// on the connectionless path (processHTTP2WithoutConnection) has none, and
+		// for a connection userspace never tracked has none, and
 		// createConnectionFromSocketInfo sets Timestamp: 0 because the socket tuple
 		// carries no timestamp. Comparing either against a real value would report
 		// a reuse that never happened, in both directions. The cost is that reuse
@@ -1335,7 +1257,11 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			parser.DestClass = h2DestClass
 		}
 		conn.http2Parser = parser // Keep reference on connection for compatibility
-		requests := parser.Parse(r.Method, r.Payload, uint64(r.Duration), r.PayloadSize > uint64(len(r.Payload)))
+		var missing uint64
+		if r.PayloadSize > uint64(len(r.Payload)) {
+			missing = r.PayloadSize - uint64(len(r.Payload))
+		}
+		requests := parser.Parse(r.Method, r.Payload, r.KernelTime, missing)
 
 		// HTTP/2 has the weakest detection heuristic of any protocol here — it
 		// accepts arbitrary binary as a frame roughly once every 9k buffers —
@@ -1379,63 +1305,9 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			}
 		}
 
-		// Feed active streams to LLM parser if this is an LLM-tagged connection
-		destIP := conn.DestinationKey.ActualDestinationIfKnown().IP()
-		llmTag := c.llmDetector.IsLLMConnection(pidFd, destIP)
-
-		// Late-tag fallback: if not tagged yet, check :authority from parsed requests
-		if llmTag == nil {
-			for _, req := range requests {
-				authority := stripPort(req.Authority)
-				if authority != "" && !isIPAddress(authority) {
-					llmTag = c.llmDetector.LateTag(pidFd, authority, destIP)
-					if llmTag != nil {
-						break
-					}
-				}
-			}
-		}
-
-		if klog.V(4).Enabled() {
-			activeStreamsDbg := parser.GetActiveStreamsForLLM()
-			authorities := []string{}
-			respLens := []int{}
-			hasStatus := []bool{}
-			for _, u := range activeStreamsDbg {
-				authorities = append(authorities, u.Authority)
-				respLens = append(respLens, len(u.ResponsePayload))
-				hasStatus = append(hasStatus, u.HasResponseStatus)
-			}
-			tagStr := "nil"
-			if llmTag != nil {
-				tagStr = string(llmTag.Provider) + "/" + llmTag.Host
-			}
-			klog.V(4).Infof("LLM_ROUTE: pid=%d fd=%d destIP=%s llmTag=%s activeStreams=%d authorities=%v respLens=%v hasStatus=%v requestsLen=%d",
-				pid, fd, destIP, tagStr, len(activeStreamsDbg), authorities, respLens, hasStatus, len(requests))
-		}
-
-		if llmTag != nil && c.llmParser != nil {
-			activeStreams := parser.GetActiveStreamsForLLM()
-			for _, update := range activeStreams {
-				// Feed request data
-				c.llmParser.FeedHTTP2Data(llmTag, update.StreamId,
-					nil, false, update.Path, 0, update.RequestHeaders)
-
-				// Feed response status
-				if update.HasResponseStatus {
-					c.llmParser.OnHTTP2Status(update.StreamId, int(update.Status))
-				}
-
-				// Feed response data
-				if len(update.ResponsePayload) > 0 {
-					c.llmParser.FeedHTTP2Data(llmTag, update.StreamId,
-						update.ResponsePayload, true, update.Path, int(update.Status), nil)
-				}
-			}
-		}
 		for _, req := range requests {
-			klog.V(4).Infof("HTTP2_COMPLETED_REQUEST: pid=%d fd=%d method=%s path=%s status=%d req_payload_len=%d resp_payload_len=%d",
-				pid, fd, req.Method, req.Path, req.Status, len(req.RequestPayload), len(req.ResponsePayload))
+			klog.V(4).Infof("HTTP2_COMPLETED_REQUEST: pid=%d fd=%d method=%s path=%s status=%d",
+				pid, fd, req.Method, req.Path, req.Status)
 			if !common.HttpFilter.ShouldBeSkipped(req.Path) {
 				status := req.Status.Http()
 				if req.GrpcStatus >= 0 {
@@ -1447,7 +1319,6 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 				}
 			}
 
-			// HTTP/2 LLM tracking is handled by the LLM parser above via FeedHTTP2Data.
 		}
 	case l7.ProtocolPostgres:
 		// Update stats for Postgres
@@ -1587,100 +1458,6 @@ func (c *Container) trackParseFail(conn *ActiveConnection, pid uint32, fd uint64
 		klog.Warningf("reclassified connection pid=%d fd=%d from %s to unknown after %d consecutive parse failures",
 			pid, fd, proto, conn.parseFailCount)
 	}
-}
-
-// processHTTP2WithoutConnection handles HTTP/2 events when TCP connection tracking failed.
-// This is common for Go TLS connections where goroutines switch threads between
-// TCP connect and TLS write, causing fd_by_pid_tgid lookup to fail in eBPF.
-//
-// Uses LLMDetector for fast IP-based detection. No skip-set needed — the detector
-// handles caching at the connection level.
-func (c *Container) processHTTP2WithoutConnection(pid uint32, fd uint64, r *l7.RequestData, dstIP ...netaddr.IP) (map[netaddr.IP]*common.Domain, L7RequestResult) {
-	pidFd := PidFd{Pid: pid, Fd: fd}
-
-	// Check if this is an LLM connection via IP-based detection
-	var llmTag *LLMConnectionTag
-	if len(dstIP) > 0 && !dstIP[0].IsZero() {
-		llmTag = c.llmDetector.IsLLMConnection(pidFd, dstIP[0])
-	}
-
-	// Note: do NOT early-skip when llmTag is nil. The IP cache is positive-only —
-	// Google providers (generativelanguage.googleapis.com, *-aiplatform.googleapis.com)
-	// are intentionally excluded from the cache because they share anycast IPs with
-	// non-LLM googleapis.com services. For those, detection MUST come from the
-	// HTTP/2 :authority header below. We bound overhead with Lightweight mode and
-	// per-container parser caps; non-LLM parsers are deleted after first completion.
-
-	// Parse the HTTP/2 frames
-	if c.googleHTTP2Parsers == nil {
-		c.googleHTTP2Parsers = make(map[PidFd]*l7.Http2Parser)
-	}
-	parser := c.googleHTTP2Parsers[pidFd]
-	if parser == nil {
-		if len(c.googleHTTP2Parsers) >= maxHTTP2ParsersPerContainer {
-			return nil, L7RequestProcessed
-		}
-		parser = l7.NewHttp2Parser()
-		parser.Lightweight = true
-		parser.LLMHostChecker = isLLMRelevantHost
-		c.googleHTTP2Parsers[pidFd] = parser
-	}
-
-	requests := parser.Parse(r.Method, r.Payload, uint64(r.Duration), r.PayloadSize > uint64(len(r.Payload)))
-
-	// Late-tag from :authority header if not yet tagged
-	if llmTag == nil {
-		for _, req := range requests {
-			if req.Authority != "" {
-				host := stripPort(req.Authority)
-				if !isIPAddress(host) {
-					ip := netaddr.IP{}
-					if len(dstIP) > 0 {
-						ip = dstIP[0]
-					}
-					llmTag = c.llmDetector.LateTag(pidFd, host, ip)
-					if llmTag != nil {
-						klog.V(2).Infof("LLM_LATETAG_FALLBACK: pid=%d fd=%d host=%s provider=%s",
-							pid, fd, host, llmTag.Provider)
-						break
-					}
-				}
-			}
-		}
-	}
-
-	// If still not LLM, nothing to do on this connectionless path
-	if llmTag == nil {
-		if len(requests) > 0 {
-			// Completed non-LLM requests — clean up parser
-			delete(c.googleHTTP2Parsers, pidFd)
-		}
-		return nil, L7RequestProcessed
-	}
-
-	// Feed completed requests to LLM parser
-	if c.llmParser != nil {
-		for _, req := range requests {
-			c.llmParser.ParseHTTP1(llmTag, int(req.Status),
-				req.Path, req.RequestPayload, req.ResponsePayload, req.Duration, "")
-		}
-
-		// Feed active streams
-		activeStreams := parser.GetActiveStreamsForLLM()
-		for _, update := range activeStreams {
-			c.llmParser.FeedHTTP2Data(llmTag, update.StreamId,
-				nil, false, update.Path, 0, update.RequestHeaders)
-			if update.HasResponseStatus {
-				c.llmParser.OnHTTP2Status(update.StreamId, int(update.Status))
-			}
-			if len(update.ResponsePayload) > 0 {
-				c.llmParser.FeedHTTP2Data(llmTag, update.StreamId,
-					update.ResponsePayload, true, update.Path, int(update.Status), nil)
-			}
-		}
-	}
-
-	return nil, L7RequestProcessed
 }
 
 // refreshActiveConnections snapshots active connections under c.lock and
@@ -2140,7 +1917,7 @@ func (c *Container) gc(now time.Time) {
 	// Parsers hold HPACK decoders, partial frame buffers, and active request maps
 	// that accumulate memory over time if not cleaned up.
 	// Two cases: (1) connection-tracked parsers — delete when connection is gone,
-	// (2) connectionless parsers (processHTTP2WithoutConnection) — delete when pid dies.
+	// (2) parsers whose connection was never tracked — delete when pid dies.
 	if c.googleHTTP2Parsers != nil {
 		for pidFd := range c.googleHTTP2Parsers {
 			if _, hasConn := c.connectionsByPidFd[pidFd]; hasConn {
@@ -2164,14 +1941,7 @@ func (c *Container) gc(now time.Time) {
 		}
 	}
 
-	// Clean up LLM detector connection cache for dead pids
-	if c.llmDetector != nil {
-		for pidFd := range c.googleHTTP2Parsers {
-			if _, hasProc := c.processes[pidFd.Pid]; !hasProc {
-				c.llmDetector.RemoveConnection(pidFd)
-			}
-		}
-	}
+	c.gcLLMCaptures(now)
 
 	for dst, at := range c.lastConnectionAttempts {
 		_, active := establishedDst[dst]

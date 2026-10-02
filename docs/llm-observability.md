@@ -1,176 +1,146 @@
 # LLM observability
 
-The agent identifies outbound traffic to large-language-model APIs and
-exposes per-request metrics — model name, token counts, latency,
-time-to-first-token, error class, and estimated cost — alongside the
-container, pod, and namespace the request came from. No code changes,
-SDK wrappers, or proxies are required: detection happens in eBPF on
-the node.
+The agent identifies outbound calls to large-language-model APIs and
+exposes per-request metrics: model, token usage, latency and
+time-to-first-token, alongside the container, pod and namespace the
+request came from. No code changes, SDK wrappers or proxies are needed:
+the traffic is captured in eBPF on the node.
 
-This feature is specific to the nudgebee fork and is not present in
-upstream `coroot/coroot-node-agent`.
+This feature is specific to this fork and is not present in upstream
+`coroot/coroot-node-agent`.
+
+## How it works
+
+1. **Identification.** A connection is identified as an LLM API
+   connection by the hostname in its TLS ClientHello (SNI), before any
+   request is sent. Endpoints without a recognisable hostname — an LLM
+   gateway or a self-hosted model server reached over plain HTTP — are
+   identified by their API paths instead (`/v1/chat/completions`,
+   `/v1/messages`, `:generateContent`, the Bedrock `/model/...` forms,
+   and so on).
+2. **Capture.** The agent marks the connection in the kernel. From then
+   on every read and write on it is copied, in order, to userspace. For
+   HTTPS this is the plaintext seen by the TLS library (Go `crypto/tls`
+   or OpenSSL); the encrypted socket traffic of such connections is never
+   parsed.
+3. **Reassembly.** HTTP/1.1 and HTTP/2 exchanges are rebuilt from the
+   byte stream with standard parsers, including chunked transfer,
+   `gzip`/`deflate`/`zstd` content encoding, server-sent events and AWS
+   event streams. Timings come from kernel timestamps.
+4. **Usage.** The model and token counts are read from the response with
+   typed decoders per wire format: OpenAI (chat, completions, embeddings,
+   Responses API) and everything compatible with it, Anthropic, Gemini
+   and Vertex AI, Bedrock (Converse, and InvokeModel via its token-count
+   response headers, which every model returns), and Cohere.
 
 ## Supported providers
 
-| Provider                | Match                                                                   |
+| Provider                | Identified by                                                           |
 | ----------------------- | ----------------------------------------------------------------------- |
-| OpenAI                  | `api.openai.com` (and subdomains)                                       |
-| Anthropic               | `api.anthropic.com`, `claude.ai`                                        |
-| Google Gemini / Vertex  | `generativelanguage.googleapis.com`, `ai.googleapis.com`, `aiplatform.googleapis.com`, regional Vertex endpoints |
+| OpenAI                  | `api.openai.com`                                                        |
+| Azure OpenAI            | `<resource>.openai.azure.com`, `<resource>.services.ai.azure.com`       |
+| Anthropic               | `api.anthropic.com`                                                     |
+| Google Gemini           | `generativelanguage.googleapis.com`                                     |
+| Google Vertex AI        | `aiplatform.googleapis.com`, `<region>-aiplatform.googleapis.com`       |
 | AWS Bedrock             | `bedrock-runtime.<region>.amazonaws.com`                                |
-| Azure OpenAI            | `<resource>.openai.azure.com`                                           |
 | Cohere                  | `api.cohere.com`, `api.cohere.ai`                                       |
-| OpenAI-compatible       | `api.groq.com`, `api.together.xyz`, `api.fireworks.ai`, `api.deepseek.com`, `api.mistral.ai`, `api.perplexity.ai` |
+| DeepSeek, Groq, Mistral, Perplexity, xAI, Together, Fireworks | their API hostnames               |
+| Gateways, self-hosted   | API paths of any of the above wire formats (`gen_ai_provider_name="openai_compatible"`) |
 
-When the hostname doesn't match, the path is checked for known LLM
-patterns (`/v1/messages`, `:generateContent`, `/models/gemini`, the
-Bedrock `/model/.../converse` form, etc.) as a fallback.
+## Metrics
 
-## How detection works
+Every series carries `container_id`, `gen_ai_provider_name`,
+`gen_ai_request_model`, `gen_ai_operation_name` and `server_address`.
+Label names follow the OpenTelemetry GenAI semantic conventions.
 
-Three signals are used, in priority order:
+| Metric                                      | Type      | Extra labels                |
+| ------------------------------------------- | --------- | --------------------------- |
+| `container_llm_requests_total`              | counter   | `http_response_status_code` |
+| `container_llm_tokens_total`                | counter   | `gen_ai_token_type`         |
+| `container_llm_request_duration_seconds`    | histogram |                             |
+| `container_llm_time_to_first_token_seconds` | histogram | streaming responses only    |
+| `node_agent_llm_capture_total`              | counter   | `outcome` (see below)       |
 
-1. **DNS cache** — when an in-cluster DNS reply resolves an LLM
-   hostname, every IP in the reply is cached. Subsequent TCP
-   connections to those IPs are tagged at `connect()` time.
-2. **TLS SNI** — the ClientHello is parsed by an eBPF probe. The SNI
-   hostname matches the provider tables directly. SNI-based tagging
-   is the primary mechanism for everything except Google APIs (Google
-   shares anycast IPs across Gemini / Compute / etc., so SNI is the
-   only reliable disambiguator).
-3. **Late tag from HTTP headers** — when an HTTP/1.1 `Host` or HTTP/2
-   `:authority` is observed mid-request, a connection that wasn't
-   already tagged by DNS or SNI gets retroactively classified.
+`gen_ai_token_type` is one of `input` (prompt tokens not served from a
+cache), `cached_input`, `cache_write`, `output` (excluding reasoning) and
+`reasoning`. The types are disjoint, so their sum is what the provider
+bills, and each can be priced separately. Providers report overlapping
+totals instead, and each wire format is normalised accordingly.
 
-For Google APIs specifically, IP caching is suppressed because the
-anycast pool overlaps with non-LLM services. Detection there is
-SNI + header-driven only.
+The agent does not compute cost. Join `container_llm_tokens_total` with
+your own price list, which can reflect negotiated rates.
 
-## What gets extracted
+### Capture completeness
 
-Per request the agent records:
+`node_agent_llm_capture_total{outcome}` accounts for what was and was
+not captured:
 
-- Model name (read from response body's `"model"` field, with
-  fallbacks to request body and URL path patterns)
-- Input / output / cached-input token counts
-- Tool / function-call invocation count
-- Total request duration
-- Time-to-first-token (streaming requests only)
-- HTTP response status code
-- Streaming flag
-- Container ID, pod name, namespace
-- W3C trace context (`traceparent`) if present
+| Outcome         | Meaning                                                                 |
+| --------------- | ----------------------------------------------------------------------- |
+| `tagged`        | a connection was identified (TLS SNI or API path) and marked for capture |
+| `tagged_destination` | a new connection to a known LLM endpoint was captured from its first write |
+| `completed`     | a request's usage was extracted                                         |
+| `no_usage`      | the response carried no usage (an error, or a stream without it)        |
+| `undecodable`   | the response used an unsupported content encoding (for example `br`)    |
+| `truncated`     | the response body exceeded 8 MB                                         |
+| `missed_start`  | capture began mid-connection (see *Limitations*)                        |
+| `unrecoverable` | the protocol framing was lost                                           |
+| `overflow`      | the parser fell behind the capture                                      |
+| `capacity`      | a container had too many captured connections                           |
+| `abandoned`     | a captured connection carried a request but never completed one          |
 
-Streaming responses (SSE / HTTP/2 DATA frames) are accumulated into a
-bounded ring buffer (64 KB tail, since `usage` and `finish_reason`
-typically live near the end). Completion markers (`data: [DONE]` for
-OpenAI, `message_stop` for Anthropic, `finishReason` for Gemini) are
-detected inline. Idle streams time out after 30 s; the hard upper
-bound on a single stream is 5 minutes.
-
-## Metrics emitted
-
-All LLM metrics live under the `container_llm_` prefix. Standard
-container labels (`container_id`, `namespace`, `pod`) are present
-on every series; LLM-specific labels are listed per metric below.
-
-| Metric                                          | Type      | LLM-specific labels                                                                                                          |
-| ----------------------------------------------- | --------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `container_llm_requests_total`                  | counter   | `gen_ai_operation_name`, `gen_ai_request_model`, `gen_ai_provider_name`, `server_address`, `http_response_status_code` |
-| `container_llm_token_usage_total`               | counter   | + `gen_ai_token_type` (`input`, `output`)                                                                                    |
-| `container_llm_cached_input_tokens_total`       | counter   | same as token_usage                                                                                                          |
-| `container_llm_tool_calls_total`                | counter   | same as requests                                                                                                             |
-| `container_llm_errors_total`                    | counter   | + `error_type` (`rate_limit`, `timeout`, `invalid_request`, `server_error`, `auth_error`)                                    |
-| `container_llm_request_duration_seconds`        | histogram | OTel GenAI buckets (0.01 – 81.92 s)                                                                                          |
-| `container_llm_time_to_first_token_seconds`     | histogram | OTel GenAI buckets (0.001 – 10 s); streaming only                                                                            |
-| `container_llm_tokens_per_second`               | histogram | streaming only                                                                                                               |
-| `container_llm_cost_usd_total`                  | counter   | provider+model labels                                                                                                        |
-| `node_agent_llm_sni_tags_total`                 | counter   | `provider` — diagnostic for SNI tagging coverage                                                                             |
-| `node_agent_hpack_decode_errors_total`          | counter   | mid-stream-join indicator (see *Limitations*)                                                                                |
-
-Label naming follows the OpenTelemetry GenAI semantic conventions
-where applicable.
-
-## Cost estimation
-
-A static pricing table (`containers/llm_pricing.go`) maps
-`<provider>:<model-prefix>` to per-million-token rates (input,
-output, and cached-input where applicable). Longest-prefix wins, so
-`gpt-4o-2024-05-13` resolves to the `gpt-4o` row.
-
-Cost is computed as:
-
-```
-cost = (input - cached) * inputRate/1M
-     + output           * outputRate/1M
-     + cached           * cachedRate/1M
-```
-
-Coverage includes OpenAI (GPT-4, GPT-4o, o1, o3, embeddings),
-Anthropic Claude 3 / 3.5, Google Gemini 1.5 / 2.x / 3.x, AWS Bedrock
-(Anthropic, Nova, Llama, Mistral, Cohere), and direct Cohere.
-OpenAI-compatible providers have placeholder entries and may report
-zero cost depending on the model string.
-
-Numbers are **list prices** — no volume or contract discounts are
-applied. If no row matches, cost is 0 and the request is still
-counted in the other metrics.
+`node_agent_l7_tls_ciphertext_skipped_total` counts the encrypted socket
+events the kernel skipped on TLS connections it already sees in plaintext,
+and `node_agent_llm_capture_drops_total` the capture chunks lost because the
+ring buffer was full.
 
 ## Sample queries
 
-Cost-by-model in the last hour:
+Tokens per model and type over the last hour:
 
 ```promql
-sum by (gen_ai_request_model) (
-  rate(container_llm_cost_usd_total[1h])
-) * 3600
+sum by (gen_ai_request_model, gen_ai_token_type) (
+  increase(container_llm_tokens_total[1h])
+)
 ```
 
-P95 time-to-first-token, per provider, last 5 m (streaming endpoints):
+P95 time-to-first-token per provider:
 
 ```promql
-histogram_quantile(
-  0.95,
+histogram_quantile(0.95,
   sum by (gen_ai_provider_name, le) (
     rate(container_llm_time_to_first_token_seconds_bucket[5m])
   )
 )
 ```
 
-Rate-limit error count per pod:
+Share of requests whose usage was captured:
 
 ```promql
-sum by (namespace, pod) (
-  rate(container_llm_errors_total{error_type="rate_limit"}[5m])
-)
+sum(rate(node_agent_llm_capture_total{outcome="completed"}[1h]))
+/
+sum(rate(node_agent_llm_capture_total{outcome=~"completed|no_usage|undecodable|truncated"}[1h]))
 ```
 
 ## Limitations
 
-- **HTTP/2 mid-stream-join.** If a workload's HTTP/2 connection to a
-  provider predates the agent attaching to that workload's TLS session,
-  HPACK dynamic-table state is unrecoverable and the agent will see
-  malformed frames for the lifetime of that connection. Mitigations:
-  restart the workload after rolling out the agent (forces fresh
-  connections), or rely on SNI-based tagging which works regardless of
-  HPACK state. `node_agent_hpack_decode_errors_total` is the canary —
-  if it climbs steadily for a particular pod, that pod likely needs a
-  restart. SNI tagging itself is bypassed if a sidecar proxy (Istio,
-  Envoy) terminates TLS upstream of the workload.
-- **Service-mesh TLS termination.** Same as above — when an in-cluster
-  mesh sidecar handles TLS to the LLM provider, the workload itself
-  doesn't open the provider connection, and the agent can only attribute
-  the call to the sidecar process. There's no general workaround short
-  of instrumenting the sidecar.
-- **Body capture is bounded.** eBPF payload capture is limited per
-  packet; very large request or response bodies may have token counts
-  extracted only partially. Streaming responses use a 64 KB tail
-  buffer that retains the end of the stream where token counts
-  typically land.
-- **Pricing is best-effort.** Prices in `containers/llm_pricing.go`
-  reflect list rates at the time the entry was written and require
-  manual updates. Models not in the table report cost = 0.
-- **Google Gemini cannot be IP-tagged.** Because Google's anycast IP
-  pool is shared across many services, IP-only detection would
-  produce false positives. Detection requires SNI (TLS) or the
-  `:authority` header (HTTP/2).
+- **Connections opened before the agent.** An HTTPS connection that was
+  already open when the agent started was never seen in its ClientHello,
+  so it is not identified. HTTP/1.1 keep-alive connections are picked up
+  by path detection at their next request; HTTP/2 ones cannot be decoded
+  mid-connection at all, since their header compression state is unknown.
+  Restart workloads after installing the agent to see all of their
+  traffic. `missed_start` counts identified connections whose capture
+  still began too late.
+- **Streams without usage.** OpenAI-compatible streaming responses only
+  carry usage when the client sets `stream_options.include_usage`.
+  Without it the request, latency and time-to-first-token are recorded,
+  but not tokens (`no_usage`).
+- **TLS libraries.** Plaintext is captured for Go `crypto/tls` and
+  dynamically linked OpenSSL (Python, Ruby, PHP, curl, .NET on Linux,
+  and others). Java's JSSE, rustls, and runtimes that statically link
+  their TLS library (Node.js, BoringSSL in Envoy) are not covered. An
+  application that talks plain HTTP to a sidecar is captured through
+  path detection.
+- **gRPC transports** (for example Vertex AI's gRPC API) are not decoded.
+- **Brotli** response encoding is not decoded (`undecodable`).

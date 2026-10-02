@@ -76,6 +76,12 @@ func NewL7Stats(constLabels prometheus.Labels) L7Stats {
 }
 
 func (s *L7Stats) observe(protocol l7.Protocol, status, method, path string, duration time.Duration, key common.DestinationKey, srcWorkload common.Workload, r *l7.RequestData, traceId string) {
+	// HTTP/1 and HTTP/2 are one set of metrics, so they must share one vector:
+	// two vectors under the same name emit identical series for a destination
+	// reached over both, and a duplicate series fails the whole scrape.
+	if protocol == l7.ProtocolHTTP2 {
+		protocol = l7.ProtocolHTTP
+	}
 	s.ensureInitialized(protocol)
 
 	actualDestWorkload := key.GetActualDestinationWorkload()
