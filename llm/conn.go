@@ -258,6 +258,24 @@ func (c *Conn) Close() {
 	// the parsers see the end of the stream, so judge after they finish.
 	go func() {
 		c.parsers.Wait()
+		// HTTP/2 streams whose response had started when the connection
+		// went away end here, with what arrived.
+		c.mu.Lock()
+		var pending []*h2stream
+		for id, st := range c.streams {
+			if st.req != nil && st.status != 0 {
+				pending = append(pending, st)
+				delete(c.streams, id)
+			}
+		}
+		c.mu.Unlock()
+		for _, st := range pending {
+			end := st.end
+			if end == 0 {
+				end = st.firstData
+			}
+			c.finish(st.req, st.status, st.header, st.body.Bytes(), st.firstData, end, st.truncated)
+		}
 		c.mu.Lock()
 		abandoned := c.stats.Exchanges == 0 && c.stats.Bytes[Egress] > 0
 		c.mu.Unlock()

@@ -644,3 +644,42 @@ func TestReplayClientStopsAtDone(t *testing.T) {
 		t.Errorf("outcome=%s usage=%+v", e.Outcome, e.Usage)
 	}
 }
+
+// An HTTP/2 connection that goes away while a stream is still responding:
+// the request is reported with what arrived.
+func TestReplayHTTP2ConnectionLostMidStream(t *testing.T) {
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		for i := 1; i <= 5; i++ {
+			_, _ = fmt.Fprintf(w, `data: {"candidates":[],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":%d},"modelVersion":"gemini-test-flash"}`+"\r\n\r\n", i*10)
+			flush(w, w)
+			time.Sleep(2 * time.Millisecond)
+		}
+	})
+	rec := &recorder{}
+	resp, err := h2Client(srv, rec).Post(srv.URL+"/v1beta/models/gemini-test-flash:streamGenerateContent?alt=sse", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	// Drop everything after the third DATA-carrying ingress chunk.
+	cut, seen := len(rec.chunks), 0
+	for i, ch := range rec.chunks {
+		if ch.dir == Ingress && bytes.Contains(ch.data, []byte("usageMetadata")) {
+			if seen++; seen == 3 {
+				cut = i + 1
+				break
+			}
+		}
+	}
+	rec.chunks = rec.chunks[:cut]
+	exchanges, _ := replay(t, rec, 0, 0)
+	if len(exchanges) != 1 {
+		t.Fatalf("got %d exchanges, want 1", len(exchanges))
+	}
+	if e := exchanges[0]; e.Model != "gemini-test-flash" || e.Outcome != OutcomeCompleted || e.Usage.Output != 30 {
+		t.Errorf("model=%q outcome=%s usage=%+v", e.Model, e.Outcome, e.Usage)
+	}
+}
