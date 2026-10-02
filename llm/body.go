@@ -50,7 +50,13 @@ func decodeBody(encoding string, body []byte) ([]byte, error) {
 	default:
 		return nil, errUnsupportedEncoding
 	}
-	return io.ReadAll(io.LimitReader(r, maxDecodedBody))
+	out, err := io.ReadAll(io.LimitReader(r, maxDecodedBody))
+	if errors.Is(err, io.ErrUnexpectedEOF) && len(out) > 0 {
+		// A body cut short (the application stopped reading) still
+		// decompresses up to the cut.
+		return out, nil
+	}
+	return out, err
 }
 
 // payloads splits a decoded response body into the JSON documents that carry

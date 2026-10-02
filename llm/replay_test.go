@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -146,6 +147,8 @@ func replay(t *testing.T, rec *recorder, maxChunk int, from int) ([]*Exchange, [
 		time.Sleep(5 * time.Millisecond)
 	}
 	c.Close()
+	// A response delimited by the connection closing completes only now.
+	time.Sleep(100 * time.Millisecond)
 	mu.Lock()
 	defer mu.Unlock()
 	return exchanges, outcomes
@@ -596,5 +599,48 @@ func TestAbandonedReportsStats(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("no abandoned outcome (or deadlock)")
+	}
+}
+
+// A client that stops reading at [DONE] and closes the connection, without
+// reading the chunked body's terminator. The capture sees only what the
+// application read, so the stream ends mid-body; the exchange must still be
+// reported with the usage that arrived.
+func TestReplayClientStopsAtDone(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"model":"qwen-test","choices":[{"delta":{"content":"hi"}}]}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"model":"qwen-test","choices":[],"usage":{"prompt_tokens":120,"completion_tokens":30,"total_tokens":150}}`+"\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		w.(http.Flusher).Flush()
+		time.Sleep(200 * time.Millisecond) // the terminator follows later
+	}))
+	defer srv.Close()
+	rec := &recorder{}
+	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		c, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return &recConn{Conn: c, r: rec}, nil
+	}}}
+	resp, err := client.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := bufio.NewScanner(resp.Body)
+	for sc.Scan() {
+		if sc.Text() == "data: [DONE]" {
+			break
+		}
+	}
+	_ = resp.Body.Close() // closes the connection: the body was not drained
+	exchanges, _ := replay(t, rec, 65535, 0)
+	if len(exchanges) != 1 {
+		t.Fatalf("got %d exchanges, want 1", len(exchanges))
+	}
+	if e := exchanges[0]; e.Outcome != OutcomeCompleted || e.Usage != (Usage{Input: 120, Output: 30}) {
+		t.Errorf("outcome=%s usage=%+v", e.Outcome, e.Usage)
 	}
 }

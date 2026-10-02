@@ -134,6 +134,9 @@ type Conn struct {
 	// What the connection has seen, for diagnosing captures that never
 	// complete a request.
 	stats Stats
+	// parsers tracks the parser goroutines, so a capture is judged only
+	// once they have consumed everything it received.
+	parsers sync.WaitGroup
 }
 
 // Stats describes what a Conn has seen.
@@ -194,13 +197,15 @@ func (c *Conn) Feed(dir Direction, data []byte, ts uint64, skipped uint64) {
 		case skipped == 0 && bytes.HasPrefix(data, []byte(http2.ClientPreface)):
 			c.state = stateHTTP2
 			c.streams = map[uint32]*h2stream{}
-			go c.h2Egress()
-			go c.h2Ingress()
+			c.parsers.Add(2)
+			go func() { defer c.parsers.Done(); c.h2Egress() }()
+			go func() { defer c.parsers.Done(); c.h2Ingress() }()
 		case skipped == 0 && looksLikeRequestLine(data):
 			c.state = stateHTTP1
 			c.requests = make(chan *request, 64)
-			go c.h1Requests()
-			go c.h1Responses()
+			c.parsers.Add(2)
+			go func() { defer c.parsers.Done(); c.h1Requests() }()
+			go func() { defer c.parsers.Done(); c.h1Responses() }()
 		case len(data) > 1 && data[0] >= 0x14 && data[0] <= 0x17 && data[1] == 0x03:
 			// TLS records: a connection marked by destination is captured
 			// from its first write, which for HTTPS is the handshake. The
@@ -241,15 +246,25 @@ func (c *Conn) Feed(dir Direction, data []byte, ts uint64, skipped uint64) {
 // requests and never completed one is reported as abandoned.
 func (c *Conn) Close() {
 	c.mu.Lock()
-	abandoned := c.state != stateDead && c.state != stateNew && c.stats.Exchanges == 0 && c.stats.Bytes[Egress] > 0
+	active := c.state == stateHTTP1 || c.state == stateHTTP2
 	c.state = stateDead
 	c.egress.close()
 	c.ingress.close()
 	c.mu.Unlock()
-	// Reported outside the lock: the callback may ask for Stats.
-	if abandoned {
-		c.report(OutcomeAbandoned)
+	if !active {
+		return
 	}
+	// A response delimited by the connection closing completes only once
+	// the parsers see the end of the stream, so judge after they finish.
+	go func() {
+		c.parsers.Wait()
+		c.mu.Lock()
+		abandoned := c.stats.Exchanges == 0 && c.stats.Bytes[Egress] > 0
+		c.mu.Unlock()
+		if abandoned {
+			c.report(OutcomeAbandoned)
+		}
+	}()
 }
 
 func (c *Conn) fail(o Outcome) {
@@ -353,12 +368,20 @@ func (c *Conn) h1Responses() {
 				}
 			}
 			if err != nil {
-				if !errors.Is(err, io.EOF) {
-					_ = resp.Body.Close()
-					c.fail(OutcomeUnrecoverable)
-					return
+				if errors.Is(err, io.EOF) {
+					break
 				}
-				break
+				// The stream ended inside the body. Usually the application
+				// stopped reading — at an SSE [DONE], say — and closed the
+				// connection, so the rest of the body was never read and so
+				// never captured; what it did read, usage included, is
+				// complete. Report that rather than drop the request.
+				_ = resp.Body.Close()
+				c.finish(req, resp.StatusCode, resp.Header, body.Bytes(), firstData, c.ingress.tsAt(c.ingress.consumed(br)-1), truncated)
+				if !errors.Is(err, io.ErrUnexpectedEOF) {
+					c.fail(OutcomeUnrecoverable)
+				}
+				return
 			}
 		}
 		_ = resp.Body.Close()
