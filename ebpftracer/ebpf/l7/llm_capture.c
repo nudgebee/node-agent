@@ -14,6 +14,23 @@
 // a single ordered buffer lets userspace splice those and the capture chunks
 // into one stream without a gap or a reordering.
 
+// llm_capture_config[0] is non-zero when LLM capture is enabled. Userspace
+// sets it at load time; while it is zero, the read and write paths pay one
+// array lookup for this feature and nothing else.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u32));
+    __uint(max_entries, 1);
+} llm_capture_config SEC(".maps");
+
+static inline __attribute__((__always_inline__))
+int llm_capture_enabled(void) {
+    __u32 zero = 0;
+    __u32 *enabled = bpf_map_lookup_elem(&llm_capture_config, &zero);
+    return enabled && *enabled;
+}
+
 // Each read or write is copied in up to two chunks of LLM_CHUNK-1 bytes; the
 // mask that bounds a copy for the verifier cannot express LLM_CHUNK itself.
 // Two chunks cover a full 64KB read. Anything beyond is reported in
@@ -111,6 +128,9 @@ void llm_emit(struct llm_event *e, char *src, __u64 len, __u64 skip_after) {
 // larger only when buf holds an iovec prefix.
 static inline __attribute__((__always_inline__))
 int llm_capture(struct connection_id *cid, struct connection *conn, __u8 direction, char *buf, __u64 size, __u64 total) {
+    if (!llm_capture_enabled()) {
+        return 0;
+    }
     __u64 *conn_ts = bpf_map_lookup_elem(&llm_conns, cid);
     if (!conn_ts) {
         return 0;

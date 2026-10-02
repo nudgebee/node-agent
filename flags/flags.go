@@ -20,7 +20,12 @@ var (
 	// currently consumes, and attaching the probes reads the whole ELF symbol
 	// table of every Node.js process's binary. Opt-in matches .NET rather than
 	// the always-on Python probes.
-	EnableNodejsTracing  = kingpin.Flag("enable-nodejs-tracing", "Enable Node.js event loop tracing (attaches libuv uprobes)").Default("false").Envar("ENABLE_NODEJS_TRACING").Bool()
+	EnableNodejsTracing = kingpin.Flag("enable-nodejs-tracing", "Enable Node.js event loop tracing (attaches libuv uprobes)").Default("false").Envar("ENABLE_NODEJS_TRACING").Bool()
+	// Off by default: capturing LLM API connections in full (see
+	// docs/llm-observability.md) adds work to every socket read and write in
+	// the kernel and parses captured traffic in userspace. Clusters with no
+	// LLM traffic, or no interest in it, should not pay for it.
+	EnableLLMCapture     = kingpin.Flag("enable-llm-capture", "Capture LLM API traffic and export token usage metrics").Default("false").Envar("ENABLE_LLM_CAPTURE").Bool()
 	DisableGPUMonitoring = kingpin.Flag("disable-gpu-monitoring", "Disable GPU monitoring (NVML)").Default("false").Envar("DISABLE_GPU_MONITORING").Bool()
 
 	ContainerAllowlist = kingpin.Flag("container-allowlist", "List of allowed containers (regex patterns)").Envar("CONTAINER_ALLOWLIST").Strings()
