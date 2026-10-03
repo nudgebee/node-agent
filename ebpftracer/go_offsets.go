@@ -3,10 +3,12 @@ package ebpftracer
 import (
 	"debug/dwarf"
 	"debug/elf"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/coroot/coroot-node-agent/common"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"k8s.io/klog/v2"
 )
 
@@ -81,18 +83,39 @@ var knownGoOffsets = map[string]GoTLSOffsets{
 	},
 }
 
+var (
+	// goTLSOffsetsCache holds the complete result per binary. The itab
+	// addresses are per binary, so this is the only level that can answer for
+	// a repeat process on its own. A node can start the same handful of Go
+	// binaries (CLIs, exec probes) hundreds of times an hour, and without it
+	// each start re-read the binary's DWARF and symbol table.
+	goTLSOffsetsCache, _ = lru.New[binaryKey, GoTLSOffsets](symbolCacheSize)
+
+	// goStructOffsetsCache holds the DWARF-derived struct offsets per Go
+	// version. They describe standard-library types (crypto/tls.Conn,
+	// net.netFD, internal/poll.FD), so every binary built by one toolchain
+	// shares them, and only the first binary of each version pays for the
+	// DWARF parse. That matters on CI nodes, where every `go test` binary is
+	// new. The version string includes GOEXPERIMENT tags, so it already
+	// separates toolchain variants.
+	goStructOffsetsCache, _ = lru.New[string, GoTLSOffsets](64)
+)
+
 // DiscoverGoTLSOffsets attempts to discover Go TLS offsets from a binary.
 // It first tries DWARF-based discovery, then falls back to version-based offsets.
 // It also discovers itab addresses for gRPC syscallConn support.
+//
+// Results are cached per binary identity (see binaryKey), so only the first
+// process of each binary does the parsing.
 func DiscoverGoTLSOffsets(binaryPath string, goVersion string) (*GoTLSOffsets, error) {
-	// Try DWARF-based discovery first
-	offsets, err := discoverOffsetsFromDWARF(binaryPath)
-	if err != nil {
-		klog.V(3).Infof("DWARF discovery failed for %s: %v, using version-based fallback", binaryPath, err)
-		// Fall back to version-based offsets
-		offsets = getVersionBasedOffsets(goVersion)
+	key, keyErr := binaryKeyFor(binaryPath)
+	if keyErr == nil {
+		if cached, ok := goTLSOffsetsCache.Get(key); ok {
+			return &cached, nil
+		}
 	}
 
+	offsets := structOffsetsFor(binaryPath, goVersion)
 	offsets.GoVersion = goVersion
 
 	// Discover itab addresses for interface type detection
@@ -115,7 +138,28 @@ func DiscoverGoTLSOffsets(binaryPath string, goVersion string) (*GoTLSOffsets, e
 		offsets.TLSConnConnOffset, offsets.ConnFdOffset, offsets.NetFDPfdOffset, offsets.FDSysfdOffset,
 		offsets.NetTCPConnItab, offsets.GRPCSyscallConnItab)
 
+	// A stripped binary (no .symtab) is a property of the file and is cached
+	// like a success. Any other failure is not: it may be transient.
+	if keyErr == nil && (itabErr == nil || errors.Is(itabErr, elf.ErrNoSymbols)) {
+		goTLSOffsetsCache.Add(key, *offsets)
+	}
 	return offsets, nil
+}
+
+// structOffsetsFor returns the struct offsets for binaries built by goVersion,
+// reading binaryPath's DWARF only if no earlier binary of that version has.
+func structOffsetsFor(binaryPath, goVersion string) *GoTLSOffsets {
+	if cached, ok := goStructOffsetsCache.Get(goVersion); ok {
+		return &cached
+	}
+	offsets, err := discoverOffsetsFromDWARF(binaryPath)
+	if err != nil {
+		klog.V(3).Infof("DWARF discovery failed for %s: %v, using version-based fallback", binaryPath, err)
+		// Not cached: a later binary of the same version may carry DWARF.
+		return getVersionBasedOffsets(goVersion)
+	}
+	goStructOffsetsCache.Add(goVersion, *offsets)
+	return offsets
 }
 
 // discoverOffsetsFromDWARF extracts struct offsets from DWARF debug info
@@ -191,6 +235,11 @@ func discoverOffsetsFromDWARF(binaryPath string) (*GoTLSOffsets, error) {
 		// Skip children if we don't need to read members
 		if entry.Children {
 			reader.SkipChildren()
+		}
+
+		// The rest of .debug_info cannot change the answer.
+		if foundTLSConn && foundNetConn && foundNetFD && foundPollFD {
+			break
 		}
 	}
 
