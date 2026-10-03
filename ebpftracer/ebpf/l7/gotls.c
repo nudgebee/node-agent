@@ -223,9 +223,14 @@ int ensure_connection_tracked(__u32 pid, __u64 fd) {
     new_conn.timestamp = bpf_ktime_get_ns();
     new_conn.protocol = PROTOCOL_UNKNOWN;
     new_conn.tls = 1;
-    // TODO: Extract actual destination port from socket instead of hardcoding
-    // This requires reading socket info via bpf_get_socket_cookie or similar
-    new_conn.dport = 443;  // Assume HTTPS for Go TLS
+    // Not the real port: 443 marks the connection as HTTPS-like so the
+    // port-gated HTTP/2 frame detection in trace_enter_write runs on it. Only
+    // connections the TCP tracking missed get here (most often ones that
+    // predate the agent), and their HTTP/2 traffic, gRPC on any port included,
+    // carries no connection preface to detect it by. Events take their real
+    // address and port from the socket (see send_event), so no label shows
+    // this value.
+    new_conn.dport = 443;
 
     int ret = bpf_map_update_elem(&active_connections, &cid, &new_conn, BPF_NOEXIST);
     if (ret == 0) {
@@ -247,6 +252,7 @@ int go_crypto_tls_write_enter(struct pt_regs *ctx) {
 
     __u32 fd;
     if (go_crypto_tls_get_fd_from_conn(ctx, &fd)) {
+        count_tls_drop(TLS_DROP_GO_FD_UNKNOWN);
         return 0;
     }
 
@@ -268,6 +274,7 @@ int go_crypto_tls_read_enter(struct pt_regs *ctx) {
 
     __u32 fd;
     if (go_crypto_tls_get_fd_from_conn(ctx, &fd)) {
+        count_tls_drop(TLS_DROP_GO_FD_UNKNOWN);
         return 0;
     }
     char *buf_ptr = (char*)GO_PARAM2(ctx);

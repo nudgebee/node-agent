@@ -450,9 +450,10 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 				}
 			}
 		}
-		if process.isGolangApp {
+		if process.golang() {
 			appTypes["golang"] = struct{}{}
 		}
+		dotNetMonitor := process.dotNet()
 		switch {
 		case proc.IsJvm(cmdline):
 			jvm, jMetrics := c.jvmMetrics(pid)
@@ -462,12 +463,12 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 					ch <- m
 				}
 			}
-		case process.dotNetMonitor != nil:
+		case dotNetMonitor != nil:
 			appTypes["dotnet"] = struct{}{}
-			appName := process.dotNetMonitor.AppName()
+			appName := dotNetMonitor.AppName()
 			if !seenDotNetApps[appName] {
 				seenDotNetApps[appName] = true
-				process.dotNetMonitor.Collect(ch)
+				dotNetMonitor.Collect(ch)
 			}
 		}
 
@@ -527,6 +528,16 @@ func (c *Container) onProcessStart(pid uint32) *Process {
 	if err != nil {
 		return nil
 	}
+	if p := c.processes[pid]; p != nil {
+		// Already registered for this same process: a connection can be
+		// handled before the process start event (see attachTlsUprobes).
+		// Replacing it would drop its uprobes without closing them.
+		if p.StartedAt.Equal(stats.BeginTime) {
+			return p
+		}
+		// The pid was reused: the previous process exited unnoticed.
+		c.closeProcess(pid, p)
+	}
 	c.zombieAt = time.Time{}
 	p := NewProcess(pid, stats, c.registry.tracer)
 
@@ -556,10 +567,7 @@ func (c *Container) onProcessExit(pid uint32, oomKill bool) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	if p := c.processes[pid]; p != nil {
-		p.Close()
-		if p.isGolangApp {
-			c.registry.tracer.ReleaseGoTLSOffsets(pid)
-		}
+		c.closeProcess(pid, p)
 	}
 	delete(c.processes, pid)
 	if len(c.processes) == 0 {
@@ -568,6 +576,14 @@ func (c *Container) onProcessExit(pid uint32, oomKill bool) {
 	delete(c.delaysByPid, pid)
 	if oomKill {
 		c.tcpMetrics.ObserveOOMKill()
+	}
+}
+
+// closeProcess releases everything held for a process that is gone.
+func (c *Container) closeProcess(pid uint32, p *Process) {
+	p.Close()
+	if p.golang() {
+		c.registry.tracer.ReleaseGoTLSOffsets(pid)
 	}
 }
 
@@ -743,7 +759,7 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 // createConnectionFromSocketInfo creates an ActiveConnection from socket info extracted in eBPF
 // This is used when TCP connection tracking fails (common for Go TLS due to goroutine thread switching)
 // but we have socket tuple info extracted directly from the fd
-func (c *Container) createConnectionFromSocketInfo(pid uint32, fd uint64, socketInfo *ebpftracer.SocketInfo) *ActiveConnection {
+func (c *Container) createConnectionFromSocketInfo(pid uint32, fd uint64, timestamp uint64, socketInfo *ebpftracer.SocketInfo) *ActiveConnection {
 	if socketInfo == nil || !socketInfo.Valid {
 		return nil
 	}
@@ -781,8 +797,11 @@ func (c *Container) createConnectionFromSocketInfo(pid uint32, fd uint64, socket
 		DestinationKey: key,
 		Pid:            pid,
 		Fd:             fd,
-		Timestamp:      0, // We don't have timestamp from socket info
-		srcWorkload:    srcWorkload,
+		// The kernel's timestamp for this connection, from the event. Without
+		// it every later event on the connection failed the timestamp check
+		// in onL7RequestWithResult and was dropped.
+		Timestamp:   timestamp,
+		srcWorkload: srcWorkload,
 	}
 
 	// Store in connectionsByPidFd for future L7 events on same connection
@@ -1060,13 +1079,14 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		if socketInfo != nil && socketInfo.Valid {
 			klog.V(3).Infof("L7_CREATING_CONN_FROM_SOCKET_INFO: pid=%d fd=%d dst=%s:%d container=%s",
 				pid, fd, socketInfo.DstIP, socketInfo.DstPort, c.id)
-			conn = c.createConnectionFromSocketInfo(pid, fd, socketInfo)
+			conn = c.createConnectionFromSocketInfo(pid, fd, timestamp, socketInfo)
 		}
 
 		if conn == nil {
 			// HTTP/2 frames cannot be parsed out of order, which is what a
 			// retry would deliver them as.
 			if r.Protocol == l7.ProtocolHTTP2 {
+				countL7Drop("unknown_connection", r)
 				return nil, L7RequestProcessed
 			}
 			klog.V(3).Infof("L7_EVENT_CONN_NOT_FOUND: pid=%d fd=%d container=%s num_connections=%d",
@@ -1074,9 +1094,27 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			return nil, L7RequestConnNotFound
 		}
 	}
+	if timestamp != 0 && conn.Timestamp != timestamp && timestamp > conn.Timestamp {
+		// A newer connection on a reused fd whose open event has not been
+		// handled yet: L7 events come through a ring buffer that is read at
+		// once, connection events through per-CPU buffers read on a timer.
+		// The tracked entry is its closed predecessor, so take the
+		// connection from the event's own socket tuple instead.
+		if prev := conn; socketInfo != nil && socketInfo.Valid {
+			if conn = c.createConnectionFromSocketInfo(pid, fd, timestamp, socketInfo); conn == nil {
+				countL7Drop("unknown_connection", r)
+				return nil, L7RequestProcessed
+			}
+			prev.Closed = time.Now()
+		} else if r.Protocol != l7.ProtocolHTTP2 {
+			// No tuple to go on: retry, the open event is on its way.
+			return nil, L7RequestConnNotFound
+		}
+	}
 	if timestamp != 0 && conn.Timestamp != timestamp {
 		klog.V(5).Infof("L7_EVENT_TIMESTAMP_MISMATCH: pid=%d fd=%d event_ts=%d conn_ts=%d protocol=%d",
 			pid, fd, timestamp, conn.Timestamp, r.Protocol)
+		countL7Drop("stale_connection", r)
 		return nil, L7RequestTimestampMismatch
 	}
 
@@ -1241,14 +1279,12 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		// connection a parser whose HPACK dynamic table belongs to the previous
 		// one. Count that rather than assume it does or does not happen.
 		//
-		// Only comparable when both sides carry a real timestamp. A parser created
-		// for a connection userspace never tracked has none, and
-		// createConnectionFromSocketInfo sets Timestamp: 0 because the socket tuple
-		// carries no timestamp. Comparing either against a real value would report
-		// a reuse that never happened, in both directions. The cost is that reuse
-		// is undetectable for socket-info-derived connections — undercounting is
-		// the right failure here, since this counter exists to decide whether the
-		// mechanism matters at all.
+		// Only comparable when both sides carry a real timestamp. Events from
+		// sockets the kernel never tracked carry none, and neither do
+		// connections made from them. Comparing either against a real value
+		// would report a reuse that never happened, in both directions.
+		// Undercounting is the right failure here, since this counter exists to
+		// decide whether the mechanism matters at all.
 		if conn.Timestamp != 0 {
 			if parser.ConnTimestamp != 0 && parser.ConnTimestamp != conn.Timestamp {
 				Http2ParserStaleReuseTotal.WithLabelValues(h2DestClass).Inc()
@@ -1578,7 +1614,12 @@ func (c *Container) updateNodejsStats(s NodejsStatsUpdate) {
 	defer c.lock.Unlock()
 
 	p := c.processes[s.Pid]
-	if p == nil || p.nodejsPrevStats == nil {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.nodejsPrevStats == nil {
 		return
 	}
 	if delta := s.Stats.EventLoopBlockedTime - p.nodejsPrevStats.EventLoopBlockedTime; delta > 0 {
@@ -1595,7 +1636,12 @@ func (c *Container) updatePythonStats(s PythonStatsUpdate) {
 	defer c.lock.Unlock()
 
 	p := c.processes[s.Pid]
-	if p == nil || p.pythonPrevStats == nil {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pythonPrevStats == nil {
 		return
 	}
 	if delta := s.Stats.ThreadLockWaitTime - p.pythonPrevStats.ThreadLockWaitTime; delta > 0 {
@@ -2029,23 +2075,87 @@ const (
 	openSslRecheckInterval = 10 * time.Second
 )
 
-func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32) {
+// tlsExeRecheckInterval bounds how often a process's executable is re-read to
+// notice an exec (see recheckTlsAfterExec). Wrappers usually exec within
+// seconds of starting, so the interval has to be short to catch the first
+// connections of the program they start.
+const tlsExeRecheckInterval = time.Second
+
+// processForSocket returns the process that opened a socket, registering it
+// if its start event has not been handled yet. Socket events often come
+// first: they arrive on separate buffers, and connect events are read more
+// often. Waiting for the start event dropped the connection (onConnectionOpen
+// ignores unknown pids) and left a short-lived process's first TLS calls,
+// often all of them, unprobed.
+func (c *Container) processForSocket(pid uint32) *Process {
+	if p := c.processes[pid]; p != nil {
+		return p
+	}
+	return c.onProcessStart(pid)
+}
+
+// attachTlsUprobes is called for every new connection or listening socket
+// (newSocket) and periodically for processes with open connections.
+func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32, newSocket bool) {
 	p := c.processes[pid]
 	if p == nil {
+		if newSocket {
+			// processForSocket could not register it: the process is gone.
+			countTLSAttach("-", "not_registered")
+		}
 		return
 	}
+	c.recheckTlsAfterExec(p)
 	if !p.openSslUprobesChecked && time.Since(p.openSslLastCheck) >= openSslRecheckInterval {
 		p.openSslLastCheck = time.Now()
 		p.openSslChecks++
-		openSslUprobes := tracer.AttachOpenSslUprobes(pid)
-		p.uprobes = append(p.uprobes, openSslUprobes...)
-		p.openSslUprobesChecked = len(openSslUprobes) > 0 || p.openSslChecks >= openSslMaxChecks
+		links, result := tracer.AttachOpenSslUprobes(pid)
+		countTLSAttach("openssl", result)
+		p.addUprobes(links)
+		p.tlsAttached = p.tlsAttached || len(links) > 0
+		p.openSslUprobesChecked = len(links) > 0 || p.openSslChecks >= openSslMaxChecks
 	}
 	if !p.goTlsUprobesChecked {
-		uprobes, isGolangApp := tracer.AttachGoTlsUprobes(pid)
-		p.isGolangApp = isGolangApp
-		p.uprobes = append(p.uprobes, uprobes...)
+		p.tlsExe, _ = exeIdentityOf(pid)
+		p.tlsExeCheckedAt = time.Now()
+		links, isGolangApp, result := tracer.AttachGoTlsUprobes(pid)
+		countTLSAttach("go", result)
+		p.setGolang(isGolangApp)
+		p.addUprobes(links)
+		p.tlsAttached = p.tlsAttached || len(links) > 0
 		p.goTlsUprobesChecked = true
+	}
+}
+
+// recheckTlsAfterExec lets a process be probed again after it execs a
+// different binary. Attach runs on the first connection, so a wrapper that
+// connects before exec'ing the real program (a secrets launcher, for example)
+// would otherwise leave that program unprobed for its whole life, or probed
+// at addresses of the wrapper's binary.
+func (c *Container) recheckTlsAfterExec(p *Process) {
+	if !p.goTlsUprobesChecked || time.Since(p.tlsExeCheckedAt) < tlsExeRecheckInterval {
+		return
+	}
+	p.tlsExeCheckedAt = time.Now()
+	exe, err := exeIdentityOf(p.Pid)
+	if err != nil || exe == p.tlsExe {
+		return
+	}
+	// The old image's probes point into a binary the process no longer runs.
+	p.dropUprobes()
+	if p.golang() {
+		c.registry.tracer.ReleaseGoTLSOffsets(p.Pid)
+	}
+	p.tlsAttached = false
+	p.goTlsUprobesChecked = false
+	p.openSslUprobesChecked = false
+	p.openSslChecks = 0
+	p.openSslLastCheck = time.Time{}
+}
+
+func countTLSAttach(lib string, result ebpftracer.TLSAttachResult) {
+	if result != ebpftracer.TLSAttachNotApplicable {
+		TLSAttachTotal.WithLabelValues(lib, string(result)).Inc()
 	}
 }
 
