@@ -1,6 +1,8 @@
 package containers
 
 import (
+	"strconv"
+
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -182,6 +184,36 @@ var (
 	)
 )
 
+// TLSAttachTotal counts attempts to attach TLS uprobes to a process, by
+// library (go, openssl; "-" when the process could not be registered) and
+// outcome (see ebpftracer.TLSAttachResult). A TLS capture gap used to be
+// visible only in logs at raised verbosity; a non-zero error,
+// attached_no_offsets or not_registered rate is that gap.
+var TLSAttachTotal = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "node_agent_tls_attach_total",
+		Help: "Attempts to attach TLS uprobes to a process, by library and outcome",
+	},
+	[]string{"lib", "result"},
+)
+
+// L7EventsDroppedTotal counts L7 events discarded in the agent before any
+// protocol parsing: the connection or process they belong to was never
+// found, or the retry queue for such events was full. Events lost in the
+// kernel are counted separately (node_agent_l7_ringbuf_drops_total,
+// node_agent_tls_plaintext_dropped_total).
+var L7EventsDroppedTotal = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "node_agent_l7_events_dropped_total",
+		Help: "L7 events dropped in the agent before protocol parsing, by reason, protocol and whether the payload is TLS plaintext",
+	},
+	[]string{"reason", "protocol", "tls"},
+)
+
+func countL7Drop(reason string, r *l7.RequestData) {
+	L7EventsDroppedTotal.WithLabelValues(reason, protocolLabel(r.Protocol), strconv.FormatBool(r.TLS)).Inc()
+}
+
 // RegisterL7SelfMetrics registers the agent's L7 self-observability counters
 // and wires the l7-package callbacks that increment them.
 func RegisterL7SelfMetrics(reg prometheus.Registerer) {
@@ -196,6 +228,8 @@ func RegisterL7SelfMetrics(reg prometheus.Registerer) {
 		Http2StageTotal,
 		Http2FramesTotal,
 		Http2PayloadSizeTotal,
+		TLSAttachTotal,
+		L7EventsDroppedTotal,
 	)
 	// Hook the HTTP/2 parser's HPACK error path so we get a counter without
 	// l7 having to import prometheus.

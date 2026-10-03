@@ -195,6 +195,35 @@ func (t *Tracer) TLSCiphertextSkipped() (writes, reads uint64, ok bool) {
 	return sumPerCPU(m, 0), sumPerCPU(m, 1), true
 }
 
+// tlsDropReasons names the indexes of the tls_plaintext_dropped map
+// (TLS_DROP_* in l7.c).
+var tlsDropReasons = []string{"go_fd_unknown", "ssl_read_fd_unknown", "ssl_write_unclaimed"}
+
+// TLSPlaintextDropped returns, per reason, how much TLS plaintext the kernel
+// saw in a library hook but could not attribute to a socket. ok is false
+// until the eBPF collection is loaded.
+func (t *Tracer) TLSPlaintextDropped() (map[string]uint64, bool) {
+	m := t.readyMap("tls_plaintext_dropped")
+	if m == nil {
+		return nil, false
+	}
+	res := make(map[string]uint64, len(tlsDropReasons))
+	for i, reason := range tlsDropReasons {
+		res[reason] = sumPerCPU(m, uint32(i))
+	}
+	return res, true
+}
+
+// L7RingbufDrops returns how many L7 events the kernel lost because the
+// l7_events ring buffer was full.
+func (t *Tracer) L7RingbufDrops() (uint64, bool) {
+	m := t.readyMap("l7_ringbuf_drops")
+	if m == nil {
+		return 0, false
+	}
+	return sumPerCPU(m, 0), true
+}
+
 // LLMCaptureDrops returns how many LLM capture chunks the kernel lost because
 // the llm_events ring buffer was full.
 func (t *Tracer) LLMCaptureDrops() (uint64, bool) {

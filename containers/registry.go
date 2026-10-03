@@ -354,8 +354,9 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 
 			case ebpftracer.EventTypeListenOpen:
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
+					c.processForSocket(e.Pid)
 					c.onListenOpen(e.Pid, e.SrcAddr, false)
-					c.attachTlsUprobes(r.tracer, e.Pid)
+					c.attachTlsUprobes(r.tracer, e.Pid, true)
 				}
 			case ebpftracer.EventTypeListenClose:
 				r.containerLock.RLock()
@@ -367,11 +368,13 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 
 			case ebpftracer.EventTypeConnectionOpen:
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
+					c.processForSocket(e.Pid)
 					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, e.Timestamp, false, e.Duration)
-					c.attachTlsUprobes(r.tracer, e.Pid)
+					c.attachTlsUprobes(r.tracer, e.Pid, true)
 				}
 			case ebpftracer.EventTypeConnectionError:
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
+					c.processForSocket(e.Pid)
 					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, 0, true, e.Duration)
 				}
 			case ebpftracer.EventTypeConnectionClose:
@@ -419,6 +422,7 @@ func (r *Registry) processL7Event(e ebpftracer.Event) {
 	defer func() {
 		if p := recover(); p != nil {
 			klog.Errorf("recovered from panic in L7 event handler: pid=%d fd=%d protocol=%d: %v", e.Pid, e.Fd, e.L7Request.Protocol, p)
+			countL7Drop("panic", e.L7Request)
 		}
 	}()
 	if c := r.containersByPid[e.Pid]; c != nil {
@@ -462,6 +466,7 @@ func (r *Registry) queueL7EventForRetry(e ebpftracer.Event) {
 	const maxPendingEvents = 500
 	if len(r.pendingL7Events) >= maxPendingEvents {
 		klog.V(3).Infof("L7_EVENT_QUEUE_FULL: dropping event pid=%d fd=%d", e.Pid, e.Fd)
+		countL7Drop("retry_queue_full", e.L7Request)
 		return
 	}
 
@@ -496,6 +501,7 @@ func (r *Registry) processPendingL7Events() {
 		// Expire old events
 		if now.Sub(p.addedAt) > maxAge {
 			klog.V(3).Infof("L7_EVENT_EXPIRED: pid=%d fd=%d age=%v", p.event.Pid, p.event.Fd, now.Sub(p.addedAt))
+			countL7Drop("retry_expired", p.event.L7Request)
 			continue
 		}
 
@@ -505,12 +511,15 @@ func (r *Registry) processPendingL7Events() {
 			if p.retryCount < maxRetries {
 				p.retryCount++
 				stillPending = append(stillPending, p)
+			} else {
+				countL7Drop("unknown_process", p.event.L7Request)
 			}
 			continue
 		}
 
 		ip2fqdn, result, panicked := r.safeOnL7Request(c, p.event)
 		if panicked {
+			countL7Drop("panic", p.event.L7Request)
 			continue
 		}
 		if result == L7RequestConnNotFound {
@@ -520,6 +529,7 @@ func (r *Registry) processPendingL7Events() {
 				stillPending = append(stillPending, p)
 			} else {
 				klog.V(3).Infof("L7_EVENT_MAX_RETRIES: pid=%d fd=%d", p.event.Pid, p.event.Fd)
+				countL7Drop("unknown_connection", p.event.L7Request)
 			}
 			continue
 		}
@@ -730,7 +740,7 @@ func (r *Registry) updateEbpfStatsAndActiveConns() {
 			// otherwise never be retried.
 			if !tlsRechecked[cid.PID] {
 				tlsRechecked[cid.PID] = true
-				c.attachTlsUprobes(r.tracer, cid.PID)
+				c.attachTlsUprobes(r.tracer, cid.PID, false)
 			}
 		}
 	}
