@@ -9,7 +9,7 @@ require (
 	github.com/cilium/cilium v1.17.16
 	github.com/cilium/ebpf v0.20.0
 	github.com/containerd/cgroups v1.1.0
-	github.com/containerd/containerd v1.7.33
+	github.com/containerd/containerd v1.7.34
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/docker/docker v28.5.2+incompatible
 	github.com/florianl/go-conntrack v0.7.0
