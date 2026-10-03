@@ -11,12 +11,22 @@ fi
 BIN_DIR=/usr/bin
 SYSTEMD_DIR=/etc/systemd/system
 VERSION="latest"
+LOCAL_BINARY=
 SYSTEM_NAME=nudgebee-node-agent
 SYSTEMD_SERVICE=${SYSTEM_NAME}.service
 UNINSTALL_SH=${BIN_DIR}/${SYSTEM_NAME}-uninstall.sh
 FILE_SERVICE=${SYSTEMD_DIR}/${SYSTEMD_SERVICE}
 FILE_ENV=${SYSTEMD_DIR}/${SYSTEMD_SERVICE}.env
-ENV_VARS="^(LISTEN|CGROUPFS_ROOT|DISABLE_LOG_PARSING|DISABLE_PINGER|DISABLE_L7_TRACING|DISABLE_GPU_MONITORING|TRACK_PUBLIC_NETWORK|EPHEMERAL_PORT_RANGE|PROVIDER|REGION|AVAILABILITY_ZONE|INSTANCE_TYPE|INSTANCE_LIFE_CYCLE|LOG_PER_SECOND|LOG_BURST|COLLECTOR_ENDPOINT|API_KEY|METRICS_ENDPOINT|TRACES_ENDPOINT|LOGS_ENDPOINT|PROFILES_ENDPOINT|SCRAPE_INTERVAL|WAL_DIR)"
+STATE_DIR=/var/lib/${SYSTEM_NAME}
+# Every environment variable the agent reads. Only these are copied from the
+# installer's environment into the env file. flags/install_env_test.go fails
+# when an agent flag is missing here.
+ENV_VARS="^(ACCOUNT_ID|AGGREGATE_EPHEMERAL_WORKLOADS|API_KEY|AVAILABILITY_ZONE|CGROUPFS_ROOT|COLLAPSE_INTERNAL_DESTINATIONS|COLLECTOR_ENDPOINT|CONTAINER_ALLOWLIST|CONTAINER_DENYLIST|DISABLE_GPU_MONITORING|DISABLE_KUBE_PROBE|DISABLE_L7_TRACING|DISABLE_LOG_PARSING|DISABLE_PINGER|DISABLE_SENSITIVE_LOG_PARSING|ENABLE_DOTNET_TRACING|ENABLE_DYNAMIC_LOG_TAILING|ENABLE_NODEJS_TRACING|EPHEMERAL_PORT_RANGE|EXCLUDE_HTTP_REQUESTS_BY_PATH|HTTP_PATH_NORMALIZATION_RULES|IGNORE_CONTROL_PLANE|INSECURE_SKIP_VERIFY|INSTANCE_LIFE_CYCLE|INSTANCE_TYPE|LISTEN|LOG_BURST|LOG_PATTERNS_PER_CONTAINER|LOG_PER_SECOND|LOGS_ENDPOINT|MAX_LABEL_LENGTH|MAX_SPOOL_SIZE|METRICS_ENDPOINT|PROFILES_ENDPOINT|PROVIDER|REGION|RESOLVE_DNS|SANITIZE_HEADERS|SCRAPE_INTERVAL|SENSITIVE_HEADERS|SENSITIVE_LOG_MAX_DETECTIONS_PER_CONTAINER|SENSITIVE_LOG_MIN_CONFIDENCE|SENSITIVE_LOG_SAMPLE_RATE|SKIP_SYSTEMD_SYSTEM_SERVICES|TRACE_ID_HEADERS|TRACES_ENDPOINT|TRACES_SAMPLING|TRACK_PUBLIC_NETWORK|WAL_DIR|GOMEMLIMIT|KLOG_V)="
+# Resource limits for the unit, read at install time. Defaults match the limits
+# of the Kubernetes DaemonSet. The agent sets GOMEMLIMIT from the memory limit,
+# so without one its heap is unbounded.
+DEFAULT_MEMORY_MAX=1G
+DEFAULT_CPU_QUOTA=100%
 
 info()
 {
@@ -35,6 +45,13 @@ show_help() {
     echo "Options:"
     echo "  -h, --help                        Show this help message and exit"
     echo "  -v v1.22.2, --version v1.22.2     Specify the version to install (default: latest)"
+    echo "  -b PATH, --binary PATH            Install this binary instead of downloading one,"
+    echo "                                    for hosts without access to GitHub"
+    echo
+    echo "Agent settings are read from the environment, e.g. COLLECTOR_ENDPOINT, API_KEY,"
+    echo "TRACES_SAMPLING. They are kept across re-runs; set a variable again to change it."
+    echo "MEMORY_MAX (default ${DEFAULT_MEMORY_MAX}) and CPU_QUOTA (default ${DEFAULT_CPU_QUOTA}) limit the systemd unit,"
+    echo "and are kept across re-runs in the same way."
 }
 
 verify_system() {
@@ -143,6 +160,14 @@ setup_binary() {
 }
 
 download() {
+    if [ -n "${LOCAL_BINARY}" ]; then
+        [ -f "${LOCAL_BINARY}" ] || fatal "Binary not found: ${LOCAL_BINARY}"
+        setup_tmp
+        info "Using local binary ${LOCAL_BINARY}"
+        cp "${LOCAL_BINARY}" ${TMP_BIN}
+        setup_binary
+        return
+    fi
     verify_arch
     verify_downloader curl || verify_downloader wget || fatal 'Can not find curl or wget for downloading files'
     setup_tmp
@@ -191,11 +216,32 @@ systemd_disable() {
     $SUDO rm -f ${FILE_ENV} || true
 }
 
+# Settings from a previous install, read before systemd_disable removes the
+# file. Without this, upgrading by re-running the installer with no variables
+# set would wipe API_KEY and the endpoints.
+read_existing_env() {
+    EXISTING_ENV=$($SUDO cat ${FILE_ENV} 2>/dev/null || true)
+    # Resource limits: set now > previous install > default.
+    if [ -z "${MEMORY_MAX}" ]; then
+        MEMORY_MAX=$(sed -n 's/^MemoryMax=//p' ${FILE_SERVICE} 2>/dev/null | head -n 1 || true)
+    fi
+    if [ -z "${CPU_QUOTA}" ]; then
+        CPU_QUOTA=$(sed -n 's/^CPUQuota=//p' ${FILE_SERVICE} 2>/dev/null | head -n 1 || true)
+    fi
+    MEMORY_MAX=${MEMORY_MAX:-${DEFAULT_MEMORY_MAX}}
+    CPU_QUOTA=${CPU_QUOTA:-${DEFAULT_CPU_QUOTA}}
+}
+
 create_env_file() {
     info "env: Creating environment file ${FILE_ENV}"
+    # Double-quote each value, escaping \ and ", which systemd's EnvironmentFile
+    # parser unescapes back. Regex settings such as HTTP_PATH_NORMALIZATION_RULES
+    # contain backslashes that an unquoted value, or "read" without -r, loses.
+    NEW_ENV=$(env | grep -E "${ENV_VARS}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/=/="/' -e 's/$/"/' || true)
     $SUDO touch ${FILE_ENV}
     $SUDO chmod 0600 ${FILE_ENV}
-    sh -c export | while read x v; do echo $v; done | grep -E ${ENV_VARS} | $SUDO tee ${FILE_ENV} >/dev/null
+    # Variables set now win; the rest are carried over from the previous install.
+    { printf '%s\n' "${NEW_ENV}"; printf '%s\n' "${EXISTING_ENV}"; } | awk -F= 'NF && !seen[$1]++' | $SUDO tee ${FILE_ENV} >/dev/null
 }
 
 create_systemd_service_file() {
@@ -212,6 +258,19 @@ WantedBy=multi-user.target
 
 [Service]
 Type=exec
+# Defaults for standalone hosts; the env files below override them.
+# /tmp is cleared on reboot on some distros, which would drop unsent metrics.
+Environment=WAL_DIR=${STATE_DIR}
+# Hosts outside Kubernetes run many chatty local services; sample traces
+# instead of exporting every request.
+Environment=TRACES_SAMPLING=0.1
+# The agent's built-in default is 0.0.0.0:80, which clashes with any web server
+# on the host and also exposes /debug/pprof. Bind to localhost on a high port;
+# set LISTEN=0.0.0.0:10300 to let a remote Prometheus scrape it.
+Environment=LISTEN=127.0.0.1:10300
+StateDirectory=${SYSTEM_NAME}
+MemoryMax=${MEMORY_MAX}
+CPUQuota=${CPU_QUOTA}
 EnvironmentFile=-/etc/default/%N
 EnvironmentFile=-/etc/sysconfig/%N
 EnvironmentFile=-${FILE_ENV}
@@ -274,6 +333,10 @@ while [ $# -gt 0 ]; do
             VERSION="$2"
             shift 2
             ;;
+        -b|--binary)
+            LOCAL_BINARY="$2"
+            shift 2
+            ;;
         *)
             fatal "Unknown option: $1"
             ;;
@@ -282,6 +345,8 @@ done
 
 {
     verify_system
+    PRE_INSTALL_HASHES=$(get_installed_hashes)
+    read_existing_env
     download
     create_uninstall
     systemd_disable
