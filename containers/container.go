@@ -495,11 +495,23 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	for appType := range appTypes {
 		ch <- c.gauge(metrics.ApplicationType, 1, appType)
 	}
-	if c.pythonStats != nil {
-		ch <- c.counter(metrics.PythonThreadLockWaitTime, c.pythonStats.ThreadLockWaitTime.Seconds())
+	// Written under c.lock by updatePythonStats/updateNodejsStats on the
+	// registry's event loop; read under it here.
+	c.lock.RLock()
+	pythonStats, nodejsStats := c.pythonStats, c.nodejsStats
+	var pythonLockWait, nodejsBlocked float64
+	if pythonStats != nil {
+		pythonLockWait = pythonStats.ThreadLockWaitTime.Seconds()
 	}
-	if c.nodejsStats != nil {
-		ch <- c.counter(metrics.NodejsEventLoopBlockedTime, c.nodejsStats.EventLoopBlockedTime.Seconds())
+	if nodejsStats != nil {
+		nodejsBlocked = nodejsStats.EventLoopBlockedTime.Seconds()
+	}
+	c.lock.RUnlock()
+	if pythonStats != nil {
+		ch <- c.counter(metrics.PythonThreadLockWaitTime, pythonLockWait)
+	}
+	if nodejsStats != nil {
+		ch <- c.counter(metrics.NodejsEventLoopBlockedTime, nodejsBlocked)
 	}
 
 	// --- L7 metrics: push-model, own lock ---
