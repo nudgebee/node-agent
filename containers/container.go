@@ -557,6 +557,9 @@ func (c *Container) onProcessExit(pid uint32, oomKill bool) {
 	defer c.lock.Unlock()
 	if p := c.processes[pid]; p != nil {
 		p.Close()
+		if p.isGolangApp {
+			c.registry.tracer.ReleaseGoTLSOffsets(pid)
+		}
 	}
 	delete(c.processes, pid)
 	if len(c.processes) == 0 {

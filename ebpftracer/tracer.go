@@ -728,8 +728,12 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 // Ring buffer provides global event ordering across CPUs, which is important
 // for streaming responses (SSE) where chunk order matters
 func runRingbufEventsReader(name string, r *ringbuf.Reader, ch chan<- Event) {
+	// One record reused for every read: everything sent on ch is copied out of
+	// RawSample first, and a fresh buffer per event was 10-20% of the agent's
+	// allocated bytes.
+	var rec ringbuf.Record
 	for {
-		rec, err := r.Read()
+		err := r.ReadInto(&rec)
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
 				klog.V(2).Infof("ring buffer reader %s closed", name)

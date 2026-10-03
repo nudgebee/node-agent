@@ -6,12 +6,14 @@ import (
 	"debug/buildinfo"
 	"debug/elf"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
 	"strings"
 	"unsafe"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/proc"
@@ -37,6 +39,14 @@ const (
 	// The conn struct embeds net.Conn at offset 0, same as tls.Conn.
 	goALTSWriteSymbol = "google.golang.org/grpc/credentials/alts/internal/conn.(*conn).Write"
 	goALTSReadSymbol  = "google.golang.org/grpc/credentials/alts/internal/conn.(*conn).Read"
+)
+
+var (
+	goTlsWriteSymbols = []string{goTlsWriteSymbol, goS2AWriteSymbol, goALTSWriteSymbol}
+	goTlsReadSymbols  = []string{goTlsReadSymbol, goS2AReadSymbol, goALTSReadSymbol}
+	// Every symbol resolved in one pass over the ELF symbol table, so a cache
+	// miss costs a single parse rather than one per symbol.
+	goTlsProbeSymbols = append(append([]string{}, goTlsWriteSymbols...), goTlsReadSymbols...)
 )
 
 // Additional TLS symbols to hook for HTTP/2 and gRPC connections
@@ -236,17 +246,27 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 		return nil, isGolangApp
 	}
 
-	// Discover Go TLS offsets and populate the BPF map
-	if err := t.populateGoTLSOffsets(pid, path, version); err != nil {
-		klog.V(2).Infof("pid=%d: failed to populate Go TLS offsets (will use defaults): %v", pid, err)
-	}
-
-	ef, err := OpenELFFile(path)
+	// Resolved once per binary rather than once per pid — see LookupSymbols.
+	targets, err := LookupSymbols(path, goTlsProbeSymbols)
 	if err != nil {
 		log("failed to open as elf binary", err)
 		return nil, isGolangApp
 	}
-	defer ef.Close()
+	if !targets[goTlsWriteSymbol].Found {
+		log("failed to get write symbol", fmt.Errorf("symbol %s not found", goTlsWriteSymbol))
+		// Cache this exe as stripped to skip future attempts
+		if exeName != "" {
+			strippedGoExeCache.Add(exeName, struct{}{})
+		}
+		return nil, isGolangApp
+	}
+
+	// Discover Go TLS offsets and populate the BPF map. Only binaries that
+	// have probe points get this far, so a Go binary without crypto/tls never
+	// pays for the DWARF read.
+	if err := t.populateGoTLSOffsets(pid, path, version); err != nil {
+		klog.V(2).Infof("pid=%d: failed to populate Go TLS offsets (will use defaults): %v", pid, err)
+	}
 
 	exe, err := link.OpenExecutable(path)
 	if err != nil {
@@ -261,21 +281,14 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 		}
 	}
 
-	// Attach Write uprobes (crypto/tls + S2A + ALTS)
-	for _, writeSymbol := range []string{goTlsWriteSymbol, goS2AWriteSymbol, goALTSWriteSymbol} {
-		ws, err := ef.GetSymbol(writeSymbol)
-		if err != nil {
-			if writeSymbol == goTlsWriteSymbol {
-				log("failed to get write symbol", err)
-				// Cache this exe as stripped to skip future attempts
-				if exeName != "" {
-					strippedGoExeCache.Add(exeName, struct{}{})
-				}
-				return nil, isGolangApp
-			}
-			continue // S2A symbol is optional
+	// Attach Write uprobes (crypto/tls + S2A + ALTS). crypto/tls is checked
+	// above; S2A and ALTS are optional.
+	for _, writeSymbol := range goTlsWriteSymbols {
+		ws := targets[writeSymbol]
+		if !ws.Found {
+			continue
 		}
-		l, err := ws.AttachUprobe(exe, t.uprobes["go_crypto_tls_write_enter"], pid)
+		l, err := attachUprobeAt(exe, t.uprobes["go_crypto_tls_write_enter"], pid, ws.Address)
 		if err != nil {
 			log(fmt.Sprintf("failed to attach write_enter uprobe for %s", writeSymbol), err)
 			closeLinks()
@@ -285,17 +298,17 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 	}
 
 	// Attach Read uprobes + return-offset exit probes (crypto/tls + S2A + ALTS)
-	for _, readSymbol := range []string{goTlsReadSymbol, goS2AReadSymbol, goALTSReadSymbol} {
-		rs, err := ef.GetSymbol(readSymbol)
-		if err != nil {
+	for _, readSymbol := range goTlsReadSymbols {
+		rs := targets[readSymbol]
+		if !rs.Found {
 			if readSymbol == goTlsReadSymbol {
-				log("failed to get read symbol", err)
+				log("failed to get read symbol", fmt.Errorf("symbol %s not found", goTlsReadSymbol))
 				closeLinks()
 				return nil, isGolangApp
 			}
 			continue // S2A symbol is optional
 		}
-		l, err := rs.AttachUprobe(exe, t.uprobes["go_crypto_tls_read_enter"], pid)
+		l, err := attachUprobeAt(exe, t.uprobes["go_crypto_tls_read_enter"], pid, rs.Address)
 		if err != nil {
 			log(fmt.Sprintf("failed to attach read_enter uprobe for %s", readSymbol), err)
 			closeLinks()
@@ -303,7 +316,7 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 		}
 		links = append(links, l)
 
-		ls, err := rs.AttachUretprobes(exe, t.uprobes["go_crypto_tls_read_exit"], pid)
+		ls, err := attachUretprobesAt(exe, t.uprobes["go_crypto_tls_read_exit"], pid, rs)
 		links = append(links, ls...)
 		if err != nil {
 			log(fmt.Sprintf("failed to attach read_exit uprobe for %s", readSymbol), err)
@@ -452,4 +465,19 @@ func (t *Tracer) populateGoTLSOffsets(pid uint32, binaryPath string, goVersion s
 		offsets.NetTCPConnItab, offsets.GRPCSyscallConnItab)
 
 	return nil
+}
+
+// ReleaseGoTLSOffsets removes pid's entry from go_tls_offsets_map; call it
+// when the process exits. Nothing in the kernel removes these entries, so
+// without this every short-lived Go process leaves one behind. Once the
+// map's 1024 slots are full, every later Go process is probed without its
+// itab addresses. On a busy node the map filled within two hours.
+func (t *Tracer) ReleaseGoTLSOffsets(pid uint32) {
+	m := t.readyMap("go_tls_offsets_map")
+	if m == nil {
+		return
+	}
+	if err := m.Delete(pid); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		klog.V(3).Infof("pid=%d: failed to remove Go TLS offsets: %v", pid, err)
+	}
 }
