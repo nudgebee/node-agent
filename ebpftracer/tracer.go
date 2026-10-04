@@ -195,6 +195,27 @@ func (t *Tracer) TLSCiphertextSkipped() (writes, reads uint64, ok bool) {
 	return sumPerCPU(m, 0), sumPerCPU(m, 1), true
 }
 
+// ActualDestination returns the post-NAT destination of the TCP connection
+// whose local address is src, as the kernel recorded it from conntrack
+// (actual_destinations in conntrack.c). It is what a connection's open event
+// carries as its actual destination; ok is false if no translation was seen.
+func (t *Tracer) ActualDestination(src netaddr.IPPort) (netaddr.IPPort, bool) {
+	m := t.readyMap("actual_destinations")
+	if m == nil {
+		return netaddr.IPPort{}, false
+	}
+	// struct ipPort: a 16-byte address (IPv4-mapped for IPv4) and a port in
+	// host byte order.
+	var key, value [18]byte
+	ip := src.IP().As16()
+	copy(key[:16], ip[:])
+	binary.LittleEndian.PutUint16(key[16:], src.Port())
+	if err := m.Lookup(key, &value); err != nil {
+		return netaddr.IPPort{}, false
+	}
+	return ipPort(value[:16], binary.LittleEndian.Uint16(value[16:])), true
+}
+
 // tlsDropReasons names the indexes of the tls_plaintext_dropped map
 // (TLS_DROP_* in l7.c).
 var tlsDropReasons = []string{"go_fd_unknown", "ssl_read_fd_unknown", "ssl_write_unclaimed"}

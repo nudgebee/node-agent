@@ -24,7 +24,7 @@ var llmCaptureDropsDesc = prometheus.NewDesc(
 
 var tlsPlaintextDroppedDesc = prometheus.NewDesc(
 	"node_agent_tls_plaintext_dropped_total",
-	"TLS plaintext seen by a library hook in the kernel but not attributed to a socket, so never captured, by reason",
+	"TLS plaintext seen by a library hook in the kernel but not attributed to a socket, so never captured, by reason. go_fd_unknown includes TLS over in-memory connections (net.Pipe, gRPC bufconn), which have no socket to capture",
 	[]string{"reason"}, nil,
 )
 

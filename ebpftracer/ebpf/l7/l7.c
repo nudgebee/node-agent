@@ -357,7 +357,7 @@ void count_ciphertext_skip(__u32 direction) {
 // were visible only through bpf_printk in a debug build. Userspace exports it
 // as node_agent_tls_plaintext_dropped_total{reason}; the indexes must match
 // tlsDropReasons in tracer.go.
-#define TLS_DROP_GO_FD_UNKNOWN       0 // Go crypto/tls call whose socket fd could not be read
+#define TLS_DROP_GO_FD_UNKNOWN       0 // Go crypto/tls call whose socket fd could not be read; includes in-memory conns (net.Pipe, bufconn)
 #define TLS_DROP_SSL_READ_FD_UNKNOWN 1 // SSL_read returned data, its socket was never seen
 #define TLS_DROP_SSL_WRITE_UNCLAIMED 2 // SSL_write plaintext never matched to a socket write
 #define TLS_DROP_REASONS             3

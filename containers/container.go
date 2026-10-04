@@ -701,17 +701,18 @@ func ignoreControlPlane(name string) bool {
 	return false
 }
 
-func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst netaddr.IPPort, timestamp uint64, failed bool, duration time.Duration) {
+// connectionKey applies the filters a connection must pass to be tracked and
+// builds its destination key. actualDst is the post-NAT destination if known,
+// zero otherwise. ok is false if the connection is not to be tracked. Both
+// ways a connection is created — its open event (onConnectionOpen) and the
+// socket tuple of an L7 event that arrived first (createConnectionFromSocketInfo)
+// — go through here, so they track the same connections with the same labels.
+func (c *Container) connectionKey(p *Process, src, dst, actualDst netaddr.IPPort) (key common.DestinationKey, srcWorkload, dstWorkload common.Workload, ok bool) {
 	if common.PortFilter.ShouldBeSkipped(dst.Port()) {
 		return
 	}
-	c.lock.RLock()
-	p := c.processes[pid]
-	c.lock.RUnlock()
-	if p == nil {
-		return
-	}
-	if dst.IP().IsLoopback() && !p.isHostNs() {
+	hostNs := p != nil && p.isHostNs()
+	if dst.IP().IsLoopback() && !hostNs {
 		return
 	}
 	if actualDst.Port() == 0 {
@@ -722,23 +723,39 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 		}
 	}
 
-	srcWorkload := c.ip_resolver.ResolveSource(src.IP().String(), c.srcWorkload)
+	srcWorkload = c.ip_resolver.ResolveSource(src.IP().String(), c.srcWorkload)
 	if ignoreControlPlane(srcWorkload.Name) {
 		return
 	}
-	dstWorkload := c.ip_resolver.ResolveIP(dst.IP().String())
+	dstWorkload = c.ip_resolver.ResolveIP(dst.IP().String())
 	if ignoreControlPlane(dstWorkload.Name) {
 		return
 	}
 	actualDstWorkload := c.ip_resolver.ResolveActualIP(actualDst.IP().String())
-	if actualDst.IP().IsLoopback() && !p.isHostNs() {
+	if actualDst.IP().IsLoopback() && !hostNs {
 		return
 	}
 	if common.ConnectionFilter.ShouldBeSkipped(dst.IP(), actualDst.IP()) {
 		return
 	}
+	key = common.NewDestinationKey(dst, actualDst, c.registry.getDomain(dst.IP()), dstWorkload, actualDstWorkload)
+	return key, srcWorkload, dstWorkload, true
+}
 
-	key := common.NewDestinationKey(dst, actualDst, c.registry.getDomain(dst.IP()), dstWorkload, actualDstWorkload)
+func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst netaddr.IPPort, timestamp uint64, failed bool, duration time.Duration) {
+	if common.PortFilter.ShouldBeSkipped(dst.Port()) {
+		return
+	}
+	c.lock.RLock()
+	p := c.processes[pid]
+	c.lock.RUnlock()
+	if p == nil {
+		return
+	}
+	key, srcWorkload, dstWorkload, ok := c.connectionKey(p, src, dst, actualDst)
+	if !ok {
+		return
+	}
 
 	if failed {
 		c.tcpMetrics.ObserveConnectionFailed(key.Destination(), dstWorkload)
@@ -771,38 +788,42 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 // createConnectionFromSocketInfo creates an ActiveConnection from socket info extracted in eBPF
 // This is used when TCP connection tracking fails (common for Go TLS due to goroutine thread switching)
 // but we have socket tuple info extracted directly from the fd
-func (c *Container) createConnectionFromSocketInfo(pid uint32, fd uint64, timestamp uint64, socketInfo *ebpftracer.SocketInfo) *ActiveConnection {
+func (c *Container) createConnectionFromSocketInfo(pid uint32, fd uint64, timestamp uint64, socketInfo *ebpftracer.SocketInfo) (conn *ActiveConnection, filtered bool) {
 	if socketInfo == nil || !socketInfo.Valid {
-		return nil
+		return nil, false
 	}
 
 	// Parse destination IP
 	dstIP, err := netaddr.ParseIP(socketInfo.DstIP)
 	if err != nil {
 		klog.V(2).Infof("createConnectionFromSocketInfo: failed to parse dst IP %s: %v", socketInfo.DstIP, err)
-		return nil
+		return nil, false
 	}
 
 	// Parse source IP
 	srcIP, err := netaddr.ParseIP(socketInfo.SrcIP)
 	if err != nil {
 		klog.V(2).Infof("createConnectionFromSocketInfo: failed to parse src IP %s: %v", socketInfo.SrcIP, err)
-		return nil
+		return nil, false
 	}
 
 	dst := netaddr.IPPortFrom(dstIP, socketInfo.DstPort)
 	src := netaddr.IPPortFrom(srcIP, socketInfo.SrcPort)
 
-	// Resolve workloads
-	srcWorkload := c.ip_resolver.ResolveSource(src.IP().String(), c.srcWorkload)
-	dstWorkload := c.ip_resolver.ResolveIP(dst.IP().String())
-	actualDstWorkload := c.ip_resolver.ResolveActualIP(dst.IP().String())
-
-	// Try to get DNS domain for destination
-	domain := c.registry.getDomain(dst.IP())
-
-	// Create destination key
-	key := common.NewDestinationKey(dst, dst, domain, dstWorkload, actualDstWorkload)
+	// The socket holds the address the application connected to, before any
+	// NAT: a service's ClusterIP, not the pod behind it. The kernel records the
+	// translation per local address from conntrack, as the open event's
+	// actual destination does.
+	var actualDst netaddr.IPPort
+	if c.registry.tracer != nil {
+		actualDst, _ = c.registry.tracer.ActualDestination(src)
+	}
+	// Same filters and labels as a connection seen opening: without them,
+	// traffic to ignored destinations was tracked through this path alone.
+	key, srcWorkload, _, ok := c.connectionKey(c.processes[pid], src, dst, actualDst)
+	if !ok {
+		return nil, true
+	}
 
 	// Create connection
 	connection := &ActiveConnection{
@@ -820,14 +841,14 @@ func (c *Container) createConnectionFromSocketInfo(pid uint32, fd uint64, timest
 	k := PidFd{Pid: pid, Fd: fd}
 	if !c.canTrackConnection(k) {
 		ConnectionCapDropsTotal.Inc()
-		return nil
+		return nil, false
 	}
 	c.connectionsByPidFd[k] = connection
 
-	klog.V(3).Infof("L7_CONN_CREATED_FROM_SOCKET: pid=%d fd=%d src=%s dst=%s domain=%v",
-		pid, fd, src, dst, domain)
+	klog.V(3).Infof("L7_CONN_CREATED_FROM_SOCKET: pid=%d fd=%d src=%s dst=%s actual_dst=%s",
+		pid, fd, src, dst, key.ActualDestinationIfKnown())
 
-	return connection
+	return connection, false
 }
 
 // canTrackConnection reports whether pid+fd k may be added to
@@ -1091,7 +1112,12 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		if socketInfo != nil && socketInfo.Valid {
 			klog.V(3).Infof("L7_CREATING_CONN_FROM_SOCKET_INFO: pid=%d fd=%d dst=%s:%d container=%s",
 				pid, fd, socketInfo.DstIP, socketInfo.DstPort, c.id)
-			conn = c.createConnectionFromSocketInfo(pid, fd, timestamp, socketInfo)
+			var filtered bool
+			if conn, filtered = c.createConnectionFromSocketInfo(pid, fd, timestamp, socketInfo); filtered {
+				// A connection the agent does not track (an ignored
+				// destination, loopback, a filtered port).
+				return nil, L7RequestProcessed
+			}
 		}
 
 		if conn == nil {
@@ -1113,11 +1139,16 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		// The tracked entry is its closed predecessor, so take the
 		// connection from the event's own socket tuple instead.
 		if prev := conn; socketInfo != nil && socketInfo.Valid {
-			if conn = c.createConnectionFromSocketInfo(pid, fd, timestamp, socketInfo); conn == nil {
+			fresh, filtered := c.createConnectionFromSocketInfo(pid, fd, timestamp, socketInfo)
+			if fresh == nil && !filtered {
 				countL7Drop("unknown_connection", r)
 				return nil, L7RequestProcessed
 			}
 			prev.Closed = time.Now()
+			if filtered {
+				return nil, L7RequestProcessed
+			}
+			conn = fresh
 		} else if r.Protocol != l7.ProtocolHTTP2 {
 			// No tuple to go on: retry, the open event is on its way.
 			return nil, L7RequestConnNotFound
@@ -2087,10 +2118,9 @@ const (
 	openSslRecheckInterval = 10 * time.Second
 )
 
-// tlsExeRecheckInterval bounds how often a process's executable is re-read to
-// notice an exec (see recheckTlsAfterExec). Wrappers usually exec within
-// seconds of starting, so the interval has to be short to catch the first
-// connections of the program they start.
+// tlsExeRecheckInterval bounds how often the periodic sweep re-reads a
+// process's executable to notice an exec (see recheckTlsAfterExec). New
+// sockets always re-read it.
 const tlsExeRecheckInterval = time.Second
 
 // processForSocket returns the process that opened a socket, registering it
@@ -2117,7 +2147,7 @@ func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32, newS
 		}
 		return
 	}
-	c.recheckTlsAfterExec(p)
+	c.recheckTlsAfterExec(p, newSocket)
 	if !p.openSslUprobesChecked && time.Since(p.openSslLastCheck) >= openSslRecheckInterval {
 		p.openSslLastCheck = time.Now()
 		p.openSslChecks++
@@ -2144,8 +2174,15 @@ func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32, newS
 // connects before exec'ing the real program (a secrets launcher, for example)
 // would otherwise leave that program unprobed for its whole life, or probed
 // at addresses of the wrapper's binary.
-func (c *Container) recheckTlsAfterExec(p *Process) {
-	if !p.goTlsUprobesChecked || time.Since(p.tlsExeCheckedAt) < tlsExeRecheckInterval {
+//
+// Every new socket checks: the program a wrapper execs usually connects
+// within a second, and a throttle shared with the periodic sweep skipped that
+// first connection. The cost is one stat of /proc/<pid>/exe per connection.
+func (c *Container) recheckTlsAfterExec(p *Process, newSocket bool) {
+	if !p.goTlsUprobesChecked {
+		return
+	}
+	if !newSocket && time.Since(p.tlsExeCheckedAt) < tlsExeRecheckInterval {
 		return
 	}
 	p.tlsExeCheckedAt = time.Now()
