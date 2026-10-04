@@ -33,7 +33,7 @@ int openssl_SSL_write_enter(struct pt_regs *ctx) {
     // thread names the fd (sys_enter_write and friends in l7.c). A pending
     // write still here was never claimed, and its plaintext is lost.
     if (bpf_map_lookup_elem(&ssl_write_pending, &tid)) {
-        count_tls_drop(TLS_DROP_SSL_WRITE_UNCLAIMED);
+        count_tls_drop_by_pid(TLS_DROP_SSL_WRITE_UNCLAIMED);
     }
     struct ssl_args args = {};
     args.buf = buf;
@@ -88,7 +88,7 @@ int openssl_SSL_read_exit(struct pt_regs *ctx) {
         fd = ssl_known_fd(pid, ssl);
         if (!fd) {
             if ((int)PT_REGS_RC(ctx) > 0) {
-                count_tls_drop(TLS_DROP_SSL_READ_FD_UNKNOWN);
+                count_tls_drop_by_pid(TLS_DROP_SSL_READ_FD_UNKNOWN);
             }
             return 0;
         }

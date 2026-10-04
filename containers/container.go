@@ -156,6 +156,9 @@ type Container struct {
 
 	nodejsStats *ebpftracer.NodejsStats
 	pythonStats *ebpftracer.PythonStats
+	// tlsDrops counts TLS plaintext the kernel could not attribute to a
+	// socket for this container's processes, by reason. Guarded by lock.
+	tlsDrops map[string]float64
 
 	mounts     map[string]proc.MountInfo
 	seenMounts map[uint64]struct{}
@@ -499,6 +502,10 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	// registry's event loop; read under it here.
 	c.lock.RLock()
 	pythonStats, nodejsStats := c.pythonStats, c.nodejsStats
+	tlsDrops := make(map[string]float64, len(c.tlsDrops))
+	for reason, n := range c.tlsDrops {
+		tlsDrops[reason] = n
+	}
 	var pythonLockWait, nodejsBlocked float64
 	if pythonStats != nil {
 		pythonLockWait = pythonStats.ThreadLockWaitTime.Seconds()
@@ -512,6 +519,9 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	}
 	if nodejsStats != nil {
 		ch <- c.counter(metrics.NodejsEventLoopBlockedTime, nodejsBlocked)
+	}
+	for reason, n := range tlsDrops {
+		ch <- c.counter(metrics.TLSPlaintextDropped, n, reason)
 	}
 
 	// --- L7 metrics: push-model, own lock ---
@@ -591,11 +601,19 @@ func (c *Container) onProcessExit(pid uint32, oomKill bool) {
 	}
 }
 
-// closeProcess releases everything held for a process that is gone.
+// closeProcess releases everything held for a process that is gone. The
+// caller holds c.lock.
 func (c *Container) closeProcess(pid uint32, p *Process) {
 	p.Close()
 	if p.golang() {
 		c.registry.tracer.ReleaseGoTLSOffsets(pid)
+	}
+	if p.tlsAttached {
+		// The last chance to attribute its losses: the periodic read comes
+		// too late for a short-lived process.
+		if d := c.registry.tracer.TLSPlaintextDroppedForPid(pid); len(d) > 0 {
+			c.recordTLSDropsLocked(pid, p, d)
+		}
 	}
 }
 
@@ -2159,6 +2177,7 @@ func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32, newS
 	}
 	if !p.goTlsUprobesChecked {
 		p.tlsExe, _ = exeIdentityOf(pid)
+		p.tlsExeName, _ = os.Readlink(proc.Path(pid, "exe"))
 		p.tlsExeCheckedAt = time.Now()
 		links, isGolangApp, result := tracer.AttachGoTlsUprobes(pid)
 		countTLSAttach("go", result)

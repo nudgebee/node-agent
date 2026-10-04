@@ -252,7 +252,7 @@ int go_crypto_tls_write_enter(struct pt_regs *ctx) {
 
     __u32 fd;
     if (go_crypto_tls_get_fd_from_conn(ctx, &fd)) {
-        count_tls_drop(TLS_DROP_GO_FD_UNKNOWN);
+        count_tls_drop_by_pid(TLS_DROP_GO_FD_UNKNOWN);
         return 0;
     }
 
@@ -274,7 +274,7 @@ int go_crypto_tls_read_enter(struct pt_regs *ctx) {
 
     __u32 fd;
     if (go_crypto_tls_get_fd_from_conn(ctx, &fd)) {
-        count_tls_drop(TLS_DROP_GO_FD_UNKNOWN);
+        count_tls_drop_by_pid(TLS_DROP_GO_FD_UNKNOWN);
         return 0;
     }
     char *buf_ptr = (char*)GO_PARAM2(ctx);

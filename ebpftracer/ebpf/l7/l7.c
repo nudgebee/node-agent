@@ -377,6 +377,39 @@ void count_tls_drop(__u32 reason) {
     }
 }
 
+// tls_plaintext_dropped_by_pid attributes the same losses to a process, so
+// userspace can name the container and binary they come from. The per-CPU
+// total above cannot. Userspace reads and deletes the entries periodically.
+struct tls_drop_key {
+    __u32 pid;
+    __u32 reason;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(key_size, sizeof(struct tls_drop_key));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, 4096);
+} tls_plaintext_dropped_by_pid SEC(".maps");
+
+// count_tls_drop_by_pid also attributes a loss to the current process. It is
+// used only from the TLS library uprobes, which are small, and kept out of
+// the syscall programs, which are already near the verifier's limits.
+static inline __attribute__((__always_inline__))
+void count_tls_drop_by_pid(__u32 reason) {
+    count_tls_drop(reason);
+    struct tls_drop_key k = {};
+    k.pid = bpf_get_current_pid_tgid() >> 32;
+    k.reason = reason;
+    __u64 *v = bpf_map_lookup_elem(&tls_plaintext_dropped_by_pid, &k);
+    if (v) {
+        __sync_fetch_and_add(v, 1);
+        return;
+    }
+    __u64 one = 1;
+    bpf_map_update_elem(&tls_plaintext_dropped_by_pid, &k, &one, BPF_NOEXIST);
+}
+
 // mark_tls records that a TLS library hook handles this connection.
 //
 // A TLS connection is seen twice: once as plaintext by the Go crypto/tls or

@@ -58,6 +58,7 @@ type Process struct {
 	openSslLastCheck      time.Time
 	tlsAttached           bool
 	tlsExe                exeIdentity
+	tlsExeName            string
 	tlsExeCheckedAt       time.Time
 
 	// Only touched by the instrument goroutine.
