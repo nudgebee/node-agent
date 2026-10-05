@@ -102,6 +102,30 @@ int extract_fd_from_tcpconn(void* conn_data, struct go_tls_offsets *offsets, __u
     return 0;
 }
 
+// GO_CONN_MAX_DEPTH bounds how many net.Conn wrappers are unwrapped.
+#define GO_CONN_MAX_DEPTH 4
+
+// go_plausible_iface reports whether i looks like a non-nil Go interface
+// value: both words user-space pointers rather than small integers.
+static inline __attribute__((__always_inline__))
+int go_plausible_iface(struct go_interface *i) {
+    return (__u64)i->type > 4096 && (__u64)i->ptr > 4096;
+}
+
+// go_fd_is_socket reports whether fd is an IPv4 or IPv6 socket of the
+// current process. It also reports 1 when that cannot be checked (no socket
+// struct offsets), which keeps the previous behaviour of trusting the read.
+static inline __attribute__((__always_inline__))
+int go_fd_is_socket(__u32 fd) {
+    __u32 zero = 0;
+    struct socket_info_offsets *so = bpf_map_lookup_elem(&socket_info_offsets_map, &zero);
+    if (!so || !so->offsets_valid) {
+        return 1;
+    }
+    struct socket_tuple t = {};
+    return get_socket_tuple_from_fd(fd, &t);
+}
+
 static inline __attribute__((__always_inline__))
 int go_crypto_tls_get_fd_from_conn(struct pt_regs *ctx, __u32 *fd) {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
@@ -135,64 +159,36 @@ int go_crypto_tls_get_fd_from_conn(struct pt_regs *ctx, __u32 *fd) {
     }
     bpf_printk("go_tls: conn_interface.type=%llx data=%p", conn_interface.type, conn_interface.ptr);
 
-    // Step 3: Check if this is a gRPC syscallConn wrapper and unwrap if needed
-    // gRPC wraps connections in credentials.syscallConn which implements net.Conn
-    // Structure: syscallConn { Conn net.Conn; rawConn syscall.RawConn }
-    void* actual_conn_data = conn_interface.ptr;
-
-    if (offsets && offsets->grpc_syscallconn_itab != 0) {
-        // Check if this connection is wrapped in gRPC's syscallConn
-        if ((__u64)conn_interface.type == offsets->grpc_syscallconn_itab) {
-            bpf_printk("go_tls: detected gRPC syscallConn wrapper, unwrapping");
-
-            // Read the underlying Conn interface from syscallConn
-            // syscallConn.Conn is at offset syscallconn_conn_offset (typically 0)
-            struct go_interface inner_conn;
-            __s32 sc_offset = offsets->syscallconn_conn_offset;
-            if (sc_offset == 0) {
-                sc_offset = DEFAULT_SYSCALLCONN_CONN_OFFSET;
-            }
-
-            if (bpf_probe_read(&inner_conn, sizeof(inner_conn), conn_interface.ptr + sc_offset)) {
-                bpf_printk("go_tls: failed to read inner conn from syscallConn+%d", sc_offset);
-                return 1;
-            }
-            bpf_printk("go_tls: unwrapped inner_conn.type=%llx data=%p", inner_conn.type, inner_conn.ptr);
-
-            // Use the unwrapped connection data
-            actual_conn_data = inner_conn.ptr;
+    // Step 3: Find the socket behind the connection. Applications and
+    // libraries wrap net.Conn in their own types, each embedding the
+    // connection it wraps as an interface field: first (offset 0), or after a
+    // small counter or flag (offset 8). Proxies stack them; traefik's TLS
+    // connections are TLSConn -> peekConn -> trackedConnection ->
+    // *net.TCPConn, and VictoriaMetrics' scrape connections are statConn
+    // {closed int32; net.Conn}. gRPC's syscallConn is the same shape.
+    // Descend until a level is a TCP connection.
+    __u64 tcp_itab = offsets ? offsets->net_tcpconn_itab : 0;
+    struct go_interface c = conn_interface;
+#pragma unroll
+    for (int depth = 0; depth < GO_CONN_MAX_DEPTH; depth++) {
+        if (tcp_itab && (__u64)c.type == tcp_itab) {
+            // Exact: the binary's own *net.TCPConn itab.
+            return extract_fd_from_tcpconn(c.ptr, offsets, fd);
         }
-    } else {
-        // No itab info available - try heuristic detection
-        // If FD extraction fails with direct approach, try treating as syscallConn
-        // This is a fallback for when we don't have symbol information
-        bpf_printk("go_tls: no itab info, trying direct extraction first");
-    }
-
-    // Step 4: Extract FD from the actual connection data
-    if (extract_fd_from_tcpconn(actual_conn_data, offsets, fd) == 0) {
-        bpf_printk("go_tls: extracted fd=%d", *fd);
-        return 0;
-    }
-
-    // Step 5: If direct extraction failed and we haven't tried unwrapping,
-    // try treating conn_interface.ptr as a wrapper struct
-    if (actual_conn_data == conn_interface.ptr) {
-        bpf_printk("go_tls: direct extraction failed, trying wrapper unwrap");
-
-        // Try reading as if it's a wrapper with Conn interface at offset 0
-        struct go_interface wrapper_inner;
-        if (bpf_probe_read(&wrapper_inner, sizeof(wrapper_inner), conn_interface.ptr) == 0) {
-            if (wrapper_inner.ptr != NULL && wrapper_inner.type != 0) {
-                bpf_printk("go_tls: found wrapper inner.type=%llx data=%p",
-                          wrapper_inner.type, wrapper_inner.ptr);
-
-                if (extract_fd_from_tcpconn(wrapper_inner.ptr, offsets, fd) == 0) {
-                    bpf_printk("go_tls: extracted fd=%d via wrapper unwrap", *fd);
-                    return 0;
-                }
+        // Without the itab (a stripped binary) or with one that does not
+        // match (a PIE binary, whose symbol table holds it unrelocated), try
+        // the level as a TCP connection, and believe the result only if it
+        // names a socket of this process.
+        if (extract_fd_from_tcpconn(c.ptr, offsets, fd) == 0 && go_fd_is_socket(*fd)) {
+            return 0;
+        }
+        struct go_interface inner = {};
+        if (bpf_probe_read(&inner, sizeof(inner), c.ptr) || !go_plausible_iface(&inner)) {
+            if (bpf_probe_read(&inner, sizeof(inner), c.ptr + 8) || !go_plausible_iface(&inner)) {
+                break;
             }
         }
+        c = inner;
     }
 
     bpf_printk("go_tls: failed to extract fd");
@@ -252,7 +248,7 @@ int go_crypto_tls_write_enter(struct pt_regs *ctx) {
 
     __u32 fd;
     if (go_crypto_tls_get_fd_from_conn(ctx, &fd)) {
-        count_tls_drop(TLS_DROP_GO_FD_UNKNOWN);
+        count_tls_drop_by_pid(TLS_DROP_GO_FD_UNKNOWN);
         return 0;
     }
 
@@ -274,7 +270,7 @@ int go_crypto_tls_read_enter(struct pt_regs *ctx) {
 
     __u32 fd;
     if (go_crypto_tls_get_fd_from_conn(ctx, &fd)) {
-        count_tls_drop(TLS_DROP_GO_FD_UNKNOWN);
+        count_tls_drop_by_pid(TLS_DROP_GO_FD_UNKNOWN);
         return 0;
     }
     char *buf_ptr = (char*)GO_PARAM2(ctx);

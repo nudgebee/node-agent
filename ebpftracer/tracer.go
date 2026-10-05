@@ -235,6 +235,74 @@ func (t *Tracer) TLSPlaintextDropped() (map[string]uint64, bool) {
 	return res, true
 }
 
+// tlsDropKey is struct tls_drop_key in l7.c.
+type tlsDropKey struct{ Pid, Reason uint32 }
+
+// TLSPlaintextDroppedByPid returns, per process and reason, the TLS plaintext
+// losses the kernel attributed since the last call (tls_plaintext_dropped_by_pid),
+// and clears them.
+func (t *Tracer) TLSPlaintextDroppedByPid() map[uint32]map[string]uint64 {
+	m := t.readyMap("tls_plaintext_dropped_by_pid")
+	if m == nil {
+		return nil
+	}
+	var keys []tlsDropKey
+	var k tlsDropKey
+	var v uint64
+	for it := m.Iterate(); it.Next(&k, &v); {
+		keys = append(keys, k)
+	}
+	res := map[uint32]map[string]uint64{}
+	for _, k := range keys {
+		var n uint64
+		err := m.LookupAndDelete(k, &n)
+		if errors.Is(err, ebpf.ErrNotSupported) {
+			// Hash-map LookupAndDelete needs 5.14; a count that lands between
+			// these two calls is lost, which is fine for a diagnostic.
+			if m.Lookup(k, &n) != nil {
+				continue
+			}
+			_ = m.Delete(k)
+		} else if err != nil {
+			continue
+		}
+		if n == 0 || int(k.Reason) >= len(tlsDropReasons) {
+			continue
+		}
+		if res[k.Pid] == nil {
+			res[k.Pid] = map[string]uint64{}
+		}
+		res[k.Pid][tlsDropReasons[k.Reason]] += n
+	}
+	return res
+}
+
+// TLSPlaintextDroppedForPid returns and clears the losses attributed to one
+// process. It is called when the process exits, which is the last chance to
+// attribute them: a short-lived process is gone before the periodic read.
+func (t *Tracer) TLSPlaintextDroppedForPid(pid uint32) map[string]uint64 {
+	m := t.readyMap("tls_plaintext_dropped_by_pid")
+	if m == nil {
+		return nil
+	}
+	var res map[string]uint64
+	for reason, name := range tlsDropReasons {
+		k := tlsDropKey{Pid: pid, Reason: uint32(reason)}
+		var n uint64
+		if m.Lookup(k, &n) != nil {
+			continue
+		}
+		_ = m.Delete(k)
+		if n > 0 {
+			if res == nil {
+				res = map[string]uint64{}
+			}
+			res[name] = n
+		}
+	}
+	return res
+}
+
 // L7RingbufDrops returns how many L7 events the kernel lost because the
 // l7_events ring buffer was full.
 func (t *Tracer) L7RingbufDrops() (uint64, bool) {

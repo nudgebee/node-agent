@@ -718,6 +718,17 @@ func (r *Registry) updateEbpfStatsAndActiveConns() {
 	if !r.tracer.Ready() {
 		return
 	}
+	// TLS plaintext the kernel could not attribute to a socket, per process:
+	// counted on the process's container and logged once per binary.
+	for pid, byReason := range r.tracer.TLSPlaintextDroppedByPid() {
+		r.containerLock.RLock()
+		c := r.containersByPid[pid]
+		r.containerLock.RUnlock()
+		if c != nil {
+			c.recordTLSDrops(pid, byReason)
+		}
+	}
+
 	// Traffic stats from eBPF maps
 	iter := r.tracer.ActiveConnectionsIterator()
 	cid := ebpftracer.ConnectionId{}
