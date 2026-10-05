@@ -61,6 +61,7 @@ func newHpackDecoder() *hpackDecoder {
 // reset forgets the dynamic table, for when the caller knows a header block
 // was lost and the table no longer matches the encoder's.
 func (d *hpackDecoder) reset() {
+	clear(d.dynamic) // release the strings the backing array still holds
 	d.dynamic = d.dynamic[:0]
 	d.size = 0
 	d.maxSize = hpackDefaultTableSize
@@ -149,13 +150,14 @@ func (d *hpackDecoder) field(idx uint64) (hpackEntry, bool) {
 	if i > uint64(len(d.dynamic)) {
 		return hpackEntry{}, false
 	}
-	return d.dynamic[uint64(len(d.dynamic))-i], true
+	return d.dynamic[len(d.dynamic)-int(i)], true
 }
 
 func (d *hpackDecoder) insert(f hpackEntry) {
 	size := uint32(len(f.Name)+len(f.Value)) + hpackEntryOverhead
 	if size > d.maxSize {
 		// RFC 7541 4.4: an entry larger than the table empties it.
+		clear(d.dynamic)
 		d.dynamic = d.dynamic[:0]
 		d.size = 0
 		return
@@ -174,7 +176,10 @@ func (d *hpackDecoder) evict(room uint32) {
 		n++
 	}
 	if n > 0 {
-		d.dynamic = append(d.dynamic[:0], d.dynamic[n:]...)
+		copy(d.dynamic, d.dynamic[n:])
+		// Release the evicted strings: the backing array keeps the tail.
+		clear(d.dynamic[len(d.dynamic)-n:])
+		d.dynamic = d.dynamic[:len(d.dynamic)-n]
 	}
 }
 
@@ -216,8 +221,8 @@ func hpackString(b []byte) (string, []byte, error) {
 	if n > uint64(len(b)) {
 		return "", nil, errHpackTruncated
 	}
-	raw := b[:n]
-	b = b[n:]
+	raw := b[:int(n)]
+	b = b[int(n):]
 	if !huffman {
 		return string(raw), b, nil
 	}
