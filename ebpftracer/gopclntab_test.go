@@ -241,3 +241,46 @@ func TestReturnOffsets_RejectsSymbolOutsideText(t *testing.T) {
 		}
 	}
 }
+
+// A stripped Go binary's symbols come only from .gopclntab. It used to be read
+// by reopening the path, a /proc/<pid>/exe link for a process: when the
+// process exited between the ELF open and that reopen, its TLS functions were
+// "not found", the binary was cached as having none, and every later process
+// of it went unprobed. The table is now read through the file already open.
+func TestGetSymbol_StrippedGoBinaryAfterPathIsGone(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds Go binaries")
+	}
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go toolchain not found")
+	}
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "go.mod"), []byte("module tlsprobe\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "main.go"), []byte(gopclntabTestProgram), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(t.TempDir(), "stripped")
+	cmd := exec.Command(goBin, "build", "-ldflags=-s -w", "-o", bin, ".")
+	cmd.Dir = src
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+
+	ef, err := OpenELFFile(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ef.Close()
+	if err := os.Remove(bin); err != nil { // the process exits
+		t.Fatal(err)
+	}
+	for _, name := range tlsFuncs {
+		if _, err := ef.GetSymbol(name); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
