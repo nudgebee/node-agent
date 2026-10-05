@@ -396,7 +396,7 @@ func (p *Http2Parser) decodeHeaderBlock(
 // the next call — see the save site at the end of this function — but when the
 // missing bytes all belong to that frame, its remainder at the start of the
 // next read is known exactly and is skipped, so framing survives the cut.
-// That is the common case: Go reads 4096 bytes and the kernel keeps 4095.
+// That is the common case for a read or write longer than MAX_PAYLOAD_SIZE.
 func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64, missing uint64) []Http2Request {
 	truncated := missing > 0
 	if method == MethodHttp2ClientFrames {
