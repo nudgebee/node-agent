@@ -601,6 +601,18 @@ func (c *Container) onProcessExit(pid uint32, oomKill bool) {
 	}
 }
 
+// dropStaleHTTP2Parser removes the HTTP/2 parser an earlier connection left on
+// pid+fd. Parsers are keyed by pid+fd alone, so a recycled fd would otherwise
+// hand the new connection the old one's HPACK dynamic table, and its headers
+// would fail to decode or decode wrong. A parser already tagged with this
+// connection's timestamp is its own, created by an L7 event that arrived
+// before the open event, and is kept.
+func (c *Container) dropStaleHTTP2Parser(k PidFd, timestamp uint64) {
+	if p := c.googleHTTP2Parsers[k]; p != nil && p.ConnTimestamp != 0 && p.ConnTimestamp != timestamp {
+		delete(c.googleHTTP2Parsers, k)
+	}
+}
+
 // closeProcess releases everything held for a process that is gone. The
 // caller holds c.lock.
 func (c *Container) closeProcess(pid uint32, p *Process) {
@@ -799,6 +811,7 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 			prev.Closed = time.Now()
 		}
 		c.connectionsByPidFd[k] = connection
+		c.dropStaleHTTP2Parser(k, timestamp)
 	}
 	c.lastConnectionAttempts[key.Destination()] = time.Now()
 }
@@ -1163,6 +1176,9 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 				return nil, L7RequestProcessed
 			}
 			prev.Closed = time.Now()
+			// Its HTTP/2 parser too: the new connection must not decode its
+			// headers against the old one's HPACK table.
+			delete(c.googleHTTP2Parsers, PidFd{Pid: pid, Fd: fd})
 			if filtered {
 				return nil, L7RequestProcessed
 			}

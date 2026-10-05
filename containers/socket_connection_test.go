@@ -5,6 +5,7 @@ import (
 
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer"
+	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/coroot/coroot-node-agent/flags"
 )
 
@@ -85,4 +86,33 @@ func TestSocketConnectionKeepsEventTimestamp(t *testing.T) {
 	if dw := conn.DestinationKey.GetDestinationWorkload(); dw.Name != "api" {
 		t.Errorf("destination workload = %q, want api", dw.Name)
 	}
+}
+
+// A recycled fd must not hand a new connection the previous one's HTTP/2
+// parser (and so its HPACK table), but a parser already created for the new
+// connection, by an L7 event that beat the open event, must survive.
+func TestDropStaleHTTP2Parser(t *testing.T) {
+	k := PidFd{Pid: 1, Fd: 7}
+	parser := func(ts uint64) *l7.Http2Parser {
+		p := l7.NewHttp2Parser()
+		p.ConnTimestamp = ts
+		return p
+	}
+	for _, tc := range []struct {
+		name     string
+		parserTs uint64
+		connTs   uint64
+		kept     bool
+	}{
+		{"previous connection's parser", 100, 200, false},
+		{"this connection's parser", 200, 200, true},
+		{"parser without a timestamp", 0, 200, true},
+	} {
+		c := &Container{googleHTTP2Parsers: map[PidFd]*l7.Http2Parser{k: parser(tc.parserTs)}}
+		c.dropStaleHTTP2Parser(k, tc.connTs)
+		if _, ok := c.googleHTTP2Parsers[k]; ok != tc.kept {
+			t.Errorf("%s: kept=%v, want %v", tc.name, ok, tc.kept)
+		}
+	}
+	(&Container{}).dropStaleHTTP2Parser(k, 1) // no parsers yet: must not panic
 }
