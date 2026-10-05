@@ -21,6 +21,9 @@ import (
 type ProbeTarget struct {
 	Address       uint64
 	ReturnOffsets []int
+	// StackCheckEnd is the offset past the function's stack check, where a
+	// probe fires once per call even if the stack grows (0: not found).
+	StackCheckEnd int
 	Found         bool
 }
 
@@ -155,6 +158,9 @@ func readProbeTargets(path string, names []string) (map[string]ProbeTarget, erro
 		// uprobe; only the uretprobes are skipped.
 		if offsets, err := s.ReturnOffsets(); err == nil {
 			t.ReturnOffsets = offsets
+		}
+		if end, err := s.StackCheckEnd(); err == nil {
+			t.StackCheckEnd = end
 		}
 		targets[name] = t
 	}
