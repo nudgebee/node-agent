@@ -53,6 +53,21 @@ struct trace_event_raw_sched_process_template__stub {
     __u32 pid;
 };
 
+// sched_process_exec reports that a process replaced its image, so userspace
+// can probe the new program at once: waiting for its first connection let a
+// short-lived program make its first requests unprobed, and left the program
+// a wrapper execs probed at the wrapper's addresses.
+SEC("tracepoint/sched/sched_process_exec")
+int sched_process_exec(void *ctx)
+{
+    struct proc_event e = {
+        .type = EVENT_TYPE_PROCESS_EXEC,
+        .pid = bpf_get_current_pid_tgid() >> 32,
+    };
+    bpf_perf_event_output(ctx, &proc_events, BPF_F_CURRENT_CPU, &e, sizeof(e));
+    return 0;
+}
+
 SEC("tracepoint/sched/sched_process_exit")
 int sched_process_exit(struct trace_event_raw_sched_process_template__stub *args)
 {
