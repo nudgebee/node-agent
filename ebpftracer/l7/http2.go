@@ -105,7 +105,8 @@ const (
 	maxPendingHeaderBlockSize = 64 * 1024
 
 	// Max concurrent HTTP/2 streams tracked per connection.
-	// Prevents unbounded memory growth when responses never complete (orphan streams).
+	// Prevents unbounded memory growth when responses never complete (orphan
+	// streams); at the limit the oldest stream makes way (evictOldestRequest).
 	maxActiveRequests = 100
 )
 
@@ -218,6 +219,29 @@ func (p *Http2Parser) resetDecoder(method Method) {
 	}
 }
 
+// evictOldestRequest makes room for a new stream by dropping the request
+// that has waited longest for its response.
+//
+// The streams that fill the table are mostly ones whose response the parser
+// will never see: it was in a read cut short by truncation, or in an event
+// lost before it. They are only collected after http2DecoderGcInterval.
+// Refusing new streams until then dropped every request on a busy
+// connection for minutes, silently; the oldest stream is the one least
+// likely to still complete.
+func (p *Http2Parser) evictOldestRequest() {
+	var oldestId uint32
+	var oldest *Http2Request
+	for id, r := range p.activeRequests {
+		if oldest == nil || r.kernelTime < oldest.kernelTime {
+			oldestId, oldest = id, r
+		}
+	}
+	if oldest != nil {
+		delete(p.activeRequests, oldestId)
+		p.stage("stream_evicted")
+	}
+}
+
 // dropPendingHeaders discards a header block still waiting for CONTINUATION
 // frames. Its insertions never reach the table, so the table is reset too.
 func (p *Http2Parser) dropPendingHeaders(method Method, pending **pendingHeaderBlock) {
@@ -297,15 +321,16 @@ func (p *Http2Parser) decodeHeaderBlock(
 	switch method {
 	case MethodHttp2ClientFrames:
 		req := p.activeRequests[streamId]
-		if req == nil && len(p.activeRequests) < maxActiveRequests {
+		if req == nil {
+			if len(p.activeRequests) >= maxActiveRequests {
+				p.evictOldestRequest()
+			}
 			req = &Http2Request{
 				kernelTime: kernelTime,
 			}
 			p.activeRequests[streamId] = req
 			p.stage("stream_created")
 		}
-		// With too many active streams req stays nil: the block is still
-		// decoded, to keep the dynamic table in sync.
 		emit = func(name, value string) {
 			switch name {
 			case ":method":
