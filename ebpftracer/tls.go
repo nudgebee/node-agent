@@ -269,6 +269,25 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) (links []link.Link, isGolangApp 
 		if !ws.Found {
 			continue
 		}
+		// Emit at return, not at entry: a Go function's entry runs twice when
+		// its goroutine's stack grows there, and a write sent twice corrupts
+		// the stream (see go_tls_write_args in gotls.c). Without return
+		// offsets, fall back to emitting at entry.
+		if len(ws.ReturnOffsets) > 0 {
+			l, err := attachUprobeAt(exe, t.uprobes["go_crypto_tls_write_save"], pid, ws.Address)
+			if err != nil {
+				closeLinks()
+				return fail(fmt.Sprintf("failed to attach write_save uprobe for %s", writeSymbol), err)
+			}
+			links = append(links, l)
+			ls, err := attachUretprobesAt(exe, t.uprobes["go_crypto_tls_write_exit"], pid, ws)
+			links = append(links, ls...)
+			if err != nil {
+				closeLinks()
+				return fail(fmt.Sprintf("failed to attach write_exit uprobe for %s", writeSymbol), err)
+			}
+			continue
+		}
 		l, err := attachUprobeAt(exe, t.uprobes["go_crypto_tls_write_enter"], pid, ws.Address)
 		if err != nil {
 			closeLinks()

@@ -353,6 +353,74 @@ int go_crypto_tls_write_enter(struct pt_regs *ctx) {
     return trace_enter_write(ctx, fd, 1, buf_ptr, buf_size, 0);
 }
 
+// go_tls_write_args holds a crypto/tls.(*Conn).Write call between the probe
+// at its entry and the probes at its returns, keyed like reads by process and
+// goroutine.
+//
+// A Go function's entry runs again when its goroutine's stack has to grow
+// there: the runtime copies the stack and restarts the function from its
+// first instruction. A probe that emits at entry then sends the same write
+// twice, and a duplicated write splices a copy of its bytes into the
+// connection's stream: the HTTP/2 parser loses frame alignment for the rest
+// of the connection, and a repeated header block inserts its HPACK entries
+// twice. Stacks grow again after the GC shrinks them, so this recurs for the
+// life of a process. Saving the arguments at entry, which a restart only
+// overwrites, and emitting once at return sends every write exactly once.
+struct go_tls_write_args {
+    __u64 fd;
+    char *buf;
+    __u64 size;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(key_size, sizeof(__u64));
+    __uint(value_size, sizeof(struct go_tls_write_args));
+    __uint(max_entries, 10240);
+} go_tls_write_args SEC(".maps");
+
+SEC("uprobe/go_crypto_tls_write_save")
+int go_crypto_tls_write_save(struct pt_regs *ctx) {
+    __u64 pid = bpf_get_current_pid_tgid() >> 32;
+    __u32 fd;
+    if (go_crypto_tls_get_fd_from_conn(ctx, &fd)) {
+        count_tls_drop_by_pid(TLS_DROP_GO_FD_UNKNOWN);
+        return 0;
+    }
+    ensure_connection_tracked(pid, fd);
+    struct go_tls_write_args args = {
+        .fd = fd,
+        .buf = (char*)GO_PARAM2(ctx),
+        .size = GO_PARAM3(ctx),
+    };
+    __u64 id = pid << 32 | GOROUTINE(ctx);
+    bpf_map_update_elem(&go_tls_write_args, &id, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uprobe/go_crypto_tls_write_exit")
+int go_crypto_tls_write_exit(struct pt_regs *ctx) {
+    __u64 pid = bpf_get_current_pid_tgid() >> 32;
+    __u64 id = pid << 32 | GOROUTINE(ctx);
+    struct go_tls_write_args *a = bpf_map_lookup_elem(&go_tls_write_args, &id);
+    if (!a) {
+        return 0;
+    }
+    struct go_tls_write_args args = *a;
+    bpf_map_delete_elem(&go_tls_write_args, &id);
+    // Write returns the bytes written; on an error part of the buffer may
+    // not have been sent.
+    long n = GO_PARAM1(ctx);
+    if (n <= 0) {
+        return 0;
+    }
+    __u64 size = args.size;
+    if ((__u64)n < size) {
+        size = n;
+    }
+    return trace_enter_write(ctx, args.fd, 1, args.buf, size, 0);
+}
+
 SEC("uprobe/go_crypto_tls_read_enter")
 int go_crypto_tls_read_enter(struct pt_regs *ctx) {
     // Debug: Log EVERY call to crypto/tls.(*Conn).Read
