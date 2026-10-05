@@ -4,6 +4,7 @@ import (
 	"debug/elf"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -116,7 +117,10 @@ func (s *Symbol) AttachUretprobes(exe *link.Executable, prog *ebpf.Program, pid 
 }
 
 type ELFFile struct {
-	path              string
+	path string
+	// file is the open binary. Everything is read through it: reopening path,
+	// a /proc/<pid>/exe link, fails once that process has exited.
+	file              *os.File
 	elf               *elf.File
 	symbols           []elf.Symbol
 	textSection       *elf.Section
@@ -126,11 +130,16 @@ type ELFFile struct {
 }
 
 func OpenELFFile(path string) (*ELFFile, error) {
-	file, err := elf.Open(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	return &ELFFile{path: path, elf: file}, nil
+	ef, err := elf.NewFile(file)
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	return &ELFFile{path: path, file: file, elf: ef}, nil
 }
 
 func (f *ELFFile) readSymbols() error {
@@ -176,7 +185,7 @@ func (f *ELFFile) GetSymbol(name string) (*Symbol, error) {
 // cannot be read.
 func (f *ELFFile) goFuncTable() *goFuncTable {
 	if f.goFuncs == nil && f.goFuncsErr == nil {
-		f.goFuncs, f.goFuncsErr = openGoFuncTable(f.path, f.elf)
+		f.goFuncs, f.goFuncsErr = openGoFuncTable(f.file, f.elf)
 	}
 	return f.goFuncs
 }
@@ -196,7 +205,8 @@ func (f *ELFFile) Close() error {
 	if f.goFuncs != nil {
 		f.goFuncs.close()
 	}
-	return f.elf.Close()
+	// elf.File.Close does nothing for a file made with elf.NewFile.
+	return f.file.Close()
 }
 
 // stackCheckWindow bounds the prologue scanned for the stack check: at most
