@@ -188,3 +188,45 @@ func TestHttp2ParserAcceptsTableSizeUpdateInLaterBlock(t *testing.T) {
 		t.Errorf("hpack_error = %d, hpack_partial = %d, want 0", stages["hpack_error"], stages["hpack_partial"])
 	}
 }
+
+func responseFrame(streamID uint32) []byte {
+	var buf bytes.Buffer
+	_ = hpack.NewEncoder(&buf).WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+	return frame(http2.FrameHeaders, http2FlagEndHeaders|http2FlagEndStream, streamID, buf.Bytes())
+}
+
+// Requests whose responses are lost (cut from a truncated read) stay active
+// until the stream GC, minutes later. Once maxActiveRequests of them pile up,
+// new streams used to be refused, so every request on the connection was
+// dropped until the GC ran. The oldest waiting request now makes room.
+func TestHttp2ParserEvictsOldestStreamAtCap(t *testing.T) {
+	stages := countStages(t)
+	p := NewHttp2Parser()
+	orphans := maxActiveRequests + 20
+	for i := 0; i < orphans; i++ {
+		p.Parse(MethodHttp2ClientFrames, headersFrame(streamID(i), "/orphan"), uint64(i), 0)
+	}
+	completed := 0
+	for i := orphans; i < orphans+50; i++ {
+		p.Parse(MethodHttp2ClientFrames, headersFrame(streamID(i), "/live"), uint64(i), 0)
+		for _, r := range p.Parse(MethodHttp2ServerFrames, responseFrame(streamID(i)), uint64(i), 0) {
+			if r.Path == "/live" {
+				completed++
+			}
+		}
+	}
+	if completed != 50 {
+		t.Errorf("completed %d of 50 requests made after the orphans filled the table", completed)
+	}
+	if len(p.activeRequests) > maxActiveRequests {
+		t.Errorf("%d active requests, cap is %d", len(p.activeRequests), maxActiveRequests)
+	}
+	if p.activeRequests[streamID(0)] != nil || p.activeRequests[streamID(orphans-1)] == nil {
+		t.Error("evicted the wrong streams: the oldest must go first")
+	}
+	// 20 orphans past the cap, then one for the first live request; each
+	// live request completes and frees its own slot.
+	if stages["stream_evicted"] != 21 {
+		t.Errorf("stream_evicted = %d, want 21", stages["stream_evicted"])
+	}
+}

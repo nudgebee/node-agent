@@ -127,6 +127,9 @@ var (
 	// inferred. Stages, in order:
 	//
 	//   stream_created   client HEADERS decoded, request object created
+	//   stream_evicted   a request still waiting for its response dropped to
+	//                    make room: the connection had too many such requests,
+	//                    nearly always ones whose response was lost
 	//   response_status  :status seen on the response
 	//   end_stream       END_STREAM flag seen (a frame flag, not HPACK)
 	//   completed        both of the above -> request emitted
