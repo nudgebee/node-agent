@@ -15,6 +15,9 @@ var tlsDropHints = map[string]string{
 type tlsDropLogKey struct {
 	exe    exeIdentity
 	reason string
+	// container is set only when the process is unknown, so that an unknown
+	// process in one container does not silence those in every other.
+	container ContainerID
 }
 
 // tlsDropLogged keeps the TLS-drop warning to one line per binary and reason,
@@ -30,11 +33,14 @@ func (c *Container) recordTLSDropsLocked(pid uint32, p *Process, byReason map[st
 	}
 	for reason, n := range byReason {
 		c.tlsDrops[reason] += float64(n)
-		exe, name := exeIdentity{}, ""
+		key := tlsDropLogKey{reason: reason}
+		name := ""
 		if p != nil {
-			exe, name = p.tlsExe, p.tlsExeName
+			key.exe, name = p.tlsExe, p.tlsExeName
+		} else {
+			key.container = c.id
 		}
-		if ok, _ := tlsDropLogged.ContainsOrAdd(tlsDropLogKey{exe: exe, reason: reason}, struct{}{}); ok {
+		if ok, _ := tlsDropLogged.ContainsOrAdd(key, struct{}{}); ok {
 			continue
 		}
 		klog.Warningf("TLS plaintext of %s (pid %d, container %s) is not being captured: %d %s events. %s",

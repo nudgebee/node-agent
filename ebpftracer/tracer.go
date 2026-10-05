@@ -235,6 +235,9 @@ func (t *Tracer) TLSPlaintextDropped() (map[string]uint64, bool) {
 	return res, true
 }
 
+// tlsDropKey is struct tls_drop_key in l7.c.
+type tlsDropKey struct{ Pid, Reason uint32 }
+
 // TLSPlaintextDroppedByPid returns, per process and reason, the TLS plaintext
 // losses the kernel attributed since the last call (tls_plaintext_dropped_by_pid),
 // and clears them.
@@ -243,9 +246,8 @@ func (t *Tracer) TLSPlaintextDroppedByPid() map[uint32]map[string]uint64 {
 	if m == nil {
 		return nil
 	}
-	type dropKey struct{ Pid, Reason uint32 }
-	var keys []dropKey
-	var k dropKey
+	var keys []tlsDropKey
+	var k tlsDropKey
 	var v uint64
 	for it := m.Iterate(); it.Next(&k, &v); {
 		keys = append(keys, k)
@@ -285,7 +287,7 @@ func (t *Tracer) TLSPlaintextDroppedForPid(pid uint32) map[string]uint64 {
 	}
 	var res map[string]uint64
 	for reason, name := range tlsDropReasons {
-		k := struct{ Pid, Reason uint32 }{pid, uint32(reason)}
+		k := tlsDropKey{Pid: pid, Reason: uint32(reason)}
 		var n uint64
 		if m.Lookup(k, &n) != nil {
 			continue
