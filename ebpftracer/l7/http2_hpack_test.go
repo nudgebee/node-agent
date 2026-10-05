@@ -152,3 +152,39 @@ func TestHttp2ParserResetsTableOnImplausibleHeaders(t *testing.T) {
 		t.Error("server table not reset")
 	}
 }
+
+// Go's HTTP/2 client starts a header block with a dynamic table size update
+// once it has the server's SETTINGS, a few requests into every connection.
+// hpack.Decoder, fed with Write and never Close as the parser must, does not
+// know where a block starts and rejected that update as "not at the beginning
+// of a header block": every Go client connection fell into the
+// reset-on-error cascade within its first requests.
+func TestHttp2ParserAcceptsTableSizeUpdateInLaterBlock(t *testing.T) {
+	stages := countStages(t)
+	var buf bytes.Buffer
+	enc := hpack.NewEncoder(&buf)
+	p := NewHttp2Parser()
+	for i := 0; i < 20; i++ {
+		buf.Reset()
+		if i == 3 {
+			enc.SetMaxDynamicTableSize(4096) // what the client does on SETTINGS
+		}
+		for _, f := range []hpack.HeaderField{
+			{Name: ":authority", Value: "api.example.com"},
+			{Name: ":method", Value: "GET"},
+			{Name: ":path", Value: "/v1/items"},
+			{Name: ":scheme", Value: "https"},
+			{Name: "user-agent", Value: "Go-http-client/2.0"},
+		} {
+			_ = enc.WriteField(f)
+		}
+		p.Parse(MethodHttp2ClientFrames, frame(http2.FrameHeaders, http2FlagEndHeaders|http2FlagEndStream, streamID(i), buf.Bytes()), uint64(i), 0)
+		req := p.activeRequests[streamID(i)]
+		if req == nil || req.Path != "/v1/items" || req.Authority != "api.example.com" {
+			t.Fatalf("request %d: %+v", i, req)
+		}
+	}
+	if stages["hpack_error"] != 0 || stages["hpack_partial"] != 0 {
+		t.Errorf("hpack_error = %d, hpack_partial = %d, want 0", stages["hpack_error"], stages["hpack_partial"])
+	}
+}
