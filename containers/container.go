@@ -1161,7 +1161,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			// HTTP/2 frames cannot be parsed out of order, which is what a
 			// retry would deliver them as.
 			if r.Protocol == l7.ProtocolHTTP2 {
-				countL7Drop("unknown_connection", r)
+				dropL7Event(c.id, "unknown_connection", pid, fd, r, socketInfo)
 				return nil, L7RequestProcessed
 			}
 			klog.V(3).Infof("L7_EVENT_CONN_NOT_FOUND: pid=%d fd=%d container=%s num_connections=%d",
@@ -1178,7 +1178,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		if prev := conn; socketInfo != nil && socketInfo.Valid {
 			fresh, filtered := c.createConnectionFromSocketInfo(pid, fd, timestamp, socketInfo)
 			if fresh == nil && !filtered {
-				countL7Drop("unknown_connection", r)
+				dropL7Event(c.id, "unknown_connection", pid, fd, r, socketInfo)
 				return nil, L7RequestProcessed
 			}
 			prev.Closed = time.Now()
@@ -1197,7 +1197,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	if timestamp != 0 && conn.Timestamp != timestamp {
 		klog.V(5).Infof("L7_EVENT_TIMESTAMP_MISMATCH: pid=%d fd=%d event_ts=%d conn_ts=%d protocol=%d",
 			pid, fd, timestamp, conn.Timestamp, r.Protocol)
-		countL7Drop("stale_connection", r)
+		dropL7Event(c.id, "stale_connection", pid, fd, r, socketInfo)
 		return nil, L7RequestTimestampMismatch
 	}
 
@@ -2158,18 +2158,16 @@ const (
 	openSslRecheckInterval = 10 * time.Second
 )
 
-// tlsExeRecheckInterval bounds how often the periodic sweep re-reads a
-// process's executable to notice an exec (see recheckTlsAfterExec). New
-// sockets always re-read it.
-const tlsExeRecheckInterval = time.Second
+// tlsExeRecheckInterval bounds how often a process's executable is re-read to
+// catch an exec whose event was lost (see recheckTlsAfterExec).
+const tlsExeRecheckInterval = 10 * time.Second
 
-// processForSocket returns the process that opened a socket, registering it
-// if its start event has not been handled yet. Socket events often come
-// first: they arrive on separate buffers, and connect events are read more
-// often. Waiting for the start event dropped the connection (onConnectionOpen
-// ignores unknown pids) and left a short-lived process's first TLS calls,
-// often all of them, unprobed.
-func (c *Container) processForSocket(pid uint32) *Process {
+// ensureProcess returns the process, registering it if its start event has
+// not been handled yet. Socket and exec events often come first: they arrive
+// on other buffers or CPUs. Waiting for the start event dropped the
+// connection (onConnectionOpen ignores unknown pids) and left a short-lived
+// process's first TLS calls, often all of them, unprobed.
+func (c *Container) ensureProcess(pid uint32) *Process {
 	if p := c.processes[pid]; p != nil {
 		return p
 	}
@@ -2182,12 +2180,12 @@ func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32, newS
 	p := c.processes[pid]
 	if p == nil {
 		if newSocket {
-			// processForSocket could not register it: the process is gone.
+			// ensureProcess could not register it: the process is gone.
 			countTLSAttach("-", "not_registered")
 		}
 		return
 	}
-	c.recheckTlsAfterExec(p, newSocket)
+	c.recheckTlsAfterExec(p)
 	if !p.openSslUprobesChecked && time.Since(p.openSslLastCheck) >= openSslRecheckInterval {
 		p.openSslLastCheck = time.Now()
 		p.openSslChecks++
@@ -2197,33 +2195,52 @@ func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32, newS
 		p.tlsAttached = p.tlsAttached || len(links) > 0
 		p.openSslUprobesChecked = len(links) > 0 || p.openSslChecks >= openSslMaxChecks
 	}
-	if !p.goTlsUprobesChecked {
-		p.tlsExe, _ = exeIdentityOf(pid)
-		p.tlsExeName, _ = os.Readlink(proc.Path(pid, "exe"))
-		p.tlsExeCheckedAt = time.Now()
-		links, isGolangApp, result := tracer.AttachGoTlsUprobes(pid)
-		countTLSAttach("go", result)
-		p.setGolang(isGolangApp)
-		p.addUprobes(links)
-		p.tlsAttached = p.tlsAttached || len(links) > 0
-		p.goTlsUprobesChecked = true
-	}
+	c.attachGoTls(tracer, p)
 }
 
-// recheckTlsAfterExec lets a process be probed again after it execs a
-// different binary. Attach runs on the first connection, so a wrapper that
-// connects before exec'ing the real program (a secrets launcher, for example)
-// would otherwise leave that program unprobed for its whole life, or probed
-// at addresses of the wrapper's binary.
-//
-// Every new socket checks: the program a wrapper execs usually connects
-// within a second, and a throttle shared with the periodic sweep skipped that
-// first connection. The cost is one stat of /proc/<pid>/exe per connection.
-func (c *Container) recheckTlsAfterExec(p *Process, newSocket bool) {
-	if !p.goTlsUprobesChecked {
+// attachGoTls probes the process's Go TLS functions, once per program image.
+func (c *Container) attachGoTls(tracer *ebpftracer.Tracer, p *Process) {
+	if p.goTlsUprobesChecked {
 		return
 	}
-	if !newSocket && time.Since(p.tlsExeCheckedAt) < tlsExeRecheckInterval {
+	p.tlsExe, _ = exeIdentityOf(p.Pid)
+	p.tlsExeName, _ = os.Readlink(proc.Path(p.Pid, "exe"))
+	p.tlsExeCheckedAt = time.Now()
+	links, isGolangApp, result := tracer.AttachGoTlsUprobes(p.Pid)
+	countTLSAttach("go", result)
+	p.setGolang(isGolangApp)
+	p.addUprobes(links)
+	p.tlsAttached = p.tlsAttached || len(links) > 0
+	p.goTlsUprobesChecked = true
+}
+
+// onProcessExec handles a process replacing its image. Its Go TLS probes are
+// attached now rather than at its first connection, which a short-lived
+// program often makes before its connect event is handled. OpenSSL is left
+// to the first connection: the dynamic loader maps the libraries after the
+// exec, so they are not there yet.
+func (c *Container) onProcessExec(tracer *ebpftracer.Tracer, pid uint32) {
+	p := c.ensureProcess(pid)
+	if p == nil {
+		return
+	}
+	if p.goTlsUprobesChecked {
+		exe, err := exeIdentityOf(pid)
+		if err != nil || exe == p.tlsExe {
+			// Gone, or a connection was handled first and already probed
+			// this image.
+			return
+		}
+		c.resetTlsForNewImage(p)
+	}
+	c.attachGoTls(tracer, p)
+}
+
+// recheckTlsAfterExec catches an exec whose event was lost (onProcessExec
+// handles the rest): a process that runs a different binary than the one it
+// was probed for is probed again.
+func (c *Container) recheckTlsAfterExec(p *Process) {
+	if !p.goTlsUprobesChecked || time.Since(p.tlsExeCheckedAt) < tlsExeRecheckInterval {
 		return
 	}
 	p.tlsExeCheckedAt = time.Now()
@@ -2231,7 +2248,12 @@ func (c *Container) recheckTlsAfterExec(p *Process, newSocket bool) {
 	if err != nil || exe == p.tlsExe {
 		return
 	}
-	// The old image's probes point into a binary the process no longer runs.
+	c.resetTlsForNewImage(p)
+}
+
+// resetTlsForNewImage forgets what was probed for the process's previous
+// image: those probes point into a binary the process no longer runs.
+func (c *Container) resetTlsForNewImage(p *Process) {
 	p.dropUprobes()
 	if p.golang() {
 		c.registry.tracer.ReleaseGoTLSOffsets(p.Pid)

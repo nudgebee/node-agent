@@ -1,10 +1,14 @@
 package containers
 
 import (
+	"net"
 	"strconv"
 
+	"github.com/coroot/coroot-node-agent/ebpftracer"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/prometheus/client_golang/prometheus"
+	"k8s.io/klog/v2"
 )
 
 var (
@@ -210,8 +214,30 @@ var L7EventsDroppedTotal = prometheus.NewCounterVec(
 	[]string{"reason", "protocol", "tls"},
 )
 
-func countL7Drop(reason string, r *l7.RequestData) {
-	L7EventsDroppedTotal.WithLabelValues(reason, protocolLabel(r.Protocol), strconv.FormatBool(r.TLS)).Inc()
+type l7DropLogKey struct {
+	container ContainerID
+	reason    string
+	protocol  l7.Protocol
+}
+
+// l7DropLogged keeps one log line per container, reason and protocol: the
+// counter says how many events are dropped, the line says where.
+var l7DropLogged, _ = lru.New[l7DropLogKey, struct{}](4096)
+
+// dropL7Event counts an L7 event dropped before parsing and, the first time
+// for its container, reason and protocol, logs the process and destination.
+// container is empty when the event's process belongs to no known container.
+func dropL7Event(container ContainerID, reason string, pid uint32, fd uint64, req *l7.RequestData, si *ebpftracer.SocketInfo) {
+	L7EventsDroppedTotal.WithLabelValues(reason, protocolLabel(req.Protocol), strconv.FormatBool(req.TLS)).Inc()
+	if ok, _ := l7DropLogged.ContainsOrAdd(l7DropLogKey{container: container, reason: reason, protocol: req.Protocol}, struct{}{}); ok {
+		return
+	}
+	dst := "unknown"
+	if si != nil && si.Valid {
+		dst = net.JoinHostPort(si.DstIP, strconv.Itoa(int(si.DstPort)))
+	}
+	klog.Infof("L7 events dropped before parsing: reason=%s protocol=%s tls=%t container=%s pid=%d fd=%d dst=%s (logged once per container, reason and protocol)",
+		reason, protocolLabel(req.Protocol), req.TLS, container, pid, fd, dst)
 }
 
 // RegisterL7SelfMetrics registers the agent's L7 self-observability counters

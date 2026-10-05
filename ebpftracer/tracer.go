@@ -56,6 +56,7 @@ const (
 	EventTypeL7Request        EventType = 10
 	EventTypePythonThreadLock EventType = 11
 	EventTypeLLMData          EventType = 12
+	EventTypeProcessExec      EventType = 13
 
 	EventReasonNone    EventReason = 0
 	EventReasonOOMKill EventReason = 1
@@ -609,7 +610,9 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	}
 
 	perfMaps := []perfMap{
-		{name: "proc_events", typ: perfMapTypeProcEvents, perCPUBufferSizePages: 4},
+		// Read as often as connect events: an exec is acted on (TLS probes
+		// attached) before the new program makes its first connection.
+		{name: "proc_events", typ: perfMapTypeProcEvents, perCPUBufferSizePages: 4, readTimeout: 10 * time.Millisecond},
 		{name: "tcp_listen_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 4},
 		{name: "tcp_connect_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 8, readTimeout: 10 * time.Millisecond},
 		{name: "tcp_retransmit_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 4},
@@ -704,6 +707,8 @@ func (t EventType) String() string {
 		return "process-start"
 	case EventTypeProcessExit:
 		return "process-exit"
+	case EventTypeProcessExec:
+		return "process-exec"
 	case EventTypeConnectionOpen:
 		return "connection-open"
 	case EventTypeConnectionClose:
