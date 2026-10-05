@@ -540,7 +540,7 @@ func (r *Registry) processPendingL7Events() {
 				stillPending = append(stillPending, p)
 			} else {
 				klog.V(3).Infof("L7_EVENT_MAX_RETRIES: pid=%d fd=%d", p.event.Pid, p.event.Fd)
-				dropL7Event(c.id, "unknown_connection", p.event.Pid, p.event.Fd, p.event.L7Request, p.event.SocketInfo)
+				dropL7Event(c.id, unknownConnectionReason(p.event.SocketInfo), p.event.Pid, p.event.Fd, p.event.L7Request, p.event.SocketInfo)
 			}
 			continue
 		}

@@ -203,7 +203,8 @@ var TLSAttachTotal = prometheus.NewCounterVec(
 
 // L7EventsDroppedTotal counts L7 events discarded in the agent before any
 // protocol parsing: the connection or process they belong to was never
-// found, or the retry queue for such events was full. Events lost in the
+// found, or the retry queue for such events was full. no_ip_socket marks
+// events on sockets the agent does not track (Unix sockets), not a loss. Events lost in the
 // kernel are counted separately (node_agent_l7_ringbuf_drops_total,
 // node_agent_tls_plaintext_dropped_total).
 var L7EventsDroppedTotal = prometheus.NewCounterVec(
@@ -223,6 +224,16 @@ type l7DropLogKey struct {
 // l7DropLogged keeps one log line per container, reason and protocol: the
 // counter says how many events are dropped, the line says where.
 var l7DropLogged, _ = lru.New[l7DropLogKey, struct{}](4096)
+
+// unknownConnectionReason names why an event's connection could not be found:
+// no_ip_socket when the event carries no IP socket tuple, as for gRPC over a
+// Unix socket, which the agent does not track; unknown_connection otherwise.
+func unknownConnectionReason(si *ebpftracer.SocketInfo) string {
+	if si == nil || !si.Valid {
+		return "no_ip_socket"
+	}
+	return "unknown_connection"
+}
 
 // dropL7Event counts an L7 event dropped before parsing and, the first time
 // for its container, reason and protocol, logs the process and destination.

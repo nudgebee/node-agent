@@ -1161,7 +1161,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			// HTTP/2 frames cannot be parsed out of order, which is what a
 			// retry would deliver them as.
 			if r.Protocol == l7.ProtocolHTTP2 {
-				dropL7Event(c.id, "unknown_connection", pid, fd, r, socketInfo)
+				dropL7Event(c.id, unknownConnectionReason(socketInfo), pid, fd, r, socketInfo)
 				return nil, L7RequestProcessed
 			}
 			klog.V(3).Infof("L7_EVENT_CONN_NOT_FOUND: pid=%d fd=%d container=%s num_connections=%d",
