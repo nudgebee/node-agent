@@ -607,8 +607,14 @@ func (c *Container) onProcessExit(pid uint32, oomKill bool) {
 // would fail to decode or decode wrong. A parser already tagged with this
 // connection's timestamp is its own, created by an L7 event that arrived
 // before the open event, and is kept.
+//
+// A parser without a timestamp is dropped too. It was created by events from
+// a socket the kernel was not tracking, such as a connection that predates
+// the agent. The connection opening now is tracked, and the kernel stamps
+// every event of a tracked connection with its timestamp, so such a parser
+// cannot be this connection's.
 func (c *Container) dropStaleHTTP2Parser(k PidFd, timestamp uint64) {
-	if p := c.googleHTTP2Parsers[k]; p != nil && p.ConnTimestamp != 0 && p.ConnTimestamp != timestamp {
+	if p := c.googleHTTP2Parsers[k]; p != nil && p.ConnTimestamp != timestamp {
 		delete(c.googleHTTP2Parsers, k)
 	}
 }

@@ -90,7 +90,9 @@ func TestSocketConnectionKeepsEventTimestamp(t *testing.T) {
 
 // A recycled fd must not hand a new connection the previous one's HTTP/2
 // parser (and so its HPACK table), but a parser already created for the new
-// connection, by an L7 event that beat the open event, must survive.
+// connection, by an L7 event that beat the open event, must survive. A parser
+// without a timestamp came from an untracked socket, so it cannot belong to
+// the tracked connection now opening on its fd.
 func TestDropStaleHTTP2Parser(t *testing.T) {
 	k := PidFd{Pid: 1, Fd: 7}
 	parser := func(ts uint64) *l7.Http2Parser {
@@ -106,7 +108,7 @@ func TestDropStaleHTTP2Parser(t *testing.T) {
 	}{
 		{"previous connection's parser", 100, 200, false},
 		{"this connection's parser", 200, 200, true},
-		{"parser without a timestamp", 0, 200, true},
+		{"parser without a timestamp", 0, 200, false},
 	} {
 		c := &Container{googleHTTP2Parsers: map[PidFd]*l7.Http2Parser{k: parser(tc.parserTs)}}
 		c.dropStaleHTTP2Parser(k, tc.connTs)
