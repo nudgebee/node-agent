@@ -34,9 +34,23 @@
     asm volatile ("%0 &= %1" : "+r"(size) : "i"(MAX_PAYLOAD_SIZE-1));   \
 })
 
+// TRUNCATE_COPY_SIZE bounds a copy into a MAX_PAYLOAD_SIZE buffer (an
+// event's payload or response, a request's payload) to the whole buffer.
+// TRUNCATE_PAYLOAD_SIZE stops one byte short, while payload_size and
+// userspace allow MAX_PAYLOAD_SIZE: a 4096-byte write, which is how Go's
+// HTTP/2 flushes its 4 KB write buffer, was decoded with a last byte the
+// event never wrote, inside whichever frame crossed the end of the buffer.
+//
+// The clamp is asm so the verifier sees the compare on the register the copy
+// uses: written in C, clang compared a copy and the verifier lost the bound.
+#define TRUNCATE_COPY_SIZE(size) ({                                         \
+    asm volatile ("if %0 <= %1 goto +1\n\t%0 = %1"                          \
+                  : "+r"(size) : "i"(MAX_PAYLOAD_SIZE));                     \
+})
+
 // COPY_PAYLOAD for use with non-ringbuf allocations (l7_request heap)
 #define COPY_PAYLOAD(dst, size, src) ({     \
-    TRUNCATE_PAYLOAD_SIZE(size);            \
+    TRUNCATE_COPY_SIZE(size);               \
     if (bpf_probe_read(dst, size, src)) {   \
         return 0;                           \
     }                                       \
@@ -45,7 +59,7 @@
 // COPY_PAYLOAD_RINGBUF copies a payload into an event from reserve_l7_event
 // and returns 0 (dropping the event) if the read fails.
 #define COPY_PAYLOAD_RINGBUF(e, dst, size, src) ({  \
-    TRUNCATE_PAYLOAD_SIZE(size);                    \
+    TRUNCATE_COPY_SIZE(size);                       \
     if (bpf_probe_read(dst, size, src)) {           \
         return 0;                                   \
     }                                               \
@@ -330,8 +344,8 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
     }
     
     *total_size = iov.size;
-    __u64 size = MIN(iov.size, MAX_PAYLOAD_SIZE);
-    TRUNCATE_PAYLOAD_SIZE(size);
+    __u64 size = iov.size;
+    TRUNCATE_COPY_SIZE(size);
     
     // Direct copy without offset arithmetic on map values
     if (bpf_probe_read(buf, size, (void *)iov.buf)) {
