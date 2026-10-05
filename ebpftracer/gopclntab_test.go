@@ -265,7 +265,8 @@ func TestGetSymbol_StrippedGoBinaryAfterPathIsGone(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "stripped")
 	cmd := exec.Command(goBin, "build", "-ldflags=-s -w", "-o", bin, ".")
 	cmd.Dir = src
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	// An ELF binary whatever the host builds natively.
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
