@@ -249,7 +249,7 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) (links []link.Link, isGolangApp 
 	result = TLSAttached
 	if err := t.populateGoTLSOffsets(pid, path, version); err != nil {
 		result = TLSAttachedNoOffsets
-		logTLSAttachOnce(bin, "go", TLSAttachedNoOffsets, "Go TLS probes for %s (pid %d) run without per-process offsets, gRPC connections may not be captured: %v", name, pid, err)
+		logTLSAttachOnce(bin, "go", TLSAttachedNoOffsets, "Go TLS probes for %s (pid %d) run without per-process offsets, so connections are found by the default struct layout, without the *net.TCPConn itab: %v", name, pid, err)
 	}
 
 	exe, err := link.OpenExecutable(path)
@@ -430,9 +430,9 @@ func (t *Tracer) populateGoTLSOffsets(pid uint32, binaryPath string, goVersion s
 		return fmt.Errorf("failed to update BPF map: %w", err)
 	}
 
-	klog.V(2).Infof("pid=%d: populated Go TLS offsets: tls_conn=%d, conn_fd=%d, netfd_pfd=%d, fd_sysfd=%d, tcp_itab=0x%x, grpc_itab=0x%x",
+	klog.V(2).Infof("pid=%d: populated Go TLS offsets: tls_conn=%d, conn_fd=%d, netfd_pfd=%d, fd_sysfd=%d, netfd_family=%d, netfd_sotype=%d, tcp_itab=0x%x",
 		pid, offsets.TLSConnConnOffset, offsets.ConnFdOffset, offsets.NetFDPfdOffset, offsets.FDSysfdOffset,
-		offsets.NetTCPConnItab, offsets.GRPCSyscallConnItab)
+		offsets.NetFDFamilyOffset, offsets.NetFDSotypeOffset, offsets.NetTCPConnItab)
 
 	return nil
 }

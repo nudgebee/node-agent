@@ -120,6 +120,16 @@ type Tracer struct {
 	links         []link.Link
 	uprobes       map[string]*ebpf.Program
 
+	// programVariant is the compiled variant loaded for this kernel (see
+	// collectionSpecForKernel). kernelBTF and socketOffsets record whether
+	// the kernel's BTF loaded and whether the socket struct offsets taken
+	// from it were set (see initSocketInfoOffsets). programInstructions
+	// holds each loaded program's size after the kernel rewrote it.
+	programVariant      string
+	kernelBTF           bool
+	socketOffsets       bool
+	programInstructions []ProgramInstructions
+
 	// ready is set once Run has loaded the eBPF collection and completed the
 	// initial process scan. Consumers running before Run completes (e.g. the
 	// registry event-handler goroutine) must check it before touching
@@ -233,6 +243,79 @@ func (t *Tracer) TLSPlaintextDropped() (map[string]uint64, bool) {
 		res[reason] = sumPerCPU(m, uint32(i))
 	}
 	return res, true
+}
+
+// goTLSFdResolvedMethods names the methods of the go_tls_fd_resolved map
+// (GO_FD_RESOLVED_* in gotls.c), and goConnMaxDepth is GO_CONN_MAX_DEPTH.
+var goTLSFdResolvedMethods = []string{"itab", "socket", "shape"}
+
+const goConnMaxDepth = 4
+
+// GoTLSFdResolved is how many Go crypto/tls calls had their socket fd found
+// by one method at one wrapper depth.
+type GoTLSFdResolved struct {
+	Method string
+	Depth  int
+	Count  uint64
+}
+
+// GoTLSFdResolved returns, per method and depth, how many Go crypto/tls calls
+// had their socket fd found: by the binary's *net.TCPConn itab ("itab"), by
+// the shape of the connection confirmed against the kernel's socket
+// ("socket"), or by the shape alone, on a kernel without BTF ("shape"). ok is
+// false until the eBPF collection is loaded.
+func (t *Tracer) GoTLSFdResolved() ([]GoTLSFdResolved, bool) {
+	m := t.readyMap("go_tls_fd_resolved")
+	if m == nil {
+		return nil, false
+	}
+	res := make([]GoTLSFdResolved, 0, len(goTLSFdResolvedMethods)*goConnMaxDepth)
+	for i, method := range goTLSFdResolvedMethods {
+		for depth := 0; depth < goConnMaxDepth; depth++ {
+			n := sumPerCPU(m, uint32(i*goConnMaxDepth+depth))
+			res = append(res, GoTLSFdResolved{Method: method, Depth: depth, Count: n})
+		}
+	}
+	return res, true
+}
+
+// EBPFInfo describes what the kernel gave the eBPF programs to work with.
+type EBPFInfo struct {
+	// ProgramVariant is the compiled variant loaded for this kernel: its
+	// minimum kernel version, with "-cep" for the ctx-extra-padding build.
+	ProgramVariant string
+	// KernelBTF is whether the kernel's BTF loaded.
+	KernelBTF bool
+	// SocketOffsets is whether the socket struct offsets read from it were
+	// set. Without them the kernel cannot read a socket's addresses from its
+	// fd, and the Go TLS fd walk cannot confirm what it found.
+	SocketOffsets bool
+	// Programs is each loaded program's size after the kernel rewrote it.
+	Programs []ProgramInstructions
+}
+
+// ProgramInstructions is a loaded program's size. Xlated is the instruction
+// count after the kernel rewrote the program; Verified, where the kernel
+// reports it (5.16+), is how many instructions the verifier processed, which
+// is what its complexity limit applies to.
+type ProgramInstructions struct {
+	Program  string
+	Xlated   int
+	Verified uint32
+}
+
+// EBPFInfo returns what the kernel gave the eBPF programs; ok is false until
+// the eBPF collection is loaded.
+func (t *Tracer) EBPFInfo() (EBPFInfo, bool) {
+	if !t.ready.Load() || t.collection == nil {
+		return EBPFInfo{}, false
+	}
+	return EBPFInfo{
+		ProgramVariant: t.programVariant,
+		KernelBTF:      t.kernelBTF,
+		SocketOffsets:  t.socketOffsets,
+		Programs:       t.programInstructions,
+	}, true
 }
 
 // tlsDropKey is struct tls_drop_key in l7.c.
@@ -425,9 +508,12 @@ type perfMap struct {
 	readTimeout           time.Duration
 }
 
-func (t *Tracer) ebpf(ch chan<- Event) error {
+// collectionSpecForKernel returns the compiled program variant for the running
+// kernel, ready to load, and the variant's name: the minimum kernel version it
+// was built for, with "-cep" for the ctx-extra-padding build.
+func collectionSpecForKernel() (*ebpf.CollectionSpec, string, error) {
 	if _, ok := ebpfProgs[runtime.GOARCH]; !ok {
-		return fmt.Errorf("unsupported architecture: %s", runtime.GOARCH)
+		return nil, "", fmt.Errorf("unsupported architecture: %s", runtime.GOARCH)
 	}
 
 	var traceFsPath string
@@ -438,7 +524,7 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		}
 	}
 	if traceFsPath == "" {
-		return fmt.Errorf("kernel tracing is not available: debugfs or tracefs must be mounted")
+		return nil, "", fmt.Errorf("kernel tracing is not available: debugfs or tracefs must be mounted")
 	}
 
 	var flags string
@@ -447,6 +533,7 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	}
 	kv := common.GetKernelVersion()
 	var prog []byte
+	var variant string
 	for _, p := range ebpfProgs[runtime.GOARCH] {
 		pv, _ := common.VersionFromString(p.version)
 		if !kv.GreaterOrEqual(pv) {
@@ -456,32 +543,45 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 			continue
 		}
 		prog = p.prog
+		variant = p.version
+		if p.flags != "" {
+			variant += "-cep"
+		}
 		break
 	}
 	if len(prog) == 0 {
-		return fmt.Errorf("unsupported kernel version: %s %s", kv, flags)
+		return nil, "", fmt.Errorf("unsupported kernel version: %s %s", kv, flags)
 	}
 
 	reader, err := gzip.NewReader(base64.NewDecoder(base64.StdEncoding, bytes.NewReader(prog)))
 	if err != nil {
-		return fmt.Errorf("invalid program encoding: %w", err)
+		return nil, "", fmt.Errorf("invalid program encoding: %w", err)
 	}
 	prog, err = io.ReadAll(reader)
 	if err != nil {
-		return fmt.Errorf("failed to ungzip program: %w", err)
+		return nil, "", fmt.Errorf("failed to ungzip program: %w", err)
 	}
 	collectionSpec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(prog))
 	if err != nil {
-		return fmt.Errorf("failed to load collection spec: %w", err)
+		return nil, "", fmt.Errorf("failed to load collection spec: %w", err)
 	}
-	_ = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY})
 	if heap, ok := collectionSpec.Maps["llm_event_heap"]; ok {
 		cpus, err := ebpf.PossibleCPU()
 		if err != nil {
-			return fmt.Errorf("failed to count possible CPUs: %w", err)
+			return nil, "", fmt.Errorf("failed to count possible CPUs: %w", err)
 		}
 		heap.MaxEntries = uint32(cpus)
 	}
+	return collectionSpec, variant, nil
+}
+
+func (t *Tracer) ebpf(ch chan<- Event) error {
+	collectionSpec, variant, err := collectionSpecForKernel()
+	if err != nil {
+		return err
+	}
+	t.programVariant = variant
+	_ = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY})
 	c, err := ebpf.NewCollectionWithOptions(collectionSpec, ebpf.CollectionOptions{
 		//Programs: ebpf.ProgramOptions{LogLevel: 2, LogSize: 20 * 1024 * 1024},
 	})
@@ -493,6 +593,7 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		return fmt.Errorf("failed to load collection: %w", err)
 	}
 	t.collection = c
+	t.programInstructions = programInstructions(c)
 
 	if t.enableLLMCapture {
 		if err := c.Maps["llm_capture_config"].Update(uint32(0), uint32(1), ebpf.UpdateAny); err != nil {
@@ -576,6 +677,25 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	// SSL uprobes are handled per-process in tls.go via AttachOpenSslUprobes()
 
 	return nil
+}
+
+// programInstructions reads each program's size from the kernel. It is read
+// once, at load: the sizes cannot change afterwards.
+func programInstructions(c *ebpf.Collection) []ProgramInstructions {
+	res := make([]ProgramInstructions, 0, len(c.Programs))
+	for name, p := range c.Programs {
+		info, err := p.Info()
+		if err != nil {
+			continue
+		}
+		pi := ProgramInstructions{Program: name}
+		if size, err := info.TranslatedSize(); err == nil {
+			pi.Xlated = size / 8
+		}
+		pi.Verified, _ = info.VerifiedInstructions()
+		res = append(res, pi)
+	}
+	return res
 }
 
 func (t EventType) String() string {

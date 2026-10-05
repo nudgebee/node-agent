@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-// goRuntimeOffsets reads the same four offsets as discoverOffsetsFromDWARF,
+// goRuntimeOffsets reads the same offsets as discoverOffsetsFromDWARF,
 // but from the running binary's type information, which the compiler
 // guarantees. The test binary is built by the same toolchain it inspects, so
 // the two must agree.
@@ -32,6 +32,8 @@ func goRuntimeOffsets(t *testing.T) GoTLSOffsets {
 		ConnFdOffset:      int32(fd.Offset),
 		NetFDPfdOffset:    int32(pfd.Offset),
 		FDSysfdOffset:     int32(sysfd.Offset),
+		NetFDFamilyOffset: int32(field(fd.Type.Elem(), "family").Offset),
+		NetFDSotypeOffset: int32(field(fd.Type.Elem(), "sotype").Offset),
 	}
 }
 
@@ -68,6 +70,18 @@ func TestDiscoverOffsetsFromDWARFMatchesRuntimeLayout(t *testing.T) {
 	want := goRuntimeOffsets(t)
 	if *got != want {
 		t.Fatalf("DWARF offsets differ from the runtime layout:\n  dwarf:   %+v\n  runtime: %+v", *got, want)
+	}
+}
+
+// Stripped binaries get the version table, and for them the eBPF walk trusts
+// a connection found without the itab only if netFD's family and sotype read
+// as a TCP socket's. The table must describe the toolchain that builds this
+// test; a Go release that changes poll.FD or net.netFD fails here first.
+func TestVersionOffsetsMatchRuntimeLayout(t *testing.T) {
+	got := *getVersionBasedOffsets(runtime.Version())
+	want := goRuntimeOffsets(t)
+	if got != want {
+		t.Fatalf("version table offsets differ from the runtime layout of %s:\n  table:   %+v\n  runtime: %+v", runtime.Version(), got, want)
 	}
 }
 

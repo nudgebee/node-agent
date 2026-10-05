@@ -21,27 +21,30 @@ struct go_interface {
 // Go TLS offsets for extracting FD from tls.Conn
 // This allows the offsets to be dynamically configured per-process
 // based on DWARF info or Go version
-//
-// Extended to support gRPC connections which wrap net.Conn in
-// credentials.syscallConn interface (following DeepFlow's approach)
 struct go_tls_offsets {
     __s32 tls_conn_conn_offset;  // Offset of 'conn' field in crypto/tls.Conn
     __s32 conn_fd_offset;         // Offset of 'fd' field in net.conn
     __s32 netfd_pfd_offset;       // Offset of 'pfd' field in net.netFD
     __s32 fd_sysfd_offset;        // Offset of 'Sysfd' field in internal/poll.FD
-    // itab addresses for interface type detection (gRPC support)
     __u64 net_tcpconn_itab;       // itab for *net.TCPConn -> net.Conn
-    __u64 grpc_syscallconn_itab;  // itab for *credentials.syscallConn -> net.Conn
-    __s32 syscallconn_conn_offset; // Offset of 'Conn' field in credentials.syscallConn
+    __s32 netfd_family_offset;    // Offset of 'family' field in net.netFD
+    __s32 netfd_sotype_offset;    // Offset of 'sotype' field in net.netFD
 };
 
 // Default offsets for Go 1.17+ standard library
 // These are known stable values:
 // - fdMutex is { uint64 state, uint32 rsema, uint32 wsema } = 16 bytes
 // - Sysfd follows fdMutex at offset 16
+// - poll.FD is 56 bytes, so net.netFD's family and sotype ints follow it at
+//   56 and 64
 #define DEFAULT_FD_SYSFD_OFFSET 16
-// Default offset for syscallConn.Conn field (typically 0 or 8)
-#define DEFAULT_SYSCALLCONN_CONN_OFFSET 0
+#define DEFAULT_NETFD_FAMILY_OFFSET 56
+#define DEFAULT_NETFD_SOTYPE_OFFSET 64
+
+// Linux values; Go stores them in net.netFD unchanged.
+#define GO_AF_INET     2
+#define GO_AF_INET6    10
+#define GO_SOCK_STREAM 1
 
 // BPF map to store Go TLS offsets per process (TGID)
 // Populated by user-space when attaching uprobes
@@ -52,10 +55,11 @@ struct {
     __uint(max_entries, 1024);
 } go_tls_offsets_map SEC(".maps");
 
-// Helper to extract FD from a net.TCPConn-like structure
-// This handles the common case: net.TCPConn → net.conn → netFD → poll.FD → Sysfd
+// go_conn_netfd reads the *net.netFD and its Sysfd from a value laid out like
+// net.TCPConn: net.TCPConn → net.conn → netFD → poll.FD → Sysfd. Nothing here
+// checks that conn_data is one; see go_netfd_is_tcp.
 static inline __attribute__((__always_inline__))
-int extract_fd_from_tcpconn(void* conn_data, struct go_tls_offsets *offsets, __u32 *fd) {
+int go_conn_netfd(void* conn_data, struct go_tls_offsets *offsets, void **netfd, __u32 *fd) {
     __s32 fd_sysfd_offset = DEFAULT_FD_SYSFD_OFFSET;
     __s32 conn_fd_offset = 0;
     __s32 netfd_pfd_offset = 0;
@@ -94,12 +98,41 @@ int extract_fd_from_tcpconn(void* conn_data, struct go_tls_offsets *offsets, __u
     }
 
     // Validate the fd is reasonable (0-65535 for most systems, but can be higher)
-    if (*fd < 0 || *fd > 1000000) {
+    if (*fd > 1000000) {
         bpf_printk("go_tls: suspicious fd value %d, likely wrong offset", *fd);
         return 1;
     }
 
+    *netfd = netfd_ptr;
     return 0;
+}
+
+// go_netfd_is_tcp reports whether netfd is a net.netFD of a TCP socket, by
+// its family and sotype fields, and returns its family. It is the check that
+// what go_conn_netfd read was a netFD at all. A wrapper type read as a
+// net.TCPConn yields a pointer to whatever the wrapper holds first, usually
+// the itab of its inner connection, and the "Sysfd" read from it is the
+// itab's type hash. At the family and sotype offsets an itab holds method
+// pointers, never 2 or 10 followed by 1. The check reads only the
+// application's memory, so it works whether or not the kernel has BTF.
+static inline __attribute__((__always_inline__))
+int go_netfd_is_tcp(void *netfd, struct go_tls_offsets *offsets, __u16 *family) {
+    __s32 family_offset = DEFAULT_NETFD_FAMILY_OFFSET;
+    __s32 sotype_offset = DEFAULT_NETFD_SOTYPE_OFFSET;
+    if (offsets) {
+        family_offset = offsets->netfd_family_offset;
+        sotype_offset = offsets->netfd_sotype_offset;
+    }
+    __s64 fam = 0, sotype = 0;
+    if (bpf_probe_read(&fam, sizeof(fam), netfd + family_offset) ||
+        bpf_probe_read(&sotype, sizeof(sotype), netfd + sotype_offset)) {
+        return 0;
+    }
+    if ((fam != GO_AF_INET && fam != GO_AF_INET6) || sotype != GO_SOCK_STREAM) {
+        return 0;
+    }
+    *family = (__u16)fam;
+    return 1;
 }
 
 // GO_CONN_MAX_DEPTH bounds how many net.Conn wrappers are unwrapped.
@@ -112,19 +145,57 @@ int go_plausible_iface(struct go_interface *i) {
     return (__u64)i->type > 4096 && (__u64)i->ptr > 4096;
 }
 
-// go_fd_is_socket reports whether fd is an IPv4 or IPv6 socket of the
-// current process. It also reports 1 when that cannot be checked (no socket
-// struct offsets), which keeps the previous behaviour of trusting the read.
+#define GO_FD_SOCKET_MISMATCH  0
+#define GO_FD_SOCKET_OK        1
+#define GO_FD_SOCKET_UNCHECKED 2
+
+// go_fd_socket_check reports whether fd is a TCP socket of the current
+// process with the given address family (GO_FD_SOCKET_OK), or not
+// (GO_FD_SOCKET_MISMATCH). Without kernel BTF there are no struct offsets to
+// find the socket by, and it reports GO_FD_SOCKET_UNCHECKED.
 static inline __attribute__((__always_inline__))
-int go_fd_is_socket(__u32 fd) {
+int go_fd_socket_check(__u32 fd, __u16 family) {
     __u32 zero = 0;
     struct socket_info_offsets *so = bpf_map_lookup_elem(&socket_info_offsets_map, &zero);
     if (!so || !so->offsets_valid) {
-        return 1;
+        return GO_FD_SOCKET_UNCHECKED;
     }
-    struct socket_tuple t = {};
-    return get_socket_tuple_from_fd(fd, &t);
+    void *socket = get_socket_from_fd(fd, so);
+    if (!socket) {
+        return GO_FD_SOCKET_MISMATCH;
+    }
+    short type = 0;
+    void *sk = NULL;
+    __u16 sk_family = 0;
+    if (bpf_probe_read_kernel(&type, sizeof(type), socket + so->socket_type_offset) ||
+        bpf_probe_read_kernel(&sk, sizeof(sk), socket + so->socket_sk_offset) || !sk ||
+        bpf_probe_read_kernel(&sk_family, sizeof(sk_family), sk + so->sk_family_offset)) {
+        return GO_FD_SOCKET_MISMATCH;
+    }
+    if (type != GO_SOCK_STREAM || sk_family != family) {
+        return GO_FD_SOCKET_MISMATCH;
+    }
+    return GO_FD_SOCKET_OK;
 }
+
+// go_tls_fd_resolved counts the Go TLS calls whose socket fd was found, by
+// how it was found and at which wrapper depth: index method *
+// GO_CONN_MAX_DEPTH + depth. It is the success-side counterpart of
+// TLS_DROP_GO_FD_UNKNOWN, and shows how much capture rests on the heuristic.
+// Userspace exports it as node_agent_go_tls_fd_resolved_total{method,depth};
+// the method indexes must match goTLSFdResolvedMethods in tracer.go.
+#define GO_FD_RESOLVED_ITAB    0 // the level's itab is the binary's *net.TCPConn one
+#define GO_FD_RESOLVED_SOCKET  1 // a TCP netFD, and the kernel confirms a TCP socket of its family
+#define GO_FD_RESOLVED_SHAPE   2 // a TCP netFD; no kernel BTF to confirm the socket with
+#define GO_FD_RESOLVED_METHODS 3
+#define GO_FD_RESOLVED_SLOTS   (GO_FD_RESOLVED_METHODS * GO_CONN_MAX_DEPTH)
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, GO_FD_RESOLVED_SLOTS);
+} go_tls_fd_resolved SEC(".maps");
 
 static inline __attribute__((__always_inline__))
 int go_crypto_tls_get_fd_from_conn(struct pt_regs *ctx, __u32 *fd) {
@@ -169,18 +240,33 @@ int go_crypto_tls_get_fd_from_conn(struct pt_regs *ctx, __u32 *fd) {
     // Descend until a level is a TCP connection.
     __u64 tcp_itab = offsets ? offsets->net_tcpconn_itab : 0;
     struct go_interface c = conn_interface;
+    __u32 slot = GO_FD_RESOLVED_SLOTS;
+    void *netfd = NULL;
 #pragma unroll
     for (int depth = 0; depth < GO_CONN_MAX_DEPTH; depth++) {
         if (tcp_itab && (__u64)c.type == tcp_itab) {
             // Exact: the binary's own *net.TCPConn itab.
-            return extract_fd_from_tcpconn(c.ptr, offsets, fd);
+            if (go_conn_netfd(c.ptr, offsets, &netfd, fd) == 0) {
+                slot = GO_FD_RESOLVED_ITAB * GO_CONN_MAX_DEPTH + depth;
+            }
+            break;
         }
         // Without the itab (a stripped binary) or with one that does not
         // match (a PIE binary, whose symbol table holds it unrelocated), try
-        // the level as a TCP connection, and believe the result only if it
-        // names a socket of this process.
-        if (extract_fd_from_tcpconn(c.ptr, offsets, fd) == 0 && go_fd_is_socket(*fd)) {
-            return 0;
+        // the level as a TCP connection. Believe it only if what it points to
+        // is a TCP netFD, and, where the kernel's struct offsets are known,
+        // if the fd is a TCP socket of the same family.
+        __u16 family = 0;
+        if (go_conn_netfd(c.ptr, offsets, &netfd, fd) == 0 && go_netfd_is_tcp(netfd, offsets, &family)) {
+            int s = go_fd_socket_check(*fd, family);
+            if (s == GO_FD_SOCKET_OK) {
+                slot = GO_FD_RESOLVED_SOCKET * GO_CONN_MAX_DEPTH + depth;
+                break;
+            }
+            if (s == GO_FD_SOCKET_UNCHECKED) {
+                slot = GO_FD_RESOLVED_SHAPE * GO_CONN_MAX_DEPTH + depth;
+                break;
+            }
         }
         struct go_interface inner = {};
         if (bpf_probe_read(&inner, sizeof(inner), c.ptr) || !go_plausible_iface(&inner)) {
@@ -191,8 +277,15 @@ int go_crypto_tls_get_fd_from_conn(struct pt_regs *ctx, __u32 *fd) {
         c = inner;
     }
 
-    bpf_printk("go_tls: failed to extract fd");
-    return 1;
+    if (slot >= GO_FD_RESOLVED_SLOTS) {
+        bpf_printk("go_tls: failed to extract fd");
+        return 1;
+    }
+    __u64 *resolved = bpf_map_lookup_elem(&go_tls_fd_resolved, &slot);
+    if (resolved) {
+        *resolved += 1;
+    }
+    return 0;
 }
 
 // ensure_connection_tracked adds the connection to active_connections if not already tracked.

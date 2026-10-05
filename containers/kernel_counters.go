@@ -1,6 +1,8 @@
 package containers
 
 import (
+	"strconv"
+
 	"github.com/coroot/coroot-node-agent/ebpftracer"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -15,7 +17,10 @@ var tlsCiphertextSkippedDesc = prometheus.NewDesc(
 // maps: socket-level ciphertext events skipped on TLS connections (before the
 // kernel made that distinction, every one reached the L7 parsers as if it were
 // protocol data), LLM capture chunks and L7 events lost to a full ring buffer,
-// and TLS plaintext the hooks could not attribute to a socket.
+// TLS plaintext the hooks could not attribute to a socket, and how the Go TLS
+// hooks found the sockets they did attribute. It also exports what the kernel
+// gave the programs (node_agent_ebpf_info) and their sizes, so a capture gap
+// on one cluster can be told apart from a bug.
 var llmCaptureDropsDesc = prometheus.NewDesc(
 	"node_agent_llm_capture_drops_total",
 	"LLM capture chunks lost in the kernel because the L7 ring buffer was full",
@@ -34,6 +39,30 @@ var l7RingbufDropsDesc = prometheus.NewDesc(
 	nil, nil,
 )
 
+var goTLSFdResolvedDesc = prometheus.NewDesc(
+	"node_agent_go_tls_fd_resolved_total",
+	"Go crypto/tls calls whose socket fd was found, by method and net.Conn wrapper depth. itab: the binary's *net.TCPConn itab; socket: a TCP netFD by its fields, confirmed as a TCP socket of that family by the kernel; shape: a TCP netFD by its fields only, as the kernel has no BTF to confirm it with",
+	[]string{"method", "depth"}, nil,
+)
+
+var ebpfInfoDesc = prometheus.NewDesc(
+	"node_agent_ebpf_info",
+	"The eBPF program variant loaded for this kernel, whether the kernel's BTF loaded, and whether the socket struct offsets read from it were set. Without them sockets cannot be read from fds in the kernel, and Go TLS capture through wrapped connections rests on the shape check alone",
+	[]string{"program_variant", "btf", "socket_offsets"}, nil,
+)
+
+var ebpfProgramInstructionsDesc = prometheus.NewDesc(
+	"node_agent_ebpf_program_instructions",
+	"Instructions in each loaded eBPF program after the kernel rewrote it",
+	[]string{"program"}, nil,
+)
+
+var ebpfProgramVerifiedInstructionsDesc = prometheus.NewDesc(
+	"node_agent_ebpf_program_verified_instructions",
+	"Instructions the verifier processed to load each eBPF program, which its complexity limit applies to. Reported by kernels 5.16+",
+	[]string{"program"}, nil,
+)
+
 type kernelCounterCollector struct {
 	tracer *ebpftracer.Tracer
 }
@@ -43,6 +72,10 @@ func (c kernelCounterCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- llmCaptureDropsDesc
 	ch <- tlsPlaintextDroppedDesc
 	ch <- l7RingbufDropsDesc
+	ch <- goTLSFdResolvedDesc
+	ch <- ebpfInfoDesc
+	ch <- ebpfProgramInstructionsDesc
+	ch <- ebpfProgramVerifiedInstructionsDesc
 }
 
 func (c kernelCounterCollector) Collect(ch chan<- prometheus.Metric) {
@@ -62,5 +95,22 @@ func (c kernelCounterCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 	if drops, ok := c.tracer.L7RingbufDrops(); ok {
 		ch <- prometheus.MustNewConstMetric(l7RingbufDropsDesc, prometheus.CounterValue, float64(drops))
+	}
+	if resolved, ok := c.tracer.GoTLSFdResolved(); ok {
+		for _, r := range resolved {
+			ch <- prometheus.MustNewConstMetric(goTLSFdResolvedDesc, prometheus.CounterValue, float64(r.Count), r.Method, strconv.Itoa(r.Depth))
+		}
+	}
+	if info, ok := c.tracer.EBPFInfo(); ok {
+		ch <- prometheus.MustNewConstMetric(ebpfInfoDesc, prometheus.GaugeValue, 1,
+			info.ProgramVariant, strconv.FormatBool(info.KernelBTF), strconv.FormatBool(info.SocketOffsets))
+		for _, p := range info.Programs {
+			if p.Xlated > 0 {
+				ch <- prometheus.MustNewConstMetric(ebpfProgramInstructionsDesc, prometheus.GaugeValue, float64(p.Xlated), p.Program)
+			}
+			if p.Verified > 0 {
+				ch <- prometheus.MustNewConstMetric(ebpfProgramVerifiedInstructionsDesc, prometheus.GaugeValue, float64(p.Verified), p.Program)
+			}
+		}
 	}
 }
