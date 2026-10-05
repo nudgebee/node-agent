@@ -638,8 +638,19 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
 
         // Port-based HTTP/2 hint: Try HTTP/2 detection first for HTTPS traffic (port 443/8443)
         // Most modern HTTPS traffic uses HTTP/2, and this helps detect gRPC DATA frames
-        // that don't have the connection preface
-        if (conn->dport != 53 && http2_detection_allowed(conn) && is_likely_http2_port(conn->dport) && looks_like_http2_frame(payload, size, METHOD_HTTP2_CLIENT_FRAMES)) {
+        // that don't have the connection preface.
+        //
+        // The client connection preface is unambiguous on any port, and must be
+        // checked before the detectors below: is_redis_query takes anything
+        // starting with an uppercase letter, "PRI * HTTP/2.0" included. On
+        // other ports the connection was cached as Redis, and every write
+        // until the first server frame was read (the preface and, from Go and
+        // gRPC clients, the first request's headers) was lost. Those headers
+        // carry most of the HPACK dynamic table's insertions, so the table
+        // was missing them for the life of the connection.
+        if (conn->dport != 53 && http2_detection_allowed(conn) &&
+            (is_likely_http2_port(conn->dport) || is_http2_client_preface(payload, size)) &&
+            looks_like_http2_frame(payload, size, METHOD_HTTP2_CLIENT_FRAMES)) {
             conn->protocol = PROTOCOL_HTTP2; // Cache for subsequent frames
             struct l7_event *e = reserve_l7_event();
             if (!e) { return 0; }
