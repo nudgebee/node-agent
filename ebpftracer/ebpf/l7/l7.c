@@ -98,7 +98,7 @@ struct l7_event {
     __u8 protocol;
     __u8 method;
     __u8 is_tls;  // payload came from a TLS library hook, i.e. it is plaintext
-    __u8 padding;
+    __u8 lost_before; // connection.l7_lost when this event was sent
     __u32 statement_id;
     __u64 payload_size;
     __u64 response_size;
@@ -294,12 +294,28 @@ void send_event(void *ctx, struct l7_event *e, struct connection_id cid, struct 
     if (len > sizeof(struct l7_event)) {
         len = sizeof(struct l7_event);
     }
+    // A record with a response carries the whole payload buffer, so the bytes
+    // between payload_size and MAX_PAYLOAD_SIZE are left over from an earlier
+    // event on this CPU. They are plaintext the agent already received, the
+    // ring is readable only by the agent, and the decoder copies exactly
+    // payload_size bytes; zeroing 4 KB per event would cost more than it buys.
+    //
+    // A lost event leaves a gap in its connection's stream that a stateful
+    // parser cannot see on its own: HTTP/2 frames are cut mid-way and the
+    // HPACK table misses insertions, so later headers decode to wrong values.
+    // Record the loss on the connection and hand it to the next event that is
+    // delivered. The read-modify-write is not atomic (atomic OR needs 5.12);
+    // two CPUs racing on one connection can lose a flag, rarely.
+    e->lost_before = conn->l7_lost;
     if (bpf_ringbuf_output(&l7_events, e, len, 0)) {
         __u32 zero = 0;
         __u64 *drops = bpf_map_lookup_elem(&l7_ringbuf_drops, &zero);
         if (drops) {
             *drops += 1;
         }
+        conn->l7_lost |= e->method == METHOD_HTTP2_SERVER_FRAMES ? 2 : 1;
+    } else if (e->lost_before) {
+        conn->l7_lost = 0;
     }
 }
 
