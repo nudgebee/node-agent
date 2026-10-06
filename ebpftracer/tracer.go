@@ -506,7 +506,9 @@ type perfMap struct {
 	name                  string
 	perCPUBufferSizePages int
 	typ                   perfMapType
-	readTimeout           time.Duration
+	// readTimeout bounds how long events below wakeupEvents wait to be
+	// read; 0 means 100 ms. A reader woken for every event needs none.
+	readTimeout time.Duration
 	// wakeupEvents is how many events a CPU's buffer collects before the
 	// kernel wakes the reader; 0 means 100. Below that, events wait for the
 	// reader's next readTimeout.
@@ -616,9 +618,9 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	perfMaps := []perfMap{
 		// An exec must be acted on (TLS probes attached) before the new
 		// program makes its first connection, so the reader is woken for
-		// every event. Polling instead, with a 10 ms deadline to bound that
-		// wait, cost ~5 millicores on an idle node: 100 wakeups a second
-		// for events that arrive a few times a second.
+		// every event and needs no deadline. Polling instead, with a 10 ms
+		// deadline to bound that wait, cost ~5 millicores on an idle node:
+		// 100 wakeups a second for events that arrive a few times a second.
 		{name: "proc_events", typ: perfMapTypeProcEvents, perCPUBufferSizePages: 4, wakeupEvents: 1},
 		{name: "tcp_listen_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 4},
 		{name: "tcp_connect_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 8, readTimeout: 10 * time.Millisecond},
@@ -639,7 +641,11 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 			return fmt.Errorf("failed to create ebpf reader: %w", err)
 		}
 		t.readers[pm.name] = r
-		go runEventsReader(pm.name, r, ch, pm.typ, pm.readTimeout)
+		readTimeout := pm.readTimeout
+		if readTimeout == 0 && wakeup > 1 {
+			readTimeout = 100 * time.Millisecond
+		}
+		go runEventsReader(pm.name, r, ch, pm.typ, readTimeout)
 	}
 
 	// Create ring buffer reader for l7_events (provides global ordering for SSE streaming)
@@ -861,13 +867,14 @@ func (t *lostSamplesTracker) recordLostSamples(name string, count uint64, cpu in
 	}
 }
 
+// runEventsReader reads r until it is closed. readTimeout 0 means no deadline:
+// the reader sleeps until the kernel wakes it (Close interrupts that too).
 func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapType, readTimeout time.Duration) {
 	tracker := getLostSamplesTracker(name)
-	if readTimeout == 0 {
-		readTimeout = 100 * time.Millisecond
-	}
 	for {
-		r.SetDeadline(time.Now().Add(readTimeout))
+		if readTimeout > 0 {
+			r.SetDeadline(time.Now().Add(readTimeout))
+		}
 		rec, err := r.Read()
 		if err != nil {
 			if errors.Is(err, perf.ErrClosed) {
