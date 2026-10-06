@@ -246,12 +246,27 @@ void send_event(void *ctx, struct l7_event *e, struct connection_id cid, struct 
     bpf_ringbuf_submit(e, 0);
 }
 
+// l7_ringbuf_drops counts L7 events lost because l7_events was full.
+// Userspace exports it as node_agent_l7_ringbuf_drops_total.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, 1);
+} l7_ringbuf_drops SEC(".maps");
+
 // reserve_l7_event allocates an l7_event from the ring buffer
 // Returns NULL if the ring buffer is full (backpressure)
 static inline __attribute__((__always_inline__))
 struct l7_event *reserve_l7_event(void) {
     struct l7_event *e = bpf_ringbuf_reserve(&l7_events, sizeof(struct l7_event), 0);
-    if (e) {
+    if (!e) {
+        __u32 zero = 0;
+        __u64 *drops = bpf_map_lookup_elem(&l7_ringbuf_drops, &zero);
+        if (drops) {
+            *drops += 1;
+        }
+    } else {
         // Initialize event to zero state
         e->protocol = PROTOCOL_UNKNOWN;
         e->status = STATUS_UNKNOWN;
@@ -335,6 +350,64 @@ void count_ciphertext_skip(__u32 direction) {
     if (v) {
         *v += 1;
     }
+}
+
+// tls_plaintext_dropped counts TLS plaintext a library hook saw but could not
+// attribute to a socket, so it never left the kernel. Without it these losses
+// were visible only through bpf_printk in a debug build. Userspace exports it
+// as node_agent_tls_plaintext_dropped_total{reason}; the indexes must match
+// tlsDropReasons in tracer.go.
+#define TLS_DROP_GO_FD_UNKNOWN       0 // Go crypto/tls call whose socket fd could not be read; includes in-memory conns (net.Pipe, bufconn)
+#define TLS_DROP_SSL_READ_FD_UNKNOWN 1 // SSL_read returned data, its socket was never seen
+#define TLS_DROP_SSL_WRITE_UNCLAIMED 2 // SSL_write plaintext never matched to a socket write
+#define TLS_DROP_REASONS             3
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, TLS_DROP_REASONS);
+} tls_plaintext_dropped SEC(".maps");
+
+static inline __attribute__((__always_inline__))
+void count_tls_drop(__u32 reason) {
+    __u64 *v = bpf_map_lookup_elem(&tls_plaintext_dropped, &reason);
+    if (v) {
+        *v += 1;
+    }
+}
+
+// tls_plaintext_dropped_by_pid attributes the same losses to a process, so
+// userspace can name the container and binary they come from. The per-CPU
+// total above cannot. Userspace reads and deletes the entries periodically.
+struct tls_drop_key {
+    __u32 pid;
+    __u32 reason;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(key_size, sizeof(struct tls_drop_key));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, 4096);
+} tls_plaintext_dropped_by_pid SEC(".maps");
+
+// count_tls_drop_by_pid also attributes a loss to the current process. It is
+// used only from the TLS library uprobes, which are small, and kept out of
+// the syscall programs, which are already near the verifier's limits.
+static inline __attribute__((__always_inline__))
+void count_tls_drop_by_pid(__u32 reason) {
+    count_tls_drop(reason);
+    struct tls_drop_key k = {};
+    k.pid = bpf_get_current_pid_tgid() >> 32;
+    k.reason = reason;
+    __u64 *v = bpf_map_lookup_elem(&tls_plaintext_dropped_by_pid, &k);
+    if (v) {
+        __sync_fetch_and_add(v, 1);
+        return;
+    }
+    __u64 one = 1;
+    bpf_map_update_elem(&tls_plaintext_dropped_by_pid, &k, &one, BPF_NOEXIST);
 }
 
 // mark_tls records that a TLS library hook handles this connection.
@@ -889,26 +962,71 @@ void ssl_remember_fd(__u32 pid, __u64 ssl, __u64 fd) {
     bpf_map_update_elem(&ssl_fds, &k, &fd, BPF_ANY);
 }
 
+// starts_with_tls_record reports whether a socket write begins with a TLS
+// record header: content type 20-23 (change_cipher_spec, alert, handshake,
+// application_data) and protocol version 3.x. buf is the write buffer, or an
+// iovec array when iovlen is set.
+static inline __attribute__((__always_inline__))
+int starts_with_tls_record(char *buf, __u64 iovlen) {
+    char *p = buf;
+    if (iovlen) {
+        struct iovec iov = {};
+        if (bpf_probe_read(&iov, sizeof(iov), buf)) {
+            return 0;
+        }
+        p = iov.buf;
+    }
+    __u8 h[3] = {};
+    if (bpf_probe_read(&h, sizeof(h), p)) {
+        return 0;
+    }
+    return h[0] >= 20 && h[0] <= 23 && h[1] == 3 && h[2] <= 4;
+}
+
 // ssl_claim_write hands the plaintext of a pending SSL_write to the socket
 // write that carries it. Returns 1 when this write is that socket.
+//
+// *buf and *size describe the socket write on entry (an iovec array when
+// iovlen is set) and the plaintext on a successful claim. Only a write that
+// starts with a TLS record can carry the ciphertext: with a memory BIO the
+// application sends the ciphertext itself after SSL_write returns, and an
+// unrelated write on the same thread in between (a DNS query, a log line, a
+// metrics datagram) used to take the plaintext and be marked as TLS.
 static inline __attribute__((__always_inline__))
-int ssl_claim_write(__u64 tid, __u64 fd, char **buf, __u64 *size) {
+int ssl_claim_write(__u64 tid, __u64 fd, char **buf, __u64 *size, __u64 iovlen) {
     struct ssl_args *args = bpf_map_lookup_elem(&ssl_write_pending, &tid);
     if (!args) {
         return 0;
     }
     if (bpf_ktime_get_ns() - args->ns > SSL_PENDING_WRITE_TTL_NS) {
         bpf_map_delete_elem(&ssl_write_pending, &tid);
+        count_tls_drop(TLS_DROP_SSL_WRITE_UNCLAIMED);
         return 0;
     }
     __u32 pid = tid >> 32;
     if (!ssl_socket_fd(pid, fd)) {
         return 0;
     }
+    if (!starts_with_tls_record(*buf, iovlen)) {
+        return 0;
+    }
+    // This write's ciphertext is replaced by the plaintext below, so the
+    // connection's sent bytes would otherwise never include it. The size of
+    // a vectored write is not known here; it is left out.
+    __u64 ciphertext_size = *size;
     *buf = args->buf;
     *size = args->size;
     ssl_remember_fd(pid, args->ssl, fd);
     bpf_map_delete_elem(&ssl_write_pending, &tid);
+    if (ciphertext_size) {
+        struct connection_id cid = {};
+        cid.pid = pid;
+        cid.fd = fd;
+        struct connection *conn = bpf_map_lookup_elem(&active_connections, &cid);
+        if (conn) {
+            __sync_fetch_and_add(&conn->bytes_sent, ciphertext_size);
+        }
+    }
     return 1;
 }
 
@@ -944,7 +1062,7 @@ SEC("tracepoint/syscalls/sys_enter_write")
 int sys_enter_write(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     char *buf = ctx->buf;
     __u64 size = ctx->size;
-    __u16 is_tls = ssl_claim_write(bpf_get_current_pid_tgid(), ctx->fd, &buf, &size);
+    __u16 is_tls = ssl_claim_write(bpf_get_current_pid_tgid(), ctx->fd, &buf, &size, 0);
     return trace_enter_write(ctx, ctx->fd, is_tls, buf, size, 0);
 }
 
@@ -953,7 +1071,7 @@ int sys_enter_writev(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     char *buf = ctx->buf;
     __u64 size = 0;
     __u64 iovlen = ctx->size;
-    __u16 is_tls = ssl_claim_write(bpf_get_current_pid_tgid(), ctx->fd, &buf, &size);
+    __u16 is_tls = ssl_claim_write(bpf_get_current_pid_tgid(), ctx->fd, &buf, &size, iovlen);
     if (is_tls) {
         iovlen = 0;
     }
@@ -969,7 +1087,7 @@ int sys_enter_sendmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     char *buf = (char*)msghdr.msg_iov;
     __u64 size = 0;
     __u64 iovlen = msghdr.msg_iovlen;
-    __u16 is_tls = ssl_claim_write(bpf_get_current_pid_tgid(), ctx->fd, &buf, &size);
+    __u16 is_tls = ssl_claim_write(bpf_get_current_pid_tgid(), ctx->fd, &buf, &size, iovlen);
     if (is_tls) {
         iovlen = 0;
     }
@@ -997,7 +1115,7 @@ SEC("tracepoint/syscalls/sys_enter_sendto")
 int sys_enter_sendto(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     char *buf = ctx->buf;
     __u64 size = ctx->size;
-    __u16 is_tls = ssl_claim_write(bpf_get_current_pid_tgid(), ctx->fd, &buf, &size);
+    __u16 is_tls = ssl_claim_write(bpf_get_current_pid_tgid(), ctx->fd, &buf, &size, 0);
     return trace_enter_write(ctx, ctx->fd, is_tls, buf, size, 0);
 }
 

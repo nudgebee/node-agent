@@ -23,6 +23,7 @@ struct socket_info_offsets {
 
     // socket offsets
     __s32 socket_sk_offset;            // socket->sk
+    __s32 socket_type_offset;          // socket->type (SOCK_STREAM, SOCK_DGRAM, ...)
 
     // sock_common offsets (connection tuple)
     __s32 sk_family_offset;            // sock_common->skc_family
@@ -57,6 +58,72 @@ struct socket_tuple {
     __u8 padding;
 };
 
+// get_socket_from_fd returns the struct socket behind fd in the current
+// process (file->private_data), or NULL. It does not check that fd is a
+// socket: for any other file, private_data is whatever that file keeps there,
+// so callers must validate what they read through it.
+static inline __attribute__((__always_inline__))
+void *get_socket_from_fd(__u32 fd, struct socket_info_offsets *offsets) {
+    // Get current task
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    if (!task) {
+        return NULL;
+    }
+
+    // Read files_struct pointer: task->files
+    void *files = NULL;
+    if (bpf_probe_read_kernel(&files, sizeof(files), (void *)task + offsets->task_files_offset)) {
+        return NULL;
+    }
+    if (!files) {
+        return NULL;
+    }
+
+    // Read fdtable pointer: files->fdt
+    void *fdt = NULL;
+    if (bpf_probe_read_kernel(&fdt, sizeof(fdt), (void *)files + offsets->files_fdt_offset)) {
+        return NULL;
+    }
+    if (!fdt) {
+        return NULL;
+    }
+
+    // Read max_fds to validate fd
+    __u32 max_fds = 0;
+    if (bpf_probe_read_kernel(&max_fds, sizeof(max_fds), (void *)fdt + offsets->fdt_max_fds_offset)) {
+        return NULL;
+    }
+    if (fd >= max_fds) {
+        return NULL;
+    }
+
+    // Read fd array pointer: fdt->fd
+    void **fd_array = NULL;
+    if (bpf_probe_read_kernel(&fd_array, sizeof(fd_array), (void *)fdt + offsets->fdt_fd_offset)) {
+        return NULL;
+    }
+    if (!fd_array) {
+        return NULL;
+    }
+
+    // Read file pointer: fd_array[fd]
+    void *file = NULL;
+    if (bpf_probe_read_kernel(&file, sizeof(file), &fd_array[fd])) {
+        return NULL;
+    }
+    if (!file) {
+        return NULL;
+    }
+
+    // Read socket pointer: file->private_data
+    // For socket fds, private_data points to struct socket
+    void *socket = NULL;
+    if (bpf_probe_read_kernel(&socket, sizeof(socket), (void *)file + offsets->file_private_data_offset)) {
+        return NULL;
+    }
+    return socket;
+}
+
 // Extract socket tuple from fd number
 // Returns 1 on success, 0 on failure
 static inline __attribute__((__always_inline__))
@@ -71,63 +138,7 @@ int get_socket_tuple_from_fd(__u32 fd, struct socket_tuple *tuple) {
         return 0;
     }
 
-    // Get current task
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    if (!task) {
-        return 0;
-    }
-
-    // Read files_struct pointer: task->files
-    void *files = NULL;
-    if (bpf_probe_read_kernel(&files, sizeof(files), (void *)task + offsets->task_files_offset)) {
-        return 0;
-    }
-    if (!files) {
-        return 0;
-    }
-
-    // Read fdtable pointer: files->fdt
-    void *fdt = NULL;
-    if (bpf_probe_read_kernel(&fdt, sizeof(fdt), (void *)files + offsets->files_fdt_offset)) {
-        return 0;
-    }
-    if (!fdt) {
-        return 0;
-    }
-
-    // Read max_fds to validate fd
-    __u32 max_fds = 0;
-    if (bpf_probe_read_kernel(&max_fds, sizeof(max_fds), (void *)fdt + offsets->fdt_max_fds_offset)) {
-        return 0;
-    }
-    if (fd >= max_fds) {
-        return 0;
-    }
-
-    // Read fd array pointer: fdt->fd
-    void **fd_array = NULL;
-    if (bpf_probe_read_kernel(&fd_array, sizeof(fd_array), (void *)fdt + offsets->fdt_fd_offset)) {
-        return 0;
-    }
-    if (!fd_array) {
-        return 0;
-    }
-
-    // Read file pointer: fd_array[fd]
-    void *file = NULL;
-    if (bpf_probe_read_kernel(&file, sizeof(file), &fd_array[fd])) {
-        return 0;
-    }
-    if (!file) {
-        return 0;
-    }
-
-    // Read socket pointer: file->private_data
-    // For socket fds, private_data points to struct socket
-    void *socket = NULL;
-    if (bpf_probe_read_kernel(&socket, sizeof(socket), (void *)file + offsets->file_private_data_offset)) {
-        return 0;
-    }
+    void *socket = get_socket_from_fd(fd, offsets);
     if (!socket) {
         return 0;
     }

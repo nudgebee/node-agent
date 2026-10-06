@@ -17,7 +17,6 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/proc"
-	lru "github.com/hashicorp/golang-lru/v2"
 	"k8s.io/klog/v2"
 )
 
@@ -69,41 +68,70 @@ var (
 	libCryptoRe = regexp.MustCompile(`libcrypto\.so(\.\d+)*`)
 	// A more specific regex for psycopg2's bundled libs
 	psycopg2LibRe = regexp.MustCompile(`lib(ssl|crypto)-[a-f0-9]+\.so\.\d+`)
-
-	// strippedGoExeCache caches exe paths that are Go binaries but have no TLS symbols.
-	// This avoids expensive ELF scanning for the same stripped binary across many
-	// short-lived processes (e.g., kubectl invocations). Capped at 1000 entries to
-	// prevent unbounded growth on CI/CD nodes with many unique Go binaries.
-	strippedGoExeCache, _ = lru.New[string, struct{}](1000)
 )
 
-func (t *Tracer) AttachOpenSslUprobes(pid uint32) []link.Link {
+// openSslProbes lists every OpenSSL function the probes use. The _ex variants
+// exist from 1.1.1 on, so they are attached only for those versions.
+type openSslProbe struct {
+	symbol    string
+	uprobe    string
+	uretprobe string
+	needs111  bool
+}
+
+var openSslProbes = []openSslProbe{
+	{symbol: "SSL_write", uprobe: "openssl_SSL_write_enter"},
+	{symbol: "SSL_read", uprobe: "openssl_SSL_read_enter"},
+	{symbol: "SSL_read", uretprobe: "openssl_SSL_read_exit"},
+	{symbol: "SSL_free", uprobe: "openssl_SSL_free_enter"},
+	{symbol: "SSL_write_ex", uprobe: "openssl_SSL_write_enter", needs111: true},
+	{symbol: "SSL_read_ex", uprobe: "openssl_SSL_read_ex_enter", needs111: true},
+	{symbol: "SSL_read_ex", uretprobe: "openssl_SSL_read_exit", needs111: true},
+}
+
+var openSslSymbols = []string{"SSL_write", "SSL_read", "SSL_free", "SSL_write_ex", "SSL_read_ex"}
+
+func (t *Tracer) AttachOpenSslUprobes(pid uint32) ([]link.Link, TLSAttachResult) {
 	if t.disableL7Tracing {
-		return nil
+		return nil, TLSAttachNotApplicable
 	}
 	libPath, version := getSslLibPathAndVersion(pid)
 	if libPath == "" || version == "" {
 		klog.V(3).Infof("pid=%d: no SSL libraries found (libPath='%s', version='%s')", pid, libPath, version)
-		return nil
+		return nil, TLSAttachNoLibrary
 	}
-
-	log := func(msg string, err error) {
-		if err != nil {
-			for _, s := range []string{"no such file or directory", "no such process", "permission denied"} {
-				if strings.HasSuffix(err.Error(), s) {
-					return
-				}
-			}
-			klog.ErrorfDepth(1, "pid=%d libssl_version=%s: %s: %s", pid, version, msg, err)
-			return
+	bin, err := binaryKeyFor(libPath)
+	if err != nil {
+		return nil, failureResult(err)
+	}
+	fail := func(msg string, err error) ([]link.Link, TLSAttachResult) {
+		result := failureResult(err)
+		if result == TLSAttachProcessExited {
+			klog.V(3).Infof("pid=%d libssl_version=%s: %s: %s", pid, version, msg, err)
+		} else {
+			logTLSAttachOnce(bin, "openssl", result, "TLS capture unavailable for %s (libssl %s, first seen in pid %d): %s: %s", libPath, version, pid, msg, err)
 		}
-		klog.InfofDepth(1, "pid=%d libssl_version=%s: %s", pid, version, msg)
+		return nil, result
 	}
 
+	// The programs are the same for every OpenSSL release: they never read the
+	// SSL/BIO structs, whose layout is what used to differ between versions.
+	// The version only decides whether the _ex variants exist.
+	v, err := common.VersionFromString(version)
+	if err != nil {
+		logTLSAttachOnce(bin, "openssl", TLSAttachUnsupported, "TLS capture unavailable for %s: cannot parse libssl version %q: %s", libPath, version, err)
+		return nil, TLSAttachUnsupported
+	}
+	hasEx := v.GreaterOrEqual(common.NewVersion(1, 1, 1))
+
+	// Resolved once per library file rather than once per pid — see LookupSymbols.
+	targets, err := LookupSymbols(libPath, openSslSymbols)
+	if err != nil {
+		return fail("failed to read symbols", err)
+	}
 	exe, err := link.OpenExecutable(libPath)
 	if err != nil {
-		log("failed to open executable", err)
-		return nil
+		return fail("failed to open executable", err)
 	}
 	var links []link.Link
 	closeLinks := func() {
@@ -111,170 +139,123 @@ func (t *Tracer) AttachOpenSslUprobes(pid uint32) []link.Link {
 			l.Close()
 		}
 	}
-	// The programs are the same for every OpenSSL release: they never read the
-	// SSL/BIO structs, whose layout is what used to differ between versions.
-	// The version only decides whether the _ex variants exist.
-	writeEnter := "openssl_SSL_write_enter"
-	readEnter := "openssl_SSL_read_enter"
-	readExEnter := "openssl_SSL_read_ex_enter"
-	readExit := "openssl_SSL_read_exit"
-	v, err := common.VersionFromString(version)
-	if err != nil {
-		log("failed to determine version", err)
-		return nil
-	}
-
-	type prog struct {
-		symbol    string
-		uprobe    string
-		uretprobe string
-	}
-	progs := []prog{
-		{symbol: "SSL_write", uprobe: writeEnter},
-		{symbol: "SSL_read", uprobe: readEnter},
-		{symbol: "SSL_read", uretprobe: readExit},
-		{symbol: "SSL_free", uprobe: "openssl_SSL_free_enter"},
-	}
-	if v.GreaterOrEqual(common.NewVersion(1, 1, 1)) {
-		progs = append(progs, []prog{
-			{symbol: "SSL_write_ex", uprobe: writeEnter},
-			{symbol: "SSL_read_ex", uprobe: readExEnter},
-			{symbol: "SSL_read_ex", uretprobe: readExit},
-		}...)
-	}
-
-	ef, err := OpenELFFile(libPath)
-	if err != nil {
-		log("open elf", err)
-		return nil
-	}
-	defer ef.Close()
-
-	for _, p := range progs {
-		s, err := ef.GetSymbol(p.symbol)
-		if err != nil {
-			log("failed to get symbol", err)
+	for _, p := range openSslProbes {
+		if p.needs111 && !hasEx {
+			continue
+		}
+		target := targets[p.symbol]
+		if !target.Found {
 			closeLinks()
-			return nil
+			logTLSAttachOnce(bin, "openssl", TLSAttachNoSymbols, "TLS capture unavailable for %s (libssl %s): symbol %s not found", libPath, version, p.symbol)
+			return nil, TLSAttachNoSymbols
 		}
 		if p.uprobe != "" {
-			l, err := s.AttachUprobe(exe, t.uprobes[p.uprobe], pid)
+			l, err := attachUprobeAt(exe, t.uprobes[p.uprobe], pid, target.Address)
 			if err != nil {
-				log("failed to attach uprobe", err)
 				closeLinks()
-				return nil
+				return fail("failed to attach uprobe to "+p.symbol, err)
 			}
 			links = append(links, l)
 		}
 		if p.uretprobe != "" {
-			ls, err := s.AttachUretprobes(exe, t.uprobes[p.uretprobe], pid)
+			ls, err := attachUretprobesAt(exe, t.uprobes[p.uretprobe], pid, target)
 			links = append(links, ls...)
 			if err != nil {
-				log("failed to attach exit uprobe", err)
 				closeLinks()
-				return nil
+				return fail("failed to attach exit uprobe to "+p.symbol, err)
 			}
 		}
 	}
-	if len(links) > 0 {
-		log("libssl uprobes attached", nil)
+	if !logTLSAttachOnce(bin, "openssl", TLSAttached, "libssl uprobes attached: %s (libssl %s, pid %d; later processes using this library are logged at -v=2)", libPath, version, pid) {
+		klog.V(2).Infof("pid=%d libssl_version=%s: libssl uprobes attached", pid, version)
 	}
-	return links
+	return links, TLSAttached
 }
 
-func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
-	isGolangApp := false
+// AttachGoTlsUprobes attaches the crypto/tls (and S2A, ALTS) probes to a Go
+// process. isGolangApp reports whether the executable is a Go binary at all,
+// whatever the result.
+func (t *Tracer) AttachGoTlsUprobes(pid uint32) (links []link.Link, isGolangApp bool, result TLSAttachResult) {
 	if t.disableL7Tracing {
-		return nil, isGolangApp
+		return nil, false, TLSAttachNotApplicable
 	}
 
 	path := proc.Path(pid, "exe")
-
-	exeName, _ := os.Readlink(path)
-	if exeName == "" {
-		// /proc/<pid>/exe is unreadable (transient process exiting, namespace
-		// issues, etc.). Demote to V(3) so we don't spam at default verbosity —
-		// this fires for every short-lived process the agent observes.
-		klog.V(3).Infof("GO_TLS_ATTACH_ATTEMPT: pid=%d exe=<unreadable>", pid)
-	} else {
-		klog.V(2).Infof("GO_TLS_ATTACH_ATTEMPT: pid=%d exe=%s", pid, exeName)
+	bin, err := binaryKeyFor(path)
+	if err != nil {
+		klog.V(3).Infof("GO_TLS_ATTACH_ATTEMPT: pid=%d exe=<unreadable>: %v", pid, err)
+		return nil, false, failureResult(err)
+	}
+	// Binaries that can never be probed are recognised by file identity and
+	// skipped before any parsing. This matters for repeated short-lived
+	// processes such as CLI invocations and exec probes.
+	if skip, ok := goTLSSkipCache.Get(bin); ok {
+		return nil, skip.isGo, skip.result
 	}
 
-	// Skip binaries we already know are stripped (no TLS symbols).
-	// This avoids expensive ELF scanning for repeated short-lived processes like kubectl.
-	if strippedGoExeCache.Contains(exeName) {
-		klog.V(3).Infof("GO_TLS_SKIP_STRIPPED: pid=%d exe=%s", pid, exeName)
-		return nil, true // still a Go app, just stripped
-	}
-
-	var err error
-	var name, version string
-	log := func(msg string, err error) {
-		if err != nil {
-			for _, s := range []string{"not a Go executable", "no such file or directory", "no such process", "permission denied"} {
-				if strings.HasSuffix(err.Error(), s) {
-					klog.V(3).Infof("GO_TLS_FILTERED: pid=%d exe=%s msg=%s err=%s", pid, exeName, msg, err.Error())
-					return
-				}
-			}
-			klog.ErrorfDepth(1, "pid=%d golang_app=%s golang_version=%s: %s: %s", pid, name, version, msg, err)
-			return
-		}
-		klog.InfofDepth(1, "pid=%d golang_app=%s golang_version=%s: %s", pid, name, version, msg)
-	}
+	name, _ := os.Readlink(path)
+	klog.V(2).Infof("GO_TLS_ATTACH_ATTEMPT: pid=%d exe=%s", pid, name)
 
 	bi, err := buildinfo.ReadFile(path)
 	if err != nil {
-		log("failed to read build info", err)
-		return nil, isGolangApp
+		if strings.HasSuffix(err.Error(), "not a Go executable") {
+			goTLSSkipCache.Add(bin, goTLSSkip{result: TLSAttachNotApplicable})
+			return nil, false, TLSAttachNotApplicable
+		}
+		result := failureResult(err)
+		if result != TLSAttachProcessExited {
+			logTLSAttachOnce(bin, "go", result, "Go TLS capture unavailable for %s (pid %d): failed to read build info: %s", name, pid, err)
+		}
+		return nil, false, result
 	}
-	klog.V(2).Infof("GO_TLS_BUILD_INFO: pid=%d exe=%s go_version=%s", pid, exeName, bi.GoVersion)
-	isGolangApp = true
+	version := bi.GoVersion
+	v, err := common.VersionFromString(strings.Replace(version, "go", "", 1))
+	if err != nil || !v.GreaterOrEqual(common.NewVersion(1, 17, 0)) {
+		goTLSSkipCache.Add(bin, goTLSSkip{result: TLSAttachUnsupported, isGo: true})
+		logTLSAttachOnce(bin, "go", TLSAttachUnsupported, "Go TLS capture unavailable for %s: %s is not supported (1.17 or later is required)", name, version)
+		return nil, true, TLSAttachUnsupported
+	}
 
-	name, err = os.Readlink(path)
-	if err != nil {
-		log("failed to read name", err)
-		return nil, isGolangApp
+	fail := func(msg string, err error) ([]link.Link, bool, TLSAttachResult) {
+		result := failureResult(err)
+		if result == TLSAttachProcessExited {
+			klog.V(3).Infof("pid=%d golang_app=%s golang_version=%s: %s: %s", pid, name, version, msg, err)
+		} else {
+			logTLSAttachOnce(bin, "go", result, "Go TLS capture unavailable for %s (%s, first seen in pid %d): %s: %s", name, version, pid, msg, err)
+		}
+		return nil, true, result
 	}
-	version = bi.GoVersion
-	v, err := common.VersionFromString(strings.Replace(bi.GoVersion, "go", "", 1))
-	if err != nil {
-		log("failed to determine version", err)
-	}
-	if !v.GreaterOrEqual(common.NewVersion(1, 17, 0)) {
-		log("versions below 1.17 are not supported", nil)
-		return nil, isGolangApp
+	noSymbols := func(symbol string) ([]link.Link, bool, TLSAttachResult) {
+		goTLSSkipCache.Add(bin, goTLSSkip{result: TLSAttachNoSymbols, isGo: true})
+		logTLSAttachOnce(bin, "go", TLSAttachNoSymbols, "Go TLS capture unavailable for %s (%s): %s not found; the binary does not use crypto/tls, or its function table cannot be read", name, version, symbol)
+		return nil, true, TLSAttachNoSymbols
 	}
 
 	// Resolved once per binary rather than once per pid — see LookupSymbols.
 	targets, err := LookupSymbols(path, goTlsProbeSymbols)
 	if err != nil {
-		log("failed to open as elf binary", err)
-		return nil, isGolangApp
+		return fail("failed to open as elf binary", err)
 	}
 	if !targets[goTlsWriteSymbol].Found {
-		log("failed to get write symbol", fmt.Errorf("symbol %s not found", goTlsWriteSymbol))
-		// Cache this exe as stripped to skip future attempts
-		if exeName != "" {
-			strippedGoExeCache.Add(exeName, struct{}{})
-		}
-		return nil, isGolangApp
+		return noSymbols(goTlsWriteSymbol)
+	}
+	if !targets[goTlsReadSymbol].Found {
+		return noSymbols(goTlsReadSymbol)
 	}
 
 	// Discover Go TLS offsets and populate the BPF map. Only binaries that
 	// have probe points get this far, so a Go binary without crypto/tls never
 	// pays for the DWARF read.
+	result = TLSAttached
 	if err := t.populateGoTLSOffsets(pid, path, version); err != nil {
-		klog.V(2).Infof("pid=%d: failed to populate Go TLS offsets (will use defaults): %v", pid, err)
+		result = TLSAttachedNoOffsets
+		logTLSAttachOnce(bin, "go", TLSAttachedNoOffsets, "Go TLS probes for %s (pid %d) run without per-process offsets, so connections are found by the default struct layout, without the *net.TCPConn itab: %v", name, pid, err)
 	}
 
 	exe, err := link.OpenExecutable(path)
 	if err != nil {
-		log("failed to open executable", err)
-		return nil, isGolangApp
+		return fail("failed to open executable", err)
 	}
-
-	var links []link.Link
 	closeLinks := func() {
 		for _, l := range links {
 			l.Close()
@@ -290,9 +271,8 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 		}
 		l, err := attachUprobeAt(exe, t.uprobes["go_crypto_tls_write_enter"], pid, ws.Address)
 		if err != nil {
-			log(fmt.Sprintf("failed to attach write_enter uprobe for %s", writeSymbol), err)
 			closeLinks()
-			return nil, isGolangApp
+			return fail(fmt.Sprintf("failed to attach write_enter uprobe for %s", writeSymbol), err)
 		}
 		links = append(links, l)
 	}
@@ -301,36 +281,26 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 	for _, readSymbol := range goTlsReadSymbols {
 		rs := targets[readSymbol]
 		if !rs.Found {
-			if readSymbol == goTlsReadSymbol {
-				log("failed to get read symbol", fmt.Errorf("symbol %s not found", goTlsReadSymbol))
-				closeLinks()
-				return nil, isGolangApp
-			}
-			continue // S2A symbol is optional
+			continue
 		}
 		l, err := attachUprobeAt(exe, t.uprobes["go_crypto_tls_read_enter"], pid, rs.Address)
 		if err != nil {
-			log(fmt.Sprintf("failed to attach read_enter uprobe for %s", readSymbol), err)
 			closeLinks()
-			return nil, isGolangApp
+			return fail(fmt.Sprintf("failed to attach read_enter uprobe for %s", readSymbol), err)
 		}
 		links = append(links, l)
 
 		ls, err := attachUretprobesAt(exe, t.uprobes["go_crypto_tls_read_exit"], pid, rs)
 		links = append(links, ls...)
 		if err != nil {
-			log(fmt.Sprintf("failed to attach read_exit uprobe for %s", readSymbol), err)
 			closeLinks()
-			return nil, isGolangApp
+			return fail(fmt.Sprintf("failed to attach read_exit uprobe for %s", readSymbol), err)
 		}
 	}
-	if len(links) == 0 {
-		klog.V(1).Infof("GO_TLS_NO_UPROBES: pid=%d exe=%s - no crypto/tls or S2A uprobes attached (symbols may not be functions)", pid, name)
-		return nil, isGolangApp
+	if !logTLSAttachOnce(bin, "go", TLSAttached, "GO_TLS_SUCCESS: exe=%s go_version=%s uprobes_attached=%d (first pid %d; later processes of this binary are logged at -v=2)", name, version, len(links), pid) {
+		klog.V(2).Infof("GO_TLS_SUCCESS: pid=%d exe=%s go_version=%s uprobes_attached=%d", pid, name, version, len(links))
 	}
-	klog.Infof("GO_TLS_SUCCESS: pid=%d exe=%s go_version=%s uprobes_attached=%d", pid, name, version, len(links))
-	log("crypto/tls uprobes attached", nil)
-	return links, isGolangApp
+	return links, true, result
 }
 
 func getSslLibPathAndVersion(pid uint32) (string, string) {
@@ -460,9 +430,9 @@ func (t *Tracer) populateGoTLSOffsets(pid uint32, binaryPath string, goVersion s
 		return fmt.Errorf("failed to update BPF map: %w", err)
 	}
 
-	klog.V(2).Infof("pid=%d: populated Go TLS offsets: tls_conn=%d, conn_fd=%d, netfd_pfd=%d, fd_sysfd=%d, tcp_itab=0x%x, grpc_itab=0x%x",
+	klog.V(2).Infof("pid=%d: populated Go TLS offsets: tls_conn=%d, conn_fd=%d, netfd_pfd=%d, fd_sysfd=%d, netfd_family=%d, netfd_sotype=%d, tcp_itab=0x%x",
 		pid, offsets.TLSConnConnOffset, offsets.ConnFdOffset, offsets.NetFDPfdOffset, offsets.FDSysfdOffset,
-		offsets.NetTCPConnItab, offsets.GRPCSyscallConnItab)
+		offsets.NetFDFamilyOffset, offsets.NetFDSotypeOffset, offsets.NetTCPConnItab)
 
 	return nil
 }
