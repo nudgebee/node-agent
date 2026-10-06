@@ -8,7 +8,7 @@ A per-node observability agent for Kubernetes and Linux hosts. The agent
 gathers container and host metrics, logs, and L7 traffic using eBPF and
 exposes them in Prometheus format.
 
-Minimum Linux kernel: **5.1** (eBPF CO-RE).
+Minimum Linux kernel: **5.8** (L7 events use a BPF ring buffer).
 
 > This project is a fork of
 > [coroot/coroot-node-agent](https://github.com/coroot/coroot-node-agent)
