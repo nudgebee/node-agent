@@ -108,7 +108,7 @@ const (
 	// Prevents unbounded memory growth when responses never complete (orphan
 	// streams); at the limit the oldest stream makes way (evictOldestRequest).
 	// It must exceed what one connection legitimately carries: gRPC clients
-	// multiplex long-polls (a Temporal worker's task-queue polls, which get
+	// multiplex long-polls (workflow and job-queue workers' polls, which get
 	// no response headers until the poll returns, up to a minute later) by
 	// the hundred over one connection, and at 100 live polls were evicted.
 	// Orphans are still reclaimed by the stream GC (http2DecoderGcInterval);
