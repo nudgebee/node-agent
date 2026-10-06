@@ -164,6 +164,10 @@ func main() {
 	flag.Set("logtostderr", "false")
 	flag.Set("alsologtostderr", "false")
 	flag.Set("stderrthreshold", "FATAL")
+	// SetOutput gives every severity the same writer, and klog writes a
+	// message to its own severity's writer and every lower one's: without
+	// one_output each warning was logged twice and each error three times.
+	flag.Set("one_output", "true")
 	klog.SetOutput(&RateLimitedLogOutput{limiter: rate.NewLimiter(rate.Limit(*flags.LogPerSecond), *flags.LogBurst)})
 
 	klog.Infoln("agent version:", version)
