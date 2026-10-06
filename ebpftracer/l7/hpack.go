@@ -26,9 +26,12 @@ import (
 // insertions) breaks that alignment silently; callers reset the decoder when
 // they know a block was lost.
 type hpackDecoder struct {
-	// dynamic holds the entries the decoder knows, newest last.
-	dynamic []hpackEntry
-	size    uint32 // RFC 7541 4.1 size of dynamic
+	// ring holds the n entries the decoder knows, oldest at head. A ring
+	// makes eviction O(1): shifting a slice per eviction cost ~34 ms on one
+	// 64 KB block of minimal insertions after a size update to 64 KiB.
+	ring    []hpackEntry
+	head, n int
+	size    uint32 // RFC 7541 4.1 size of the known entries
 	maxSize uint32 // set by dynamic table size updates
 }
 
@@ -61,10 +64,19 @@ func newHpackDecoder() *hpackDecoder {
 // reset forgets the dynamic table, for when the caller knows a header block
 // was lost and the table no longer matches the encoder's.
 func (d *hpackDecoder) reset() {
-	clear(d.dynamic) // release the strings the backing array still holds
-	d.dynamic = d.dynamic[:0]
-	d.size = 0
+	d.empty()
 	d.maxSize = hpackDefaultTableSize
+}
+
+// empty drops every entry, releasing their strings.
+func (d *hpackDecoder) empty() {
+	clear(d.ring)
+	d.head, d.n, d.size = 0, 0, 0
+}
+
+// entry returns the i-th known entry, 0 being the oldest.
+func (d *hpackDecoder) entry(i int) *hpackEntry {
+	return &d.ring[(d.head+i)%len(d.ring)]
 }
 
 // decode decodes one complete header block, calling emit for every field it
@@ -94,10 +106,11 @@ func (d *hpackDecoder) decode(block []byte, emit func(name, value string)) (unkn
 			if size, block, err = hpackInt(block, 5); err != nil {
 				return unknown, err
 			}
-			if size > hpackMaxTableSize {
-				return unknown, errHpackInvalid
-			}
-			d.maxSize = uint32(size)
+			// The decoder only mirrors the table; clamping an outsized
+			// update keeps decoding the rest of the block, and at worst
+			// evicts entries the encoder still has, which then read as
+			// unknown rather than wrong.
+			d.maxSize = uint32(min(size, hpackMaxTableSize))
 			d.evict(0)
 		default: // 6.2 Literal Header Field
 			prefix, index := uint8(4), false
@@ -147,39 +160,40 @@ func (d *hpackDecoder) field(idx uint64) (hpackEntry, bool) {
 		return hpackEntry{HeaderField: hpackStaticTable[idx-1]}, true
 	}
 	i := idx - uint64(len(hpackStaticTable)) // 1 = newest
-	if i > uint64(len(d.dynamic)) {
+	if i > uint64(d.n) {
 		return hpackEntry{}, false
 	}
-	return d.dynamic[len(d.dynamic)-int(i)], true
+	return *d.entry(d.n - int(i)), true
 }
 
 func (d *hpackDecoder) insert(f hpackEntry) {
 	size := uint32(len(f.Name)+len(f.Value)) + hpackEntryOverhead
 	if size > d.maxSize {
 		// RFC 7541 4.4: an entry larger than the table empties it.
-		clear(d.dynamic)
-		d.dynamic = d.dynamic[:0]
-		d.size = 0
+		d.empty()
 		return
 	}
 	d.evict(size)
-	d.dynamic = append(d.dynamic, f)
+	if d.n == len(d.ring) {
+		grown := make([]hpackEntry, max(2*len(d.ring), 16))
+		for i := 0; i < d.n; i++ {
+			grown[i] = *d.entry(i)
+		}
+		d.ring, d.head = grown, 0
+	}
+	*d.entry(d.n) = f
+	d.n++
 	d.size += size
 }
 
 // evict drops the oldest entries until room more bytes fit.
 func (d *hpackDecoder) evict(room uint32) {
-	n := 0
-	for d.size+room > d.maxSize && n < len(d.dynamic) {
-		f := d.dynamic[n]
+	for d.size+room > d.maxSize && d.n > 0 {
+		f := d.entry(0)
 		d.size -= uint32(len(f.Name)+len(f.Value)) + hpackEntryOverhead
-		n++
-	}
-	if n > 0 {
-		copy(d.dynamic, d.dynamic[n:])
-		// Release the evicted strings: the backing array keeps the tail.
-		clear(d.dynamic[len(d.dynamic)-n:])
-		d.dynamic = d.dynamic[:len(d.dynamic)-n]
+		*f = hpackEntry{} // release its strings
+		d.head = (d.head + 1) % len(d.ring)
+		d.n--
 	}
 }
 

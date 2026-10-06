@@ -164,6 +164,10 @@ func main() {
 	flag.Set("logtostderr", "false")
 	flag.Set("alsologtostderr", "false")
 	flag.Set("stderrthreshold", "FATAL")
+	// SetOutput gives every severity the same writer, and klog writes a
+	// message to its own severity's writer and every lower one's: without
+	// one_output each warning was logged twice and each error three times.
+	flag.Set("one_output", "true")
 	klog.SetOutput(&RateLimitedLogOutput{limiter: rate.NewLimiter(rate.Limit(*flags.LogPerSecond), *flags.LogBurst)})
 
 	klog.Infoln("agent version:", version)
@@ -189,8 +193,11 @@ func main() {
 		klog.Exitln(err)
 	}
 
-	if !common.GetKernelVersion().GreaterOrEqual(common.NewVersion(4, 16, 0)) {
-		klog.Exitln("the minimum Linux kernel version required is 4.16 or later")
+	// L7 events go through a BPF ring buffer (BPF_MAP_TYPE_RINGBUF), which
+	// every program variant uses and which kernels before 5.8 do not have:
+	// on them the programs fail to load further on, with a less clear error.
+	if !common.GetKernelVersion().GreaterOrEqual(common.NewVersion(5, 8, 0)) {
+		klog.Exitln("the minimum Linux kernel version required is 5.8 or later (BPF ring buffer)")
 	}
 
 	resolver, err := newIPResolver(hostname)

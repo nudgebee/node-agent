@@ -829,6 +829,13 @@ func (c *Container) createConnectionFromSocketInfo(pid uint32, fd uint64, timest
 	if socketInfo == nil || !socketInfo.Valid {
 		return nil, false
 	}
+	// connectionKey applies the same filter below; checking it first skips
+	// the parsing and the kernel map lookup for the commonest case. A TLS
+	// server's accepted sockets have a client's ephemeral port as their
+	// destination, are never tracked, and come through here on every event.
+	if common.PortFilter.ShouldBeSkipped(socketInfo.DstPort) {
+		return nil, true
+	}
 
 	// Parse destination IP
 	dstIP, err := netaddr.ParseIP(socketInfo.DstIP)
@@ -1379,6 +1386,11 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		var missing uint64
 		if r.PayloadSize > uint64(len(r.Payload)) {
 			missing = r.PayloadSize - uint64(len(r.Payload))
+		}
+		// Events of this connection the kernel could not deliver (its ring
+		// buffer was full) leave a gap the parser cannot see in the bytes.
+		if r.LostBefore != 0 {
+			parser.Lost(r.LostBefore)
 		}
 		requests := parser.Parse(r.Method, r.Payload, r.KernelTime, missing)
 

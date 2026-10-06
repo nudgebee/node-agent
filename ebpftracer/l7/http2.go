@@ -219,27 +219,56 @@ func (p *Http2Parser) resetDecoder(method Method) {
 	}
 }
 
-// evictOldestRequest makes room for a new stream by dropping the request
-// that has waited longest for its response.
+// Lost tells the parser that events of its connection were not delivered
+// before the current one (l7.LostWrites: client frames, l7.LostReads: server
+// frames). Nothing in the bytes shows the gap: a frame cut by it would be
+// spliced onto unrelated bytes, and a header block in it took its HPACK
+// insertions with it, so later references would decode to the wrong
+// headers. That direction's partial frame and pending header block are
+// dropped and its table reset.
+func (p *Http2Parser) Lost(lost uint8) {
+	if lost&LostWrites != 0 {
+		p.clientPartialFrame, p.clientSkip, p.clientPendingHeaders = nil, 0, nil
+		p.resetDecoder(MethodHttp2ClientFrames)
+		p.stage("events_lost")
+	}
+	if lost&LostReads != 0 {
+		p.serverPartialFrame, p.serverSkip, p.serverPendingHeaders = nil, 0, nil
+		p.resetDecoder(MethodHttp2ServerFrames)
+		p.stage("events_lost")
+	}
+}
+
+// evictOldestRequest makes room for a new stream by dropping a request still
+// waiting for its response.
 //
 // The streams that fill the table are mostly ones whose response the parser
 // will never see: it was in a read cut short by truncation, or in an event
 // lost before it. They are only collected after http2DecoderGcInterval.
 // Refusing new streams until then dropped every request on a busy
-// connection for minutes, silently; the oldest stream is the one least
-// likely to still complete.
+// connection for minutes, silently. A request without response headers goes
+// first, oldest first: one whose response was lost never gets them, while
+// the oldest stream overall is often a live long-lived one (a watch, a
+// bidirectional stream) that already has its headers and awaits its end.
 func (p *Http2Parser) evictOldestRequest() {
-	var oldestId uint32
-	var oldest *Http2Request
+	var victimId uint32
+	var victim *Http2Request
 	for id, r := range p.activeRequests {
-		if oldest == nil || r.kernelTime < oldest.kernelTime {
-			oldestId, oldest = id, r
+		if victim == nil || evictsBefore(r, victim) {
+			victimId, victim = id, r
 		}
 	}
-	if oldest != nil {
-		delete(p.activeRequests, oldestId)
+	if victim != nil {
+		delete(p.activeRequests, victimId)
 		p.stage("stream_evicted")
 	}
+}
+
+func evictsBefore(a, b *Http2Request) bool {
+	if a.hasResponseStatus != b.hasResponseStatus {
+		return !a.hasResponseStatus
+	}
+	return a.kernelTime < b.kernelTime
 }
 
 // dropPendingHeaders discards a header block still waiting for CONTINUATION
@@ -317,21 +346,26 @@ func (p *Http2Parser) decodeHeaderBlock(
 	// be right for its direction: a sign the dynamic table has drifted from
 	// the encoder's because a block was lost unnoticed.
 	implausible := false
+	// created marks a client block on a stream not yet tracked; sawPseudo
+	// that it carried pseudo-headers.
+	created, sawPseudo := false, false
+	var req *Http2Request
 	var emit func(name, value string)
 	switch method {
 	case MethodHttp2ClientFrames:
-		req := p.activeRequests[streamId]
+		req = p.activeRequests[streamId]
 		if req == nil {
-			if len(p.activeRequests) >= maxActiveRequests {
-				p.evictOldestRequest()
-			}
+			// Added to activeRequests once decoded, if it is a request: see
+			// below.
 			req = &Http2Request{
 				kernelTime: kernelTime,
 			}
-			p.activeRequests[streamId] = req
-			p.stage("stream_created")
+			created = true
 		}
 		emit = func(name, value string) {
+			if strings.HasPrefix(name, ":") {
+				sawPseudo = true
+			}
 			switch name {
 			case ":method":
 				if !isHttpMethod(value) {
@@ -410,6 +444,19 @@ func (p *Http2Parser) decodeHeaderBlock(
 	// Fields are emitted as they decode, so on an error the ones before it
 	// (often :method or :status, from the static table) are kept.
 	unknown, err := decoder.decode(hpackData, emit)
+	if created {
+		// A block with no pseudo-headers on a stream the parser does not
+		// track is trailers of a stream it evicted or never saw, not a
+		// request. Anything else (including a block it could not fully
+		// decode) starts one.
+		if sawPseudo || unknown > 0 || err != nil {
+			if len(p.activeRequests) >= maxActiveRequests {
+				p.evictOldestRequest()
+			}
+			p.activeRequests[streamId] = req
+			p.stage("stream_created")
+		}
+	}
 	if err != nil || unknown > 0 || implausible {
 		// Mark the request as having partial headers so downstream can apply fallbacks
 		if req := p.activeRequests[streamId]; req != nil {
@@ -496,8 +543,10 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64, mi
 			*skip = 0
 		default:
 			// The frame ends inside this read's own missing tail: whatever
-			// follows it was never captured, so framing is lost.
+			// follows it was never captured, so framing is lost, and a header
+			// block among it took its insertions with it.
 			*skip = 0
+			p.resetDecoder(method)
 			return nil
 		}
 	}
@@ -507,6 +556,7 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64, mi
 		// HTTP/2 default max frame size is 16KB, so 64KB should be plenty for reassembly
 		if len(*partialFrame) > 64*1024 {
 			*partialFrame = nil
+			p.resetDecoder(method)
 		} else {
 			// Prepend saved partial data to new payload
 			payload = append(*partialFrame, payload...)
@@ -606,10 +656,16 @@ frameLoop:
 			framePayload := payload[offset : offset+h.Length]
 			offset += h.Length
 
+			// A header block still waiting for CONTINUATION frames lost them:
+			// a new block cannot start before it ends.
+			p.dropPendingHeaders(method, pendingHeaders)
+
 			// Extract HPACK data, stripping optional PADDED/PRIORITY fields
 			hpackFragment := extractHeaderBlockFragment(h.Flags, framePayload)
 			if hpackFragment == nil {
-				// Malformed HEADERS frame, skip
+				// Malformed HEADERS frame: its block, and its insertions, are
+				// lost.
+				p.resetDecoder(method)
 				continue
 			}
 
@@ -695,19 +751,27 @@ frameLoop:
 	// This is why large-header HTTPS/2 endpoints decode nothing while small
 	// internal h2c (frames well under 4KB) works: only the former truncates.
 	if truncated {
-		// If the missing tail lies entirely within the cut frame, the rest of
-		// that frame opens the next read: skip exactly that much there.
+		// The table survives only if the missing bytes are known to be the
+		// tail of one frame that is not part of a header block. Otherwise a
+		// header block may be among them: the cut frame itself, or a frame
+		// after it (one write often holds a response's DATA and then its
+		// trailers), or one whose header was never captured. Its insertions
+		// are missing from the table, which would decode later references to
+		// the wrong headers.
+		lostHeaders := true
 		if rest := len(payload) - offset; rest >= http2FrameHeaderLength {
 			length := uint64(binary.BigEndian.Uint32(payload[offset:]) >> 8)
 			captured := uint64(rest - http2FrameHeaderLength)
+			// If the missing tail lies entirely within the cut frame, the rest
+			// of that frame opens the next read: skip exactly that much there.
 			if length >= captured+missing {
 				*skip = length - captured - missing
+				t := http2.FrameType(payload[offset+3])
+				lostHeaders = t == http2.FrameHeaders || t == http2.FrameContinuation
 			}
-			// A header block cut short never reaches the decoder, and the
-			// entries it inserted are missing from the table.
-			if t := http2.FrameType(payload[offset+3]); t == http2.FrameHeaders || t == http2.FrameContinuation {
-				p.resetDecoder(method)
-			}
+		}
+		if lostHeaders {
+			p.resetDecoder(method)
 		}
 		*partialFrame = nil
 		// A header block interrupted by truncation can never be completed by a
