@@ -245,7 +245,6 @@ func TestHpackDecoderRejectsMalformedBlocks(t *testing.T) {
 		"truncated integer": {0xff, 0x80},
 		"truncated string":  {0x40, 0x05, 'a'},
 		"integer overflow":  {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01},
-		"huge size update":  {0x3f, 0xe1, 0xff, 0x7f},
 		"bad huffman":       {0x40, 0x81, 0xff, 0x00},
 	} {
 		if _, err := newHpackDecoder().decode(block, func(string, string) {}); err == nil {
@@ -289,4 +288,44 @@ func BenchmarkHpackDecoder(b *testing.B) {
 			}
 		}
 	})
+}
+
+// A size update above what the decoder will hold is clamped, not an error
+// that would lose the rest of the block.
+func TestHpackDecoderClampsOversizedTableUpdate(t *testing.T) {
+	block := []byte{0x3f, 0xe1, 0xff, 0x7f} // size update to ~2 MiB
+	var buf bytes.Buffer
+	_ = hpack.NewEncoder(&buf).WriteField(hpack.HeaderField{Name: "x-a", Value: "1"})
+	block = append(block, buf.Bytes()...)
+	d := newHpackDecoder()
+	got, unknown := decodeAll(t, d, block)
+	if unknown != 0 || len(got) != 1 || got[0].Value != "1" {
+		t.Fatalf("got %v, %d unknown", got, unknown)
+	}
+	if d.maxSize != hpackMaxTableSize {
+		t.Errorf("maxSize = %d, want %d", d.maxSize, hpackMaxTableSize)
+	}
+}
+
+// A 64 KB block of minimal insertions after a size update to 64 KiB evicts
+// on every insertion once the table is full. With a slice that shifted per
+// eviction this took ~34 ms; the ring makes it linear.
+func manySmallInsertions() []byte {
+	var b bytes.Buffer
+	b.Write([]byte{0x3f, 0xe1, 0xff, 0x03}) // size update to 64 KiB
+	for b.Len() < 64*1024 {
+		b.Write([]byte{0x40, 0x01, 'a', 0x00}) // literal with indexing, name "a", empty value
+	}
+	return b.Bytes()
+}
+
+func BenchmarkHpackDecoderManySmallInsertions(b *testing.B) {
+	block := manySmallInsertions()
+	emit := func(string, string) {}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := newHpackDecoder().decode(block, emit); err != nil {
+			b.Fatal(err)
+		}
+	}
 }

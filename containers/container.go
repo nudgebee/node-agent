@@ -1387,6 +1387,11 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		if r.PayloadSize > uint64(len(r.Payload)) {
 			missing = r.PayloadSize - uint64(len(r.Payload))
 		}
+		// Events of this connection the kernel could not deliver (its ring
+		// buffer was full) leave a gap the parser cannot see in the bytes.
+		if r.LostBefore != 0 {
+			parser.Lost(r.LostBefore)
+		}
 		requests := parser.Parse(r.Method, r.Payload, r.KernelTime, missing)
 
 		// HTTP/2 has the weakest detection heuristic of any protocol here — it

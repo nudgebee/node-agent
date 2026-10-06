@@ -133,6 +133,8 @@ var (
 	//   response_status  :status seen on the response
 	//   end_stream       END_STREAM flag seen (a frame flag, not HPACK)
 	//   completed        both of the above -> request emitted
+	//   events_lost      events of the connection were lost before this one
+	//                    (full ring buffer); that direction was resynchronized
 	//   hpack_partial    a header block referenced table entries the decoder
 	//                    does not hold (inserted before it joined or was
 	//                    reset); the other headers in it were decoded
