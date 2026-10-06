@@ -148,7 +148,7 @@ func TestHttp2ParserResetsTableOnImplausibleHeaders(t *testing.T) {
 	if stages["hpack_error"] != 1 {
 		t.Errorf("hpack_error = %d, want 1", stages["hpack_error"])
 	}
-	if len(p.serverDecoder.dynamic) != 0 {
+	if p.serverDecoder.n != 0 {
 		t.Error("server table not reset")
 	}
 }
