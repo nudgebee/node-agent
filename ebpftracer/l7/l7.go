@@ -195,6 +195,12 @@ func (s Status) Error() bool {
 	return s == StatusFailed
 }
 
+// LostBefore bits.
+const (
+	LostWrites = 1 << 0
+	LostReads  = 1 << 1
+)
+
 type RequestData struct {
 	Protocol Protocol
 	Status   Status
@@ -206,8 +212,12 @@ type RequestData struct {
 	// KernelTime is the raw kernel timestamp (bpf_ktime_get_ns) that HTTP/2
 	// and ClientHello events carry in place of a duration. Duration cannot
 	// hold it: it is clamped to under an hour, which a kernel uptime exceeds.
-	KernelTime   uint64
-	StatementId  uint32
+	KernelTime  uint64
+	StatementId uint32
+	// LostBefore reports events of this connection that the kernel could not
+	// deliver since the previous one (its ring buffer was full): LostWrites
+	// and/or LostReads. A stateful parser must resynchronize.
+	LostBefore   uint8
 	Payload      []byte
 	PayloadSize  uint64
 	ResponseSize uint64

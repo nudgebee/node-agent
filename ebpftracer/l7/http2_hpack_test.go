@@ -230,3 +230,130 @@ func TestHttp2ParserEvictsOldestStreamAtCap(t *testing.T) {
 		t.Errorf("stream_evicted = %d, want 21", stages["stream_evicted"])
 	}
 }
+
+// pathBlocks encodes requests whose :path alternates /a, /b, /a, /b, ... on
+// one connection, so that after the first two every :path is a reference
+// into the dynamic table: the shape that decodes to a wrong path if the
+// table misses an insertion.
+func pathBlocks(n int) [][]byte {
+	var buf bytes.Buffer
+	enc := hpack.NewEncoder(&buf)
+	out := make([][]byte, n)
+	for i := range out {
+		buf.Reset()
+		_ = enc.WriteField(hpack.HeaderField{Name: ":method", Value: "GET"})
+		_ = enc.WriteField(hpack.HeaderField{Name: ":path", Value: altPath(i)})
+		out[i] = append([]byte(nil), buf.Bytes()...)
+	}
+	return out
+}
+
+func altPath(i int) string { return []string{"/a", "/b"}[i%2] }
+
+func headersFrameEnd(streamID uint32, block []byte) []byte {
+	return frame(http2.FrameHeaders, http2FlagEndHeaders|http2FlagEndStream, streamID, block)
+}
+
+// checkPaths fails on any request whose decoded :path is set but wrong.
+func checkPaths(t *testing.T, p *Http2Parser, from, n int) {
+	t.Helper()
+	for i := from; i < n; i++ {
+		if req := p.activeRequests[streamID(i)]; req != nil && req.Path != "" && req.Path != altPath(i) {
+			t.Errorf("request %d: path %q, want %q or unknown", i, req.Path, altPath(i))
+		}
+	}
+}
+
+// A block lost before the parser saw it (the ring buffer was full) leaves the
+// table missing its insertion; the kernel now flags the next delivered event
+// and the parser resets that direction instead of decoding wrong paths.
+func TestHttp2ParserResetsOnLostEvents(t *testing.T) {
+	const n = 8
+	blocks := pathBlocks(n)
+	run := func(signal bool) *Http2Parser {
+		p := NewHttp2Parser()
+		for i := 0; i < n; i++ {
+			if i == 1 {
+				continue // dropped by the kernel
+			}
+			if i == 2 && signal {
+				p.Lost(LostWrites)
+			}
+			p.Parse(MethodHttp2ClientFrames, headersFrameEnd(streamID(i), blocks[i]), uint64(i), 0)
+		}
+		return p
+	}
+	// Without the signal the loss decodes wrong paths: the scenario is real.
+	wrong := 0
+	p := run(false)
+	for i := 2; i < n; i++ {
+		if req := p.activeRequests[streamID(i)]; req != nil && req.Path != "" && req.Path != altPath(i) {
+			wrong++
+		}
+	}
+	if wrong == 0 {
+		t.Fatal("losing a block decoded nothing wrong; the scenario is too weak")
+	}
+	checkPaths(t, run(true), 2, n)
+}
+
+// One write held a large DATA frame and then a HEADERS frame, and only its
+// first 4096 bytes were captured: the HEADERS frame is in the missing tail,
+// not the cut frame. The table must still be reset.
+func TestHttp2ParserResetsWhenTruncationHidesFollowingHeaders(t *testing.T) {
+	const n = 8
+	blocks := pathBlocks(n)
+	p := NewHttp2Parser()
+	p.Parse(MethodHttp2ClientFrames, headersFrameEnd(streamID(0), blocks[0]), 0, 0)
+	write := append(frame(http2.FrameData, 0, streamID(0), make([]byte, 5000)), headersFrameEnd(streamID(1), blocks[1])...)
+	p.Parse(MethodHttp2ClientFrames, write[:4096], 1, uint64(len(write)-4096))
+	for i := 2; i < n; i++ {
+		p.Parse(MethodHttp2ClientFrames, headersFrameEnd(streamID(i), blocks[i]), uint64(i), 0)
+	}
+	checkPaths(t, p, 2, n)
+}
+
+// A HEADERS frame whose CONTINUATION never arrived is followed by a new
+// HEADERS frame: the pending block is lost, and with it its insertions.
+func TestHttp2ParserResetsWhenPendingHeadersAreOverwritten(t *testing.T) {
+	const n = 8
+	blocks := pathBlocks(n)
+	p := NewHttp2Parser()
+	p.Parse(MethodHttp2ClientFrames, headersFrameEnd(streamID(0), blocks[0]), 0, 0)
+	// Block 1 starts without END_HEADERS; its CONTINUATION is lost.
+	p.Parse(MethodHttp2ClientFrames, frame(http2.FrameHeaders, 0, streamID(1), blocks[1]), 1, 0)
+	for i := 2; i < n; i++ {
+		p.Parse(MethodHttp2ClientFrames, headersFrameEnd(streamID(i), blocks[i]), uint64(i), 0)
+	}
+	checkPaths(t, p, 2, n)
+}
+
+// At the limit, a request still waiting for response headers is evicted
+// before an older one that has them: that one is usually a live long-lived
+// stream (a watch), while one without headers has usually lost its response.
+func TestHttp2ParserEvictsWaitingRequestsBeforeLongLivedStreams(t *testing.T) {
+	p := NewHttp2Parser()
+	p.Parse(MethodHttp2ClientFrames, headersFrame(streamID(0), "/watch"), 0, 0)
+	var buf bytes.Buffer
+	_ = hpack.NewEncoder(&buf).WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+	p.Parse(MethodHttp2ServerFrames, frame(http2.FrameHeaders, http2FlagEndHeaders, streamID(0), buf.Bytes()), 1, 0)
+	for i := 1; i <= maxActiveRequests+20; i++ {
+		p.Parse(MethodHttp2ClientFrames, headersFrame(streamID(i), "/orphan"), uint64(i+1), 0)
+	}
+	if req := p.activeRequests[streamID(0)]; req == nil || req.Path != "/watch" {
+		t.Fatal("the long-lived stream with response headers was evicted")
+	}
+}
+
+// A block without pseudo-headers on a stream the parser does not track is
+// trailers (of an evicted stream, or one it never saw), not a new request.
+func TestHttp2ParserTrailersOnUntrackedStreamCreateNoRequest(t *testing.T) {
+	stages := countStages(t)
+	var buf bytes.Buffer
+	_ = hpack.NewEncoder(&buf).WriteField(hpack.HeaderField{Name: "grpc-status", Value: "0"})
+	p := NewHttp2Parser()
+	p.Parse(MethodHttp2ClientFrames, headersFrameEnd(7, buf.Bytes()), 1, 0)
+	if len(p.activeRequests) != 0 || stages["stream_created"] != 0 {
+		t.Errorf("trailers created a request: %d active, %d created", len(p.activeRequests), stages["stream_created"])
+	}
+}

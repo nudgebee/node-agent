@@ -80,6 +80,11 @@ struct connection {
     // ciphertext for it; see mark_tls in l7/l7.c.
     __u8 tls;
     __u16 dport;  // Destination port for protocol detection
+    // l7_lost records L7 events of this connection that l7_events had no room
+    // for since its last delivered one: bit 0 written frames, bit 1 read
+    // frames. The next delivered event carries it (l7_event.lost_before) and
+    // clears it. Stored in what was tail padding; the struct stays 32 bytes.
+    __u8 l7_lost;
 };
 
 struct {
