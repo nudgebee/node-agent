@@ -269,7 +269,12 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) (links []link.Link, isGolangApp 
 		if !ws.Found {
 			continue
 		}
-		l, err := attachUprobeAt(exe, t.uprobes["go_crypto_tls_write_enter"], pid, ws.Address)
+		// Past the stack check, not at the entry: when the goroutine's stack
+		// has to grow, the function restarts from its entry and an entry probe
+		// sent the write twice. A duplicated write splices a copy of its bytes
+		// into the stream, which costs the HTTP/2 parser its frame alignment
+		// for the rest of the connection.
+		l, err := attachUprobeAt(exe, t.uprobes["go_crypto_tls_write_enter"], pid, ws.Address+uint64(ws.StackCheckEnd))
 		if err != nil {
 			closeLinks()
 			return fail(fmt.Sprintf("failed to attach write_enter uprobe for %s", writeSymbol), err)
