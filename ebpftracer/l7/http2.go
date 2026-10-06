@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/hpack"
 	"k8s.io/klog/v2"
 )
 
@@ -106,7 +105,8 @@ const (
 	maxPendingHeaderBlockSize = 64 * 1024
 
 	// Max concurrent HTTP/2 streams tracked per connection.
-	// Prevents unbounded memory growth when responses never complete (orphan streams).
+	// Prevents unbounded memory growth when responses never complete (orphan
+	// streams); at the limit the oldest stream makes way (evictOldestRequest).
 	maxActiveRequests = 100
 )
 
@@ -163,8 +163,8 @@ type Http2Parser struct {
 	// frames, indefinitely, because the protocol is cached per connection.
 	sawValidFrame bool
 
-	clientDecoder  *hpack.Decoder
-	serverDecoder  *hpack.Decoder
+	clientDecoder  *hpackDecoder
+	serverDecoder  *hpackDecoder
 	activeRequests map[uint32]*Http2Request
 	lastGcTime     uint64
 
@@ -195,26 +195,59 @@ type Http2Parser struct {
 
 func NewHttp2Parser() *Http2Parser {
 	return &Http2Parser{
-		clientDecoder:  hpack.NewDecoder(4096, nil),
-		serverDecoder:  hpack.NewDecoder(4096, nil),
+		clientDecoder:  newHpackDecoder(),
+		serverDecoder:  newHpackDecoder(),
 		activeRequests: make(map[uint32]*Http2Request),
 		statuses:       make(map[uint32]Status),
 		grpcStatuses:   make(map[uint32]Status),
 	}
 }
 
-// resetDecoder creates a fresh HPACK decoder after an unrecoverable decode error.
-// This discards the dynamic table but preserves static table (indices 1-61) functionality.
-// Headers like :method (2,3), :path (4,5), :scheme (6,7), :status (8-14) remain decodable.
-// The dynamic table gradually rebuilds as the encoder sends new literal-with-indexing headers.
+// resetDecoder forgets a direction's HPACK dynamic table, when a header block
+// was lost or decoded to garbage and the table can no longer be trusted to
+// match the encoder's. The static table (indices 1-61) keeps working, and the
+// decoder converges on the encoder's table again as new entries are inserted:
+// see hpackDecoder.
 func (p *Http2Parser) resetDecoder(method Method) {
 	switch method {
 	case MethodHttp2ClientFrames:
-		p.clientDecoder = hpack.NewDecoder(4096, nil)
+		p.clientDecoder.reset()
 		p.clientDecoderDegraded = true
 	case MethodHttp2ServerFrames:
-		p.serverDecoder = hpack.NewDecoder(4096, nil)
+		p.serverDecoder.reset()
 		p.serverDecoderDegraded = true
+	}
+}
+
+// evictOldestRequest makes room for a new stream by dropping the request
+// that has waited longest for its response.
+//
+// The streams that fill the table are mostly ones whose response the parser
+// will never see: it was in a read cut short by truncation, or in an event
+// lost before it. They are only collected after http2DecoderGcInterval.
+// Refusing new streams until then dropped every request on a busy
+// connection for minutes, silently; the oldest stream is the one least
+// likely to still complete.
+func (p *Http2Parser) evictOldestRequest() {
+	var oldestId uint32
+	var oldest *Http2Request
+	for id, r := range p.activeRequests {
+		if oldest == nil || r.kernelTime < oldest.kernelTime {
+			oldestId, oldest = id, r
+		}
+	}
+	if oldest != nil {
+		delete(p.activeRequests, oldestId)
+		p.stage("stream_evicted")
+	}
+}
+
+// dropPendingHeaders discards a header block still waiting for CONTINUATION
+// frames. Its insertions never reach the table, so the table is reset too.
+func (p *Http2Parser) dropPendingHeaders(method Method, pending **pendingHeaderBlock) {
+	if *pending != nil {
+		*pending = nil
+		p.resetDecoder(method)
 	}
 }
 
@@ -270,27 +303,27 @@ func extractHeaderBlockFragment(flags http2.Flags, framePayload []byte) []byte {
 }
 
 // decodeHeaderBlock processes a complete HPACK-encoded header block for a stream.
-// It sets up the emit function, writes the HPACK data to the decoder, and handles errors.
 func (p *Http2Parser) decodeHeaderBlock(
 	method Method,
 	streamId uint32,
 	endStream bool,
 	hpackData []byte,
-	decoder *hpack.Decoder,
+	decoder *hpackDecoder,
 	statuses map[uint32]Status,
 	grpcStatuses map[uint32]Status,
 	kernelTime uint64,
 ) {
+	// implausible is set when the block decodes to pseudo-headers that cannot
+	// be right for its direction: a sign the dynamic table has drifted from
+	// the encoder's because a block was lost unnoticed.
+	implausible := false
+	var emit func(name, value string)
 	switch method {
 	case MethodHttp2ClientFrames:
 		req := p.activeRequests[streamId]
 		if req == nil {
 			if len(p.activeRequests) >= maxActiveRequests {
-				// Too many active streams; set no-op emit so decoder.Write still
-				// processes the HPACK block (keeps dynamic table in sync) without
-				// dereferencing a nil request.
-				decoder.SetEmitFunc(func(hf hpack.HeaderField) {})
-				break
+				p.evictOldestRequest()
 			}
 			req = &Http2Request{
 				kernelTime: kernelTime,
@@ -298,30 +331,36 @@ func (p *Http2Parser) decodeHeaderBlock(
 			p.activeRequests[streamId] = req
 			p.stage("stream_created")
 		}
-		decoder.SetEmitFunc(func(hf hpack.HeaderField) {
-			switch hf.Name {
+		emit = func(name, value string) {
+			switch name {
 			case ":method":
-				if req.Method == "" && isHttpMethod(hf.Value) {
-					req.Method = hf.Value
+				if !isHttpMethod(value) {
+					implausible = true
+				} else if req != nil && req.Method == "" {
+					req.Method = value
 				}
 			case ":path":
-				if req.Path == "" && isHttpPath(hf.Value) {
-					req.Path = hf.Value
+				if !isHttpPath(value) {
+					implausible = true
+				} else if req != nil && req.Path == "" {
+					req.Path = value
 				}
 			case ":scheme":
-				if req.Scheme == "" && isHttpScheme(hf.Value) {
-					req.Scheme = hf.Value
+				if req != nil && req.Scheme == "" && isHttpScheme(value) {
+					req.Scheme = value
 				}
 			case ":authority":
-				if req.Authority == "" && hf.Value != "" {
-					req.Authority = hf.Value
+				if req != nil && req.Authority == "" && value != "" {
+					req.Authority = value
 				}
 			case "content-type":
-				if req.ContentType == "" && hf.Value != "" {
-					req.ContentType = hf.Value
+				if req != nil && req.ContentType == "" && value != "" {
+					req.ContentType = value
 				}
+			case ":status":
+				implausible = true
 			}
-		})
+		}
 
 	case MethodHttp2ServerFrames:
 		req := p.activeRequests[streamId]
@@ -331,10 +370,14 @@ func (p *Http2Parser) decodeHeaderBlock(
 				statuses[streamId] = 0
 			}
 		}
-		decoder.SetEmitFunc(func(hf hpack.HeaderField) {
-			switch hf.Name {
+		emit = func(name, value string) {
+			switch name {
 			case ":status":
-				s, _ := strconv.Atoi(hf.Value)
+				s, err := strconv.Atoi(value)
+				if err != nil || s < 100 || s > 999 {
+					implausible = true
+					return
+				}
 				if req != nil {
 					req.Status = Status(s)
 					if !req.hasResponseStatus {
@@ -344,13 +387,15 @@ func (p *Http2Parser) decodeHeaderBlock(
 				}
 				statuses[streamId] = Status(s)
 			case "grpc-status":
-				s, _ := strconv.Atoi(hf.Value)
+				s, _ := strconv.Atoi(value)
 				if req != nil {
 					req.GrpcStatus = Status(s)
 				}
 				grpcStatuses[streamId] = Status(s)
+			case ":method", ":path", ":scheme", ":authority":
+				implausible = true
 			}
-		})
+		}
 		// Check for END_STREAM flag on HEADERS (no body response)
 		if req != nil && endStream {
 			if !req.responseEndStream {
@@ -358,32 +403,34 @@ func (p *Http2Parser) decodeHeaderBlock(
 			}
 			req.responseEndStream = true
 		}
+	default:
+		return
 	}
 
-	// Decode the complete HPACK header block.
-	// The emit function (set above) fires per-header, so headers decoded before any
-	// error are already stored in the request struct (e.g., :method from static index 3,
-	// :status from static index 8). We preserve these partial results on error.
-	if _, err := decoder.Write(hpackData); err != nil {
-		// HPACK decode error - commonly happens during mid-stream join when the agent
-		// starts monitoring after HTTP/2 connection was established. The remote encoder's
-		// dynamic table has entries our decoder doesn't have.
-		klog.V(3).Infof("http2: HPACK decode error on stream %d: %v (partial headers preserved)", streamId, err)
-		if OnHPACKDecodeError != nil {
-			OnHPACKDecodeError()
-		}
-		p.stage("hpack_error")
-
+	// Fields are emitted as they decode, so on an error the ones before it
+	// (often :method or :status, from the static table) are kept.
+	unknown, err := decoder.decode(hpackData, emit)
+	if err != nil || unknown > 0 || implausible {
 		// Mark the request as having partial headers so downstream can apply fallbacks
 		if req := p.activeRequests[streamId]; req != nil {
 			req.PartialHeaders = true
 		}
-
-		// Reset the decoder to prevent cascading failures. After a decode error, the
-		// decoder's internal buffer position and dynamic table are desynchronized.
-		// A fresh decoder starts with an empty dynamic table but static table (indices 1-61)
-		// always works. The dynamic table rebuilds from new literal-with-indexing headers.
+	}
+	switch {
+	case err != nil || implausible:
+		klog.V(3).Infof("http2: HPACK decode error on stream %d: %v, implausible=%v (partial headers preserved)", streamId, err, implausible)
+		if OnHPACKDecodeError != nil {
+			OnHPACKDecodeError()
+		}
+		p.stage("hpack_error")
+		// The block is not valid HPACK, or decoded to headers it cannot
+		// contain: either way the table no longer matches the encoder's.
 		p.resetDecoder(method)
+	case unknown > 0:
+		// References to entries inserted before the decoder joined, or before
+		// it was reset. Expected, and not an error: the decoder catches up as
+		// the encoder inserts new entries.
+		p.stage("hpack_partial")
 	}
 }
 
@@ -396,7 +443,7 @@ func (p *Http2Parser) decodeHeaderBlock(
 // the next call — see the save site at the end of this function — but when the
 // missing bytes all belong to that frame, its remainder at the start of the
 // next read is known exactly and is skipped, so framing survives the cut.
-// That is the common case: Go reads 4096 bytes and the kernel keeps 4095.
+// That is the common case for a read or write longer than MAX_PAYLOAD_SIZE.
 func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64, missing uint64) []Http2Request {
 	truncated := missing > 0
 	if method == MethodHttp2ClientFrames {
@@ -410,7 +457,7 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64, mi
 		return nil
 	}
 
-	var decoder *hpack.Decoder
+	var decoder *hpackDecoder
 	clear(p.statuses)
 	clear(p.grpcStatuses)
 	statuses := p.statuses
@@ -597,8 +644,10 @@ frameLoop:
 
 			// Validate: CONTINUATION must follow a HEADERS on the same stream
 			if *pendingHeaders == nil || (*pendingHeaders).streamId != h.StreamId {
-				// Protocol error or we missed the HEADERS frame -- discard
-				*pendingHeaders = nil
+				// We missed the HEADERS frame (or this is a protocol error):
+				// the block it starts is lost.
+				p.dropPendingHeaders(method, pendingHeaders)
+				p.resetDecoder(method)
 				continue
 			}
 
@@ -606,7 +655,7 @@ frameLoop:
 			pending := *pendingHeaders
 			if len(pending.fragments)+len(continuationPayload) > maxPendingHeaderBlockSize {
 				// Too large, discard the pending header block
-				*pendingHeaders = nil
+				p.dropPendingHeaders(method, pendingHeaders)
 				continue
 			}
 			pending.fragments = append(pending.fragments, continuationPayload...)
@@ -654,12 +703,17 @@ frameLoop:
 			if length >= captured+missing {
 				*skip = length - captured - missing
 			}
+			// A header block cut short never reaches the decoder, and the
+			// entries it inserted are missing from the table.
+			if t := http2.FrameType(payload[offset+3]); t == http2.FrameHeaders || t == http2.FrameContinuation {
+				p.resetDecoder(method)
+			}
 		}
 		*partialFrame = nil
 		// A header block interrupted by truncation can never be completed by a
 		// CONTINUATION frame, and feeding its fragments to the decoder later
 		// would desync the dynamic table just as badly.
-		*pendingHeaders = nil
+		p.dropPendingHeaders(method, pendingHeaders)
 	} else if offset < len(payload) {
 		remaining := payload[offset:]
 		// Only save if it looks like start of a valid frame (has at least some bytes)
@@ -739,8 +793,8 @@ frameLoop:
 				}
 			}
 			// Clear stale pending headers
-			p.clientPendingHeaders = nil
-			p.serverPendingHeaders = nil
+			p.dropPendingHeaders(MethodHttp2ClientFrames, &p.clientPendingHeaders)
+			p.dropPendingHeaders(MethodHttp2ServerFrames, &p.serverPendingHeaders)
 		}
 		p.lastGcTime = kernelTime
 	}

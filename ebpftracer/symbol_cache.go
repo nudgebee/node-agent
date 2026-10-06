@@ -1,6 +1,7 @@
 package ebpftracer
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -21,6 +22,9 @@ import (
 type ProbeTarget struct {
 	Address       uint64
 	ReturnOffsets []int
+	// StackCheckEnd is the offset past the function's stack check, where a
+	// probe fires once per call even if the stack grows (0: not found).
+	StackCheckEnd int
 	Found         bool
 }
 
@@ -147,6 +151,12 @@ func readProbeTargets(path string, names []string) (map[string]ProbeTarget, erro
 	for _, name := range names {
 		s, err := ef.GetSymbol(name)
 		if err != nil {
+			// "Not found" is cached for the binary, so it must mean the
+			// binary lacks the symbol, not that its function table (the only
+			// symbol source of a stripped Go binary) could not be read.
+			if ef.goFuncsErr != nil && !errors.Is(ef.goFuncsErr, errNoGoFuncTable) {
+				return nil, ef.goFuncsErr
+			}
 			targets[name] = ProbeTarget{}
 			continue
 		}
@@ -155,6 +165,9 @@ func readProbeTargets(path string, names []string) (map[string]ProbeTarget, erro
 		// uprobe; only the uretprobes are skipped.
 		if offsets, err := s.ReturnOffsets(); err == nil {
 			t.ReturnOffsets = offsets
+		}
+		if end, err := s.StackCheckEnd(); err == nil {
+			t.StackCheckEnd = end
 		}
 		targets[name] = t
 	}

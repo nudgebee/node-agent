@@ -34,20 +34,33 @@
     asm volatile ("%0 &= %1" : "+r"(size) : "i"(MAX_PAYLOAD_SIZE-1));   \
 })
 
+// TRUNCATE_COPY_SIZE bounds a copy into a MAX_PAYLOAD_SIZE buffer (an
+// event's payload or response, a request's payload) to the whole buffer.
+// TRUNCATE_PAYLOAD_SIZE stops one byte short, while payload_size and
+// userspace allow MAX_PAYLOAD_SIZE: a 4096-byte write, which is how Go's
+// HTTP/2 flushes its 4 KB write buffer, was decoded with a last byte the
+// event never wrote, inside whichever frame crossed the end of the buffer.
+//
+// The clamp is asm so the verifier sees the compare on the register the copy
+// uses: written in C, clang compared a copy and the verifier lost the bound.
+#define TRUNCATE_COPY_SIZE(size) ({                                         \
+    asm volatile ("if %0 <= %1 goto +1\n\t%0 = %1"                          \
+                  : "+r"(size) : "i"(MAX_PAYLOAD_SIZE));                     \
+})
+
 // COPY_PAYLOAD for use with non-ringbuf allocations (l7_request heap)
 #define COPY_PAYLOAD(dst, size, src) ({     \
-    TRUNCATE_PAYLOAD_SIZE(size);            \
+    TRUNCATE_COPY_SIZE(size);               \
     if (bpf_probe_read(dst, size, src)) {   \
         return 0;                           \
     }                                       \
 })
 
-// COPY_PAYLOAD_RINGBUF for use with ring buffer allocations
-// Discards the event and returns 0 on failure to satisfy eBPF verifier
+// COPY_PAYLOAD_RINGBUF copies a payload into an event from reserve_l7_event
+// and returns 0 (dropping the event) if the read fails.
 #define COPY_PAYLOAD_RINGBUF(e, dst, size, src) ({  \
-    TRUNCATE_PAYLOAD_SIZE(size);                    \
+    TRUNCATE_COPY_SIZE(size);                       \
     if (bpf_probe_read(dst, size, src)) {           \
-        bpf_ringbuf_discard(e, 0);                  \
         return 0;                                   \
     }                                               \
 })
@@ -217,8 +230,34 @@ struct user_msghdr {
     __u32 msg_flags;
 };
 
-// send_event submits an L7 event to the ring buffer
-// The event must have been allocated via bpf_ringbuf_reserve(&l7_events, ...)
+// l7_ringbuf_drops counts L7 events lost because l7_events was full.
+// Userspace exports it as node_agent_l7_ringbuf_drops_total.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, 1);
+} l7_ringbuf_drops SEC(".maps");
+
+// L7_EVENT_LEN_MASK is the smallest all-ones mask covering sizeof(struct
+// l7_event); send_event uses it to bound the record length for the verifier.
+#define L7_EVENT_LEN_MASK 0x3fff
+
+// l7_event_heap is where an event is built before it is copied into
+// l7_events at its actual size (see send_event).
+struct {
+     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+     __type(key, int);
+     __type(value, struct l7_event);
+     __uint(max_entries, 1);
+} l7_event_heap SEC(".maps");
+
+// send_event copies an L7 event built by reserve_l7_event into the ring
+// buffer, sized to what it carries. Records used to be reserved at the full
+// struct size, two MAX_PAYLOAD_SIZE buffers whatever the payload, so a burst
+// of small events (HTTP/2 frames of a streaming response) filled the buffer
+// with mostly empty slots and later events were lost. Payload and response
+// stay at their fixed offsets, so userspace decodes either size the same way.
 static inline __attribute__((__always_inline__))
 void send_event(void *ctx, struct l7_event *e, struct connection_id cid, struct connection *conn) {
     e->connection_timestamp = conn->timestamp;
@@ -243,46 +282,49 @@ void send_event(void *ctx, struct l7_event *e, struct connection_id cid, struct 
         e->socket_info_valid = 0;
     }
 
-    bpf_ringbuf_submit(e, 0);
-}
-
-// l7_ringbuf_drops counts L7 events lost because l7_events was full.
-// Userspace exports it as node_agent_l7_ringbuf_drops_total.
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(key_size, sizeof(__u32));
-    __uint(value_size, sizeof(__u64));
-    __uint(max_entries, 1);
-} l7_ringbuf_drops SEC(".maps");
-
-// reserve_l7_event allocates an l7_event from the ring buffer
-// Returns NULL if the ring buffer is full (backpressure)
-static inline __attribute__((__always_inline__))
-struct l7_event *reserve_l7_event(void) {
-    struct l7_event *e = bpf_ringbuf_reserve(&l7_events, sizeof(struct l7_event), 0);
-    if (!e) {
+    __u64 data = e->response_size ? e->response_size : e->payload_size;
+    if (data > MAX_PAYLOAD_SIZE) {
+        data = MAX_PAYLOAD_SIZE;
+    }
+    __u64 len = (e->response_size ? __builtin_offsetof(struct l7_event, response)
+                                  : __builtin_offsetof(struct l7_event, payload)) + data;
+    // Bound len for the verifier: the mask makes it non-negative and small,
+    // the comparison caps it at the event's size.
+    asm volatile ("%0 &= %1" : "+r"(len) : "i"(L7_EVENT_LEN_MASK));
+    if (len > sizeof(struct l7_event)) {
+        len = sizeof(struct l7_event);
+    }
+    if (bpf_ringbuf_output(&l7_events, e, len, 0)) {
         __u32 zero = 0;
         __u64 *drops = bpf_map_lookup_elem(&l7_ringbuf_drops, &zero);
         if (drops) {
             *drops += 1;
         }
-    } else {
-        // Initialize event to zero state
-        e->protocol = PROTOCOL_UNKNOWN;
-        e->status = STATUS_UNKNOWN;
-        e->method = METHOD_UNKNOWN;
-        e->statement_id = 0;
-        e->payload_size = 0;
-        e->response_size = 0;
     }
+}
+
+// reserve_l7_event returns this CPU's scratch event, with its header reset.
+// Nothing is taken from the ring buffer until send_event, so an event that is
+// built and then dropped (most reads turn out not to need one) costs no ring
+// space.
+static inline __attribute__((__always_inline__))
+struct l7_event *reserve_l7_event(void) {
+    int zero = 0;
+    struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
+    if (!e) {
+        return 0;
+    }
+    __builtin_memset(e, 0, __builtin_offsetof(struct l7_event, payload));
+    e->protocol = PROTOCOL_UNKNOWN;
+    e->status = STATUS_UNKNOWN;
+    e->method = METHOD_UNKNOWN;
     return e;
 }
 
-// discard_l7_event discards a reserved event without sending
-// Use when an error occurs after reserve but before send
+// discard_l7_event drops an event from reserve_l7_event without sending it.
+// The scratch buffer needs no release; this marks where an event is dropped.
 static inline __attribute__((__always_inline__))
 void discard_l7_event(struct l7_event *e) {
-    bpf_ringbuf_discard(e, 0);
 }
 
 static inline __attribute__((__always_inline__))
@@ -302,8 +344,8 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
     }
     
     *total_size = iov.size;
-    __u64 size = MIN(iov.size, MAX_PAYLOAD_SIZE);
-    TRUNCATE_PAYLOAD_SIZE(size);
+    __u64 size = iov.size;
+    TRUNCATE_COPY_SIZE(size);
     
     // Direct copy without offset arithmetic on map values
     if (bpf_probe_read(buf, size, (void *)iov.buf)) {
@@ -596,8 +638,19 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
 
         // Port-based HTTP/2 hint: Try HTTP/2 detection first for HTTPS traffic (port 443/8443)
         // Most modern HTTPS traffic uses HTTP/2, and this helps detect gRPC DATA frames
-        // that don't have the connection preface
-        if (conn->dport != 53 && http2_detection_allowed(conn) && is_likely_http2_port(conn->dport) && looks_like_http2_frame(payload, size, METHOD_HTTP2_CLIENT_FRAMES)) {
+        // that don't have the connection preface.
+        //
+        // The client connection preface is unambiguous on any port, and must be
+        // checked before the detectors below: is_redis_query takes anything
+        // starting with an uppercase letter, "PRI * HTTP/2.0" included. On
+        // other ports the connection was cached as Redis, and every write
+        // until the first server frame was read (the preface and, from Go and
+        // gRPC clients, the first request's headers) was lost. Those headers
+        // carry most of the HPACK dynamic table's insertions, so the table
+        // was missing them for the life of the connection.
+        if (conn->dport != 53 && http2_detection_allowed(conn) &&
+            (is_http2_client_preface(payload, size) ||
+             (is_likely_http2_port(conn->dport) && looks_like_http2_frame(payload, size, METHOD_HTTP2_CLIENT_FRAMES)))) {
             conn->protocol = PROTOCOL_HTTP2; // Cache for subsequent frames
             struct l7_event *e = reserve_l7_event();
             if (!e) { return 0; }
