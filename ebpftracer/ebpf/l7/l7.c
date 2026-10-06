@@ -581,6 +581,14 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
             // here on.
             conn_on_stack.timestamp = bpf_ktime_get_ns();
             bpf_map_update_elem(&active_connections, &cid, &conn_on_stack, BPF_NOEXIST);
+            // Continue on the map entry (another CPU's, if it won the race):
+            // the protocol detected below, and a loss recorded by
+            // send_event, would otherwise be written to this stack copy and
+            // discarded, and the next write would have to detect afresh.
+            struct connection *tracked = bpf_map_lookup_elem(&active_connections, &cid);
+            if (tracked) {
+                conn = tracked;
+            }
         }
     } else if (conn->tls) {
         if (is_tls_clienthello(payload, size)) {
