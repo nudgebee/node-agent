@@ -39,7 +39,7 @@ type goFuncTable struct {
 	textEnd   uint64 // end of .text; a function must lie in [textStart, textEnd)
 }
 
-func openGoFuncTable(path string, ef *elf.File) (*goFuncTable, error) {
+func openGoFuncTable(file *os.File, ef *elf.File) (*goFuncTable, error) {
 	sec := ef.Section(".gopclntab")
 	if sec == nil {
 		// PIE binaries place it in the relocated read-only data.
@@ -49,11 +49,7 @@ func openGoFuncTable(path string, ef *elf.File) (*goFuncTable, error) {
 		return nil, errNoGoFuncTable
 	}
 
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
+	// The mapping outlives file: closing the descriptor does not unmap it.
 	info, err := file.Stat()
 	if err != nil {
 		return nil, err

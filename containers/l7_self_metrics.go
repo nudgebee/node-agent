@@ -12,14 +12,16 @@ import (
 )
 
 var (
-	// HPACKDecodeErrorsTotal counts HPACK decode failures in the HTTP/2
-	// parser: the decoder's dynamic table no longer matches the peer's, as
-	// when the agent joined a long-lived connection mid-stream or missed a
-	// HEADERS frame.
+	// HPACKDecodeErrorsTotal counts HTTP/2 header blocks that were not valid
+	// HPACK, or decoded to pseudo-headers that cannot be right for their
+	// direction: the decoder's dynamic table had drifted from the peer's, as
+	// when a HEADERS frame was lost unnoticed. References to entries inserted
+	// before the agent joined the connection are not errors; they are counted
+	// as the hpack_partial stage of node_agent_http2_stage_total.
 	HPACKDecodeErrorsTotal = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Name: "node_agent_hpack_decode_errors_total",
-			Help: "Total HPACK decode errors in HTTP/2 parser (mid-stream join indicator)",
+			Help: "HTTP/2 header blocks that failed to decode or decoded to implausible headers; the decoder's table is reset",
 		},
 	)
 
@@ -125,9 +127,15 @@ var (
 	// inferred. Stages, in order:
 	//
 	//   stream_created   client HEADERS decoded, request object created
+	//   stream_evicted   a request still waiting for its response dropped to
+	//                    make room: the connection had too many such requests,
+	//                    nearly always ones whose response was lost
 	//   response_status  :status seen on the response
 	//   end_stream       END_STREAM flag seen (a frame flag, not HPACK)
 	//   completed        both of the above -> request emitted
+	//   hpack_partial    a header block referenced table entries the decoder
+	//                    does not hold (inserted before it joined or was
+	//                    reset); the other headers in it were decoded
 	//   hpack_error      HPACK block failed to decode; decoder reset
 	//
 	// A request is only emitted with BOTH response_status and end_stream, so
