@@ -56,13 +56,20 @@
     }                                       \
 })
 
-// COPY_PAYLOAD_RINGBUF copies a payload into an event from reserve_l7_event
-// and returns 0 (dropping the event) if the read fails.
-#define COPY_PAYLOAD_RINGBUF(e, dst, size, src) ({  \
-    TRUNCATE_COPY_SIZE(size);                       \
-    if (bpf_probe_read(dst, size, src)) {           \
-        return 0;                                   \
-    }                                               \
+// connection.l7_lost bits: events lost on the written and read side.
+#define L7_LOST_WRITES 1
+#define L7_LOST_READS  2
+
+// COPY_PAYLOAD_RINGBUF copies a payload into an event from reserve_l7_event.
+// If the read fails the event is dropped (returns 0), and the loss is
+// recorded on the connection as send_event records a full ring buffer, so a
+// stateful parser learns of the gap.
+#define COPY_PAYLOAD_RINGBUF(conn, lost, dst, size, src) ({     \
+    TRUNCATE_COPY_SIZE(size);                                   \
+    if (bpf_probe_read(dst, size, src)) {                       \
+        (conn)->l7_lost |= (lost);                              \
+        return 0;                                               \
+    }                                                           \
 })
 
 #define IOVEC_BUF_SIZE MAX_PAYLOAD_SIZE * 2  // must be double of MAX_PAYLOAD_SIZE
@@ -313,7 +320,7 @@ void send_event(void *ctx, struct l7_event *e, struct connection_id cid, struct 
         if (drops) {
             *drops += 1;
         }
-        conn->l7_lost |= e->method == METHOD_HTTP2_SERVER_FRAMES ? 2 : 1;
+        conn->l7_lost |= e->method == METHOD_HTTP2_SERVER_FRAMES ? L7_LOST_READS : L7_LOST_WRITES;
     } else if (e->lost_before) {
         conn->l7_lost = 0;
     }
@@ -588,6 +595,9 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
             struct connection *tracked = bpf_map_lookup_elem(&active_connections, &cid);
             if (tracked) {
                 conn = tracked;
+                // If another CPU inserted it first (the TCP connect path
+                // does, with tls 0), the mark above went to the stack copy.
+                mark_tls(conn);
             }
         }
     } else if (conn->tls) {
@@ -638,7 +648,7 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
         e->method = METHOD_HTTP2_CLIENT_FRAMES;
         e->duration = bpf_ktime_get_ns();
         e->payload_size = size;
-        COPY_PAYLOAD_RINGBUF(e, e->payload, size, payload);
+        COPY_PAYLOAD_RINGBUF(conn, L7_LOST_WRITES, e->payload, size, payload);
         send_event(ctx, e, cid, conn);
         if (is_tls) { bpf_printk("l7_H2_SENT: pid=%u fd=%llu size=%llu", cid.pid, fd, size); }
         return 0;
@@ -655,7 +665,7 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
             e->method = 0;
             e->duration = bpf_ktime_get_ns();
             e->payload_size = size;
-            COPY_PAYLOAD_RINGBUF(e, e->payload, size, payload);
+            COPY_PAYLOAD_RINGBUF(conn, L7_LOST_WRITES, e->payload, size, payload);
             send_event(ctx, e, cid, conn);
             return 0;
         }
@@ -682,7 +692,7 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
             e->method = METHOD_HTTP2_CLIENT_FRAMES;
             e->duration = bpf_ktime_get_ns();
             e->payload_size = size;
-            COPY_PAYLOAD_RINGBUF(e, e->payload, size, payload);
+            COPY_PAYLOAD_RINGBUF(conn, L7_LOST_WRITES, e->payload, size, payload);
             send_event(ctx, e, cid, conn);
             return 0;
         }
@@ -726,7 +736,7 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
             e->method = METHOD_HTTP2_CLIENT_FRAMES;
             e->duration = bpf_ktime_get_ns();
             e->payload_size = size;
-            COPY_PAYLOAD_RINGBUF(e, e->payload, size, payload);
+            COPY_PAYLOAD_RINGBUF(conn, L7_LOST_WRITES, e->payload, size, payload);
             send_event(ctx, e, cid, conn);
             return 0;
         } else if (conn->dport == 5672 && (is_rabbitmq_connection(payload, size) || is_amqp_frame(payload, size) || is_amqp_method_frame(payload, size))) {
@@ -761,7 +771,7 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
         e->protocol = PROTOCOL_POSTGRES;
         e->method = METHOD_STATEMENT_CLOSE;
         e->payload_size = size;
-        COPY_PAYLOAD_RINGBUF(e, e->payload, size, payload);
+        COPY_PAYLOAD_RINGBUF(conn, L7_LOST_WRITES, e->payload, size, payload);
         send_event(ctx, e, cid, conn);
         return 0;
     }
@@ -771,7 +781,7 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, char *buf, __u64 size, 
         e->protocol = PROTOCOL_MYSQL;
         e->method = METHOD_STATEMENT_CLOSE;
         e->payload_size = size;
-        COPY_PAYLOAD_RINGBUF(e, e->payload, size, payload);
+        COPY_PAYLOAD_RINGBUF(conn, L7_LOST_WRITES, e->payload, size, payload);
         send_event(ctx, e, cid, conn);
         return 0;
     }
@@ -906,7 +916,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
         e->method = METHOD_HTTP2_SERVER_FRAMES;
         e->duration = bpf_ktime_get_ns();
         e->payload_size = ret;
-        COPY_PAYLOAD_RINGBUF(e, e->payload, ret, payload);
+        COPY_PAYLOAD_RINGBUF(conn, L7_LOST_READS, e->payload, ret, payload);
         send_event(ctx, e, cid, conn);
         return 0;
     }
@@ -923,7 +933,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
             e->protocol = PROTOCOL_DNS;
             e->duration = bpf_ktime_get_ns() - req->ns;
             e->payload_size = ret;
-            COPY_PAYLOAD_RINGBUF(e, e->payload, ret, payload);
+            COPY_PAYLOAD_RINGBUF(conn, L7_LOST_READS, e->payload, ret, payload);
             send_event(ctx, e, cid, conn);
             bpf_map_delete_elem(&active_l7_requests, &k);
             return 0;
@@ -941,7 +951,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
             e->method = METHOD_HTTP2_SERVER_FRAMES;
             e->duration = bpf_ktime_get_ns();
             e->payload_size = ret;
-            COPY_PAYLOAD_RINGBUF(e, e->payload, ret, payload);
+            COPY_PAYLOAD_RINGBUF(conn, L7_LOST_READS, e->payload, ret, payload);
             send_event(ctx, e, cid, conn);
             return 0;
         } else {
@@ -952,7 +962,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
 
     e->protocol = req->protocol;
     e->payload_size = req->payload_size;
-    COPY_PAYLOAD_RINGBUF(e, e->payload, req->payload_size, req->payload);
+    COPY_PAYLOAD_RINGBUF(conn, L7_LOST_READS, e->payload, req->payload_size, req->payload);
     if (e->protocol == PROTOCOL_HTTP) {
         response = is_http_response(payload, &e->status);
     } else if (e->protocol == PROTOCOL_POSTGRES) {
@@ -1007,7 +1017,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     }
     e->duration = bpf_ktime_get_ns() - req->ns;
     e->response_size = ret;
-    COPY_PAYLOAD_RINGBUF(e, e->response, ret, payload);
+    COPY_PAYLOAD_RINGBUF(conn, L7_LOST_READS, e->response, ret, payload);
     send_event(ctx, e, cid, conn);
     return 0;
 }
