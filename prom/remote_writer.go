@@ -119,10 +119,16 @@ func (a *Agent) sendLoop() {
 
 		err = a.send(fName)
 		if err == nil {
-			if rmErr := os.Remove(fName); rmErr != nil {
+			if rmErr := os.Remove(fName); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
 				klog.Warningln("failed to remove sent spool file:", rmErr)
 			}
 			b.Reset()
+			continue
+		}
+
+		// truncateSpoolIfNeeded (scrape goroutine) removed the file after it
+		// was listed: move on to the next one instead of backing off.
+		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
 
@@ -243,13 +249,18 @@ func (a *Agent) truncateSpoolIfNeeded() error {
 	for _, f := range files {
 		st, err := os.Stat(f)
 		if err != nil {
+			// sendLoop removed it after sending: failing here would drop
+			// the payload being spooled.
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
 			return err
 		}
 		totalSize += st.Size()
 	}
 	if totalSize > a.maxSpoolSize {
 		klog.Warningln("spool size exceeded, removing the oldest file:", files[0])
-		if err = os.Remove(files[0]); err != nil {
+		if err = os.Remove(files[0]); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
