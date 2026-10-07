@@ -328,8 +328,8 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	if taskstatsClient != nil {
 		// Processes whose exit event was missed: without this they keep
 		// the container out of zombie state and its age wrong.
-		for _, pid := range c.updateDelays() {
-			c.onProcessExit(pid, false)
+		for pid, p := range c.updateDelays() {
+			c.onProcessExitIf(pid, p)
 		}
 	}
 
@@ -656,6 +656,17 @@ func (c *Container) onProcessExit(pid uint32, oomKill bool) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	c.onProcessExitLocked(pid, oomKill)
+}
+
+// onProcessExitIf handles the exit of pid only if it is still registered as
+// p: between finding p gone and getting here, the pid may have been reused
+// by a new process that must not be untracked.
+func (c *Container) onProcessExitIf(pid uint32, p *Process) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	if c.processes[pid] == p {
+		c.onProcessExitLocked(pid, false)
+	}
 }
 
 func (c *Container) onFileOpen(pid uint32, fd uint64, mnt uint64, log bool) {
@@ -1687,13 +1698,15 @@ func (c *Container) onRetransmission(src netaddr.IPPort, dst netaddr.IPPort) boo
 }
 
 // updateDelays refreshes the per-process CPU and disk delay counters and
-// returns the pids that no longer exist.
-func (c *Container) updateDelays() []uint32 {
+// returns the processes whose pid no longer exists.
+func (c *Container) updateDelays() map[uint32]*Process {
 	// Get a snapshot of PIDs under read lock to avoid concurrent map access
 	c.lock.RLock()
 	pids := make([]uint32, 0, len(c.processes))
-	for pid := range c.processes {
+	procs := make(map[uint32]*Process, len(c.processes))
+	for pid, p := range c.processes {
 		pids = append(pids, pid)
+		procs[pid] = p
 	}
 	c.lock.RUnlock()
 
@@ -1704,14 +1717,17 @@ func (c *Container) updateDelays() []uint32 {
 		diskDelay time.Duration
 	}
 	pidStats := make([]pidDelayStats, 0, len(pids))
-	var deadPids []uint32
+	var dead map[uint32]*Process
 	for _, pid := range pids {
 		stats, err := TaskstatsTGID(pid)
 		if err != nil {
 			// Only a pid that is gone is dead: a failed netlink call for a
 			// live process would otherwise close its uprobes.
 			if _, statErr := os.Stat(proc.Path(pid)); os.IsNotExist(statErr) {
-				deadPids = append(deadPids, pid)
+				if dead == nil {
+					dead = map[uint32]*Process{}
+				}
+				dead[pid] = procs[pid]
 			}
 			continue
 		}
@@ -1733,7 +1749,7 @@ func (c *Container) updateDelays() []uint32 {
 		c.delaysByPid[ps.pid] = d
 	}
 	c.lock.Unlock()
-	return deadPids
+	return dead
 }
 
 // youngerThan reports whether the container has existed for less than d,
