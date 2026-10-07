@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/features"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
 	"github.com/cilium/ebpf/ringbuf"
@@ -589,6 +590,11 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	}
 	t.programVariant = variant
 	_ = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY})
+	for _, pt := range []ebpf.ProgramType{ebpf.TracePoint, ebpf.Kprobe} {
+		if err := features.HaveProgramType(pt); errors.Is(err, ebpf.ErrNotSupported) {
+			return fmt.Errorf("kernel does not support BPF %s programs (CONFIG_BPF_EVENTS is not set?): %w", pt, ebpf.ErrNotSupported)
+		}
+	}
 	c, err := ebpf.NewCollectionWithOptions(collectionSpec, ebpf.CollectionOptions{
 		//Programs: ebpf.ProgramOptions{LogLevel: 2, LogSize: 20 * 1024 * 1024},
 	})

@@ -40,7 +40,7 @@ var (
 					Envar("TRACK_PUBLIC_NETWORK").
 					Default("0.0.0.0/0").
 					Strings()
-	EphemeralPortRange = kingpin.Flag("ephemeral-port-range", "Destination and Listen TCP ports from this range will be skipped").Default("32768-60999").Envar("EPHEMERAL_PORT_RANGE").String()
+	EphemeralPortRange = kingpin.Flag("ephemeral-port-range", `Destination and Listen TCP ports from these ranges will be skipped, e.g. "32768-60999" or "1024-23768 30000-65535"`).Default("32768-60999").Envar("EPHEMERAL_PORT_RANGE").String()
 
 	Provider                = kingpin.Flag("provider", "`provider` label for `node_cloud_info` metric").Envar("PROVIDER").String()
 	Region                  = kingpin.Flag("region", "`region` label for `node_cloud_info` metric").Envar("REGION").String()
@@ -62,6 +62,7 @@ var (
 	LogsEndpoint       = kingpin.Flag("logs-endpoint", "The URL of the endpoint to send logs to").Envar("LOGS_ENDPOINT").URL()
 	ProfilesEndpoint   = kingpin.Flag("profiles-endpoint", "The URL of the endpoint to send profiles to").Envar("PROFILES_ENDPOINT").URL()
 	InsecureSkipVerify = kingpin.Flag("insecure-skip-verify", "whether to skip verifying the certificate or not").Envar("INSECURE_SKIP_VERIFY").Default("false").Bool()
+	CAFile             = kingpin.Flag("ca-file", "Path to the custom CA certificate file").Envar("CA_FILE").String()
 
 	ScrapeInterval                        = kingpin.Flag("scrape-interval", "How often to gather metrics from the agent").Default("15s").Envar("SCRAPE_INTERVAL").Duration()
 	WalDir                                = kingpin.Flag("wal-dir", "Path to where the agent stores data (e.g. the metrics Write-Ahead Log)").Default("/tmp/nudgebee-node-agent").Envar("WAL_DIR").String()

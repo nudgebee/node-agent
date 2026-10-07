@@ -1,8 +1,8 @@
 package prom
 
 import (
+	"bytes"
 	"crypto/md5"
-	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -67,7 +67,7 @@ func StartAgent(reg *prometheus.Registry, machineId, systemUuid string) error {
 		httpClient: http.Client{
 			Timeout: RemoteWriteTimeout,
 			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: *flags.InsecureSkipVerify},
+				TLSClientConfig: common.TlsConfig(),
 			},
 		},
 		spoolDir:     path.Join(*flags.WalDir, "spool"),
@@ -111,32 +111,53 @@ func (a *Agent) sendLoop() {
 			time.Sleep(5 * time.Second)
 			continue
 		}
-		err = func() error {
-			if err := a.send(fName); err != nil {
-				return err
-			}
-			return os.Remove(fName)
-		}()
-		if err != nil {
-			dur := b.Duration()
-			klog.Warningf(
-				"failed to send metrics to %s, next attempt in %s: %s",
-				a.url, dur.String(), err,
-			)
-			time.Sleep(dur)
+		if fi, statErr := os.Stat(fName); statErr == nil && fi.Size() == 0 {
+			klog.Warningln("discarding empty spool file:", fName)
+			_ = os.Remove(fName)
 			continue
 		}
-		b.Reset()
+
+		err = a.send(fName)
+		if err == nil {
+			if rmErr := os.Remove(fName); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+				klog.Warningln("failed to remove sent spool file:", rmErr)
+			}
+			b.Reset()
+			continue
+		}
+
+		// truncateSpoolIfNeeded (scrape goroutine) removed the file after it
+		// was listed: move on to the next one instead of backing off.
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+
+		if errors.Is(err, errRejectedByCollector) {
+			klog.Warningf("dropping spool file %s: %s", fName, err)
+			_ = os.Remove(fName)
+			b.Reset()
+			continue
+		}
+
+		dur := b.Duration()
+		klog.Warningf(
+			"failed to send metrics to %s, next attempt in %s: %s",
+			a.url, dur.String(), err,
+		)
+		time.Sleep(dur)
 	}
 }
 
+var errRejectedByCollector = errors.New("rejected by the collector")
+
 func (a *Agent) send(fPath string) error {
-	f, err := os.Open(fPath)
+	// Read into memory so the request has an explicit Content-Length; streaming an *os.File
+	// makes net/http use chunked encoding, which some middleboxes reset (seen as EOF).
+	payload, err := os.ReadFile(fPath)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	req, err := http.NewRequest(http.MethodPost, a.url.String(), f)
+	req, err := http.NewRequest(http.MethodPost, a.url.String(), bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -154,6 +175,9 @@ func (a *Agent) send(fPath string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusRequestEntityTooLarge {
+			return fmt.Errorf("%w: %s", errRejectedByCollector, resp.Status)
+		}
 		return errors.New(resp.Status)
 	}
 	klog.Infof("sent metrics in %s", time.Since(t).Truncate(time.Millisecond))
@@ -183,6 +207,9 @@ func (a *Agent) scrape() error {
 }
 
 func (a *Agent) writeToSpool(timestamp int64, payload []byte) error {
+	if len(payload) == 0 {
+		return nil
+	}
 	if err := a.truncateSpoolIfNeeded(); err != nil {
 		return err
 	}
@@ -196,6 +223,9 @@ func (a *Agent) writeToSpool(timestamp int64, payload []byte) error {
 		_ = os.Remove(f.Name())
 	}()
 	if _, err = f.Write(payload); err != nil {
+		return err
+	}
+	if err = f.Sync(); err != nil {
 		return err
 	}
 	if err = f.Close(); err != nil {
@@ -219,13 +249,18 @@ func (a *Agent) truncateSpoolIfNeeded() error {
 	for _, f := range files {
 		st, err := os.Stat(f)
 		if err != nil {
+			// sendLoop removed it after sending: failing here would drop
+			// the payload being spooled.
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
 			return err
 		}
 		totalSize += st.Size()
 	}
 	if totalSize > a.maxSpoolSize {
 		klog.Warningln("spool size exceeded, removing the oldest file:", files[0])
-		if err = os.Remove(files[0]); err != nil {
+		if err = os.Remove(files[0]); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
