@@ -102,6 +102,10 @@ type ActiveConnection struct {
 	Timestamp      uint64
 	Closed         time.Time
 
+	// dst is the address the socket is connected to, before NAT. It tells
+	// this connection apart from another socket that had the same fd number.
+	dst netaddr.IPPort
+
 	BytesSent     uint64
 	BytesReceived uint64
 	Protocol      uint8
@@ -843,6 +847,7 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 			Fd:             fd,
 			Timestamp:      timestamp,
 			srcWorkload:    srcWorkload,
+			dst:            dst,
 		}
 		c.activeConnections[ConnectionKey{src: src, dst: dst}] = connection
 		k := PidFd{Pid: pid, Fd: fd}
@@ -860,6 +865,29 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 // This is used when TCP connection tracking fails (common for Go TLS due to goroutine thread switching)
 // but we have socket tuple info extracted directly from the fd
 func (c *Container) createConnectionFromSocketInfo(pid uint32, fd uint64, timestamp uint64, socketInfo *ebpftracer.SocketInfo) (conn *ActiveConnection, filtered bool) {
+	connection, filtered := c.connectionFromSocketInfo(pid, fd, timestamp, socketInfo)
+	if connection == nil {
+		return nil, filtered
+	}
+
+	// Store in connectionsByPidFd for future L7 events on same connection
+	k := PidFd{Pid: pid, Fd: fd}
+	if !c.canTrackConnection(k) {
+		ConnectionCapDropsTotal.Inc()
+		return nil, false
+	}
+	c.connectionsByPidFd[k] = connection
+
+	klog.V(3).Infof("L7_CONN_CREATED_FROM_SOCKET: pid=%d fd=%d dst=%s actual_dst=%s",
+		pid, fd, connection.dst, connection.DestinationKey.ActualDestinationIfKnown())
+
+	return connection, false
+}
+
+// connectionFromSocketInfo builds the connection an L7 event's socket tuple
+// describes, without tracking it. filtered is true for a connection the agent
+// does not track.
+func (c *Container) connectionFromSocketInfo(pid uint32, fd uint64, timestamp uint64, socketInfo *ebpftracer.SocketInfo) (conn *ActiveConnection, filtered bool) {
 	if socketInfo == nil || !socketInfo.Valid {
 		return nil, false
 	}
@@ -871,21 +899,18 @@ func (c *Container) createConnectionFromSocketInfo(pid uint32, fd uint64, timest
 		return nil, true
 	}
 
-	// Parse destination IP
-	dstIP, err := netaddr.ParseIP(socketInfo.DstIP)
-	if err != nil {
-		klog.V(2).Infof("createConnectionFromSocketInfo: failed to parse dst IP %s: %v", socketInfo.DstIP, err)
+	dst, ok := socketDestination(socketInfo)
+	if !ok {
+		klog.V(2).Infof("connectionFromSocketInfo: failed to parse dst IP %s", socketInfo.DstIP)
 		return nil, false
 	}
 
 	// Parse source IP
 	srcIP, err := netaddr.ParseIP(socketInfo.SrcIP)
 	if err != nil {
-		klog.V(2).Infof("createConnectionFromSocketInfo: failed to parse src IP %s: %v", socketInfo.SrcIP, err)
+		klog.V(2).Infof("connectionFromSocketInfo: failed to parse src IP %s: %v", socketInfo.SrcIP, err)
 		return nil, false
 	}
-
-	dst := netaddr.IPPortFrom(dstIP, socketInfo.DstPort)
 	src := netaddr.IPPortFrom(srcIP, socketInfo.SrcPort)
 
 	// The socket holds the address the application connected to, before any
@@ -903,8 +928,7 @@ func (c *Container) createConnectionFromSocketInfo(pid uint32, fd uint64, timest
 		return nil, true
 	}
 
-	// Create connection
-	connection := &ActiveConnection{
+	return &ActiveConnection{
 		DestinationKey: key,
 		Pid:            pid,
 		Fd:             fd,
@@ -913,20 +937,34 @@ func (c *Container) createConnectionFromSocketInfo(pid uint32, fd uint64, timest
 		// in onL7RequestWithResult and was dropped.
 		Timestamp:   timestamp,
 		srcWorkload: srcWorkload,
+		dst:         dst,
+	}, false
+}
+
+// socketDestination returns the destination of an L7 event's socket tuple.
+func socketDestination(si *ebpftracer.SocketInfo) (netaddr.IPPort, bool) {
+	if si == nil || !si.Valid {
+		return netaddr.IPPort{}, false
 	}
-
-	// Store in connectionsByPidFd for future L7 events on same connection
-	k := PidFd{Pid: pid, Fd: fd}
-	if !c.canTrackConnection(k) {
-		ConnectionCapDropsTotal.Inc()
-		return nil, false
+	ip, err := netaddr.ParseIP(si.DstIP)
+	if err != nil {
+		return netaddr.IPPort{}, false
 	}
-	c.connectionsByPidFd[k] = connection
+	return netaddr.IPPortFrom(ip, si.DstPort), true
+}
 
-	klog.V(3).Infof("L7_CONN_CREATED_FROM_SOCKET: pid=%d fd=%d src=%s dst=%s actual_dst=%s",
-		pid, fd, src, dst, key.ActualDestinationIfKnown())
-
-	return connection, false
+// isSocket reports whether conn is the socket an L7 event's tuple, read from
+// the fd as the event happened, describes. The kernel reuses an fd number as
+// soon as its socket is closed, so the entry tracked for a pid and fd can be
+// an earlier socket's: L7 events are handled as they come, connection events
+// later. It is true when there is nothing to compare, with no tuple or with
+// a connection whose address is unknown.
+func (conn *ActiveConnection) isSocket(si *ebpftracer.SocketInfo) bool {
+	dst, ok := socketDestination(si)
+	if !ok || conn.dst.IP().IsZero() {
+		return true
+	}
+	return dst.Port() == conn.dst.Port() && dst.IP().Unmap() == conn.dst.IP().Unmap()
 }
 
 // canTrackConnection reports whether pid+fd k may be added to
@@ -1146,6 +1184,12 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		}
 		pidFd := PidFd{Pid: pid, Fd: fd}
 		conn := c.connectionsByPidFd[pidFd]
+		if conn != nil && !conn.isSocket(socketInfo) {
+			// An earlier socket on this fd. Naming its address after this
+			// ClientHello's host is how a resolver came to be named after
+			// whatever host was connected to right after resolving it.
+			conn = nil
+		}
 		destIP := netaddr.IP{}
 		if conn != nil {
 			destIP = conn.DestinationKey.ActualDestinationIfKnown().IP()
@@ -1184,6 +1228,21 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	c.detectLLMEndpoint(pid, fd, timestamp, r, socketInfo)
 
 	conn := c.connectionsByPidFd[PidFd{Pid: pid, Fd: fd}]
+	if r.Protocol == l7.ProtocolDNS && socketInfo != nil && socketInfo.Valid &&
+		(conn == nil || !conn.isSocket(socketInfo)) {
+		// DNS over UDP is never tracked: a UDP socket has no close event, so
+		// its entry would outlive it and be taken for the next socket on its
+		// fd, usually the connection to the address just resolved. For the
+		// same reason an entry on the fd that is not this socket is an
+		// earlier socket's. The query takes its connection from its own tuple.
+		var filtered bool
+		if conn, filtered = c.connectionFromSocketInfo(pid, fd, timestamp, socketInfo); conn == nil {
+			if !filtered {
+				dropL7Event(c.id, "unknown_connection", pid, fd, r, socketInfo)
+			}
+			return nil, L7RequestProcessed
+		}
+	}
 	if conn == nil {
 		// TCP connection tracking failed - common for Go TLS due to goroutine thread switching
 		// Try to create connection from socket info extracted directly from fd in eBPF
