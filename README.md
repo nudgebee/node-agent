@@ -75,6 +75,8 @@ Pass `-v vX.Y.Z` to pin to a specific release. The script writes a
 systemd unit at `/etc/systemd/system/nudgebee-node-agent.service` and
 starts it.
 
+To install on many hosts at once, see [installing on a fleet](docs/fleet-install.md).
+
 Kubernetes is not required. With no Kubernetes API available, the agent
 names connections by systemd unit, container, host and DNS name instead
 of by pod and service; see
