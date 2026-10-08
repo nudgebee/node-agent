@@ -960,11 +960,18 @@ func socketDestination(si *ebpftracer.SocketInfo) (netaddr.IPPort, bool) {
 // later. It is true when there is nothing to compare, with no tuple or with
 // a connection whose address is unknown.
 func (conn *ActiveConnection) isSocket(si *ebpftracer.SocketInfo) bool {
-	dst, ok := socketDestination(si)
-	if !ok || conn.dst.IP().IsZero() {
+	if si == nil || !si.Valid || conn.dst.IP().IsZero() {
 		return true
 	}
-	return dst.Port() == conn.dst.Port() && dst.IP().Unmap() == conn.dst.IP().Unmap()
+	// The port is enough to tell most reuses apart without parsing the IP.
+	if si.DstPort != conn.dst.Port() {
+		return false
+	}
+	dst, ok := socketDestination(si)
+	if !ok {
+		return true
+	}
+	return dst.IP().Unmap() == conn.dst.IP().Unmap()
 }
 
 // canTrackConnection reports whether pid+fd k may be added to
