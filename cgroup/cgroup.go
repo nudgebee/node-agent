@@ -67,6 +67,16 @@ type Cgroup struct {
 	ContainerId   string
 
 	subsystems map[string]string
+
+	// initScope: the process is in systemd's /init.scope, where systemd
+	// forks a unit's process before moving it to the unit's cgroup.
+	initScope bool
+}
+
+// InitScope reports whether the process is in systemd's /init.scope. Its Id
+// is empty then, as for the root cgroup.
+func (cg *Cgroup) InitScope() bool {
+	return cg.initScope
 }
 
 func (cg *Cgroup) getId() string {
@@ -139,7 +149,10 @@ func NewFromProcessCgroupFile(filePath string) (*Cgroup, error) {
 			}
 			p := path.Join(baseCgroupPath, cgPath)
 			switch p {
-			case "/", "/init.scope":
+			case "/init.scope":
+				cg.initScope = true
+				continue
+			case "/":
 				continue
 			}
 			cg.subsystems[cgType] = p

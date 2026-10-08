@@ -238,16 +238,24 @@ func TestContainerByCgroup(t *testing.T) {
 	as.Nil(err)
 }
 
-// The registry relies on a process in systemd's /init.scope, or in the root
-// cgroup, having an empty Id: it is not cached as ignored, so its exec after
-// systemd moves it to a unit's cgroup is seen.
+// The registry does not cache a process in systemd's /init.scope as ignored,
+// so its exec after systemd moves it to a unit's cgroup is seen. A process in
+// the root cgroup (hosts without systemd) is cached as usual.
 func TestInitScopeAndRootHaveEmptyId(t *testing.T) {
-	for _, content := range []string{"0::/init.scope\n", "0::/\n"} {
+	for _, c := range []struct {
+		content   string
+		initScope bool
+	}{
+		{"0::/init.scope\n", true},
+		{"1:name=systemd:/init.scope\n2:cpu,cpuacct:/\n", true},
+		{"0::/\n", false},
+	} {
 		f := path.Join(t.TempDir(), "cgroup")
-		require.NoError(t, os.WriteFile(f, []byte(content), 0644))
+		require.NoError(t, os.WriteFile(f, []byte(c.content), 0644))
 		cg, err := NewFromProcessCgroupFile(f)
 		require.NoError(t, err)
-		assert.Equal(t, "", cg.Id, content)
-		assert.Equal(t, ContainerTypeStandaloneProcess, cg.ContainerType, content)
+		assert.Equal(t, "", cg.Id, c.content)
+		assert.Equal(t, ContainerTypeStandaloneProcess, cg.ContainerType, c.content)
+		assert.Equal(t, c.initScope, cg.InitScope(), c.content)
 	}
 }

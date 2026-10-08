@@ -643,19 +643,15 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		// systemd forks a unit's process inside its own /init.scope and
 		// moves it to the unit's cgroup before exec. Caching the pid as
 		// ignored here would drop that exec, and a unit that does nothing
-		// else would never be detected. /init.scope and the root cgroup
-		// both parse to an empty Id (cgroup.go skips them).
-		if cg.Id == "" && pid != 1 {
+		// else would never be detected. Processes in the root cgroup (hosts
+		// without systemd) are cached as before.
+		if cg.InitScope() && pid != 1 {
 			klog.V(5).InfoS("ignoring without persisting", "cg", cg.Id, "pid", pid)
 		} else {
 			klog.V(5).InfoS("ignoring", "cg", cg.Id, "pid", pid)
 			r.containerLock.Lock()
 			t := time.Now()
 			r.containersByPidIgnored[pid] = &t
-			// Clean up stale ignored PIDs while we have the lock
-			if oldT := r.containersByPidIgnored[pid]; oldT != nil && time.Since(*oldT) >= IgnoredContainersCacheTTL {
-				delete(r.containersByPidIgnored, pid)
-			}
 			r.containerLock.Unlock()
 		}
 		return nil
