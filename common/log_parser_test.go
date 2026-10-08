@@ -12,7 +12,7 @@ import (
 func TestLogParser(t *testing.T) {
 	const defaultPatternsPerLevel = 256
 	ch := make(chan logparser.LogEntry)
-	parser := logparser.NewParser(ch, nil, nil, 1*time.Second, defaultPatternsPerLevel, logparser.SensitiveConfig{
+	parser := logparser.NewParser(ch, nil, nil, 1*time.Second, defaultPatternsPerLevel, false, nil, logparser.SensitiveConfig{
 		Enabled:       true,
 		MinConfidence: "high",
 		MaxDetections: 100,
