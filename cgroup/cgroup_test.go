@@ -244,9 +244,9 @@ func TestContainerByCgroup(t *testing.T) {
 func TestInitScopeAndRootHaveEmptyId(t *testing.T) {
 	for _, content := range []string{"0::/init.scope\n", "0::/\n"} {
 		f := path.Join(t.TempDir(), "cgroup")
-		assert.Nil(t, os.WriteFile(f, []byte(content), 0644))
+		require.NoError(t, os.WriteFile(f, []byte(content), 0644))
 		cg, err := NewFromProcessCgroupFile(f)
-		assert.Nil(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, "", cg.Id, content)
 		assert.Equal(t, ContainerTypeStandaloneProcess, cg.ContainerType, content)
 	}
