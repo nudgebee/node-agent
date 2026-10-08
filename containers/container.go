@@ -132,6 +132,7 @@ type Container struct {
 
 	processes map[uint32]*Process
 
+	createdAt time.Time // when the agent found the container
 	startedAt time.Time
 	zombieAt  time.Time
 
@@ -246,6 +247,8 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		cgroup:   cg,
 		metadata: md,
 
+		createdAt: time.Now(),
+
 		processes: map[uint32]*Process{},
 
 		delaysByPid: map[uint32]Delays{},
@@ -322,6 +325,18 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	defer c.collectMu.Unlock()
 	collectStart := time.Now()
 
+	if taskstatsClient != nil {
+		// Processes whose exit event was missed: without this they keep
+		// the container out of zombie state and its age wrong.
+		for pid, p := range c.updateDelays() {
+			c.onProcessExitIf(pid, p)
+		}
+	}
+
+	if minAge := *flags.MinContainerAge; minAge > 0 && c.youngerThan(minAge) {
+		return
+	}
+
 	if c.metadata.image != "" || !c.metadata.systemd.IsEmpty() {
 		ch <- c.gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemd.TriggeredBy, c.metadata.systemd.Type)
 	}
@@ -337,7 +352,6 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	if taskstatsClient != nil {
-		c.updateDelays()
 		ch <- c.counter(metrics.CPUDelay, float64(c.delays.cpu)/float64(time.Second))
 		ch <- c.counter(metrics.DiskDelay, float64(c.delays.disk)/float64(time.Second))
 	}
@@ -590,9 +604,7 @@ func (c *Container) onProcessStart(pid uint32) *Process {
 	return p
 }
 
-func (c *Container) onProcessExit(pid uint32, oomKill bool) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
+func (c *Container) onProcessExitLocked(pid uint32, oomKill bool) {
 	if p := c.processes[pid]; p != nil {
 		c.closeProcess(pid, p)
 	}
@@ -637,6 +649,23 @@ func (c *Container) closeProcess(pid uint32, p *Process) {
 		if d := c.registry.tracer.TLSPlaintextDroppedForPid(pid); len(d) > 0 {
 			c.recordTLSDropsLocked(pid, p, d)
 		}
+	}
+}
+
+func (c *Container) onProcessExit(pid uint32, oomKill bool) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.onProcessExitLocked(pid, oomKill)
+}
+
+// onProcessExitIf handles the exit of pid only if it is still registered as
+// p: between finding p gone and getting here, the pid may have been reused
+// by a new process that must not be untracked.
+func (c *Container) onProcessExitIf(pid uint32, p *Process) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	if c.processes[pid] == p {
+		c.onProcessExitLocked(pid, false)
 	}
 }
 
@@ -1668,12 +1697,16 @@ func (c *Container) onRetransmission(src netaddr.IPPort, dst netaddr.IPPort) boo
 	return true
 }
 
-func (c *Container) updateDelays() {
+// updateDelays refreshes the per-process CPU and disk delay counters and
+// returns the processes whose pid no longer exists.
+func (c *Container) updateDelays() map[uint32]*Process {
 	// Get a snapshot of PIDs under read lock to avoid concurrent map access
 	c.lock.RLock()
 	pids := make([]uint32, 0, len(c.processes))
-	for pid := range c.processes {
+	procs := make(map[uint32]*Process, len(c.processes))
+	for pid, p := range c.processes {
 		pids = append(pids, pid)
+		procs[pid] = p
 	}
 	c.lock.RUnlock()
 
@@ -1684,9 +1717,18 @@ func (c *Container) updateDelays() {
 		diskDelay time.Duration
 	}
 	pidStats := make([]pidDelayStats, 0, len(pids))
+	var dead map[uint32]*Process
 	for _, pid := range pids {
 		stats, err := TaskstatsTGID(pid)
 		if err != nil {
+			// Only a pid that is gone is dead: a failed netlink call for a
+			// live process would otherwise close its uprobes.
+			if _, statErr := os.Stat(proc.Path(pid)); os.IsNotExist(statErr) {
+				if dead == nil {
+					dead = map[uint32]*Process{}
+				}
+				dead[pid] = procs[pid]
+			}
 			continue
 		}
 		pidStats = append(pidStats, pidDelayStats{
@@ -1707,6 +1749,26 @@ func (c *Container) updateDelays() {
 		c.delaysByPid[ps.pid] = d
 	}
 	c.lock.Unlock()
+	return dead
+}
+
+// youngerThan reports whether the container has existed for less than d,
+// counted from its earliest process start or from when the agent found it,
+// whichever is earlier, until now or until it became a zombie. Counting from
+// discovery keeps a restarted unit, whose startedAt moves to the new
+// process, from disappearing for d after every restart.
+func (c *Container) youngerThan(d time.Duration) bool {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	since := c.startedAt
+	if since.IsZero() || c.createdAt.Before(since) {
+		since = c.createdAt
+	}
+	end := time.Now()
+	if !c.zombieAt.IsZero() && c.zombieAt.Before(end) {
+		end = c.zombieAt
+	}
+	return end.Sub(since) < d
 }
 
 func (c *Container) updateNodejsStats(s NodejsStatsUpdate) {

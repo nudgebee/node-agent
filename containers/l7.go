@@ -7,6 +7,7 @@ import (
 
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
+	"github.com/coroot/coroot-node-agent/flags"
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/klog/v2"
 )
@@ -64,7 +65,14 @@ type L7Stats struct {
 	latency         map[l7.Protocol]*prometheus.HistogramVec
 	initialized     map[l7.Protocol]bool
 	promConstLabels prometheus.Labels // container_id, app_id, machine_id, system_uuid, az, region
+
+	// DNS domain label values in use; at most --max-fqdns-per-container.
+	seenFQDNs map[string]struct{}
 }
+
+// fqdnOverflowLabel is the domain label of DNS requests for domains beyond
+// the first --max-fqdns-per-container seen in a container.
+const fqdnOverflowLabel = "~other"
 
 func NewL7Stats(constLabels prometheus.Labels) L7Stats {
 	return L7Stats{
@@ -72,7 +80,28 @@ func NewL7Stats(constLabels prometheus.Labels) L7Stats {
 		latency:         make(map[l7.Protocol]*prometheus.HistogramVec),
 		initialized:     make(map[l7.Protocol]bool),
 		promConstLabels: constLabels,
+		seenFQDNs:       make(map[string]struct{}),
 	}
+}
+
+// dnsDomainLabel returns fqdn while the container has seen fewer than
+// --max-fqdns-per-container distinct domains, and fqdnOverflowLabel for any
+// new domain after that: a process resolving many unique names (crawlers,
+// per-tenant hostnames) would otherwise create series without bound.
+func (s *L7Stats) dnsDomainLabel(fqdn string) string {
+	if fqdn == "" {
+		return fqdn
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.seenFQDNs[fqdn]; ok {
+		return fqdn
+	}
+	if len(s.seenFQDNs) >= *flags.MaxFQDNsPerContainer {
+		return fqdnOverflowLabel
+	}
+	s.seenFQDNs[fqdn] = struct{}{}
+	return fqdn
 }
 
 func (s *L7Stats) observe(protocol l7.Protocol, status, method, path string, duration time.Duration, key common.DestinationKey, srcWorkload common.Workload, r *l7.RequestData, traceId string) {
@@ -110,6 +139,13 @@ func (s *L7Stats) observe(protocol l7.Protocol, status, method, path string, dur
 		labelInterner.intern(actualDestWorkload.Namespace),
 	}
 
+	var dnsRequestType, dnsDomain string
+	if metricsProtocol == l7.ProtocolDNS {
+		var domain string
+		dnsRequestType, domain, _ = l7.ParseDns(r.Payload)
+		dnsDomain = s.dnsDomainLabel(common.NormalizeFQDN(domain, dnsRequestType))
+	}
+
 	// Protocol-specific labels for counters (keep all labels including path for HTTP)
 	counterLabelValues := make([]string, len(labelValues))
 	copy(counterLabelValues, labelValues)
@@ -125,8 +161,7 @@ func (s *L7Stats) observe(protocol l7.Protocol, status, method, path string, dur
 		}
 		counterLabelValues = append(counterLabelValues, labelInterner.intern(method))
 	case l7.ProtocolDNS:
-		requestType, domain, _ := l7.ParseDns(r.Payload)
-		counterLabelValues = append(counterLabelValues, labelInterner.intern(requestType), labelInterner.intern(common.NormalizeFQDN(domain, requestType)))
+		counterLabelValues = append(counterLabelValues, labelInterner.intern(dnsRequestType), labelInterner.intern(dnsDomain))
 	}
 
 	// Protocol-specific labels for histograms (exclude path and method for HTTP, use grouped status to reduce cardinality)
@@ -137,8 +172,7 @@ func (s *L7Stats) observe(protocol l7.Protocol, status, method, path string, dur
 
 	switch metricsProtocol {
 	case l7.ProtocolDNS:
-		requestType, domain, _ := l7.ParseDns(r.Payload)
-		histogramLabelValues = append(histogramLabelValues, labelInterner.intern(requestType), labelInterner.intern(common.NormalizeFQDN(domain, requestType)))
+		histogramLabelValues = append(histogramLabelValues, labelInterner.intern(dnsRequestType), labelInterner.intern(dnsDomain))
 	}
 
 	// Map reads are safe after ensureInitialized — the protocol entry exists.
