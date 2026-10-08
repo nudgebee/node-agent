@@ -61,11 +61,14 @@ int is_clickhouse_query(char *buf, __u64 buf_size) {
         return 0;
     }
     offset += 1 + len;
-    if (offset > CLICKHOUSE_MAX_OFFSET) {
+    if (offset > CLICKHOUSE_MAX_OFFSET || offset >= buf_size) {
         return 0;
     }
     bpf_read(buf+offset, len); // initial_query_id
     if (len == CLICKHOUSE_QUERY_ID_SIZE) {
+        if (offset + 1 + CLICKHOUSE_QUERY_ID_SIZE > buf_size) {
+            return 0;
+        }
         if (!is_clickhouse_uuid(buf+offset+1)) {
             return 0;
         }
@@ -73,7 +76,7 @@ int is_clickhouse_query(char *buf, __u64 buf_size) {
         return 0;
     }
     offset += 1 + len;
-    if (offset > CLICKHOUSE_MAX_OFFSET) {
+    if (offset > CLICKHOUSE_MAX_OFFSET || offset >= buf_size) {
         return 0;
     }
     bpf_read(buf+offset, len); // initial_address
@@ -81,6 +84,9 @@ int is_clickhouse_query(char *buf, __u64 buf_size) {
         return 0;
     }
     if (len > 0) {
+        if (offset + 1 >= buf_size) {
+            return 0;
+        }
         __u8 c = 0;
         bpf_read(buf+offset+1, c);
         if (!((c >= '0' && c <= '9') || c == '[' || c == ':')) {
@@ -101,15 +107,28 @@ int is_clickhouse_query(char *buf, __u64 buf_size) {
 
 static __always_inline
 int is_clickhouse_response(char *buf, __u64 buf_size, __s32 *status) {
-    __u8 b[3];
-    bpf_read(buf, b);
+    if (buf_size < 1) {
+        return 0;
+    }
+    __u8 b[3] = {};
+    if (buf_size < 3) {
+        bpf_read(buf, b[0]);
+    } else {
+        bpf_read(buf, b);
+    }
     if (b[0] == CLICKHOUSE_SERVER_CODE_DATA) {
+        if (buf_size < 3) {
+            return 0;
+        }
         if (b[1] != 0) { // temporary table name is always empty
             return 0;
         }
         if (b[2] == 1) { // uncompressed block: BlockInfo field number 1
             *status = STATUS_OK;
             return 1;
+        }
+        if (buf_size < 2+16+1) {
+            return 0;
         }
         __u8 method = 0;
         bpf_read(buf+2+16, method); // compressed block: compression method follows the 16-byte checksum
@@ -120,6 +139,9 @@ int is_clickhouse_response(char *buf, __u64 buf_size, __s32 *status) {
         return 0;
     }
     if (b[0] == CLICKHOUSE_SERVER_CODE_EXCEPTION) {
+        if (buf_size < 1+4) {
+            return 0;
+        }
         __s32 code = 0;
         bpf_read(buf+1, code);
         if (code <= 0 || code > 4096) {
