@@ -30,7 +30,9 @@ func PatternExtractionRateLimiter() *rate.Limiter {
 	if limit <= 0 {
 		return nil
 	}
-	return rate.NewLimiter(rate.Limit(limit), int(limit*10))
+	// At least 1: with a burst of 0 the limiter rejects every event, so a
+	// limit below 0.1/s would turn pattern extraction off entirely.
+	return rate.NewLimiter(rate.Limit(limit), max(1, int(limit*10)))
 }
 
 func Init(machineId, hostname, version string) {
