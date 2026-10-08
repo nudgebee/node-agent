@@ -36,6 +36,9 @@ var (
 	statfsTimeout    = 2 * time.Second
 	stuckMountRetry  = 5 * time.Minute
 	errStatfsTimeout = errors.New("statfs timed out")
+	errStatfsRunning = errors.New("statfs still running")
+
+	statfsSyscall = unix.Statfs // replaced in tests
 )
 
 var hostDescs = []*prometheus.Desc{
@@ -63,12 +66,13 @@ type hostMount struct {
 type hostCollector struct {
 	procRoot string
 
-	lock  sync.Mutex
-	stuck map[string]time.Time // mount points whose statfs timed out
+	lock    sync.Mutex
+	stuck   map[string]time.Time // mount points whose statfs timed out
+	running map[string]bool      // mount points with a statfs call in flight
 }
 
 func newHostCollector(procRoot string) *hostCollector {
-	return &hostCollector{procRoot: procRoot, stuck: map[string]time.Time{}}
+	return &hostCollector{procRoot: procRoot, stuck: map[string]time.Time{}, running: map[string]bool{}}
 }
 
 func (h *hostCollector) collect(ch chan<- prometheus.Metric) {
@@ -94,7 +98,7 @@ func (h *hostCollector) collect(ch chan<- prometheus.Metric) {
 		if h.isStuck(m.mountPoint) {
 			continue
 		}
-		s, err := statfs(path.Join(h.procRoot, "1", "root", m.mountPoint))
+		s, err := h.statfs(m.mountPoint)
 		if err != nil {
 			if errors.Is(err, errStatfsTimeout) {
 				klog.Warningf("statfs of %s timed out, skipping it for %s", m.mountPoint, stuckMountRetry)
@@ -135,16 +139,30 @@ func (h *hostCollector) markStuck(mountPoint string) {
 }
 
 // statfs runs statfs(2) with a timeout: on a hung network mount it never
-// returns, and a scrape must not hang with it.
-func statfs(p string) (*unix.Statfs_t, error) {
+// returns, and a scrape must not hang with it. A call that hangs keeps its
+// goroutine, and its OS thread, blocked in the kernel, so no second call is
+// started for a mount point while one is still in flight.
+func (h *hostCollector) statfs(mountPoint string) (*unix.Statfs_t, error) {
+	h.lock.Lock()
+	if h.running[mountPoint] {
+		h.lock.Unlock()
+		return nil, errStatfsRunning
+	}
+	h.running[mountPoint] = true
+	h.lock.Unlock()
+
 	type result struct {
 		s   unix.Statfs_t
 		err error
 	}
 	ch := make(chan result, 1)
+	p := path.Join(h.procRoot, "1", "root", mountPoint)
 	go func() {
 		var r result
-		r.err = unix.Statfs(p, &r.s)
+		r.err = statfsSyscall(p, &r.s)
+		h.lock.Lock()
+		delete(h.running, mountPoint)
+		h.lock.Unlock()
 		ch <- r
 	}()
 	select {
@@ -152,6 +170,9 @@ func statfs(p string) (*unix.Statfs_t, error) {
 		if r.err != nil {
 			return nil, r.err
 		}
+		h.lock.Lock()
+		delete(h.stuck, mountPoint)
+		h.lock.Unlock()
 		return &r.s, nil
 	case <-time.After(statfsTimeout):
 		return nil, errStatfsTimeout
