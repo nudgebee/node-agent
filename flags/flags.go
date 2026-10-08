@@ -9,7 +9,7 @@ import (
 )
 
 var (
-	ListenAddress       = kingpin.Flag("listen", "Listen address - ip:port or :port").Default("0.0.0.0:80").Envar("LISTEN").String()
+	ListenAddress       = kingpin.Flag("listen", "Listen address - ip:port or :port (default 0.0.0.0:80, or 127.0.0.1:10300 when --metrics-endpoint is set)").Envar("LISTEN").String()
 	CgroupRoot          = kingpin.Flag("cgroupfs-root", "The mount point of the host cgroupfs root").Default("/sys/fs/cgroup").Envar("CGROUPFS_ROOT").String()
 	DisableLogParsing   = kingpin.Flag("disable-log-parsing", "Disable container log parsing").Default("false").Envar("DISABLE_LOG_PARSING").Bool()
 	DisablePinger       = kingpin.Flag("disable-pinger", "Don't ping upstreams").Default("true").Envar("DISABLE_PINGER").Bool()
@@ -135,7 +135,12 @@ func init() {
 		}
 	}
 
-	if *MetricsEndpoint != nil {
-		*ListenAddress = "127.0.0.1:10300"
+	if *ListenAddress == "" {
+		*ListenAddress = "0.0.0.0:80"
+		if *MetricsEndpoint != nil {
+			// Metrics are pushed, so nothing needs to scrape this endpoint:
+			// keep it off the network and off port 80.
+			*ListenAddress = "127.0.0.1:10300"
+		}
 	}
 }

@@ -284,7 +284,16 @@ func main() {
 
 	klog.Infoln("listening on:", *flags.ListenAddress)
 	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-		klog.Errorln(err)
+		if *flags.MetricsEndpoint == nil {
+			// Nothing can scrape the agent: exit non-zero so the service
+			// manager restarts it.
+			klog.Exitln(err)
+		} else {
+			// Metrics are pushed: the local endpoint is optional, so a
+			// taken port must not stop the agent.
+			klog.Errorln("local metrics endpoint unavailable, metrics are still pushed:", err)
+			<-ctx.Done()
+		}
 	}
 	klog.Infoln("shutdown complete")
 }
