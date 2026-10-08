@@ -1,0 +1,141 @@
+---
+# Install, upgrade or remove nudgebee-node-agent on a fleet of Linux hosts.
+# See docs/fleet-install.md.
+#
+#   ansible-playbook -i inventory.ini -e @vars.yml install-node-agent.yml
+#   ansible-playbook -i inventory.ini -e @vars.yml install-node-agent.yml -e node_agent_state=absent
+#
+# Variables (set them in vars.yml, group_vars or host_vars; every one has a default):
+#   node_agent_state    present | absent          (default: present)
+#   node_agent_version  a release tag, or latest  (default: latest; pin one for a fleet)
+#   node_agent_env      agent settings, written to /etc/default/nudgebee-node-agent
+#   node_agent_serial   hosts per batch           (default: 20%)
+- name: Nudgebee node-agent
+  hosts: "{{ node_agent_hosts | default('node_agent') }}"
+  become: true
+  # Roll through the fleet in batches and stop if a batch goes bad.
+  serial: "{{ node_agent_serial | default('20%') }}"
+  max_fail_percentage: 10
+  tasks:
+    - name: Resolve settings
+      ansible.builtin.set_fact:
+        na_state: "{{ node_agent_state | default('present') }}"
+        na_version: "{{ node_agent_version | default('latest') }}"
+        na_env: "{{ node_agent_env | default({}) }}"
+
+    - name: Check the settings
+      ansible.builtin.assert:
+        that: na_state in ['present', 'absent']
+        fail_msg: "node_agent_state must be 'present' or 'absent', not '{{ na_state }}'"
+
+    # Values are written in single quotes, where systemd keeps backslashes as they
+    # are. A single quote or newline in a value can't be represented.
+    - name: Check the agent settings can be written
+      ansible.builtin.assert:
+        that: (na_env.values() | map('string') | select('search', "['\n]") | list | length) == 0
+        fail_msg: node_agent_env values can't contain a single quote or a newline
+
+    - name: Check the host can run the agent
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['system'] == 'Linux'
+          - ansible_facts['service_mgr'] == 'systemd'
+          - ansible_facts['architecture'] in ['x86_64', 'aarch64']
+          - ansible_facts['kernel'].split('-')[0] is version('5.8', '>=')
+        fail_msg: >-
+          node-agent needs Linux with systemd, amd64 or arm64, and kernel 5.8 or newer
+          (this host: {{ ansible_facts['system'] }}, {{ ansible_facts['service_mgr'] }},
+          {{ ansible_facts['architecture'] }}, {{ ansible_facts['kernel'] }})
+      when: na_state == 'present'
+
+    - name: Install node-agent
+      when: na_state == 'present'
+      block:
+        # The agent reads this file through its systemd unit. Settings go here
+        # instead of on the installer's command line, so API_KEY stays out of
+        # sudo logs and the process list, and every agent setting is honoured.
+        - name: Write the agent settings
+          ansible.builtin.copy:
+            dest: /etc/default/nudgebee-node-agent
+            owner: root
+            group: root
+            mode: "0600"
+            content: |
+              {% for key, value in na_env.items() %}
+              {{ key }}='{{ value }}'
+              {% endfor %}
+          no_log: true  # the settings can hold API_KEY
+          register: settings
+
+        # Fetch the installer from the same ref as the binary, so a pinned
+        # version never picks up installer changes from a moving branch.
+        - name: Download the installer
+          ansible.builtin.get_url:
+            url: "https://raw.githubusercontent.com/nudgebee/node-agent/{{ 'main' if na_version == 'latest' else na_version }}/install.sh"
+            dest: /var/tmp/nudgebee-node-agent-install.sh
+            owner: root
+            group: root
+            mode: "0700"
+            force: true
+
+        - name: Install or upgrade node-agent
+          ansible.builtin.command: sh /var/tmp/nudgebee-node-agent-install.sh -v {{ na_version }}
+          register: install
+          changed_when: true
+
+        # The installer restarts the service only when its own files change,
+        # so restart for a settings-only change.
+        - name: Make sure the service is running with the current settings
+          ansible.builtin.systemd:
+            name: nudgebee-node-agent
+            state: "{{ 'restarted' if settings.changed else 'started' }}"
+            enabled: true
+          when: not ansible_check_mode
+
+        # Restart=always hides a crash-loop: the unit is briefly "active" before
+        # the agent exits on a bad endpoint, an old kernel or an eBPF load error.
+        # Wait out two restart intervals (5s each) and check it never restarted.
+        - name: Let the agent run for a moment
+          ansible.builtin.pause:
+            seconds: 12
+          when: not ansible_check_mode
+
+        - name: Read the service state
+          ansible.builtin.systemd:
+            name: nudgebee-node-agent
+          register: service
+          when: not ansible_check_mode
+
+        - name: Check the agent is up and stayed up
+          ansible.builtin.assert:
+            that:
+              - service.status.ActiveState == 'active'
+              - service.status.NRestarts | default('0') == '0'
+            fail_msg: >-
+              nudgebee-node-agent is {{ service.status.ActiveState }} and has restarted
+              {{ service.status.NRestarts | default('?') }} time(s). On the host:
+              journalctl -u nudgebee-node-agent
+          when: not ansible_check_mode
+      always:
+        - name: Remove the installer
+          ansible.builtin.file:
+            path: /var/tmp/nudgebee-node-agent-install.sh
+            state: absent
+
+    - name: Remove node-agent
+      when: na_state == 'absent'
+      block:
+        - name: Look for the uninstall script
+          ansible.builtin.stat:
+            path: /usr/bin/nudgebee-node-agent-uninstall.sh
+          register: uninstall_script
+
+        - name: Uninstall node-agent
+          ansible.builtin.command: /usr/bin/nudgebee-node-agent-uninstall.sh
+          changed_when: true
+          when: uninstall_script.stat.exists
+
+        - name: Remove the agent settings
+          ansible.builtin.file:
+            path: /etc/default/nudgebee-node-agent
+            state: absent

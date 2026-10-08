@@ -1,0 +1,18 @@
+---
+# Copy to vars.yml.
+node_agent_version: v0.1.9  # pin a release; "latest" follows new releases on every run
+
+# Written to /etc/default/nudgebee-node-agent on each host. Any agent setting works
+# here (see flags/flags.go for the names). Quote every value.
+node_agent_env:
+  # Metrics: Prometheus remote-write receiver (VictoriaMetrics, Prometheus, Mimir).
+  METRICS_ENDPOINT: "http://metrics.example.com:8428/api/v1/write"
+  # Traces and logs: OTLP/HTTP, normally an otel-collector.
+  TRACES_ENDPOINT: "http://otel.example.com:4318/v1/traces"
+  LOGS_ENDPOINT: "http://otel.example.com:4318/v1/logs"
+  TRACES_SAMPLING: "0.1"
+  # Keep the key in ansible-vault, not in this file. Create the vaulted value with
+  #   ansible-vault encrypt_string --stdin-name api_key
+  # (it reads the key from stdin, so it stays out of shell history), paste the result
+  # into a vault-vars file, and run the playbook with --ask-vault-pass.
+  # API_KEY: "{{ api_key }}"
