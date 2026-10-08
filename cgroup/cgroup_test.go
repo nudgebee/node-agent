@@ -1,6 +1,7 @@
 package cgroup
 
 import (
+	"os"
 	"path"
 	"testing"
 
@@ -235,4 +236,18 @@ func TestContainerByCgroup(t *testing.T) {
 	as.Equal(ContainerTypeDocker, typ)
 	as.Equal("ba7b10d15d16e10e3de7a2dcd408a3d971169ae303f46cfad4c5453c6326fee2", id)
 	as.Nil(err)
+}
+
+// The registry relies on a process in systemd's /init.scope, or in the root
+// cgroup, having an empty Id: it is not cached as ignored, so its exec after
+// systemd moves it to a unit's cgroup is seen.
+func TestInitScopeAndRootHaveEmptyId(t *testing.T) {
+	for _, content := range []string{"0::/init.scope\n", "0::/\n"} {
+		f := path.Join(t.TempDir(), "cgroup")
+		assert.Nil(t, os.WriteFile(f, []byte(content), 0644))
+		cg, err := NewFromProcessCgroupFile(f)
+		assert.Nil(t, err)
+		assert.Equal(t, "", cg.Id, content)
+		assert.Equal(t, ContainerTypeStandaloneProcess, cg.ContainerType, content)
+	}
 }
