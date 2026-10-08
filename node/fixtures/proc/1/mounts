@@ -1,0 +1,11 @@
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+devtmpfs /dev devtmpfs rw,nosuid,size=4096k,nr_inodes=1048576,mode=755 0 0
+/dev/nvme0n1p1 / ext4 rw,relatime,discard 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,size=1603404k,mode=755 0 0
+cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime 0 0
+/dev/nvme1n1 /var/lib/data xfs rw,relatime,attr2,inode64 0 0
+/dev/nvme1n1 /mnt/my\040disk xfs ro,relatime 0 0
+overlay /var/lib/docker/overlay2/abc/merged overlay rw,relatime 0 0
+tmpfs /run/credentials/systemd-sysctl.service tmpfs ro,nosuid 0 0
+/dev/loop0 /snap/core/1 squashfs ro,nodev,relatime 0 0
