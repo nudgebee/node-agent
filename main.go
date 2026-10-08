@@ -17,6 +17,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/features"
+
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/containers"
 	"github.com/coroot/coroot-node-agent/flags"
@@ -194,10 +197,11 @@ func main() {
 	}
 
 	// L7 events go through a BPF ring buffer (BPF_MAP_TYPE_RINGBUF), which
-	// every program variant uses and which kernels before 5.8 do not have:
-	// on them the programs fail to load further on, with a less clear error.
-	if !common.GetKernelVersion().GreaterOrEqual(common.NewVersion(5, 8, 0)) {
-		klog.Exitln("the minimum Linux kernel version required is 5.8 or later (BPF ring buffer)")
+	// every program variant uses: without it the programs fail to load
+	// further on, with a less clear error. Probe for the map type rather than
+	// checking for 5.8: RHEL 8 kernels (4.18) backport it.
+	if err := features.HaveMapType(ebpf.RingBuf); err != nil {
+		klog.Exitf("the kernel does not support BPF ring buffers (Linux 5.8 or later, or a distribution kernel that backports them, such as RHEL 8): %s", err)
 	}
 
 	resolver, err := newIPResolver(hostname)
