@@ -608,6 +608,16 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	t.collection = c
 	t.programInstructions = programInstructions(c)
 
+	// Uprobe programs are attached per process, on demand. Register them all
+	// before any tracepoint or kprobe is attached: events start flowing as
+	// soon as the first one is, and a process handled before its uprobe
+	// program was registered would never get its probes.
+	for _, programSpec := range collectionSpec.Programs {
+		if strings.HasPrefix(programSpec.SectionName, "uprobe/") || strings.HasPrefix(programSpec.SectionName, "uretprobe/") {
+			t.uprobes[programSpec.Name] = c.Programs[programSpec.Name]
+		}
+	}
+
 	if t.enableLLMCapture {
 		if err := c.Maps["llm_capture_config"].Update(uint32(0), uint32(1), ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("failed to enable LLM capture: %w", err)
@@ -684,8 +694,7 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 			l, err = link.Tracepoint(parts[0], parts[1], program, nil)
 		case ebpf.Kprobe:
 			if strings.HasPrefix(programSpec.SectionName, "uprobe/") || strings.HasPrefix(programSpec.SectionName, "uretprobe/") {
-				t.uprobes[programSpec.Name] = program
-				continue
+				continue // registered at load, attached to processes on demand
 			}
 			l, err = link.Kprobe(programSpec.AttachTo, program, nil)
 			if err != nil && programSpec.SectionName == "kprobe/nf_ct_deliver_cached_events" {

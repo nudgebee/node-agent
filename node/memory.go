@@ -23,7 +23,7 @@ func memoryInfo(procRoot string) (MemoryStat, error) {
 		}
 		mul := float64(1)
 		if len(parts) == 3 && parts[2] == "kB" {
-			mul = 1000
+			mul = 1024 // /proc/meminfo's "kB" are KiB
 		}
 		v, err := strconv.ParseFloat(parts[1], 64)
 		if err != nil {
@@ -38,6 +38,10 @@ func memoryInfo(procRoot string) (MemoryStat, error) {
 			mem.AvailableBytes = v * mul
 		case "Cached:":
 			mem.CachedBytes = v * mul
+		case "SwapTotal:":
+			mem.SwapTotalBytes = v * mul
+		case "SwapFree:":
+			mem.SwapFreeBytes = v * mul
 		}
 	}
 	return mem, nil
