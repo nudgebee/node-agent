@@ -715,7 +715,9 @@ func (c *Container) onFileOpen(pid uint32, fd uint64, mnt uint64, log bool) {
 		case log && (info == nil || !strings.HasPrefix(info.Dest, "/var/log/")):
 			// The kernel saw a /var/log/ file opened, but the fd now points
 			// elsewhere (freopen): find the log files the process holds.
-			logPaths = findLogFiles(pid)
+			if c.logFilesScanDue(pid) {
+				logPaths = findLogFiles(pid)
+			}
 		}
 		for _, logPath := range logPaths {
 			c.lock.Lock()
@@ -2507,6 +2509,26 @@ func sampleString(v interface{}) string {
 		return s
 	}
 	return ""
+}
+
+// logFilesScanInterval bounds how often findLogFiles runs for a process: one
+// that opens its log for every write (PHP's error_log, a shell's >>) would
+// otherwise have all its fds read on every write.
+const logFilesScanInterval = 10 * time.Second
+
+func (c *Container) logFilesScanDue(pid uint32) bool {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	p := c.processes[pid]
+	if p == nil {
+		return true
+	}
+	now := time.Now()
+	if now.Sub(p.logFilesScannedAt) < logFilesScanInterval {
+		return false
+	}
+	p.logFilesScannedAt = now
+	return true
 }
 
 func findLogFiles(pid uint32) []string {
