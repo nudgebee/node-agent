@@ -218,7 +218,10 @@ func main() {
 	tracing.Init(machineId, hostname, version)
 	logs.Init(machineId, hostname, version)
 
-	nodeCollector := node.NewCollector(hostname, kv)
+	// Without Kubernetes there is usually no node_exporter: export the host's
+	// filesystem, load and swap metrics under its names.
+	_, standalone := resolver.(*common.VMIPResolver)
+	nodeCollector := node.NewCollector(hostname, kv, standalone)
 
 	registry := prometheus.NewRegistry()
 
