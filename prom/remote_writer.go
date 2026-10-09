@@ -2,8 +2,6 @@ package prom
 
 import (
 	"bytes"
-	"crypto/md5"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -39,7 +37,9 @@ type Agent struct {
 	maxSpoolSize int64
 }
 
-func StartAgent(reg *prometheus.Registry, machineId, systemUuid string) error {
+// StartAgent starts remote-writing reg. identityExtras are per-machine inputs
+// (see HostIdentityExtras) that keep clones of one image apart in the store.
+func StartAgent(reg *prometheus.Registry, machineId, systemUuid string, identityExtras []string) error {
 	if *flags.MetricsEndpoint == nil {
 		return nil
 	}
@@ -49,13 +49,11 @@ func StartAgent(reg *prometheus.Registry, machineId, systemUuid string) error {
 	up.Set(1)
 	reg.MustRegister(up)
 
-	instance := machineId
-	if s := strings.ReplaceAll(systemUuid, "-", ""); s != "" && s != machineId {
-		hash := md5.New()
-		hash.Write([]byte(machineId))
-		hash.Write([]byte(s))
-		instance = hex.EncodeToString(hash.Sum(nil))
+	if *flags.LegacyInstanceID {
+		identityExtras = nil
 	}
+	instance := InstanceID(machineId, systemUuid, identityExtras...)
+	klog.Infoln("metrics instance:", instance)
 
 	a := &Agent{
 		reg: reg,
