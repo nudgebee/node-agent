@@ -989,7 +989,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
     } else if (e->protocol == PROTOCOL_KAFKA) {
         response = is_kafka_response(payload, req->request_id);
     } else if (e->protocol == PROTOCOL_CLICKHOUSE) {
-        response = is_clickhouse_response(payload, &e->status);
+        response = is_clickhouse_response(payload, ret, &e->status);
         if (!response) {
             discard_l7_event(e);
             return 0; // keeping the query in the map
