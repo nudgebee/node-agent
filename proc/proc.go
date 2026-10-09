@@ -95,8 +95,10 @@ func GetStartTime(pid uint32) time.Time {
 	if len(fields) < 20 {
 		return time.Time{}
 	}
-	startTicks, err := strconv.ParseUint(fields[19], 10, 64)
-	if err != nil || bootTime == 0 {
+	// int64 rather than uint64: the value becomes a time.Duration, and
+	// ParseInt rejects what wouldn't fit.
+	startTicks, err := strconv.ParseInt(fields[19], 10, 64)
+	if err != nil || startTicks < 0 || bootTime == 0 {
 		return time.Time{}
 	}
 	// Ticks are kept rather than rounded to seconds, so that two processes
