@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The metrics `instance` label now also mixes in the cloud instance id and the
+  permanent hardware NIC addresses (virtual, bridge and boot-random addresses
+  are ignored). VMs cloned from one image share `/etc/machine-id`, and when the
+  hypervisor gives them the same or no system UUID they previously collapsed
+  into one `instance` and overwrote each other's series. **Upgrading changes
+  `instance` once on every host that has a cloud instance id or a hardware NIC.**
+  Start with `--legacy-instance-id` (`LEGACY_INSTANCE_ID=true`) to keep the
+  previous value.
 - Prometheus `job` label and outbound `User-Agent` are now
   `nudgebee-node-agent`. Update any dashboards or alerts that filter on
   `job="coroot-node-agent"`.
