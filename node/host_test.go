@@ -22,8 +22,9 @@ func TestHostMounts(t *testing.T) {
 	assert.Equal(t, []hostMount{
 		{device: "/dev/nvme0n1p1", mountPoint: "/", fsType: "ext4"},
 		{device: "tmpfs", mountPoint: "/run", fsType: "tmpfs"},
-		{device: "/dev/nvme1n1", mountPoint: "/var/lib/data", fsType: "xfs"},
+		{device: "/dev/nvme1n1", mountPoint: "/var/lib/data", fsType: "xfs", readonly: true}, // remounted read-only further down
 		{device: "/dev/nvme1n1", mountPoint: "/mnt/my disk", fsType: "xfs", readonly: true},
+		{device: "/dev/nvme2n1", mountPoint: "/srv", fsType: "ext4"}, // mounted over a tmpfs
 	}, mounts)
 }
 

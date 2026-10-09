@@ -205,6 +205,10 @@ func hostMounts(procRoot string) ([]hostMount, error) {
 		return nil, err
 	}
 	var res []hostMount
+	// A mount point can be listed more than once (mounted over, or bind
+	// mounted again). Only the last mount is visible, and statfs reads that
+	// one, so keep only the last; reporting each would also repeat a series.
+	byMountPoint := map[string]int{}
 	for _, line := range strings.Split(string(data), "\n") {
 		parts := strings.Fields(line)
 		if len(parts) < 4 {
@@ -220,6 +224,11 @@ func hostMounts(procRoot string) ([]hostMount, error) {
 				break
 			}
 		}
+		if i, ok := byMountPoint[m.mountPoint]; ok {
+			res[i] = m
+			continue
+		}
+		byMountPoint[m.mountPoint] = len(res)
 		res = append(res, m)
 	}
 	return res, nil
