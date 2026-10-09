@@ -15,7 +15,6 @@ import (
 	"github.com/coroot/coroot-node-agent/gpu"
 	"github.com/coroot/coroot-node-agent/proc"
 	"github.com/jpillora/backoff"
-	"github.com/mdlayher/taskstats"
 )
 
 type GpuUsage struct {
@@ -66,8 +65,8 @@ type Process struct {
 	nodejsChecked    bool
 }
 
-func NewProcess(pid uint32, stats *taskstats.Stats, tracer *ebpftracer.Tracer) *Process {
-	p := &Process{Pid: pid, StartedAt: stats.BeginTime}
+func NewProcess(pid uint32, startedAt time.Time, tracer *ebpftracer.Tracer) *Process {
+	p := &Process{Pid: pid, StartedAt: startedAt}
 	p.Flags, _ = proc.GetFlags(pid)
 	p.ctx, p.cancelFunc = context.WithCancel(context.Background())
 	go p.instrument(tracer)
@@ -91,6 +90,15 @@ func (p *Process) isHostNs() bool {
 }
 
 func (p *Process) instrument(tracer *ebpftracer.Tracer) {
+	if delay := *flags.InstrumentationDelay; delay > 0 && !p.StartedAt.IsZero() {
+		if wait := delay - time.Since(p.StartedAt); wait > 0 {
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-time.After(wait):
+			}
+		}
+	}
 	b := backoff.Backoff{Factor: 2, Min: time.Second, Max: time.Minute}
 	for {
 		select {
