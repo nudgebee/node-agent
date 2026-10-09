@@ -126,7 +126,7 @@ func logRecordAttrs(patternHash string, attributes map[string]string) ([]attribu
 		switch normalizeTraceContextKey(k) {
 		case traceIdKey:
 			if traceId == nil {
-				if id, err := trace.TraceIDFromHex(strings.ToLower(v)); err == nil {
+				if id, ok := parseTraceId(k, v); ok {
 					traceId = &id
 					continue
 				}
@@ -148,10 +148,25 @@ func logRecordAttrs(patternHash string, attributes map[string]string) ([]attribu
 	return attrs, traceId, spanId
 }
 
+// parseTraceId parses a trace id. Datadog's log injection writes dd.trace_id
+// as a decimal 64-bit number unless 128-bit ids are logged, as 32 hex
+// characters; the decimal form is the lower half of the OpenTelemetry id.
+func parseTraceId(k, v string) (trace.TraceID, bool) {
+	if isDatadogKey(k) {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			var id trace.TraceID
+			binary.BigEndian.PutUint64(id[8:], n)
+			return id, n != 0
+		}
+	}
+	id, err := trace.TraceIDFromHex(strings.ToLower(v))
+	return id, err == nil
+}
+
 // parseSpanId parses a span id, which Datadog's log injection (dd.span_id)
 // writes as a decimal number and everything else as hex.
 func parseSpanId(k, v string) (trace.SpanID, bool) {
-	if strings.HasPrefix(strings.ToLower(k), "dd.") {
+	if isDatadogKey(k) {
 		n, err := strconv.ParseUint(v, 10, 64)
 		if err != nil || n == 0 {
 			return trace.SpanID{}, false
@@ -162,6 +177,10 @@ func parseSpanId(k, v string) (trace.SpanID, bool) {
 	}
 	id, err := trace.SpanIDFromHex(strings.ToLower(v))
 	return id, err == nil
+}
+
+func isDatadogKey(k string) bool {
+	return strings.HasPrefix(strings.ToLower(k), "dd.")
 }
 
 func OtelLogEmitter(containerId string) logparser.OnMsgCallbackF {
