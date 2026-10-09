@@ -200,10 +200,12 @@ func main() {
 	// L7 events go through a BPF ring buffer (BPF_MAP_TYPE_RINGBUF), which
 	// every program variant uses: without it the programs fail to load
 	// further on, with a less clear error. Probe for the map type rather than
-	// checking for 5.8: RHEL 8 kernels (4.18) backport it. Only a definite
-	// "not supported" is fatal: any other probe error (missing privileges, a
-	// low RLIMIT_MEMLOCK, which the tracer raises later) is left for the
-	// program loader to report.
+	// checking for 5.8: RHEL 8 kernels (4.18) backport it. Kernels before
+	// 5.11 charge the probe's map to RLIMIT_MEMLOCK, so raise it first, as the
+	// tracer does before loading. Only a definite "not supported" is fatal:
+	// any other probe error (missing privileges) is left for the program
+	// loader to report.
+	_ = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY})
 	if err := features.HaveMapType(ebpf.RingBuf); errors.Is(err, ebpf.ErrNotSupported) {
 		klog.Exitf("the kernel does not support BPF ring buffers (Linux 5.8 or later, or a distribution kernel that backports them, such as RHEL 8): %s", err)
 	} else if err != nil {
