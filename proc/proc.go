@@ -99,8 +99,14 @@ func GetStartTime(pid uint32) time.Time {
 	if err != nil || bootTime == 0 {
 		return time.Time{}
 	}
-	return time.Unix(bootTime+int64(float64(startTicks)/100), 0)
+	// Ticks are kept rather than rounded to seconds, so that two processes
+	// reusing a pid within the same second are told apart.
+	return time.Unix(bootTime, 0).Add(time.Duration(startTicks) * (time.Second / userHZ))
 }
+
+// userHZ is the clock tick rate of /proc/<pid>/stat times. The kernel exposes
+// it as USER_HZ, which is 100 on every architecture the agent is built for.
+const userHZ = 100
 
 func ListPids() ([]uint32, error) {
 	root, err := os.Open(root)
