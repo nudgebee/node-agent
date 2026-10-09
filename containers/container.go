@@ -569,22 +569,22 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 func (c *Container) onProcessStart(pid uint32) *Process {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	stats, err := TaskstatsPID(pid)
-	if err != nil {
+	startedAt := proc.GetStartTime(pid)
+	if startedAt.IsZero() {
 		return nil
 	}
 	if p := c.processes[pid]; p != nil {
 		// Already registered for this same process: a connection can be
 		// handled before the process start event (see attachTlsUprobes).
 		// Replacing it would drop its uprobes without closing them.
-		if p.StartedAt.Equal(stats.BeginTime) {
+		if p.StartedAt.Equal(startedAt) {
 			return p
 		}
 		// The pid was reused: the previous process exited unnoticed.
 		c.closeProcess(pid, p)
 	}
 	c.zombieAt = time.Time{}
-	p := NewProcess(pid, stats, c.registry.tracer)
+	p := NewProcess(pid, startedAt, c.registry.tracer)
 
 	if p == nil {
 		return nil
@@ -592,9 +592,9 @@ func (c *Container) onProcessStart(pid uint32) *Process {
 	c.processes[pid] = p
 
 	if c.startedAt.IsZero() {
-		c.startedAt = stats.BeginTime
+		c.startedAt = startedAt
 	} else {
-		min := stats.BeginTime
+		min := startedAt
 		for _, p := range c.processes {
 			if p.StartedAt.Before(min) {
 				min = p.StartedAt

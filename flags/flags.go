@@ -28,6 +28,7 @@ var (
 	// LLM traffic, or no interest in it, should not pay for it.
 	EnableLLMCapture     = kingpin.Flag("enable-llm-capture", "Capture LLM API traffic and export token usage metrics").Default("false").Envar("ENABLE_LLM_CAPTURE").Bool()
 	DisableGPUMonitoring = kingpin.Flag("disable-gpu-monitoring", "Disable GPU monitoring (NVML)").Default("false").Envar("DISABLE_GPU_MONITORING").Bool()
+	InstrumentationDelay = kingpin.Flag("instrumentation-delay", "Delay before enabling Python GIL and Node.js event loop instrumentation, after a process is started (0 disables)").Default("0s").Envar("INSTRUMENTATION_DELAY").Duration()
 
 	ContainerAllowlist = kingpin.Flag("container-allowlist", "List of allowed containers (regex patterns)").Envar("CONTAINER_ALLOWLIST").Strings()
 	ContainerDenylist  = kingpin.Flag("container-denylist", "List of denied containers (regex patterns)").Envar("CONTAINER_DENYLIST").Strings()
