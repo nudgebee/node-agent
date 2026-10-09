@@ -25,6 +25,7 @@ func TestHostMounts(t *testing.T) {
 		{device: "/dev/nvme1n1", mountPoint: "/var/lib/data", fsType: "xfs", readonly: true}, // remounted read-only further down
 		{device: "/dev/nvme1n1", mountPoint: "/mnt/my disk", fsType: "xfs", readonly: true},
 		{device: "/dev/nvme2n1", mountPoint: "/srv", fsType: "ext4"}, // mounted over a tmpfs
+		// /opt/app: ext4 hidden by a squashfs mounted over it, so not reported
 	}, mounts)
 }
 

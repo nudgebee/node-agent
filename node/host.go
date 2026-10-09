@@ -215,7 +215,7 @@ func hostMounts(procRoot string) ([]hostMount, error) {
 			continue
 		}
 		m := hostMount{device: unescapeMount(parts[0]), mountPoint: unescapeMount(parts[1]), fsType: parts[2]}
-		if ignoredFsTypes[m.fsType] || ignoredMountPoint(m.mountPoint) {
+		if ignoredMountPoint(m.mountPoint) {
 			continue
 		}
 		for _, o := range strings.Split(parts[3], ",") {
@@ -231,7 +231,17 @@ func hostMounts(procRoot string) ([]hostMount, error) {
 		byMountPoint[m.mountPoint] = len(res)
 		res = append(res, m)
 	}
-	return res, nil
+	// File system types are filtered only now: an ignored file system
+	// mounted over a real one hides it, so the mount point must not be
+	// reported with the hidden mount's labels and the top one's statfs.
+	n := 0
+	for _, m := range res {
+		if !ignoredFsTypes[m.fsType] {
+			res[n] = m
+			n++
+		}
+	}
+	return res[:n], nil
 }
 
 func ignoredMountPoint(mp string) bool {

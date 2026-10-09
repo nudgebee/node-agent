@@ -12,3 +12,5 @@ tmpfs /run/credentials/systemd-sysctl.service tmpfs ro,nosuid 0 0
 /dev/nvme1n1 /var/lib/data xfs ro,relatime,attr2,inode64 0 0
 tmpfs /srv tmpfs rw,nosuid 0 0
 /dev/nvme2n1 /srv ext4 rw,relatime 0 0
+/dev/nvme3n1 /opt/app ext4 rw,relatime 0 0
+/dev/loop1 /opt/app squashfs ro,nodev,relatime 0 0
