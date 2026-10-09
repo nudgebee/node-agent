@@ -37,18 +37,20 @@ func NewTailReader(fileName string, ch chan<- logparser.LogEntry) (*TailReader, 
 		stopped:  make(chan struct{}),
 	}
 	var err error
-	if r.file, err = os.Open(fileName); err != nil {
+	if r.file, err = os.Open(fileName); err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
-	if r.info, err = r.file.Stat(); err != nil {
-		_ = r.file.Close()
-		return nil, err
+	if r.file != nil { // the file may not exist yet, poll() waits for it to appear
+		if r.info, err = r.file.Stat(); err != nil {
+			_ = r.file.Close()
+			return nil, err
+		}
+		if _, err = r.file.Seek(0, io.SeekEnd); err != nil {
+			_ = r.file.Close()
+			return nil, err
+		}
+		r.reader = bufio.NewReader(r.file)
 	}
-	if _, err = r.file.Seek(0, io.SeekEnd); err != nil {
-		_ = r.file.Close()
-		return nil, err
-	}
-	r.reader = bufio.NewReader(r.file)
 
 	go func() {
 		const maxPrefixLen = 64 * 1024 // 64KB cap on partial line buffer
@@ -59,6 +61,10 @@ func NewTailReader(fileName string, ch chan<- logparser.LogEntry) (*TailReader, 
 				r.stopped <- struct{}{}
 				return
 			default:
+				if r.reader == nil {
+					r.poll(ctx)
+					continue
+				}
 				line, err := r.reader.ReadString('\n')
 				if err != nil {
 					if len(prefix)+len(line) > maxPrefixLen {

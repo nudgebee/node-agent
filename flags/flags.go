@@ -9,12 +9,13 @@ import (
 )
 
 var (
-	ListenAddress       = kingpin.Flag("listen", "Listen address - ip:port or :port (default 0.0.0.0:80, or 127.0.0.1:10300 when --metrics-endpoint is set)").Envar("LISTEN").String()
-	CgroupRoot          = kingpin.Flag("cgroupfs-root", "The mount point of the host cgroupfs root").Default("/sys/fs/cgroup").Envar("CGROUPFS_ROOT").String()
-	DisableLogParsing   = kingpin.Flag("disable-log-parsing", "Disable container log parsing").Default("false").Envar("DISABLE_LOG_PARSING").Bool()
-	DisablePinger       = kingpin.Flag("disable-pinger", "Don't ping upstreams").Default("true").Envar("DISABLE_PINGER").Bool()
-	DisableL7Tracing    = kingpin.Flag("disable-l7-tracing", "Disable L7 tracing").Default("false").Envar("DISABLE_L7_TRACING").Bool()
-	EnableDotNetTracing = kingpin.Flag("enable-dotnet-tracing", "Enable .NET CLR tracing").Default("false").Envar("ENABLE_DOTNET_TRACING").Bool()
+	ListenAddress         = kingpin.Flag("listen", "Listen address - ip:port or :port (default 0.0.0.0:80, or 127.0.0.1:10300 when --metrics-endpoint is set)").Envar("LISTEN").String()
+	CgroupRoot            = kingpin.Flag("cgroupfs-root", "The mount point of the host cgroupfs root").Default("/sys/fs/cgroup").Envar("CGROUPFS_ROOT").String()
+	DisableLogParsing     = kingpin.Flag("disable-log-parsing", "Disable container log parsing").Default("false").Envar("DISABLE_LOG_PARSING").Bool()
+	DisableJsonLogParsing = kingpin.Flag("disable-json-log-parsing", "Disable extracting the message, severity, and attributes from JSON-formatted logs").Default("false").Envar("DISABLE_JSON_LOG_PARSING").Bool()
+	DisablePinger         = kingpin.Flag("disable-pinger", "Don't ping upstreams").Default("true").Envar("DISABLE_PINGER").Bool()
+	DisableL7Tracing      = kingpin.Flag("disable-l7-tracing", "Disable L7 tracing").Default("false").Envar("DISABLE_L7_TRACING").Bool()
+	EnableDotNetTracing   = kingpin.Flag("enable-dotnet-tracing", "Enable .NET CLR tracing").Default("false").Envar("ENABLE_DOTNET_TRACING").Bool()
 	// Off by default: the only thing it produces is
 	// container_nodejs_event_loop_blocked_time_seconds_total, which nothing
 	// currently consumes, and attaching the probes reads the whole ELF symbol
@@ -44,16 +45,17 @@ var (
 					Strings()
 	EphemeralPortRange = kingpin.Flag("ephemeral-port-range", `Destination and Listen TCP ports from these ranges will be skipped, e.g. "32768-60999" or "1024-23768 30000-65535"`).Default("32768-60999").Envar("EPHEMERAL_PORT_RANGE").String()
 
-	Provider                = kingpin.Flag("provider", "`provider` label for `node_cloud_info` metric").Envar("PROVIDER").String()
-	Region                  = kingpin.Flag("region", "`region` label for `node_cloud_info` metric").Envar("REGION").String()
-	AvailabilityZone        = kingpin.Flag("availability-zone", "`availability_zone` label for `node_cloud_info` metric").Envar("AVAILABILITY_ZONE").String()
-	AccountId               = kingpin.Flag("account-id", "`account_id` label for `node_cloud_info` metric").Envar("ACCOUNT_ID").String()
-	InstanceType            = kingpin.Flag("instance-type", "`instance_type` label for `node_cloud_info` metric").Envar("INSTANCE_TYPE").String()
-	InstanceLifeCycle       = kingpin.Flag("instance-life-cycle", "`instance_life_cycle` label for `node_cloud_info` metric").Envar("INSTANCE_LIFE_CYCLE").String()
-	LogPerSecond            = kingpin.Flag("log-per-second", "The number of logs per second").Default("10.0").Envar("LOG_PER_SECOND").Float64()
-	LogBurst                = kingpin.Flag("log-burst", "The maximum number of tokens that can be consumed in a single call to allow").Default("100").Envar("LOG_BURST").Int()
-	LogPatternsPerContainer = kingpin.Flag("log-patterns-per-container", "Max unique log patterns per container per level").Default("256").Envar("LOG_PATTERNS_PER_CONTAINER").Int()
-	MaxFQDNsPerContainer    = kingpin.Flag("max-fqdns-per-container", "Max unique FQDN values per container, extras are bucketed under '~other'").Default("50").Envar("MAX_FQDNS_PER_CONTAINER").Int()
+	Provider                  = kingpin.Flag("provider", "`provider` label for `node_cloud_info` metric").Envar("PROVIDER").String()
+	Region                    = kingpin.Flag("region", "`region` label for `node_cloud_info` metric").Envar("REGION").String()
+	AvailabilityZone          = kingpin.Flag("availability-zone", "`availability_zone` label for `node_cloud_info` metric").Envar("AVAILABILITY_ZONE").String()
+	AccountId                 = kingpin.Flag("account-id", "`account_id` label for `node_cloud_info` metric").Envar("ACCOUNT_ID").String()
+	InstanceType              = kingpin.Flag("instance-type", "`instance_type` label for `node_cloud_info` metric").Envar("INSTANCE_TYPE").String()
+	InstanceLifeCycle         = kingpin.Flag("instance-life-cycle", "`instance_life_cycle` label for `node_cloud_info` metric").Envar("INSTANCE_LIFE_CYCLE").String()
+	LogPerSecond              = kingpin.Flag("log-per-second", "The number of logs per second").Default("10.0").Envar("LOG_PER_SECOND").Float64()
+	LogBurst                  = kingpin.Flag("log-burst", "The maximum number of tokens that can be consumed in a single call to allow").Default("100").Envar("LOG_BURST").Int()
+	LogPatternsPerContainer   = kingpin.Flag("log-patterns-per-container", "Max unique log patterns per container per level").Default("256").Envar("LOG_PATTERNS_PER_CONTAINER").Int()
+	LogPatternExtractionLimit = kingpin.Flag("log-pattern-extraction-limit", "Max warning/error log messages per second per container for which patterns are extracted. Over-limit messages are still exported and counted, under a dedicated 'event was sampled' pattern (0 - unlimited)").Default("0").Envar("LOG_PATTERN_EXTRACTION_LIMIT").Float64()
+	MaxFQDNsPerContainer      = kingpin.Flag("max-fqdns-per-container", "Max unique FQDN values per container, extras are bucketed under '~other'").Default("50").Envar("MAX_FQDNS_PER_CONTAINER").Int()
 
 	MaxLabelLength = kingpin.Flag("max-label-length", "Maximum length of a metric label value").Default("4096").Envar("MAX_LABEL_LENGTH").Int()
 

@@ -2,6 +2,7 @@ package logs
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	otel "github.com/agoda-com/opentelemetry-logs-go"
@@ -15,10 +16,24 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.18.0"
+	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/time/rate"
 	"k8s.io/klog/v2"
 )
 
 var otelLogger otelLogs.Logger
+
+// PatternExtractionRateLimiter caps, per container, how many warning and
+// error messages per second get a log pattern extracted (nil: unlimited).
+func PatternExtractionRateLimiter() *rate.Limiter {
+	limit := *flags.LogPatternExtractionLimit
+	if limit <= 0 {
+		return nil
+	}
+	// At least 1: with a burst of 0 the limiter rejects every event, so a
+	// limit below 0.1/s would turn pattern extraction off entirely.
+	return rate.NewLimiter(rate.Limit(limit), max(1, int(limit*10)))
+}
 
 func Init(machineId, hostname, version string) {
 	endpointUrl := *flags.LogsEndpoint
@@ -60,11 +75,72 @@ func Init(machineId, hostname, version string) {
 	otelLogger = loggerProvider.Logger("nudgebee-node-agent", otelLogs.WithInstrumentationVersion(version))
 }
 
+const (
+	traceIdKey = "traceid"
+	spanIdKey  = "spanid"
+)
+
+var (
+	traceIdKeys = []string{traceIdKey, "trace_id", "trace-id", "trace.id"}
+	spanIdKeys  = []string{spanIdKey, "span_id", "span-id", "span.id"}
+)
+
+func normalizeTraceContextKey(k string) string {
+	k = strings.ToLower(k)
+	switch k {
+	case "@tr":
+		return traceIdKey
+	case "@sp":
+		return spanIdKey
+	}
+	if strings.Contains(k, "parent") { // e.g. parent_span_id is not the record's span id
+		return ""
+	}
+	for _, s := range traceIdKeys {
+		if k == s || strings.HasSuffix(k, "."+s) {
+			return traceIdKey
+		}
+	}
+	for _, s := range spanIdKeys {
+		if k == s || strings.HasSuffix(k, "."+s) {
+			return spanIdKey
+		}
+	}
+	return ""
+}
+
+func logRecordAttrs(patternHash string, attributes map[string]string) ([]attribute.KeyValue, *trace.TraceID, *trace.SpanID) {
+	var traceId *trace.TraceID
+	var spanId *trace.SpanID
+	attrs := make([]attribute.KeyValue, 0, len(attributes)+1)
+	attrs = append(attrs, attribute.Key("pattern.hash").String(patternHash))
+	for k, v := range attributes {
+		switch normalizeTraceContextKey(k) {
+		case traceIdKey:
+			if traceId == nil {
+				if id, err := trace.TraceIDFromHex(strings.ToLower(v)); err == nil {
+					traceId = &id
+					continue
+				}
+			}
+		case spanIdKey:
+			if spanId == nil {
+				if id, err := trace.SpanIDFromHex(strings.ToLower(v)); err == nil {
+					spanId = &id
+					continue
+				}
+			}
+		}
+		attrs = append(attrs, attribute.Key(k).String(v))
+	}
+	return attrs, traceId, spanId
+}
+
 func OtelLogEmitter(containerId string) logparser.OnMsgCallbackF {
 	if otelLogger == nil {
 		return nil
 	}
-	return func(ts time.Time, level logparser.Level, patternHash string, msg string) {
+	return func(ts time.Time, level logparser.Level, patternHash string, msg string, attributes map[string]string) {
 		severityText := level.String()
 		severityNumber := otelLogs.UNSPECIFIED
 		switch level {
@@ -80,9 +156,13 @@ func OtelLogEmitter(containerId string) logparser.OnMsgCallbackF {
 			severityNumber = otelLogs.DEBUG
 		}
 
+		attrs, traceId, spanId := logRecordAttrs(patternHash, attributes)
+
 		otelLogger.Emit(
 			otelLogs.NewLogRecord(otelLogs.LogRecordConfig{
 				ObservedTimestamp: ts,
+				TraceId:           traceId,
+				SpanId:            spanId,
 				SeverityText:      &severityText,
 				SeverityNumber:    &severityNumber,
 				Body:              &msg,
@@ -90,9 +170,7 @@ func OtelLogEmitter(containerId string) logparser.OnMsgCallbackF {
 					semconv.ServiceName(common.ContainerIdToOtelServiceName(containerId)),
 					semconv.ContainerID(containerId),
 				),
-				Attributes: &[]attribute.KeyValue{
-					attribute.Key("pattern.hash").String(patternHash),
-				},
+				Attributes: &attrs,
 			}),
 		)
 	}
