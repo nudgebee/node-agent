@@ -339,7 +339,7 @@ int go_crypto_tls_write_enter(struct pt_regs *ctx) {
     __u64 buf_size_debug = GO_PARAM3(ctx);
     bpf_printk("go_tls_write_enter: tgid=%u tls_conn=%p buf_size=%llu", pid, tls_conn_ptr_debug, buf_size_debug);
 
-    __u32 fd;
+    __u32 fd = 0; // RHEL 8's verifier rejects reading it uninitialized on any path
     if (go_crypto_tls_get_fd_from_conn(ctx, &fd)) {
         count_tls_drop_by_pid(TLS_DROP_GO_FD_UNKNOWN);
         return 0;
@@ -361,7 +361,7 @@ int go_crypto_tls_read_enter(struct pt_regs *ctx) {
     void* tls_conn_ptr_debug = (void*)GO_PARAM1(ctx);
     bpf_printk("go_tls_read_enter: tgid=%u tls_conn=%p", tgid_debug, tls_conn_ptr_debug);
 
-    __u32 fd;
+    __u32 fd = 0; // RHEL 8's verifier rejects reading it uninitialized on any path
     if (go_crypto_tls_get_fd_from_conn(ctx, &fd)) {
         count_tls_drop_by_pid(TLS_DROP_GO_FD_UNKNOWN);
         return 0;
