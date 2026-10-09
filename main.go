@@ -264,7 +264,12 @@ func main() {
 	profiling.Start()
 	defer profiling.Stop()
 
-	if err := prom.StartAgent(registry, machineId, systemUuid); err != nil {
+	cloudInstanceID := ""
+	if md := nodeCollector.Metadata(); md != nil {
+		cloudInstanceID = md.InstanceId
+	}
+	identityExtras := prom.HostIdentityExtras(cloudInstanceID, proc.HostPath("/sys/class/net"))
+	if err := prom.StartAgent(registry, machineId, systemUuid, identityExtras); err != nil {
 		klog.Exitln(err)
 	}
 
