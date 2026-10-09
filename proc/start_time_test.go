@@ -15,7 +15,7 @@ func TestGetStartTime(t *testing.T) {
 	// starttime is field 22 of /proc/<pid>/stat, in clock ticks since boot:
 	// 12345 ticks = 123.45s. The comm contains spaces and ')', so fields
 	// must be counted from the last ')'.
-	assert.Equal(t, time.Unix(1700000000+123, 0), GetStartTime(123))
+	assert.Equal(t, time.Unix(1700000000+123, 450*int64(time.Millisecond)), GetStartTime(123))
 
 	assert.True(t, GetStartTime(999999).IsZero(), "missing pid")
 

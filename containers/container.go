@@ -1623,10 +1623,11 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	case l7.ProtocolClickhouse:
 		// Update stats for Clickhouse
 		c.l7Stats.observe(r.Protocol, r.Status.String(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
-		query := l7.ParseClickhouse(r.Payload)
-		if query == "" {
+		query, ok := l7.ParseClickhouse(r.Payload)
+		switch {
+		case !ok:
 			c.trackParseFail(conn, pid, fd, r.Protocol)
-		} else {
+		case query != "":
 			conn.parseFailCount = 0
 		}
 		if trace != nil {
