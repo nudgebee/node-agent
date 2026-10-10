@@ -41,7 +41,10 @@ func newSocketTestContainer(t *testing.T, names map[string]string) *Container {
 	*flags.IgnoreControlPlane = "loki,victoria"
 	t.Cleanup(func() { *flags.IgnoreControlPlane = prev })
 	return &Container{
-		registry:           &Registry{ip2fqdn: common.NewFQDNCache()},
+		registry: &Registry{
+			ip2fqdn:           common.NewFQDNCache(),
+			actualDestination: func(netaddr.IPPort) (netaddr.IPPort, bool) { return netaddr.IPPort{}, false },
+		},
 		ip_resolver:        stubResolver{names: names},
 		processes:          map[uint32]*Process{},
 		connectionsByPidFd: map[PidFd]*ActiveConnection{},

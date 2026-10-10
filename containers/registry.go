@@ -75,6 +75,7 @@ type Registry struct {
 	events chan ebpftracer.Event
 	// actualDestination is the tracer's post-NAT destination lookup for a
 	// TCP connection's local address (ebpftracer.Tracer.ActualDestination).
+	// NewRegistry always sets it.
 	actualDestination func(src netaddr.IPPort) (netaddr.IPPort, bool)
 
 	containersById         map[ContainerID]*Container

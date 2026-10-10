@@ -934,7 +934,7 @@ func (c *Container) connectionFromSocketInfo(pid uint32, fd uint64, timestamp ui
 	// whatever socket last had the same local port: DNS queries were labelled
 	// with that connection's server.
 	var actualDst netaddr.IPPort
-	if tcp && c.registry.actualDestination != nil {
+	if tcp {
 		actualDst, _ = c.registry.actualDestination(src)
 	}
 	// Same filters and labels as a connection seen opening: without them,
