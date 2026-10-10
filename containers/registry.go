@@ -73,6 +73,9 @@ type Registry struct {
 
 	tracer *ebpftracer.Tracer
 	events chan ebpftracer.Event
+	// actualDestination is the tracer's post-NAT destination lookup for a
+	// TCP connection's local address (ebpftracer.Tracer.ActualDestination).
+	actualDestination func(src netaddr.IPPort) (netaddr.IPPort, bool)
 
 	containersById         map[ContainerID]*Container
 	containersByCgroupId   map[string]*Container
@@ -161,6 +164,7 @@ func NewRegistry(reg prometheus.Registerer, rawReg prometheus.Registerer, proces
 		gpuProcessUsageSampleChan: gpuProcessUsageSampleChan,
 		nodeConstLabels:           NodeConstLabels{MachineID: machineId, SystemUUID: systemUuid, AZ: az, Region: region},
 	}
+	r.actualDestination = r.tracer.ActualDestination
 	// Register LLM metrics with the same registerer used for other container metrics
 	RegisterL7SelfMetrics(reg)
 	if *flags.EnableLLMCapture {
