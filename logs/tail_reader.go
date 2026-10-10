@@ -40,7 +40,9 @@ func NewTailReader(fileName string, ch chan<- logparser.LogEntry) (*TailReader, 
 	if r.file, err = os.Open(fileName); err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
-	if r.file != nil { // the file may not exist yet, poll() waits for it to appear
+	if r.file == nil {
+		klog.Infof("%s does not exist yet, waiting for it to appear", fileName)
+	} else {
 		if r.info, err = r.file.Stat(); err != nil {
 			_ = r.file.Close()
 			return nil, err

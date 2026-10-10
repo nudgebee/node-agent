@@ -715,7 +715,9 @@ func (c *Container) onFileOpen(pid uint32, fd uint64, mnt uint64, log bool) {
 		case log && (info == nil || !strings.HasPrefix(info.Dest, "/var/log/")):
 			// The kernel saw a /var/log/ file opened, but the fd now points
 			// elsewhere (freopen): find the log files the process holds.
-			logPaths = findLogFiles(pid)
+			if c.logFilesScanDue(pid) {
+				logPaths = findLogFiles(pid)
+			}
 		}
 		for _, logPath := range logPaths {
 			c.lock.Lock()
@@ -1623,10 +1625,11 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	case l7.ProtocolClickhouse:
 		// Update stats for Clickhouse
 		c.l7Stats.observe(r.Protocol, r.Status.String(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
-		query := l7.ParseClickhouse(r.Payload)
-		if query == "" {
+		query, ok := l7.ParseClickhouse(r.Payload)
+		switch {
+		case !ok:
 			c.trackParseFail(conn, pid, fd, r.Protocol)
-		} else {
+		case query != "":
 			conn.parseFailCount = 0
 		}
 		if trace != nil {
@@ -2506,6 +2509,26 @@ func sampleString(v interface{}) string {
 		return s
 	}
 	return ""
+}
+
+// logFilesScanInterval bounds how often findLogFiles runs for a process: one
+// that opens its log for every write (PHP's error_log, a shell's >>) would
+// otherwise have all its fds read on every write.
+const logFilesScanInterval = 10 * time.Second
+
+func (c *Container) logFilesScanDue(pid uint32) bool {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	p := c.processes[pid]
+	if p == nil {
+		return true
+	}
+	now := time.Now()
+	if now.Sub(p.logFilesScannedAt) < logFilesScanInterval {
+		return false
+	}
+	p.logFilesScannedAt = now
+	return true
 }
 
 func findLogFiles(pid uint32) []string {
