@@ -30,6 +30,14 @@ func TestNormalizeHTTPPath(t *testing.T) {
 		// rule. Still templated; kept as is so existing metric series keep
 		// their label values.
 		{"numeric segment beyond int range", "/123456789012345678901234567890/jobs", "/{hex}/jobs"},
+		// A content-addressed store's fan-out directories go with the hash, so
+		// every file of a mirror has one path whatever its hash.
+		{"pypi file, letter fan-out", "/packages/fa/e3/0a1b2c3d4e5f60718293a4b5c6d7e8f9/pkg-1.0-py3-none-any.whl", "/packages/{hex}/{hex}/{hex}/{id}"},
+		{"pypi file, digit fan-out", "/packages/62/b5/0a1b2c3d4e5f60718293a4b5c6d7e8f9/pkg-1.0-py3-none-any.whl", "/packages/{hex}/{hex}/{hex}/{id}"},
+		{"git object", "/repo.git/objects/ab/0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c", "/repo.git/objects/{hex}/{hex}"},
+		{"walk stops at a word", "/commits/9fceb02d0ae598e95dc970b74767f19372d61af8", "/commits/{hex}"},
+		{"short hex not before a hash unchanged", "/de/docs/ab", "/de/docs/ab"},
+		{"id after a word kept", "/builds/42/artifacts/9fceb02d0ae598e95dc970b74767f19372d61af8", "/builds/{id}/artifacts/{hex}"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
