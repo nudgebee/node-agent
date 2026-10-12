@@ -8,7 +8,7 @@ A per-node observability agent for Kubernetes and Linux hosts. The agent
 gathers container and host metrics, logs, and L7 traffic using eBPF and
 exposes them in Prometheus format.
 
-Minimum Linux kernel: **5.8** (L7 events use a BPF ring buffer).
+Minimum Linux kernel: **5.8** (L7 events use a BPF ring buffer), or a distribution kernel that backports BPF ring buffers, such as RHEL 8 (4.18).
 The kernel must also be built with `CONFIG_BPF_EVENTS=y` (kprobe and tracepoint BPF programs); some embedded and vendor kernels disable it.
 
 > This project is a fork of

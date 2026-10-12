@@ -2,6 +2,8 @@ package logs
 
 import (
 	"context"
+	"encoding/binary"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,7 +25,7 @@ import (
 
 var otelLogger otelLogs.Logger
 
-// PatternExtractionRateLimiter caps, per container, how many warning and
+// PatternExtractionRateLimiter caps, per log source, how many warning and
 // error messages per second get a log pattern extracted (nil: unlimited).
 func PatternExtractionRateLimiter() *rate.Limiter {
 	limit := *flags.LogPatternExtractionLimit
@@ -109,31 +111,76 @@ func normalizeTraceContextKey(k string) string {
 	return ""
 }
 
+const patternHashKey = "pattern.hash"
+
 func logRecordAttrs(patternHash string, attributes map[string]string) ([]attribute.KeyValue, *trace.TraceID, *trace.SpanID) {
 	var traceId *trace.TraceID
 	var spanId *trace.SpanID
+	var spanIdAttr string
 	attrs := make([]attribute.KeyValue, 0, len(attributes)+1)
-	attrs = append(attrs, attribute.Key("pattern.hash").String(patternHash))
+	attrs = append(attrs, attribute.Key(patternHashKey).String(patternHash))
 	for k, v := range attributes {
+		if k == patternHashKey { // the agent's own; a duplicate key would hide it
+			continue
+		}
 		switch normalizeTraceContextKey(k) {
 		case traceIdKey:
 			if traceId == nil {
-				if id, err := trace.TraceIDFromHex(strings.ToLower(v)); err == nil {
+				if id, ok := parseTraceId(k, v); ok {
 					traceId = &id
 					continue
 				}
 			}
 		case spanIdKey:
 			if spanId == nil {
-				if id, err := trace.SpanIDFromHex(strings.ToLower(v)); err == nil {
-					spanId = &id
+				if id, ok := parseSpanId(k, v); ok {
+					spanId, spanIdAttr = &id, k
 					continue
 				}
 			}
 		}
 		attrs = append(attrs, attribute.Key(k).String(v))
 	}
+	if spanId != nil && traceId == nil { // a span id means nothing without its trace
+		attrs = append(attrs, attribute.Key(spanIdAttr).String(attributes[spanIdAttr]))
+		spanId = nil
+	}
 	return attrs, traceId, spanId
+}
+
+// parseTraceId parses a trace id. Datadog's log injection writes dd.trace_id
+// as a decimal 64-bit number unless 128-bit ids are logged, as 32 hex
+// characters; the decimal form is the lower half of the OpenTelemetry id.
+func parseTraceId(k, v string) (trace.TraceID, bool) {
+	if isDatadogKey(k) {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			var id trace.TraceID
+			binary.BigEndian.PutUint64(id[8:], n)
+			return id, n != 0
+		}
+	}
+	id, err := trace.TraceIDFromHex(strings.ToLower(v))
+	return id, err == nil
+}
+
+// parseSpanId parses a span id, which Datadog's log injection (dd.span_id)
+// writes as a decimal number and everything else as hex.
+func parseSpanId(k, v string) (trace.SpanID, bool) {
+	if isDatadogKey(k) {
+		n, err := strconv.ParseUint(v, 10, 64)
+		if err != nil || n == 0 {
+			return trace.SpanID{}, false
+		}
+		var id trace.SpanID
+		binary.BigEndian.PutUint64(id[:], n)
+		return id, true
+	}
+	id, err := trace.SpanIDFromHex(strings.ToLower(v))
+	return id, err == nil
+}
+
+func isDatadogKey(k string) bool {
+	return strings.HasPrefix(strings.ToLower(k), "dd.")
 }
 
 func OtelLogEmitter(containerId string) logparser.OnMsgCallbackF {

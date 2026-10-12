@@ -127,6 +127,8 @@ type MemoryStat struct {
 	TotalBytes     float64
 	FreeBytes      float64
 	AvailableBytes float64
+	SwapTotalBytes float64
+	SwapFreeBytes  float64
 	CachedBytes    float64
 }
 
@@ -150,9 +152,13 @@ type Collector struct {
 	hostname         string
 	kernelVersion    string
 	instanceMetadata *metadata.CloudMetadata
+	host             *hostCollector // nil unless host metrics are enabled
 }
 
-func NewCollector(hostname, kernelVersion string) *Collector {
+// NewCollector creates the node collector. hostMetrics adds filesystem,
+// load and swap metrics under node_exporter's names: enable it only where no
+// node_exporter runs (standalone/VM mode), or the series are counted twice.
+func NewCollector(hostname, kernelVersion string, hostMetrics bool) *Collector {
 	md := metadata.GetInstanceMetadata()
 	if md == nil {
 		md = &metadata.CloudMetadata{}
@@ -173,11 +179,15 @@ func NewCollector(hostname, kernelVersion string) *Collector {
 		md.LifeCycle = f
 	}
 	klog.Infof("instance metadata: %+v", md)
-	return &Collector{
+	c := &Collector{
 		hostname:         hostname,
 		kernelVersion:    kernelVersion,
 		instanceMetadata: md,
 	}
+	if hostMetrics {
+		c.host = newHostCollector(procRoot)
+	}
+	return c
 }
 
 func (c *Collector) Metadata() *metadata.CloudMetadata {
@@ -186,6 +196,10 @@ func (c *Collector) Metadata() *metadata.CloudMetadata {
 
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	ch <- gauge(infoDesc, 1, c.hostname, c.kernelVersion)
+
+	if c.host != nil {
+		c.host.collect(ch)
+	}
 
 	v, err := uptime(procRoot)
 	if err != nil {
@@ -263,6 +277,11 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- infoDesc
+	if c.host != nil {
+		for _, d := range hostDescs {
+			ch <- d
+		}
+	}
 	ch <- cloudInfoDesc
 	ch <- uptimeDesc
 	ch <- cpuUsageDesc

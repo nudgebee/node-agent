@@ -53,12 +53,15 @@ type Process struct {
 	// TLS attach state, only touched by the registry's event loop.
 	goTlsUprobesChecked   bool
 	openSslUprobesChecked bool
-	openSslChecks         int
-	openSslLastCheck      time.Time
-	tlsAttached           bool
-	tlsExe                exeIdentity
-	tlsExeName            string
-	tlsExeCheckedAt       time.Time
+
+	// last findLogFiles scan, only touched by the registry's event loop
+	logFilesScannedAt time.Time
+	openSslChecks     int
+	openSslLastCheck  time.Time
+	tlsAttached       bool
+	tlsExe            exeIdentity
+	tlsExeName        string
+	tlsExeCheckedAt   time.Time
 
 	// Only touched by the instrument goroutine.
 	pythonGilChecked bool
