@@ -8,7 +8,11 @@
 // before, which is what keeps Redis inline commands and binary data out.
 static __always_inline
 int is_http_request(char *buf) {
-    char b[64];
+    // Zeroed, as bpf_probe_read_str leaves the bytes past the string as the
+    // stack had them: a previous request's " HTTP/" there passed the scan
+    // below. Eight stores, where bounding the scan by the length read added a
+    // branch per step and half again to the verifier's work.
+    char b[64] = {};
     if (bpf_probe_read_str(&b, sizeof(b), (void *)buf) < 8) {
         return 0;
     }
