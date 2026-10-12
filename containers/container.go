@@ -715,7 +715,9 @@ func (c *Container) onFileOpen(pid uint32, fd uint64, mnt uint64, log bool) {
 		case log && (info == nil || !strings.HasPrefix(info.Dest, "/var/log/")):
 			// The kernel saw a /var/log/ file opened, but the fd now points
 			// elsewhere (freopen): find the log files the process holds.
-			logPaths = findLogFiles(pid)
+			if c.logFilesScanDue(pid) {
+				logPaths = findLogFiles(pid)
+			}
 		}
 		for _, logPath := range logPaths {
 			c.lock.Lock()
@@ -875,7 +877,7 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 // This is used when TCP connection tracking fails (common for Go TLS due to goroutine thread switching)
 // but we have socket tuple info extracted directly from the fd
 func (c *Container) createConnectionFromSocketInfo(pid uint32, fd uint64, timestamp uint64, socketInfo *ebpftracer.SocketInfo) (conn *ActiveConnection, filtered bool) {
-	connection, filtered := c.connectionFromSocketInfo(pid, fd, timestamp, socketInfo)
+	connection, filtered := c.connectionFromSocketInfo(pid, fd, timestamp, socketInfo, true)
 	if connection == nil {
 		return nil, filtered
 	}
@@ -896,8 +898,9 @@ func (c *Container) createConnectionFromSocketInfo(pid uint32, fd uint64, timest
 
 // connectionFromSocketInfo builds the connection an L7 event's socket tuple
 // describes, without tracking it. filtered is true for a connection the agent
-// does not track.
-func (c *Container) connectionFromSocketInfo(pid uint32, fd uint64, timestamp uint64, socketInfo *ebpftracer.SocketInfo) (conn *ActiveConnection, filtered bool) {
+// does not track. tcp is false for a socket that may be UDP: the kernel's
+// address translations are recorded for TCP connections only.
+func (c *Container) connectionFromSocketInfo(pid uint32, fd uint64, timestamp uint64, socketInfo *ebpftracer.SocketInfo, tcp bool) (conn *ActiveConnection, filtered bool) {
 	if socketInfo == nil || !socketInfo.Valid {
 		return nil, false
 	}
@@ -926,10 +929,13 @@ func (c *Container) connectionFromSocketInfo(pid uint32, fd uint64, timestamp ui
 	// The socket holds the address the application connected to, before any
 	// NAT: a service's ClusterIP, not the pod behind it. The kernel records the
 	// translation per local address from conntrack, as the open event's
-	// actual destination does.
+	// actual destination does. The table is keyed by local address alone, so
+	// for a UDP socket it can only hold an earlier TCP connection's, from
+	// whatever socket last had the same local port: DNS queries were labelled
+	// with that connection's server.
 	var actualDst netaddr.IPPort
-	if c.registry.tracer != nil {
-		actualDst, _ = c.registry.tracer.ActualDestination(src)
+	if tcp {
+		actualDst, _ = c.registry.actualDestination(src)
 	}
 	// Same filters and labels as a connection seen opening: without them,
 	// traffic to ignored destinations was tracked through this path alone.
@@ -1252,8 +1258,10 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		// fd, usually the connection to the address just resolved. For the
 		// same reason an entry on the fd that is not this socket is an
 		// earlier socket's. The query takes its connection from its own tuple.
+		// The tuple does not say UDP or TCP, and DNS over TCP that was not
+		// seen connecting is rare enough to go without its translation.
 		var filtered bool
-		if conn, filtered = c.connectionFromSocketInfo(pid, fd, timestamp, socketInfo); conn == nil {
+		if conn, filtered = c.connectionFromSocketInfo(pid, fd, timestamp, socketInfo, false); conn == nil {
 			if !filtered {
 				dropL7Event(c.id, "unknown_connection", pid, fd, r, socketInfo)
 			}
@@ -1623,10 +1631,11 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	case l7.ProtocolClickhouse:
 		// Update stats for Clickhouse
 		c.l7Stats.observe(r.Protocol, r.Status.String(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
-		query := l7.ParseClickhouse(r.Payload)
-		if query == "" {
+		query, ok := l7.ParseClickhouse(r.Payload)
+		switch {
+		case !ok:
 			c.trackParseFail(conn, pid, fd, r.Protocol)
-		} else {
+		case query != "":
 			conn.parseFailCount = 0
 		}
 		if trace != nil {
@@ -2506,6 +2515,26 @@ func sampleString(v interface{}) string {
 		return s
 	}
 	return ""
+}
+
+// logFilesScanInterval bounds how often findLogFiles runs for a process: one
+// that opens its log for every write (PHP's error_log, a shell's >>) would
+// otherwise have all its fds read on every write.
+const logFilesScanInterval = 10 * time.Second
+
+func (c *Container) logFilesScanDue(pid uint32) bool {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	p := c.processes[pid]
+	if p == nil {
+		return true
+	}
+	now := time.Now()
+	if now.Sub(p.logFilesScannedAt) < logFilesScanInterval {
+		return false
+	}
+	p.logFilesScannedAt = now
+	return true
 }
 
 func findLogFiles(pid uint32) []string {
