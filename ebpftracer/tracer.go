@@ -820,7 +820,7 @@ type l7Event struct {
 	Dport           uint16   // Destination port
 	AddrFamily      uint16   // AF_INET (2) or AF_INET6 (10)
 	SocketInfoValid uint8    // 1 if socket info was extracted
-	Padding2        uint8
+	SockType        uint8
 	Payload         [MaxPayloadSize]byte // Must match MAX_PAYLOAD_SIZE in eBPF
 	Response        [MaxPayloadSize]byte // Must match MAX_PAYLOAD_SIZE in eBPF
 }
@@ -1076,6 +1076,7 @@ func runRingbufEventsReader(name string, r *ringbuf.Reader, ch chan<- Event) {
 				SrcPort: binary.LittleEndian.Uint16(data[88:90]),
 				DstPort: binary.LittleEndian.Uint16(data[90:92]),
 				Family:  addrFamily,
+				Type:    data[95], // SockType
 				Valid:   true,
 			}
 		}

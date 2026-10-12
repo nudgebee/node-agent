@@ -311,6 +311,12 @@ func extractIPFromSocketInfo(addr [16]byte, family uint16) string {
 	return ""
 }
 
+// Socket types (struct socket's type) as SocketInfo.Type carries them.
+const (
+	SockStream = 1 // SOCK_STREAM: TCP
+	SockDgram  = 2 // SOCK_DGRAM: UDP
+)
+
 // SocketInfo represents extracted socket connection info
 type SocketInfo struct {
 	SrcIP   string
@@ -318,7 +324,10 @@ type SocketInfo struct {
 	SrcPort uint16
 	DstPort uint16
 	Family  uint16
-	Valid   bool
+	// Type is the socket's type (SockStream, SockDgram), 0 if it could not
+	// be read.
+	Type  uint8
+	Valid bool
 }
 
 // GetSocketInfoFromL7Event extracts socket info from an L7 event
@@ -332,6 +341,7 @@ func GetSocketInfoFromL7Event(e *l7Event) *SocketInfo {
 		SrcPort: e.Sport,
 		DstPort: e.Dport,
 		Family:  e.AddrFamily,
+		Type:    e.SockType,
 		Valid:   true,
 	}
 }
