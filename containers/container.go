@@ -2197,7 +2197,12 @@ func (c *Container) gc(now time.Time) {
 		}
 		for _, s := range sockets {
 			if s.Listen {
-				listens[s.SAddr] = s.Inode
+				// onListenOpen does not track a listen on a filtered port,
+				// so revalidateListens would find it missing on every pass:
+				// a warning and a read of every process's fds each time.
+				if !common.PortFilter.ShouldBeSkipped(s.SAddr.Port()) {
+					listens[s.SAddr] = s.Inode
+				}
 			} else {
 				established[ConnectionKey{src: s.SAddr, dst: s.DAddr}] = struct{}{}
 			}
