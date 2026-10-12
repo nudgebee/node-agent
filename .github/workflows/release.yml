@@ -92,13 +92,29 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
-          # A prerelease must not become the repository's latest release, and
-          # must be flagged as one. v0.1.6-rc.1..rc.5 were all published with
-          # make_latest: true, so an RC has been presented as the latest release
-          # since. contains() on the tag is the check: v1.2.3 is a release,
-          # v1.2.3-rc.1 is not.
+          # Immutable releases are enabled on this repository, so assets can
+          # only be attached while a release is still a draft. Publishing
+          # first and uploading second left v0.1.8-rc.1 published with no
+          # binaries, and install.sh downloads from the latest release. The
+          # release is created as a draft here and published by the next step.
+          draft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
-          make_latest: ${{ !contains(github.ref_name, '-') }}
           files: |
             /tmp/nudgebee-node-agent-${{ steps.meta.outputs.version }}-amd64
             /tmp/nudgebee-node-agent-${{ steps.meta.outputs.version }}-arm64
+
+      - name: Publish the GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # A prerelease must not become the repository's latest release.
+          # v0.1.6-rc.1..rc.5 were all published as latest, so an RC was
+          # presented as the latest release. A "-" in the tag is the check:
+          # v1.2.3 is a release, v1.2.3-rc.1 is not.
+          latest=true
+          if [[ "$TAG" == *-* ]]; then
+            latest=false
+          fi
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest="$latest"

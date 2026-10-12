@@ -173,6 +173,11 @@ func TestParseHost(t *testing.T) {
 }
 
 func TestParseClickHouse(t *testing.T) {
+	query := func(payload []byte) string {
+		q, ok := ParseClickhouse(payload)
+		assert.True(t, ok)
+		return q
+	}
 	payload := []byte{
 		0x1, 0x24, 0x65, 0x38, 0x30, 0x63, 0x38, 0x31, 0x39, 0x62, 0x2d, 0x63, 0x33, 0x65, 0x33, 0x2d, 0x34, 0x66, 0x39,
 		0x35, 0x2d, 0x38, 0x30, 0x62, 0x66, 0x2d, 0x39, 0x31, 0x39, 0x34, 0x66, 0x64, 0x37, 0x32, 0x33, 0x35, 0x62, 0x31,
@@ -205,7 +210,7 @@ func TestParseClickHouse(t *testing.T) {
 
 	assert.Equal(t,
 		`INSERT INTO "otel_traces_distributed" ("Timestamp","TraceId","SpanId","ParentSpanId","TraceState","SpanName","SpanKind","ServiceName","ResourceAttributes","SpanAttributes","Duration","StatusCode","StatusMessage","Events.Timestamp","Events.Name","Events.Attributes","Links.TraceId","Links.SpanId","Links.TraceState","Links.Attributes") VALUES`,
-		ParseClickhouse(payload),
+		query(payload),
 	)
 
 	payload = []byte{
@@ -266,10 +271,10 @@ func TestParseClickHouse(t *testing.T) {
 	}
 	assert.Equal(t,
 		`SELECT Timestamp, TraceId, SpanId, ParentSpanId, SpanName, ServiceName, Duration, StatusCode, StatusMessage, ResourceAttributes, SpanAttributes, Events.Timestamp, Events.Name, Events.Attributes FROM otel_traces_distributed WHERE ServiceName IN (['/k8s/coroot/coroot-coroot', '/system.slice/k3s-agent.service', '/system.slice/k3s.service']) AND (SpanAttributes['net.peer.name'] IN (['10.42.3.84', '10.42.1.73', '10.42.0.173', '10.42.5.69']) OR (SpanAttributes['net.peer.name'], SpanAttributes['net.peer.port']) IN (('10.42.3.84', '9009'), ('10.42.3.84', '0'), ('10.42.3.84', '9000'), ('10.42.3.84', '8123'), ('10.42.1.73', '0'), ('10.42.1.73', '8123'), ('10.42.1.73', '9009'), ('10.42.1.73', '9000'), ('10.42.0.173', '0'), ('10.42.0.173', '9009'), ('10.42.0.173', '9000'), ('10.42.0.173', '8123'), ('10.42.5.69', '9000'), ('10.42.5.69', '8123'), ('10.42.5.69', '9009'), ('10.42.5.69', '0'))) AND Tim...<TRUNCATED>`,
-		ParseClickhouse(payload),
+		query(payload),
 	)
 
-	payload = []byte{ // ClientQuerySecondary, parsing doesn't work
+	payload = []byte{ // secondary query between servers at revision 54475, forwarding the client info of a 54460 client
 		0x01, 0x00, 0x02, 0x07, 0x64, 0x65, 0x66, 0x61, 0x75, 0x6c, 0x74, 0x24, 0x32, 0x34, 0x65, 0x61, 0x36, 0x33, 0x61,
 		0x64, 0x2d, 0x32, 0x61, 0x34, 0x64, 0x2d, 0x34, 0x66, 0x32, 0x64, 0x2d, 0x38, 0x34, 0x65, 0x31, 0x2d, 0x34, 0x62,
 		0x65, 0x62, 0x36, 0x35, 0x36, 0x61, 0x36, 0x30, 0x32, 0x32, 0x11, 0x31, 0x30, 0x2e, 0x34, 0x32, 0x2e, 0x30, 0x2e,
@@ -300,8 +305,8 @@ func TestParseClickHouse(t *testing.T) {
 	}
 
 	assert.Equal(t,
-		``,
-		ParseClickhouse(payload),
+		`INSERT INTO coroot_b1f5bwkg.otel_traces (Timestamp, TraceId, SpanId, ParentSpanId, TraceState, SpanName, SpanKind, ServiceName, ResourceAttributes, SpanAttributes, Duration, StatusCode, StatusMessage, `+"`Events.Timestamp`, `Events.Name`, `Events.Attributes`, `Links.TraceId`, `Links.SpanId`, `Links.TraceState`, `Links.Attributes`"+`) VALUES`,
+		query(payload),
 	)
 
 	payload = []byte{ // malformed: huge string length must not panic the parser
@@ -311,10 +316,9 @@ func TestParseClickHouse(t *testing.T) {
 		0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01, // string length = 2^56
 	}
 
-	assert.Equal(t,
-		``,
-		ParseClickhouse(payload),
-	)
+	q, ok := ParseClickhouse(payload)
+	assert.False(t, ok)
+	assert.Equal(t, ``, q)
 
 	payload = []byte{ // clickhouse-go v2.46.0 query with settings (max_execution_time=60, max_threads=2), followed by the LZ4-compressed empty block sent in the same write
 		0x1, 0x0, 0x1, 0x0, 0x0, 0xf, 0x31, 0x30, 0x2e, 0x34, 0x32, 0x2e, 0x31, 0x2e, 0x34, 0x3a, 0x35, 0x39, 0x37,
@@ -340,18 +344,18 @@ func TestParseClickHouse(t *testing.T) {
 
 	assert.Equal(t,
 		`SELECT toStartOfMinute(ts) AS m, count() FROM ingest_events WHERE ts > now() - INTERVAL 85 MINUTE AND value < 507 GROUP BY m ORDER BY m`,
-		ParseClickhouse(payload),
+		query(payload),
 	)
 
 	assert.Equal(t,
 		`SELECT toStartOfMinut...<TRUNCATED>`,
-		ParseClickhouse(payload[:200]),
+		query(payload[:200]),
 	)
 
 	// a garbage or misaligned length prefix must not turn into an allocation
 	corrupted := bytes.Clone(payload)
 	copy(corrupted[134:], []byte{0xff, 0xff, 0xff, 0xff, 0xf})
-	assert.Equal(t, ``, ParseClickhouse(corrupted))
+	assert.Equal(t, ``, query(corrupted))
 	assert.LessOrEqual(t, testing.AllocsPerRun(10, func() { ParseClickhouse(corrupted) }), 1.0)
 }
 

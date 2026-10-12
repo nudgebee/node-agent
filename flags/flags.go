@@ -54,7 +54,7 @@ var (
 	LogPerSecond              = kingpin.Flag("log-per-second", "The number of logs per second").Default("10.0").Envar("LOG_PER_SECOND").Float64()
 	LogBurst                  = kingpin.Flag("log-burst", "The maximum number of tokens that can be consumed in a single call to allow").Default("100").Envar("LOG_BURST").Int()
 	LogPatternsPerContainer   = kingpin.Flag("log-patterns-per-container", "Max unique log patterns per container per level").Default("256").Envar("LOG_PATTERNS_PER_CONTAINER").Int()
-	LogPatternExtractionLimit = kingpin.Flag("log-pattern-extraction-limit", "Max warning/error log messages per second per container for which patterns are extracted. Over-limit messages are still exported and counted, under a dedicated 'event was sampled' pattern (0 - unlimited)").Default("0").Envar("LOG_PATTERN_EXTRACTION_LIMIT").Float64()
+	LogPatternExtractionLimit = kingpin.Flag("log-pattern-extraction-limit", "Max warning/error log messages per second per log source (a file or a container's stdout/stderr) for which patterns are extracted. Over-limit messages are still exported and counted, under a dedicated 'event was sampled' pattern (0 - unlimited)").Default("0").Envar("LOG_PATTERN_EXTRACTION_LIMIT").Float64()
 	MaxFQDNsPerContainer      = kingpin.Flag("max-fqdns-per-container", "Max unique FQDN values per container, extras are bucketed under '~other'").Default("50").Envar("MAX_FQDNS_PER_CONTAINER").Int()
 
 	MaxLabelLength = kingpin.Flag("max-label-length", "Maximum length of a metric label value").Default("4096").Envar("MAX_LABEL_LENGTH").Int()

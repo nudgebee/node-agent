@@ -7,13 +7,20 @@
 
 #define CLICKHOUSE_SERVER_CODE_DATA 1
 #define CLICKHOUSE_SERVER_CODE_EXCEPTION 2
+#define CLICKHOUSE_SERVER_CODE_PROGRESS 3
 #define CLICKHOUSE_SERVER_CODE_END_OF_STREAM 5
+#define CLICKHOUSE_SERVER_CODE_PROFILE_INFO 6
+#define CLICKHOUSE_SERVER_CODE_LOG 10
+#define CLICKHOUSE_SERVER_CODE_TABLE_COLUMNS 11
+#define CLICKHOUSE_SERVER_CODE_PROFILE_EVENTS 14
+#define CLICKHOUSE_SERVER_CODE_TIMEZONE_UPDATE 17
 
 #define CLICKHOUSE_COMPRESSION_NONE 0x02
 #define CLICKHOUSE_COMPRESSION_LZ4  0x82
 #define CLICKHOUSE_COMPRESSION_ZSTD 0x90
 
 #define CLICKHOUSE_MIN_QUERY_SIZE 40
+#define CLICKHOUSE_INTERFACE_MAX 11 // ICEBERG_REST_CATALOG
 #define CLICKHOUSE_MAX_USER_SIZE 63
 #define CLICKHOUSE_MAX_ADDRESS_SIZE 48
 
@@ -98,8 +105,8 @@ int is_clickhouse_query(char *buf, __u64 buf_size) {
         return 0;
     }
     __u8 iface = 0;
-    bpf_read(buf+offset, iface); // TCP, HTTP, GRPC, MYSQL, POSTGRESQL, LOCAL, TCP_INTERSERVER, PROMETHEUS
-    if (iface < 1 || iface > 8) {
+    bpf_read(buf+offset, iface); // TCP, HTTP, GRPC, MYSQL, POSTGRESQL, LOCAL, TCP_INTERSERVER, PROMETHEUS, ...
+    if (iface < 1 || iface > CLICKHOUSE_INTERFACE_MAX) {
         return 0;
     }
     return 1;
@@ -153,6 +160,23 @@ int is_clickhouse_response(char *buf, __u64 buf_size, __s32 *status) {
     if (b[0] == CLICKHOUSE_SERVER_CODE_END_OF_STREAM && buf_size == 1) {
         *status = STATUS_OK;
         return 1;
+    }
+    switch (b[0]) {
+    // Queries that return no rows (INSERT, DDL) are answered with these and
+    // EndOfStream. A read that ends with EndOfStream is the whole response.
+    case CLICKHOUSE_SERVER_CODE_PROGRESS:
+    case CLICKHOUSE_SERVER_CODE_PROFILE_INFO:
+    case CLICKHOUSE_SERVER_CODE_LOG:
+    case CLICKHOUSE_SERVER_CODE_TABLE_COLUMNS:
+    case CLICKHOUSE_SERVER_CODE_PROFILE_EVENTS:
+    case CLICKHOUSE_SERVER_CODE_TIMEZONE_UPDATE: {
+        __u8 last = 0;
+        bpf_read(buf+buf_size-1, last);
+        if (last == CLICKHOUSE_SERVER_CODE_END_OF_STREAM) {
+            *status = STATUS_OK;
+            return 1;
+        }
+    }
     }
     return 0;
 }

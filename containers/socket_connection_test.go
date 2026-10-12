@@ -41,7 +41,10 @@ func newSocketTestContainer(t *testing.T, names map[string]string) *Container {
 	*flags.IgnoreControlPlane = "loki,victoria"
 	t.Cleanup(func() { *flags.IgnoreControlPlane = prev })
 	return &Container{
-		registry:           &Registry{ip2fqdn: common.NewFQDNCache()},
+		registry: &Registry{
+			ip2fqdn:           common.NewFQDNCache(),
+			actualDestination: func(netaddr.IPPort) (netaddr.IPPort, bool) { return netaddr.IPPort{}, false },
+		},
 		ip_resolver:        stubResolver{names: names},
 		processes:          map[uint32]*Process{},
 		connectionsByPidFd: map[PidFd]*ActiveConnection{},
@@ -180,7 +183,7 @@ func TestDNSResolverKeepsItsNameAcrossReusedFd(t *testing.T) {
 	if d := c.registry.getDomain(netaddr.MustParseIP(resolver)); d != nil {
 		t.Errorf("resolver %s named %q", resolver, d.FQDN)
 	}
-	if got := c.dnsDestinations(t); len(got) != 1 || !got[resolver+":53"] {
+	if got := c.dnsLabelValues(t, "destination"); len(got) != 1 || !got[resolver+":53"] {
 		t.Errorf("DNS destinations = %v, want only %s:53", got, resolver)
 	}
 }
@@ -207,10 +210,34 @@ func TestEarlierSocketOnFdIsNotUsed(t *testing.T) {
 		t.Errorf("earlier connection renamed to %q", got)
 	}
 
-	c.connectionsByPidFd[PidFd{Pid: 1, Fd: 7}], _ = c.connectionFromSocketInfo(1, 7, 100, socketInfo("10.0.0.2", 40001, "203.0.113.9", 443))
+	c.connectionsByPidFd[PidFd{Pid: 1, Fd: 7}], _ = c.connectionFromSocketInfo(1, 7, 100, socketInfo("10.0.0.2", 40001, "203.0.113.9", 443), true)
 	c.handleL7(t, 1, 7, 0, dnsResponse(t, "www.example.org", "198.51.100.7"), socketInfo("10.0.0.2", 40002, "192.0.2.53", 53))
-	if got := c.dnsDestinations(t); len(got) != 1 || !got["192.0.2.53:53"] {
+	if got := c.dnsLabelValues(t, "destination"); len(got) != 1 || !got["192.0.2.53:53"] {
 		t.Errorf("DNS destinations = %v, want only 192.0.2.53:53", got)
+	}
+}
+
+// The kernel's address translations are recorded for TCP connections only,
+// keyed by local address. A UDP query whose local port an earlier TCP
+// connection had used found that connection's server there, and was labelled
+// with it: one more set of series for every server the container had reached.
+// A TCP connection built from its tuple still takes its translation.
+func TestDNSQueryTakesNoTCPTranslation(t *testing.T) {
+	c := newL7TestContainer(t)
+	tcpServer := netaddr.MustParseIPPort("198.51.100.80:8080")
+	c.registry.actualDestination = func(netaddr.IPPort) (netaddr.IPPort, bool) { return tcpServer, true }
+
+	c.handleL7(t, 1, 7, 0, dnsResponse(t, "api.example.com", "203.0.113.9"), socketInfo("10.0.0.2", 40000, "192.0.2.53", 53))
+	if got := c.dnsLabelValues(t, "actual_destination"); len(got) != 1 || !got["192.0.2.53:53"] {
+		t.Errorf("DNS actual destinations = %v, want only 192.0.2.53:53", got)
+	}
+
+	conn, _ := c.createConnectionFromSocketInfo(1, 8, 100, socketInfo("10.0.0.2", 40001, "192.0.2.80", 80))
+	if conn == nil {
+		t.Fatal("no connection for the TCP socket")
+	}
+	if got := conn.DestinationKey.ActualDestinationLabelValue(); got != tcpServer.String() {
+		t.Errorf("TCP actual destination = %q, want %s", got, tcpServer)
 	}
 }
 
@@ -242,8 +269,8 @@ func (c *Container) handleL7(t *testing.T, pid uint32, fd uint64, ts uint64, r *
 	return ip2fqdn
 }
 
-// dnsDestinations returns the destination label values of the DNS counter.
-func (c *Container) dnsDestinations(t *testing.T) map[string]bool {
+// dnsLabelValues returns the values of label name on the DNS counter.
+func (c *Container) dnsLabelValues(t *testing.T, name string) map[string]bool {
 	t.Helper()
 	ch := make(chan prometheus.Metric, 100)
 	c.l7Stats.requests[l7.ProtocolDNS].Collect(ch)
@@ -255,7 +282,7 @@ func (c *Container) dnsDestinations(t *testing.T) map[string]bool {
 			t.Fatal(err)
 		}
 		for _, l := range pb.GetLabel() {
-			if l.GetName() == "destination" {
+			if l.GetName() == name {
 				got[l.GetValue()] = true
 			}
 		}
