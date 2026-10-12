@@ -143,7 +143,11 @@ func (s *L7Stats) observe(protocol l7.Protocol, status, method, path string, dur
 	if metricsProtocol == l7.ProtocolDNS {
 		var domain string
 		dnsRequestType, domain, _ = l7.ParseDns(r.Payload)
-		dnsDomain = s.dnsDomainLabel(common.NormalizeFQDN(domain, dnsRequestType))
+		domain = common.NormalizeFQDN(domain, dnsRequestType)
+		if status == "nxdomain" {
+			domain = common.CollapseSearchPath(domain)
+		}
+		dnsDomain = s.dnsDomainLabel(domain)
 	}
 
 	// Protocol-specific labels for counters (keep all labels including path for HTTP)
