@@ -86,6 +86,36 @@ func TestNormalizeFQDN(t *testing.T) {
 	assert.Equal(t, "example.io.search_path_suffix", NormalizeFQDN("example.io.svc.default.cluster.local", "TypeA"))
 }
 
+func TestCollapseSearchPath(t *testing.T) {
+	for _, tc := range []struct{ name, want string }{
+		// A service name with each search domain of a pod appended.
+		{"api.orders.svc.cluster.local.orders.svc.cluster.local", "api.orders.svc.search_path_suffix"},
+		{"api.orders.svc.cluster.local.svc.cluster.local", "api.orders.svc.search_path_suffix"},
+		{"api.orders.svc.cluster.local.cluster.local", "api.orders.svc.search_path_suffix"},
+		{"api.orders.svc.cluster.local.c.example-project.internal", "api.orders.svc.search_path_suffix"},
+		{"api.orders.svc.cluster.local.google.internal", "api.orders.svc.search_path_suffix"},
+		{"api.orders.svc.svc.cluster.local", "api.orders.svc.search_path_suffix"},
+		// An external name under a top-level domain NormalizeFQDN does not know.
+		{"logs.example.in.svc.cluster.local", "logs.example.in.search_path_suffix"},
+		{"logs.example.in.default.svc.cluster.local", "logs.example.in.search_path_suffix"},
+		{"logs.example.in.cluster.local", "logs.example.in.search_path_suffix"},
+		{"logs.example.in.c.example-project.internal", "logs.example.in.search_path_suffix"},
+		{"app.example.dev.ec2.internal", "app.example.dev.search_path_suffix"},
+		// A namespace named like a top-level domain is cut one label early.
+		{"api.shop.svc.cluster.local.cluster.local", "api.shop.search_path_suffix"},
+		// Already complete, or nothing to cut.
+		{"api.orders.svc.cluster.local", "api.orders.svc.search_path_suffix"},
+		{"logs.example.in", "logs.example.in"},
+		{"redis.cluster.local", "redis.cluster.local"},
+		{"redis.c.example-project.internal", "redis.c.example-project.internal"},
+		{"redis", "redis"},
+		{"in.svc.cluster.local", "in.svc.search_path_suffix"},
+		{"example.com.search_path_suffix", "example.com.search_path_suffix"},
+	} {
+		assert.Equal(t, tc.want, CollapseSearchPath(tc.name), tc.name)
+	}
+}
+
 func TestDestinationLabelValue(t *testing.T) {
 	fqdn := HostPortWithEmptyIP("api.openai.com", 443)
 	internal := internalHP("10.64.3.17", 8080)
