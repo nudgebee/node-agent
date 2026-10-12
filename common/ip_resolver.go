@@ -12,10 +12,12 @@ import (
 
 	"github.com/coroot/coroot-node-agent/flags"
 	lrucache "github.com/hashicorp/golang-lru/v2"
+	"inet.af/netaddr"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -124,9 +126,32 @@ func NewK8sIPResolver(clientset kubernetes.Interface, resolveDns bool) (*K8sIPRe
 	}, nil
 }
 
+// LoopbackWorkload is the identity used for 127.0.0.0/8 and ::1.
+//
+// Loopback is the least external destination there is — IsIpExternal already
+// says so — but the resolvers cannot map it to a pod, service or node, so it
+// used to fall through to the "external" placeholder. That put self-directed
+// traffic (health probes in the host netns, where loopback is deliberately not
+// skipped) into every external-destination view as a 127.0.0.1 -> 127.0.0.1
+// self-loop.
+func LoopbackWorkload() Workload {
+	return Workload{Name: "localhost", Namespace: "localhost", Kind: "localhost"}
+}
+
+func isLoopbackIP(ip string) bool {
+	parsed, err := netaddr.ParseIP(StripPort(ip))
+	return err == nil && parsed.IsLoopback()
+}
+
 func (resolver *K8sIPResolver) ResolveActualIP(ip string) Workload {
 	if val, ok := resolver.podIpsMap.Get(ip); ok {
 		return val
+	}
+	// Checked only after the lookups miss, so resolvable addresses never pay for
+	// the parse on this hot path. Loopback is never in those maps, so it always
+	// reaches here.
+	if isLoopbackIP(ip) {
+		return LoopbackWorkload()
 	}
 	host := ip
 
@@ -159,6 +184,11 @@ func (resolver *K8sIPResolver) ResolveIP(ip string) Workload {
 	if val, ok := resolver.podIpsMap.Get(ip); ok {
 		return val
 	}
+	// See ResolveActualIP: checked after the lookups so resolvable addresses
+	// never pay for the parse.
+	if isLoopbackIP(ip) {
+		return LoopbackWorkload()
+	}
 	host := ip
 
 	if resolver.shouldResolveDns {
@@ -176,6 +206,14 @@ func (resolver *K8sIPResolver) ResolveIP(ip string) Workload {
 		Region:    "",
 		Instance:  "",
 	}
+}
+
+// ResolveSource resolves the source of a connection by its IP, which maps a
+// pod's address to its owning workload. The container argument is unused:
+// in a cluster the address is the more specific identity (a hostNetwork pod
+// resolves to its node, not to the container).
+func (resolver *K8sIPResolver) ResolveSource(ip string, _ Workload) Workload {
+	return resolver.ResolveIP(ip)
 }
 
 func (resolver *K8sIPResolver) CacheDNS(ip string, dns string) Workload {
@@ -347,40 +385,109 @@ func (resolver *K8sIPResolver) StartWatching() error {
 func (resolve *K8sIPResolver) addReplicaSetHandlers(replicaSetInformer cache.SharedIndexInformer) {
 	replicaSetInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			rs := obj.(*appsv1.ReplicaSet)
+			rs, ok := objectAs[*appsv1.ReplicaSet](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.ReplicaSets.Store(rs.UID, MinimalOwnerInfo{
 				OwnerReferences: rs.OwnerReferences,
 			})
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			rs := newObj.(*appsv1.ReplicaSet)
+			rs, ok := objectAs[*appsv1.ReplicaSet](newObj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.ReplicaSets.Store(rs.UID, MinimalOwnerInfo{
 				OwnerReferences: rs.OwnerReferences,
 			})
 		},
 		DeleteFunc: func(obj interface{}) {
-			rs := obj.(*appsv1.ReplicaSet)
+			rs, ok := deletedObject[*appsv1.ReplicaSet](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.ReplicaSets.Delete(rs.UID)
 		},
 	})
 }
 
+// deletedObject extracts the deleted object from an informer DeleteFunc payload.
+//
+// client-go does not always deliver the object itself on a delete. When the
+// watch is interrupted and the final delete event is missed, the informer
+// resyncs and delivers a cache.DeletedFinalStateUnknown tombstone wrapping the
+// last known state. Asserting the payload directly panics on that tombstone,
+// and because these handlers run on the shared informer's goroutine the panic
+// reaches k8s.io/apimachinery's runtime handler, which is fatal — the whole
+// agent exits and the pod restarts.
+//
+// Reported from a customer cluster where node-agent crashlooped 15 times:
+//
+//	panic: interface conversion: interface {} is cache.DeletedFinalStateUnknown, not *v1.Pod
+//
+// A tombstone whose payload is the wrong type, or nil, is not recoverable — the
+// caller skips that delete rather than dying.
+func deletedObject[T any](obj interface{}) (T, bool) {
+	if o, ok := obj.(T); ok {
+		return o, true
+	}
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		if o, ok := tombstone.Obj.(T); ok {
+			return o, true
+		}
+	}
+	var zero T
+	klog.V(2).Infof("ignoring delete event with unexpected payload %T", obj)
+	return zero, false
+}
+
+// objectAs asserts an add/update informer payload to T without panicking.
+//
+// Add and update never carry a tombstone, so unlike deletedObject there is
+// nothing to unwrap — but the assertion is still on the shared informer's
+// goroutine, where a panic reaches apimachinery's runtime handler and kills the
+// process. The informers here also register transform functions (stripPod,
+// stripNode, stripService) that return the object unchanged when their own
+// assertion fails, so an unexpected type can reach a handler rather than being
+// filtered out.
+//
+// Skipping the event is the right failure mode: the resolver loses one object
+// until the next resync, instead of taking the agent down.
+func objectAs[T any](obj interface{}) (T, bool) {
+	if o, ok := obj.(T); ok {
+		return o, true
+	}
+	var zero T
+	klog.V(2).Infof("ignoring event with unexpected payload %T", obj)
+	return zero, false
+}
+
 func (resolve *K8sIPResolver) addDaemonSetHandlers(daemonSetInformer cache.SharedIndexInformer) {
 	daemonSetInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			ds := obj.(*appsv1.DaemonSet)
+			ds, ok := objectAs[*appsv1.DaemonSet](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.DaemonSets.Store(ds.UID, MinimalOwnerInfo{
 				OwnerReferences: ds.OwnerReferences,
 			})
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			ds := newObj.(*appsv1.DaemonSet)
+			ds, ok := objectAs[*appsv1.DaemonSet](newObj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.DaemonSets.Store(ds.UID, MinimalOwnerInfo{
 				OwnerReferences: ds.OwnerReferences,
 			})
 		},
 		DeleteFunc: func(obj interface{}) {
-			ds := obj.(*appsv1.DaemonSet)
+			ds, ok := deletedObject[*appsv1.DaemonSet](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.DaemonSets.Delete(ds.UID)
 		},
 	})
@@ -389,19 +496,28 @@ func (resolve *K8sIPResolver) addDaemonSetHandlers(daemonSetInformer cache.Share
 func (resolve *K8sIPResolver) addStatefulSetHandlers(statefulSetInformer cache.SharedIndexInformer) {
 	statefulSetInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			ss := obj.(*appsv1.StatefulSet)
+			ss, ok := objectAs[*appsv1.StatefulSet](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.StatefulSets.Store(ss.UID, MinimalOwnerInfo{
 				OwnerReferences: ss.OwnerReferences,
 			})
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			ss := newObj.(*appsv1.StatefulSet)
+			ss, ok := objectAs[*appsv1.StatefulSet](newObj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.StatefulSets.Store(ss.UID, MinimalOwnerInfo{
 				OwnerReferences: ss.OwnerReferences,
 			})
 		},
 		DeleteFunc: func(obj interface{}) {
-			ss := obj.(*appsv1.StatefulSet)
+			ss, ok := deletedObject[*appsv1.StatefulSet](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.StatefulSets.Delete(ss.UID)
 		},
 	})
@@ -410,19 +526,28 @@ func (resolve *K8sIPResolver) addStatefulSetHandlers(statefulSetInformer cache.S
 func (resolve *K8sIPResolver) addJobHandlers(jobInformer cache.SharedIndexInformer) {
 	jobInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			job := obj.(*batchv1.Job)
+			job, ok := objectAs[*batchv1.Job](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.Jobs.Store(job.UID, MinimalOwnerInfo{
 				OwnerReferences: job.OwnerReferences,
 			})
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			job := newObj.(*batchv1.Job)
+			job, ok := objectAs[*batchv1.Job](newObj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.Jobs.Store(job.UID, MinimalOwnerInfo{
 				OwnerReferences: job.OwnerReferences,
 			})
 		},
 		DeleteFunc: func(obj interface{}) {
-			job := obj.(*batchv1.Job)
+			job, ok := deletedObject[*batchv1.Job](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.Jobs.Delete(job.UID)
 		},
 	})
@@ -431,19 +556,28 @@ func (resolve *K8sIPResolver) addJobHandlers(jobInformer cache.SharedIndexInform
 func (resolve *K8sIPResolver) addCronJobHandlers(cronJobInformer cache.SharedIndexInformer) {
 	cronJobInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			cronJob := obj.(*batchv1.CronJob)
+			cronJob, ok := objectAs[*batchv1.CronJob](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.CronJobs.Store(cronJob.UID, MinimalOwnerInfo{
 				OwnerReferences: cronJob.OwnerReferences,
 			})
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			cronJob := newObj.(*batchv1.CronJob)
+			cronJob, ok := objectAs[*batchv1.CronJob](newObj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.CronJobs.Store(cronJob.UID, MinimalOwnerInfo{
 				OwnerReferences: cronJob.OwnerReferences,
 			})
 		},
 		DeleteFunc: func(obj interface{}) {
-			cronJob := obj.(*batchv1.CronJob)
+			cronJob, ok := deletedObject[*batchv1.CronJob](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.CronJobs.Delete(cronJob.UID)
 		},
 	})
@@ -452,7 +586,10 @@ func (resolve *K8sIPResolver) addCronJobHandlers(cronJobInformer cache.SharedInd
 func (resolve *K8sIPResolver) addServiceHandlers(serviceInformer cache.SharedIndexInformer) {
 	serviceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			service := obj.(*v1.Service)
+			service, ok := objectAs[*v1.Service](obj)
+			if !ok {
+				return
+			}
 			minSvc := MinimalService{
 				Name:       service.Name,
 				Namespace:  service.Namespace,
@@ -468,8 +605,14 @@ func (resolve *K8sIPResolver) addServiceHandlers(serviceInformer cache.SharedInd
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			oldService := oldObj.(*v1.Service)
-			service := newObj.(*v1.Service)
+			oldService, ok := objectAs[*v1.Service](oldObj)
+			if !ok {
+				return
+			}
+			service, ok := objectAs[*v1.Service](newObj)
+			if !ok {
+				return
+			}
 			minSvc := MinimalService{
 				Name:       service.Name,
 				Namespace:  service.Namespace,
@@ -495,7 +638,10 @@ func (resolve *K8sIPResolver) addServiceHandlers(serviceInformer cache.SharedInd
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			service := obj.(*v1.Service)
+			service, ok := deletedObject[*v1.Service](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.Services.Delete(service.UID)
 			for _, clusterIp := range service.Spec.ClusterIPs {
 				if clusterIp != "None" {
@@ -509,19 +655,28 @@ func (resolve *K8sIPResolver) addServiceHandlers(serviceInformer cache.SharedInd
 func (resolve *K8sIPResolver) addDeploymentHandlers(deploymentInformer cache.SharedIndexInformer) {
 	deploymentInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			deployment := obj.(*appsv1.Deployment)
+			deployment, ok := objectAs[*appsv1.Deployment](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.Deployments.Store(deployment.UID, MinimalOwnerInfo{
 				OwnerReferences: deployment.OwnerReferences,
 			})
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			deployment := newObj.(*appsv1.Deployment)
+			deployment, ok := objectAs[*appsv1.Deployment](newObj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.Deployments.Store(deployment.UID, MinimalOwnerInfo{
 				OwnerReferences: deployment.OwnerReferences,
 			})
 		},
 		DeleteFunc: func(obj interface{}) {
-			deployment := obj.(*appsv1.Deployment)
+			deployment, ok := deletedObject[*appsv1.Deployment](obj)
+			if !ok {
+				return
+			}
 			resolve.snapshot.Deployments.Delete(deployment.UID)
 		},
 	})
@@ -530,12 +685,21 @@ func (resolve *K8sIPResolver) addDeploymentHandlers(deploymentInformer cache.Sha
 func (resolver *K8sIPResolver) addPodHandlers(podInformer cache.SharedIndexInformer) {
 	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			pod := obj.(*v1.Pod)
+			pod, ok := objectAs[*v1.Pod](obj)
+			if !ok {
+				return
+			}
 			resolver.handlePodAdd(pod)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			oldPod := oldObj.(*v1.Pod)
-			newPod := newObj.(*v1.Pod)
+			oldPod, ok := objectAs[*v1.Pod](oldObj)
+			if !ok {
+				return
+			}
+			newPod, ok := objectAs[*v1.Pod](newObj)
+			if !ok {
+				return
+			}
 			// Clean old IPs that are no longer present
 			newIPs := make(map[string]bool, len(newPod.Status.PodIPs))
 			for _, ip := range newPod.Status.PodIPs {
@@ -549,7 +713,10 @@ func (resolver *K8sIPResolver) addPodHandlers(podInformer cache.SharedIndexInfor
 			resolver.handlePodAdd(newPod)
 		},
 		DeleteFunc: func(obj interface{}) {
-			pod := obj.(*v1.Pod)
+			pod, ok := deletedObject[*v1.Pod](obj)
+			if !ok {
+				return
+			}
 			resolver.snapshot.Pods.Delete(pod.UID)
 			resolver.snapshot.PodDescriptors.Delete(pod.UID)
 			resolver.snapshot.PodNameIndex.Delete(pod.Namespace + "/" + pod.Name)
@@ -603,21 +770,30 @@ func (resolver *K8sIPResolver) handlePodAdd(pod *v1.Pod) bool {
 func (resolver *K8sIPResolver) addNodeHandlers(nodeInformer cache.SharedIndexInformer) {
 	nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			node := obj.(*v1.Node)
+			node, ok := objectAs[*v1.Node](obj)
+			if !ok {
+				return
+			}
 			shouldReturn := resolver.handleNodeEvent(node)
 			if shouldReturn {
 				return
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			node := newObj.(*v1.Node)
+			node, ok := objectAs[*v1.Node](newObj)
+			if !ok {
+				return
+			}
 			shouldReturn := resolver.handleNodeEvent(node)
 			if shouldReturn {
 				return
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			node := obj.(*v1.Node)
+			node, ok := deletedObject[*v1.Node](obj)
+			if !ok {
+				return
+			}
 			resolver.snapshot.Nodes.Delete(node.UID)
 			resolver.instanceMetaMap.Delete(node.Name)
 		},
@@ -849,7 +1025,11 @@ func (resolver *K8sIPResolver) getControllerOfOwner(owner *metav1.OwnerReference
 	if !ok {
 		return nil, fmt.Errorf("%w: %s %s", errOwnerNotCached, owner.Kind, owner.UID)
 	}
-	info := val.(MinimalOwnerInfo)
+	info, ok := val.(MinimalOwnerInfo)
+	if !ok {
+		klog.V(5).Infof("type confusion in owner cache for %s %s", owner.Kind, owner.UID)
+		return nil, fmt.Errorf("%w: %s %s", errOwnerNotCached, owner.Kind, owner.UID)
+	}
 	return getControllerOwnerRef(info.OwnerReferences), nil
 }
 
@@ -900,6 +1080,47 @@ func resolveEphemeralWorkloadName(labels map[string]string, namespace string) st
 	return namespace + "-ephemeral"
 }
 
+// labelDerivedOwner names the label that carries a stable workload name, and
+// the kind to publish with it.
+type labelDerivedOwner struct {
+	nameLabel string
+	kind      string
+}
+
+// labelDerivedOwners covers custom controllers whose direct pod owner is
+// created per pod, so publishing it would mint a new workload for every pod.
+// The informer cache cannot climb these chains (the owners are CRDs we hold no
+// informer or RBAC for), so the stable workload name is read from a label the
+// controller stamps on every pod it creates.
+var labelDerivedOwners = map[schema.GroupKind]labelDerivedOwner{
+	// GitHub Actions Runner Controller (gha-runner-scale-set): Pod ->
+	// EphemeralRunner (one per job) -> EphemeralRunnerSet (renamed whenever the
+	// runner spec changes) -> AutoscalingRunnerSet.
+	{Group: "actions.github.com", Kind: "EphemeralRunner"}: {
+		nameLabel: "actions.github.com/scale-set-name",
+		kind:      "AutoscalingRunnerSet",
+	},
+}
+
+// resolveLabelDerivedOwner returns the stable workload for a pod whose
+// controller is listed in labelDerivedOwners. ok is false when the owner is not
+// listed or the pod lacks the label, leaving the caller's resolution intact.
+func resolveLabelDerivedOwner(owner metav1.OwnerReference, labels map[string]string) (name, kind string, ok bool) {
+	gv, err := schema.ParseGroupVersion(owner.APIVersion)
+	if err != nil {
+		return "", "", false
+	}
+	derived, ok := labelDerivedOwners[schema.GroupKind{Group: gv.Group, Kind: owner.Kind}]
+	if !ok {
+		return "", "", false
+	}
+	name = labels[derived.nameLabel]
+	if name == "" {
+		return "", "", false
+	}
+	return name, derived.kind, true
+}
+
 func (resolver *K8sIPResolver) resolvePodDescriptor(pod *MinimalPod) Workload {
 	existing, ok := resolver.snapshot.PodDescriptors.Load(pod.UID)
 	if ok {
@@ -929,6 +1150,11 @@ func (resolver *K8sIPResolver) resolvePodDescriptor(pod *MinimalPod) Workload {
 			}
 			name = ownerRef.Name
 			kind = ownerRef.Kind
+			if derivedName, derivedKind, ok := resolveLabelDerivedOwner(ownerRef, pod.Labels); ok {
+				name = derivedName
+				kind = derivedKind
+				break
+			}
 			// Climb to the top of the ownership chain (e.g. Pod -> ReplicaSet ->
 			// Deployment). NOTE: `current` and `err` are deliberately declared in
 			// this scope. The previous implementation used `:=` inside an `if`
@@ -1027,8 +1253,17 @@ func (resolver *K8sIPResolver) resolvePodDescriptor(pod *MinimalPod) Workload {
 
 func (resolver *K8sIPResolver) ResolvePodOwner(podName string, podNamespace string) Workload {
 	if uidVal, ok := resolver.snapshot.PodNameIndex.Load(podNamespace + "/" + podName); ok {
-		if podVal, ok := resolver.snapshot.Pods.Load(uidVal.(types.UID)); ok {
-			pod := podVal.(MinimalPod)
+		uid, ok := uidVal.(types.UID)
+		if !ok {
+			klog.V(5).Infof("type confusion in PodNameIndex for %s/%s", podNamespace, podName)
+			return Workload{}
+		}
+		if podVal, ok := resolver.snapshot.Pods.Load(uid); ok {
+			pod, ok := podVal.(MinimalPod)
+			if !ok {
+				klog.V(5).Infof("type confusion in Pods cache for %s/%s", podNamespace, podName)
+				return Workload{}
+			}
 			return resolver.resolvePodDescriptor(&pod)
 		}
 	}

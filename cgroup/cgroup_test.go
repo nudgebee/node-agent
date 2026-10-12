@@ -1,6 +1,7 @@
 package cgroup
 
 import (
+	"os"
 	"path"
 	"testing"
 
@@ -171,6 +172,16 @@ func TestContainerByCgroup(t *testing.T) {
 	as.Equal("/azure.slice/walinuxagent.service", id)
 	as.Nil(err)
 
+	typ, id, err = containerByCgroup("/podruntime.slice/containerd.service")
+	as.Equal(typ, ContainerTypeSystemdService)
+	as.Equal("/podruntime.slice/containerd.service", id)
+	as.Nil(err)
+
+	typ, id, err = containerByCgroup("/podruntime.slice/kubelet.service")
+	as.Equal(typ, ContainerTypeSystemdService)
+	as.Equal("/podruntime.slice/kubelet.service", id)
+	as.Nil(err)
+
 	typ, id, err = containerByCgroup("/system.slice/system-postgresql.slice/postgresql@9.4-main.service")
 	as.Equal(typ, ContainerTypeSystemdService)
 	as.Equal("/system.slice/system-postgresql.slice", id)
@@ -225,4 +236,26 @@ func TestContainerByCgroup(t *testing.T) {
 	as.Equal(ContainerTypeDocker, typ)
 	as.Equal("ba7b10d15d16e10e3de7a2dcd408a3d971169ae303f46cfad4c5453c6326fee2", id)
 	as.Nil(err)
+}
+
+// The registry does not cache a process in systemd's /init.scope as ignored,
+// so its exec after systemd moves it to a unit's cgroup is seen. A process in
+// the root cgroup (hosts without systemd) is cached as usual.
+func TestInitScopeAndRootHaveEmptyId(t *testing.T) {
+	for _, c := range []struct {
+		content   string
+		initScope bool
+	}{
+		{"0::/init.scope\n", true},
+		{"1:name=systemd:/init.scope\n2:cpu,cpuacct:/\n", true},
+		{"0::/\n", false},
+	} {
+		f := path.Join(t.TempDir(), "cgroup")
+		require.NoError(t, os.WriteFile(f, []byte(c.content), 0644))
+		cg, err := NewFromProcessCgroupFile(f)
+		require.NoError(t, err)
+		assert.Equal(t, "", cg.Id, c.content)
+		assert.Equal(t, ContainerTypeStandaloneProcess, cg.ContainerType, c.content)
+		assert.Equal(t, c.initScope, cg.InitScope(), c.content)
+	}
 }

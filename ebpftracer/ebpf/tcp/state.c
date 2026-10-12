@@ -75,7 +75,16 @@ struct connection {
     __u64 bytes_received;
     __u64 timestamp;
     __u8 protocol;
+    // tls is set once a TLS library hook (Go crypto/tls, OpenSSL) has handled
+    // this connection. From then on the socket-level read/write path only sees
+    // ciphertext for it; see mark_tls in l7/l7.c.
+    __u8 tls;
     __u16 dport;  // Destination port for protocol detection
+    // l7_lost records L7 events of this connection that l7_events had no room
+    // for since its last delivered one: bit 0 written frames, bit 1 read
+    // frames. The next delivered event carries it (l7_event.lost_before) and
+    // clears it. Stored in what was tail padding; the struct stays 32 bytes.
+    __u8 l7_lost;
 };
 
 struct {
@@ -84,6 +93,18 @@ struct {
     __uint(value_size, sizeof(struct connection));
     __uint(max_entries, MAX_CONNECTIONS);
 } active_connections SEC(".maps");
+
+// llm_conns marks connections whose whole byte stream is captured for LLM
+// usage accounting (see l7/llm_capture.c). Userspace adds an entry once it
+// has identified a connection as an LLM API connection. The value is the
+// connection's timestamp, so an entry can never apply to a later connection
+// that reuses the fd, and the kernel removes it when the fd is closed.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(key_size, sizeof(struct connection_id));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, 10240);
+} llm_conns SEC(".maps");
 
 struct l7_request_key {
     __u64 fd;
@@ -164,6 +185,7 @@ int inet_sock_set_state(void *ctx)
             type = EVENT_TYPE_CONNECTION_OPEN;
         } else if (args.newstate == BPF_TCP_CLOSE) {
             bpf_map_delete_elem(&connection_id_by_socket, &args.skaddr);
+            bpf_map_delete_elem(&llm_conns, cid);
             bpf_map_delete_elem(&active_connections, cid);
             type = EVENT_TYPE_CONNECTION_ERROR;
         }
@@ -317,6 +339,7 @@ int sys_enter_close(void *ctx) {
     struct connection_id cid = {};
     cid.pid = id >> 32;
     cid.fd = args.fd;
+    bpf_map_delete_elem(&llm_conns, &cid);
     struct connection *conn = bpf_map_lookup_elem(&active_connections, &cid);
     if (conn) {
         struct tcp_event e = {};

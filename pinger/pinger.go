@@ -214,7 +214,11 @@ func openConn() (*net.IPConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	ipconn := conn.(*net.IPConn)
+	ipconn, ok := conn.(*net.IPConn)
+	if !ok {
+		conn.Close()
+		return nil, fmt.Errorf("unexpected connection type %T for ip4:icmp", conn)
+	}
 	f, err := ipconn.File()
 	if err != nil {
 		return nil, err

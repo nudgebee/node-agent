@@ -61,6 +61,30 @@ reduces informer-cache memory roughly 5×.
 The DNS cache is an LRU bounded at 10,000 entries. The pod-IP index
 is an LRU bounded at 30,000 entries.
 
+## Standalone hosts (no Kubernetes)
+
+When the agent finds no Kubernetes API, it runs with a host-only
+resolver instead. The agent is in a cluster when the in-cluster service
+account config is present, or when `KUBECONFIG` is set explicitly. A
+kubeconfig at the default path (`~/.kube/config`) is **not** used, so an
+admin host with `kubectl` set up is not mistaken for a cluster node.
+
+On a standalone host:
+
+| Endpoint                      | `Name`                  | `Namespace`  | `Kind`      |
+| ----------------------------- | ----------------------- | ------------ | ----------- |
+| Connection source             | systemd unit or container name | host name | `container` |
+| One of the host's own IPs     | host name               | host name    | `vm`        |
+| Other private IP              | DNS name, else the IP   | `private`    | `private`   |
+| Public IP                     | DNS name, else the IP   | `external`   | `external`  |
+| Loopback                      | `localhost`             | `localhost`  | `localhost` |
+
+The source of a connection is the service that opened it, not the
+host's address. Private addresses are kept apart from `external`
+because on a fleet of hosts they are usually other hosts, not the
+internet. Matching a private IP to a specific host needs data from every
+host, so it is left to whatever consumes the metrics.
+
 ## Configuration
 
 | Flag                              | Default | Purpose                                                          |

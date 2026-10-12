@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/features"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
 	"github.com/cilium/ebpf/ringbuf"
@@ -55,6 +56,8 @@ const (
 	EventTypeTCPRetransmit    EventType = 9
 	EventTypeL7Request        EventType = 10
 	EventTypePythonThreadLock EventType = 11
+	EventTypeLLMData          EventType = 12
+	EventTypeProcessExec      EventType = 13
 
 	EventReasonNone    EventReason = 0
 	EventReasonOOMKill EventReason = 1
@@ -82,6 +85,19 @@ type Event struct {
 	// Socket info extracted directly from fd in eBPF (for L7 events)
 	// This enables processing L7 events even when TCP connection tracking failed
 	SocketInfo *SocketInfo
+	// LLMData is one chunk of a connection marked for LLM capture.
+	LLMData *LLMData
+}
+
+// LLMData is a chunk of the byte stream of a connection marked with
+// TagLLMConnection. Event.Timestamp is the connection's timestamp.
+type LLMData struct {
+	Ingress bool   // read by the application, rather than written
+	Time    uint64 // kernel time of the read or write, in ns
+	Data    []byte
+	// SkipAfter is the number of bytes of the same read or write that were
+	// not captured, and follow Data.
+	SkipAfter uint64
 }
 
 type perfMapType uint8
@@ -96,6 +112,7 @@ const (
 
 type Tracer struct {
 	disableL7Tracing bool
+	enableLLMCapture bool
 	hostNetNs        netns.NsHandle
 	selfNetNs        netns.NsHandle
 
@@ -105,6 +122,16 @@ type Tracer struct {
 	links         []link.Link
 	uprobes       map[string]*ebpf.Program
 
+	// programVariant is the compiled variant loaded for this kernel (see
+	// collectionSpecForKernel). kernelBTF and socketOffsets record whether
+	// the kernel's BTF loaded and whether the socket struct offsets taken
+	// from it were set (see initSocketInfoOffsets). programInstructions
+	// holds each loaded program's size after the kernel rewrote it.
+	programVariant      string
+	kernelBTF           bool
+	socketOffsets       bool
+	programInstructions []ProgramInstructions
+
 	// ready is set once Run has loaded the eBPF collection and completed the
 	// initial process scan. Consumers running before Run completes (e.g. the
 	// registry event-handler goroutine) must check it before touching
@@ -112,12 +139,18 @@ type Tracer struct {
 	ready atomic.Bool
 }
 
-func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool) *Tracer {
+func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing, enableLLMCapture bool) *Tracer {
 	if disableL7Tracing {
 		klog.Infoln("L7 tracing is disabled")
 	}
+	// LLM capture rides on the L7 programs.
+	enableLLMCapture = enableLLMCapture && !disableL7Tracing
+	if enableLLMCapture {
+		klog.Infoln("LLM capture is enabled")
+	}
 	return &Tracer{
 		disableL7Tracing: disableL7Tracing,
+		enableLLMCapture: enableLLMCapture,
 		hostNetNs:        hostNetNs,
 		selfNetNs:        selfNetNs,
 
@@ -163,6 +196,279 @@ func (t *Tracer) Close() {
 	t.collection.Close()
 }
 
+// TLSCiphertextSkipped returns how many socket-level writes and reads the
+// kernel dropped because a TLS hook already delivers that connection's
+// plaintext. ok is false until the eBPF collection is loaded.
+func (t *Tracer) TLSCiphertextSkipped() (writes, reads uint64, ok bool) {
+	m := t.readyMap("tls_ciphertext_skipped")
+	if m == nil {
+		return 0, 0, false
+	}
+	return sumPerCPU(m, 0), sumPerCPU(m, 1), true
+}
+
+// ActualDestination returns the post-NAT destination of the TCP connection
+// whose local address is src, as the kernel recorded it from conntrack
+// (actual_destinations in conntrack.c). It is what a connection's open event
+// carries as its actual destination; ok is false if no translation was seen.
+func (t *Tracer) ActualDestination(src netaddr.IPPort) (netaddr.IPPort, bool) {
+	m := t.readyMap("actual_destinations")
+	if m == nil {
+		return netaddr.IPPort{}, false
+	}
+	// struct ipPort: a 16-byte address (IPv4-mapped for IPv4) and a port in
+	// host byte order.
+	var key, value [18]byte
+	ip := src.IP().As16()
+	copy(key[:16], ip[:])
+	binary.LittleEndian.PutUint16(key[16:], src.Port())
+	if err := m.Lookup(key, &value); err != nil {
+		return netaddr.IPPort{}, false
+	}
+	return ipPort(value[:16], binary.LittleEndian.Uint16(value[16:])), true
+}
+
+// tlsDropReasons names the indexes of the tls_plaintext_dropped map
+// (TLS_DROP_* in l7.c).
+var tlsDropReasons = []string{"go_fd_unknown", "ssl_read_fd_unknown", "ssl_write_unclaimed"}
+
+// TLSPlaintextDropped returns, per reason, how much TLS plaintext the kernel
+// saw in a library hook but could not attribute to a socket. ok is false
+// until the eBPF collection is loaded.
+func (t *Tracer) TLSPlaintextDropped() (map[string]uint64, bool) {
+	m := t.readyMap("tls_plaintext_dropped")
+	if m == nil {
+		return nil, false
+	}
+	res := make(map[string]uint64, len(tlsDropReasons))
+	for i, reason := range tlsDropReasons {
+		res[reason] = sumPerCPU(m, uint32(i))
+	}
+	return res, true
+}
+
+// goTLSFdResolvedMethods names the methods of the go_tls_fd_resolved map
+// (GO_FD_RESOLVED_* in gotls.c), and goConnMaxDepth is GO_CONN_MAX_DEPTH.
+var goTLSFdResolvedMethods = []string{"itab", "socket", "shape"}
+
+const goConnMaxDepth = 4
+
+// GoTLSFdResolved is how many Go crypto/tls calls had their socket fd found
+// by one method at one wrapper depth.
+type GoTLSFdResolved struct {
+	Method string
+	Depth  int
+	Count  uint64
+}
+
+// GoTLSFdResolved returns, per method and depth, how many Go crypto/tls calls
+// had their socket fd found: by the binary's *net.TCPConn itab ("itab"), by
+// the shape of the connection confirmed against the kernel's socket
+// ("socket"), or by the shape alone, on a kernel without BTF ("shape"). ok is
+// false until the eBPF collection is loaded.
+func (t *Tracer) GoTLSFdResolved() ([]GoTLSFdResolved, bool) {
+	m := t.readyMap("go_tls_fd_resolved")
+	if m == nil {
+		return nil, false
+	}
+	res := make([]GoTLSFdResolved, 0, len(goTLSFdResolvedMethods)*goConnMaxDepth)
+	for i, method := range goTLSFdResolvedMethods {
+		for depth := 0; depth < goConnMaxDepth; depth++ {
+			n := sumPerCPU(m, uint32(i*goConnMaxDepth+depth))
+			res = append(res, GoTLSFdResolved{Method: method, Depth: depth, Count: n})
+		}
+	}
+	return res, true
+}
+
+// EBPFInfo describes what the kernel gave the eBPF programs to work with.
+type EBPFInfo struct {
+	// ProgramVariant is the compiled variant loaded for this kernel: its
+	// minimum kernel version, with "-cep" for the ctx-extra-padding build.
+	ProgramVariant string
+	// KernelBTF is whether the kernel's BTF loaded.
+	KernelBTF bool
+	// SocketOffsets is whether the socket struct offsets read from it were
+	// set. Without them the kernel cannot read a socket's addresses from its
+	// fd, and the Go TLS fd walk cannot confirm what it found.
+	SocketOffsets bool
+	// Programs is each loaded program's size after the kernel rewrote it.
+	Programs []ProgramInstructions
+}
+
+// ProgramInstructions is a loaded program's size. Xlated is the instruction
+// count after the kernel rewrote the program; Verified, where the kernel
+// reports it (5.16+), is how many instructions the verifier processed, which
+// is what its complexity limit applies to.
+type ProgramInstructions struct {
+	Program  string
+	Xlated   int
+	Verified uint32
+}
+
+// EBPFInfo returns what the kernel gave the eBPF programs; ok is false until
+// the eBPF collection is loaded.
+func (t *Tracer) EBPFInfo() (EBPFInfo, bool) {
+	if !t.ready.Load() || t.collection == nil {
+		return EBPFInfo{}, false
+	}
+	return EBPFInfo{
+		ProgramVariant: t.programVariant,
+		KernelBTF:      t.kernelBTF,
+		SocketOffsets:  t.socketOffsets,
+		Programs:       t.programInstructions,
+	}, true
+}
+
+// tlsDropKey is struct tls_drop_key in l7.c.
+type tlsDropKey struct{ Pid, Reason uint32 }
+
+// TLSPlaintextDroppedByPid returns, per process and reason, the TLS plaintext
+// losses the kernel attributed since the last call (tls_plaintext_dropped_by_pid),
+// and clears them.
+func (t *Tracer) TLSPlaintextDroppedByPid() map[uint32]map[string]uint64 {
+	m := t.readyMap("tls_plaintext_dropped_by_pid")
+	if m == nil {
+		return nil
+	}
+	var keys []tlsDropKey
+	var k tlsDropKey
+	var v uint64
+	for it := m.Iterate(); it.Next(&k, &v); {
+		keys = append(keys, k)
+	}
+	res := map[uint32]map[string]uint64{}
+	for _, k := range keys {
+		var n uint64
+		err := m.LookupAndDelete(k, &n)
+		if errors.Is(err, ebpf.ErrNotSupported) {
+			// Hash-map LookupAndDelete needs 5.14; a count that lands between
+			// these two calls is lost, which is fine for a diagnostic.
+			if m.Lookup(k, &n) != nil {
+				continue
+			}
+			_ = m.Delete(k)
+		} else if err != nil {
+			continue
+		}
+		if n == 0 || int(k.Reason) >= len(tlsDropReasons) {
+			continue
+		}
+		if res[k.Pid] == nil {
+			res[k.Pid] = map[string]uint64{}
+		}
+		res[k.Pid][tlsDropReasons[k.Reason]] += n
+	}
+	return res
+}
+
+// TLSPlaintextDroppedForPid returns and clears the losses attributed to one
+// process. It is called when the process exits, which is the last chance to
+// attribute them: a short-lived process is gone before the periodic read.
+func (t *Tracer) TLSPlaintextDroppedForPid(pid uint32) map[string]uint64 {
+	m := t.readyMap("tls_plaintext_dropped_by_pid")
+	if m == nil {
+		return nil
+	}
+	var res map[string]uint64
+	for reason, name := range tlsDropReasons {
+		k := tlsDropKey{Pid: pid, Reason: uint32(reason)}
+		var n uint64
+		if m.Lookup(k, &n) != nil {
+			continue
+		}
+		_ = m.Delete(k)
+		if n > 0 {
+			if res == nil {
+				res = map[string]uint64{}
+			}
+			res[name] = n
+		}
+	}
+	return res
+}
+
+// L7RingbufDrops returns how many L7 events the kernel lost because the
+// l7_events ring buffer was full.
+func (t *Tracer) L7RingbufDrops() (uint64, bool) {
+	m := t.readyMap("l7_ringbuf_drops")
+	if m == nil {
+		return 0, false
+	}
+	return sumPerCPU(m, 0), true
+}
+
+// LLMCaptureDrops returns how many LLM capture chunks the kernel lost because
+// the llm_events ring buffer was full.
+func (t *Tracer) LLMCaptureDrops() (uint64, bool) {
+	if !t.enableLLMCapture {
+		return 0, false
+	}
+	m := t.readyMap("llm_capture_drops")
+	if m == nil {
+		return 0, false
+	}
+	return sumPerCPU(m, 0), true
+}
+
+// TagLLMConnection marks a connection for LLM capture: from now on the kernel
+// copies all of its reads and writes to the llm_events ring buffer instead of
+// the generic L7 path. connTimestamp is the connection's timestamp from its L7
+// events, which keeps the mark from applying to a later connection reusing the
+// fd. The kernel removes the mark when the fd is closed.
+func (t *Tracer) TagLLMConnection(pid uint32, fd uint64, connTimestamp uint64) error {
+	if !t.enableLLMCapture {
+		return errors.New("LLM capture is disabled")
+	}
+	m := t.readyMap("llm_conns")
+	if m == nil {
+		return errors.New("ebpf collection not loaded")
+	}
+	return m.Update(ConnectionId{FD: fd, PID: pid}, connTimestamp, ebpf.UpdateAny)
+}
+
+// TagLLMDestination marks a destination, as a socket sees it (before any
+// NAT), as an LLM API endpoint: every new connection to it is captured from
+// its first write.
+func (t *Tracer) TagLLMDestination(ip netaddr.IP, port uint16) error {
+	if !t.enableLLMCapture {
+		return errors.New("LLM capture is disabled")
+	}
+	m := t.readyMap("llm_dests")
+	if m == nil {
+		return errors.New("ebpf collection not loaded")
+	}
+	var key [24]byte
+	if ip.Is4() {
+		a := ip.As4()
+		copy(key[0:4], a[:])
+	} else {
+		a := ip.As16()
+		copy(key[0:16], a[:])
+	}
+	binary.LittleEndian.PutUint16(key[16:18], port)
+	return m.Update(key, uint8(1), ebpf.UpdateAny)
+}
+
+func (t *Tracer) readyMap(name string) *ebpf.Map {
+	if !t.ready.Load() || t.collection == nil {
+		return nil
+	}
+	return t.collection.Maps[name]
+}
+
+func sumPerCPU(m *ebpf.Map, key uint32) uint64 {
+	var perCPU []uint64
+	if err := m.Lookup(key, &perCPU); err != nil {
+		return 0
+	}
+	var total uint64
+	for _, v := range perCPU {
+		total += v
+	}
+	return total
+}
+
 func (t *Tracer) ActiveConnectionsIterator() *ebpf.MapIterator {
 	return t.collection.Maps["active_connections"].Iterate()
 }
@@ -201,12 +507,21 @@ type perfMap struct {
 	name                  string
 	perCPUBufferSizePages int
 	typ                   perfMapType
-	readTimeout           time.Duration
+	// readTimeout bounds how long events below wakeupEvents wait to be
+	// read; 0 means 100 ms. A reader woken for every event needs none.
+	readTimeout time.Duration
+	// wakeupEvents is how many events a CPU's buffer collects before the
+	// kernel wakes the reader; 0 means 100. Below that, events wait for the
+	// reader's next readTimeout.
+	wakeupEvents int
 }
 
-func (t *Tracer) ebpf(ch chan<- Event) error {
+// collectionSpecForKernel returns the compiled program variant for the running
+// kernel, ready to load, and the variant's name: the minimum kernel version it
+// was built for, with "-cep" for the ctx-extra-padding build.
+func collectionSpecForKernel() (*ebpf.CollectionSpec, string, error) {
 	if _, ok := ebpfProgs[runtime.GOARCH]; !ok {
-		return fmt.Errorf("unsupported architecture: %s", runtime.GOARCH)
+		return nil, "", fmt.Errorf("unsupported architecture: %s", runtime.GOARCH)
 	}
 
 	var traceFsPath string
@@ -217,7 +532,7 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		}
 	}
 	if traceFsPath == "" {
-		return fmt.Errorf("kernel tracing is not available: debugfs or tracefs must be mounted")
+		return nil, "", fmt.Errorf("kernel tracing is not available: debugfs or tracefs must be mounted")
 	}
 
 	var flags string
@@ -226,6 +541,7 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	}
 	kv := common.GetKernelVersion()
 	var prog []byte
+	var variant string
 	for _, p := range ebpfProgs[runtime.GOARCH] {
 		pv, _ := common.VersionFromString(p.version)
 		if !kv.GreaterOrEqual(pv) {
@@ -235,25 +551,50 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 			continue
 		}
 		prog = p.prog
+		variant = p.version
+		if p.flags != "" {
+			variant += "-cep"
+		}
 		break
 	}
 	if len(prog) == 0 {
-		return fmt.Errorf("unsupported kernel version: %s %s", kv, flags)
+		return nil, "", fmt.Errorf("unsupported kernel version: %s %s", kv, flags)
 	}
 
 	reader, err := gzip.NewReader(base64.NewDecoder(base64.StdEncoding, bytes.NewReader(prog)))
 	if err != nil {
-		return fmt.Errorf("invalid program encoding: %w", err)
+		return nil, "", fmt.Errorf("invalid program encoding: %w", err)
 	}
 	prog, err = io.ReadAll(reader)
 	if err != nil {
-		return fmt.Errorf("failed to ungzip program: %w", err)
+		return nil, "", fmt.Errorf("failed to ungzip program: %w", err)
 	}
 	collectionSpec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(prog))
 	if err != nil {
-		return fmt.Errorf("failed to load collection spec: %w", err)
+		return nil, "", fmt.Errorf("failed to load collection spec: %w", err)
 	}
+	if heap, ok := collectionSpec.Maps["llm_event_heap"]; ok {
+		cpus, err := ebpf.PossibleCPU()
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to count possible CPUs: %w", err)
+		}
+		heap.MaxEntries = uint32(cpus)
+	}
+	return collectionSpec, variant, nil
+}
+
+func (t *Tracer) ebpf(ch chan<- Event) error {
+	collectionSpec, variant, err := collectionSpecForKernel()
+	if err != nil {
+		return err
+	}
+	t.programVariant = variant
 	_ = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY})
+	for _, pt := range []ebpf.ProgramType{ebpf.TracePoint, ebpf.Kprobe} {
+		if err := features.HaveProgramType(pt); errors.Is(err, ebpf.ErrNotSupported) {
+			return fmt.Errorf("kernel does not support BPF %s programs (CONFIG_BPF_EVENTS is not set?): %w", pt, ebpf.ErrNotSupported)
+		}
+	}
 	c, err := ebpf.NewCollectionWithOptions(collectionSpec, ebpf.CollectionOptions{
 		//Programs: ebpf.ProgramOptions{LogLevel: 2, LogSize: 20 * 1024 * 1024},
 	})
@@ -265,6 +606,23 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		return fmt.Errorf("failed to load collection: %w", err)
 	}
 	t.collection = c
+	t.programInstructions = programInstructions(c)
+
+	// Uprobe programs are attached per process, on demand. Register them all
+	// before any tracepoint or kprobe is attached: events start flowing as
+	// soon as the first one is, and a process handled before its uprobe
+	// program was registered would never get its probes.
+	for _, programSpec := range collectionSpec.Programs {
+		if strings.HasPrefix(programSpec.SectionName, "uprobe/") || strings.HasPrefix(programSpec.SectionName, "uretprobe/") {
+			t.uprobes[programSpec.Name] = c.Programs[programSpec.Name]
+		}
+	}
+
+	if t.enableLLMCapture {
+		if err := c.Maps["llm_capture_config"].Update(uint32(0), uint32(1), ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("failed to enable LLM capture: %w", err)
+		}
+	}
 
 	// Initialize socket info offsets for direct fd->socket tuple extraction
 	// This enables L7 event processing without dependency on TCP connection tracking
@@ -274,7 +632,12 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	}
 
 	perfMaps := []perfMap{
-		{name: "proc_events", typ: perfMapTypeProcEvents, perCPUBufferSizePages: 4},
+		// An exec must be acted on (TLS probes attached) before the new
+		// program makes its first connection, so the reader is woken for
+		// every event and needs no deadline. Polling instead, with a 10 ms
+		// deadline to bound that wait, cost ~5 millicores on an idle node:
+		// 100 wakeups a second for events that arrive a few times a second.
+		{name: "proc_events", typ: perfMapTypeProcEvents, perCPUBufferSizePages: 4, wakeupEvents: 1},
 		{name: "tcp_listen_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 4},
 		{name: "tcp_connect_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 8, readTimeout: 10 * time.Millisecond},
 		{name: "tcp_retransmit_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 4},
@@ -284,13 +647,21 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	// Create perf buffer readers for non-L7 events
 	pageSize := os.Getpagesize()
 	for _, pm := range perfMaps {
-		r, err := perf.NewReaderWithOptions(t.collection.Maps[pm.name], pm.perCPUBufferSizePages*pageSize, perf.ReaderOptions{WakeupEvents: 100})
+		wakeup := pm.wakeupEvents
+		if wakeup == 0 {
+			wakeup = 100
+		}
+		r, err := perf.NewReaderWithOptions(t.collection.Maps[pm.name], pm.perCPUBufferSizePages*pageSize, perf.ReaderOptions{WakeupEvents: wakeup})
 		if err != nil {
 			t.Close()
 			return fmt.Errorf("failed to create ebpf reader: %w", err)
 		}
 		t.readers[pm.name] = r
-		go runEventsReader(pm.name, r, ch, pm.typ, pm.readTimeout)
+		readTimeout := pm.readTimeout
+		if readTimeout == 0 && wakeup > 1 {
+			readTimeout = 100 * time.Millisecond
+		}
+		go runEventsReader(pm.name, r, ch, pm.typ, readTimeout)
 	}
 
 	// Create ring buffer reader for l7_events (provides global ordering for SSE streaming)
@@ -323,8 +694,7 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 			l, err = link.Tracepoint(parts[0], parts[1], program, nil)
 		case ebpf.Kprobe:
 			if strings.HasPrefix(programSpec.SectionName, "uprobe/") || strings.HasPrefix(programSpec.SectionName, "uretprobe/") {
-				t.uprobes[programSpec.Name] = program
-				continue
+				continue // registered at load, attached to processes on demand
 			}
 			l, err = link.Kprobe(programSpec.AttachTo, program, nil)
 			if err != nil && programSpec.SectionName == "kprobe/nf_ct_deliver_cached_events" {
@@ -344,12 +714,33 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	return nil
 }
 
+// programInstructions reads each program's size from the kernel. It is read
+// once, at load: the sizes cannot change afterwards.
+func programInstructions(c *ebpf.Collection) []ProgramInstructions {
+	res := make([]ProgramInstructions, 0, len(c.Programs))
+	for name, p := range c.Programs {
+		info, err := p.Info()
+		if err != nil {
+			continue
+		}
+		pi := ProgramInstructions{Program: name}
+		if size, err := info.TranslatedSize(); err == nil {
+			pi.Xlated = size / 8
+		}
+		pi.Verified, _ = info.VerifiedInstructions()
+		res = append(res, pi)
+	}
+	return res
+}
+
 func (t EventType) String() string {
 	switch t {
 	case EventTypeProcessStart:
 		return "process-start"
 	case EventTypeProcessExit:
 		return "process-exit"
+	case EventTypeProcessExec:
+		return "process-exec"
 	case EventTypeConnectionOpen:
 		return "connection-open"
 	case EventTypeConnectionClose:
@@ -448,7 +839,13 @@ func getLostSamplesTracker(name string) *lostSamplesTracker {
 	if !ok {
 		tracker, _ = lostSamplesTrackers.LoadOrStore(name, &lostSamplesTracker{interval: 10})
 	}
-	return tracker.(*lostSamplesTracker)
+	t, ok := tracker.(*lostSamplesTracker)
+	if !ok {
+		// Only this function ever writes the map, so this is unreachable; return a
+		// throwaway rather than panicking in a metrics path.
+		return &lostSamplesTracker{interval: 10}
+	}
+	return t
 }
 
 // safeDuration converts a uint64 nanosecond value from eBPF to time.Duration.
@@ -485,13 +882,14 @@ func (t *lostSamplesTracker) recordLostSamples(name string, count uint64, cpu in
 	}
 }
 
+// runEventsReader reads r until it is closed. readTimeout 0 means no deadline:
+// the reader sleeps until the kernel wakes it (Close interrupts that too).
 func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapType, readTimeout time.Duration) {
 	tracker := getLostSamplesTracker(name)
-	if readTimeout == 0 {
-		readTimeout = 100 * time.Millisecond
-	}
 	for {
-		r.SetDeadline(time.Now().Add(readTimeout))
+		if readTimeout > 0 {
+			r.SetDeadline(time.Now().Add(readTimeout))
+		}
 		rec, err := r.Read()
 		if err != nil {
 			if errors.Is(err, perf.ErrClosed) {
@@ -531,6 +929,9 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 			req := &l7.RequestData{
 				Protocol:     l7.Protocol(data[32]),
 				Method:       l7.Method(data[33]),
+				TLS:          data[34] != 0,
+				LostBefore:   data[35],
+				KernelTime:   binary.LittleEndian.Uint64(data[24:32]),
 				Status:       l7.Status(int32(binary.LittleEndian.Uint32(data[20:24]))),
 				Duration:     safeDuration(binary.LittleEndian.Uint64(data[24:32])),
 				StatementId:  binary.LittleEndian.Uint32(data[36:40]),
@@ -604,8 +1005,12 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 // Ring buffer provides global event ordering across CPUs, which is important
 // for streaming responses (SSE) where chunk order matters
 func runRingbufEventsReader(name string, r *ringbuf.Reader, ch chan<- Event) {
+	// One record reused for every read: everything sent on ch is copied out of
+	// RawSample first, and a fresh buffer per event was 10-20% of the agent's
+	// allocated bytes.
+	var rec ringbuf.Record
 	for {
-		rec, err := r.Read()
+		err := r.ReadInto(&rec)
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
 				klog.V(2).Infof("ring buffer reader %s closed", name)
@@ -616,6 +1021,12 @@ func runRingbufEventsReader(name string, r *ringbuf.Reader, ch chan<- Event) {
 		}
 
 		data := rec.RawSample
+		if len(data) > l7EventProtocolByte && data[l7EventProtocolByte] == protocolLLMCapture {
+			if ev, ok := decodeLLMEvent(data); ok {
+				ch <- ev
+			}
+			continue
+		}
 		if len(data) < l7EventHeaderSize {
 			klog.Warningln("invalid l7 event from ring buffer, size:", len(data))
 			continue
@@ -640,6 +1051,9 @@ func runRingbufEventsReader(name string, r *ringbuf.Reader, ch chan<- Event) {
 		req := &l7.RequestData{
 			Protocol:     l7.Protocol(data[32]),
 			Method:       l7.Method(data[33]),
+			TLS:          data[34] != 0,
+			LostBefore:   data[35],
+			KernelTime:   binary.LittleEndian.Uint64(data[24:32]),
 			Status:       l7.Status(int32(binary.LittleEndian.Uint32(data[20:24]))),
 			Duration:     safeDuration(binary.LittleEndian.Uint64(data[24:32])),
 			StatementId:  binary.LittleEndian.Uint32(data[36:40]),
@@ -677,6 +1091,36 @@ func runRingbufEventsReader(name string, r *ringbuf.Reader, ch chan<- Event) {
 
 		ch <- event
 	}
+}
+
+// llmEventHeaderSize is the size of struct llm_event before its data, and
+// protocolLLMCapture marks one in l7_events (PROTOCOL_LLM_CAPTURE).
+const (
+	llmEventHeaderSize  = 48
+	protocolLLMCapture  = 0xFE
+	l7EventProtocolByte = 32
+)
+
+func decodeLLMEvent(d []byte) (Event, bool) {
+	if len(d) < llmEventHeaderSize {
+		return Event{}, false
+	}
+	n := int(binary.LittleEndian.Uint32(d[20:24]))
+	if llmEventHeaderSize+n > len(d) {
+		return Event{}, false
+	}
+	return Event{
+		Type:      EventTypeLLMData,
+		Fd:        binary.LittleEndian.Uint64(d[0:8]),
+		Timestamp: binary.LittleEndian.Uint64(d[8:16]),
+		Pid:       binary.LittleEndian.Uint32(d[16:20]),
+		LLMData: &LLMData{
+			Time:      binary.LittleEndian.Uint64(d[24:32]),
+			Ingress:   d[33] == 1,
+			SkipAfter: binary.LittleEndian.Uint64(d[40:48]),
+			Data:      append([]byte(nil), d[llmEventHeaderSize:llmEventHeaderSize+n]...),
+		},
+	}, true
 }
 
 func ipPort(ip []byte, port uint16) netaddr.IPPort {

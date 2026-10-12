@@ -8,11 +8,28 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/coroot/coroot-node-agent/cgroup"
 )
 
-var root = "/proc"
+var (
+	root     = "/proc"
+	bootTime int64
+)
+
+func init() {
+	data, err := os.ReadFile(root + "/stat")
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if fields := strings.Fields(line); len(fields) == 2 && fields[0] == "btime" {
+			bootTime, _ = strconv.ParseInt(fields[1], 10, 64)
+			return
+		}
+	}
+}
 
 func Path(pid uint32, subpath ...string) string {
 	return path.Join(append([]string{root, strconv.Itoa(int(pid))}, subpath...)...)
@@ -63,6 +80,35 @@ func GetNsPid(pid uint32) (uint32, error) {
 func ReadCgroup(pid uint32) (*cgroup.Cgroup, error) {
 	return cgroup.NewFromProcessCgroupFile(Path(pid, "cgroup"))
 }
+
+func GetStartTime(pid uint32) time.Time {
+	data, err := os.ReadFile(Path(pid, "stat"))
+	if err != nil {
+		return time.Time{}
+	}
+	s := string(data)
+	idx := strings.LastIndex(s, ")")
+	if idx < 0 {
+		return time.Time{}
+	}
+	fields := strings.Fields(s[idx+1:])
+	if len(fields) < 20 {
+		return time.Time{}
+	}
+	// int64 rather than uint64: the value becomes a time.Duration, and
+	// ParseInt rejects what wouldn't fit.
+	startTicks, err := strconv.ParseInt(fields[19], 10, 64)
+	if err != nil || startTicks < 0 || bootTime == 0 {
+		return time.Time{}
+	}
+	// Ticks are kept rather than rounded to seconds, so that two processes
+	// reusing a pid within the same second are told apart.
+	return time.Unix(bootTime, 0).Add(time.Duration(startTicks) * (time.Second / userHZ))
+}
+
+// userHZ is the clock tick rate of /proc/<pid>/stat times. The kernel exposes
+// it as USER_HZ, which is 100 on every architecture the agent is built for.
+const userHZ = 100
 
 func ListPids() ([]uint32, error) {
 	root, err := os.Open(root)

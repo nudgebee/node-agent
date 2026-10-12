@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   improved Go TLS capture.
 - Oracle Cloud instance-metadata support.
 - Pressure Stall Information (PSI) cgroup metrics.
+- Fleet install guide and an Ansible playbook for installing the agent on many hosts at once.
 
 ### Changed
 

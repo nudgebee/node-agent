@@ -36,24 +36,9 @@ func init() {
 	}
 	if r := flags.EphemeralPortRange; r != nil && *r != "" {
 		klog.Infoln("ephemeral-port-range:", *r)
-		parts := strings.Split(*r, "-")
-		if len(parts) != 2 {
-			klog.Exitf("invalid port range: %s", *r)
-		}
-		from, err := strconv.ParseUint(parts[0], 10, 16)
-		if err != nil {
-			klog.Exitf("invalid port range: %s", *r)
-		}
-		to, err := strconv.ParseUint(parts[1], 10, 16)
-		if err != nil {
-			klog.Exitf("invalid port range: %s", *r)
-		}
-		if from > to {
-			klog.Exitf("invalid port range: %s", *r)
-		}
-		PortFilter = &portFilter{
-			from: uint16(from),
-			to:   uint16(to),
+		var err error
+		if PortFilter, err = newPortFilter(*r); err != nil {
+			klog.Exitln(err)
 		}
 	}
 	var err error
@@ -121,16 +106,58 @@ func (f connectionFilter) ShouldBeSkipped(dst, actualDst netaddr.IP) bool {
 	return true
 }
 
-type portFilter struct {
+type portRange struct {
 	from uint16
 	to   uint16
+}
+
+type portFilter struct {
+	ranges []portRange
+}
+
+func newPortFilter(s string) (*portFilter, error) {
+	f := &portFilter{}
+	for _, r := range strings.Fields(strings.ReplaceAll(s, ",", " ")) {
+		from, to, ok := strings.Cut(r, "-")
+		if !ok {
+			return nil, fmt.Errorf("invalid port range: %s", r)
+		}
+		f1, err := strconv.ParseUint(from, 10, 16)
+		if err != nil {
+			return nil, fmt.Errorf("invalid port range: %s", r)
+		}
+		t1, err := strconv.ParseUint(to, 10, 16)
+		if err != nil {
+			return nil, fmt.Errorf("invalid port range: %s", r)
+		}
+		if f1 > t1 {
+			return nil, fmt.Errorf("invalid port range: %s", r)
+		}
+		f.ranges = append(f.ranges, portRange{from: uint16(f1), to: uint16(t1)})
+	}
+	if len(f.ranges) == 0 {
+		return nil, fmt.Errorf("invalid port range: %s", s)
+	}
+	return f, nil
+}
+
+var wellKnownPorts = map[uint16]struct{}{
+	50051: {}, // gRPC
 }
 
 func (f *portFilter) ShouldBeSkipped(port uint16) bool {
 	if f == nil {
 		return false
 	}
-	return port >= f.from && port <= f.to
+	if _, ok := wellKnownPorts[port]; ok {
+		return false
+	}
+	for _, r := range f.ranges {
+		if port >= r.from && port <= r.to {
+			return true
+		}
+	}
+	return false
 }
 
 type HostPort struct {
@@ -203,6 +230,15 @@ func (dk DestinationKey) ActualDestinationLabelValue() string {
 	return destinationLabelValue(dk.actualDestination, dk.actualDestinationWorkload)
 }
 
+// isHostDestination reports whether wl is a standalone host or an address
+// the standalone-host resolver could not attribute (kinds only VMIPResolver
+// produces). Collapsing exists for churning pod IPs; host IPs are stable, and
+// the IP:port is the only thing that lets a consumer match the destination to
+// the host and the service listening on that port.
+func isHostDestination(wl Workload) bool {
+	return wl.Kind == VMWorkloadKind || wl.Kind == PrivateWorkloadKind
+}
+
 // destinationLabelValue produces the destination/actual_destination label value.
 //
 // External destinations resolved to an FQDN (host set, no IP) are returned as-is
@@ -224,7 +260,7 @@ func destinationLabelValue(hp HostPort, wl Workload) string {
 	if hp.ip.IsZero() {
 		return hp.String()
 	}
-	if flags.CollapseInternalDestinations == nil || !*flags.CollapseInternalDestinations {
+	if flags.CollapseInternalDestinations == nil || !*flags.CollapseInternalDestinations || isHostDestination(wl) {
 		return hp.String()
 	}
 	// Resolved workload identity (guard against the IP-echoed-back fallback that
@@ -249,7 +285,7 @@ func destinationLabelValue(hp HostPort, wl Workload) string {
 // takes a netaddr.IP. Internal pod IPs churn/recycle; keying the RTT series on
 // workload identity keeps it stable. External and unresolved IPs are kept as-is.
 func DestinationIPLabelValue(ip netaddr.IP, wl Workload) string {
-	if flags.CollapseInternalDestinations == nil || !*flags.CollapseInternalDestinations {
+	if flags.CollapseInternalDestinations == nil || !*flags.CollapseInternalDestinations || isHostDestination(wl) {
 		return ip.String()
 	}
 	if IsIpPrivate(ip) && wl.Name != "" && wl.Name != ip.String() {
@@ -352,10 +388,17 @@ func NormalizeFQDN(fqdn string, requestType string) string {
 	return fqdn
 }
 
+// WithResolvedDomain swaps an IP-named destination for its DNS name. As in
+// NewDestinationKey, a side that already resolved to a k8s workload keeps its
+// own name; the FQDN is still carried by the `destination` label.
 func (dk DestinationKey) WithResolvedDomain(fqdn string) DestinationKey {
 	dk.destination = HostPortWithEmptyIP(fqdn, dk.destination.Port())
-	dk.destinationWorkload.Name = fqdn
-	dk.actualDestinationWorkload.Name = fqdn
+	if !isKubernetesResolved(dk.destinationWorkload) {
+		dk.destinationWorkload.Name = fqdn
+	}
+	if !isKubernetesResolved(dk.actualDestinationWorkload) {
+		dk.actualDestinationWorkload.Name = fqdn
+	}
 	return dk
 }
 

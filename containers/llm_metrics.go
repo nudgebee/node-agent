@@ -1,344 +1,114 @@
 package containers
 
 import (
-	"fmt"
 	"strconv"
 
-	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
+	"github.com/coroot/coroot-node-agent/llm"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// LLM Metrics — container_llm_* naming convention.
-// Label names follow OTel GenAI semantic conventions where possible.
+// LLM metrics follow the OpenTelemetry GenAI semantic conventions for label
+// names and values. Cost is deliberately absent: prices change and are
+// negotiated per customer, so it belongs where token counts are joined with a
+// price list, not in the agent.
+var llmLabels = []string{
+	"container_id",
+	"gen_ai_provider_name",
+	"gen_ai_request_model",
+	"gen_ai_operation_name",
+	"server_address",
+}
+
 var (
 	ContainerLLMRequestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "container_llm_requests_total",
-			Help: "Total number of LLM API requests made by containers",
+			Help: "LLM API requests, by response status",
 		},
-		[]string{
-			"container_id",
-			"gen_ai_operation_name",     // chat, text_completion, embeddings, generate_content
-			"gen_ai_request_model",      // gpt-4, claude-3, gemini-2.5-pro, etc.
-			"gen_ai_provider_name",      // openai, anthropic, gcp.gemini, aws.bedrock
-			"server_address",            // api.openai.com, generativelanguage.googleapis.com
-			"http_response_status_code", // 200, 400, 429, 500
-		},
+		append(llmLabels[:len(llmLabels):len(llmLabels)], "http_response_status_code"),
 	)
 
-	ContainerLLMTokenUsageTotal = prometheus.NewCounterVec(
+	// ContainerLLMTokensTotal splits usage into disjoint token types, so the
+	// sum over gen_ai_token_type is what the provider bills: input (not served
+	// from a cache), cached_input, cache_write, output (excluding reasoning)
+	// and reasoning.
+	ContainerLLMTokensTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "container_llm_token_usage_total",
-			Help: "Total tokens processed by LLM APIs",
+			Name: "container_llm_tokens_total",
+			Help: "LLM tokens used, by token type",
 		},
-		[]string{
-			"container_id",
-			"gen_ai_operation_name",
-			"gen_ai_request_model",
-			"gen_ai_provider_name",
-			"server_address",
-			"gen_ai_token_type", // input, output
-		},
-	)
-
-	ContainerLLMTimeToFirstToken = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name: "container_llm_time_to_first_token_seconds",
-			Help: "Time from request sent to first response token received",
-			// OTel GenAI v1.37 recommended boundaries for gen_ai.server.time_to_first_token.
-			Buckets: []float64{0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0},
-		},
-		[]string{
-			"container_id",
-			"gen_ai_operation_name",
-			"gen_ai_request_model",
-			"gen_ai_provider_name",
-			"server_address",
-		},
+		append(llmLabels[:len(llmLabels):len(llmLabels)], "gen_ai_token_type"),
 	)
 
 	ContainerLLMRequestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name: "container_llm_request_duration_seconds",
-			Help: "Total LLM request duration",
-			// OTel GenAI v1.37 recommended boundaries for gen_ai.client.operation.duration.
-			Buckets: []float64{0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92},
+			Name:    "container_llm_request_duration_seconds",
+			Help:    "Time from the first byte of an LLM API request to the last byte of its response",
+			Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 40, 80},
 		},
-		[]string{
-			"container_id",
-			"gen_ai_operation_name",
-			"gen_ai_request_model",
-			"gen_ai_provider_name",
-			"server_address",
-		},
+		llmLabels,
 	)
 
-	ContainerLLMTokensPerSecond = prometheus.NewHistogramVec(
+	ContainerLLMTimeToFirstToken = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "container_llm_tokens_per_second",
-			Help:    "Token generation throughput (output tokens / generation time)",
-			Buckets: []float64{5, 10, 20, 30, 50, 75, 100, 150, 200},
+			Name:    "container_llm_time_to_first_token_seconds",
+			Help:    "Time from the first byte of a streaming LLM API request to the first byte of its response body",
+			Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8, 16},
 		},
-		[]string{
-			"container_id",
-			"gen_ai_operation_name",
-			"gen_ai_request_model",
-			"gen_ai_provider_name",
-		},
+		llmLabels,
 	)
 
-	ContainerLLMErrorsTotal = prometheus.NewCounterVec(
+	// LLMCaptureTotal makes the capture's completeness measurable. Per
+	// request: completed (usage extracted), no_usage, undecodable, truncated.
+	// Per connection: tagged, missed_start, unrecoverable, overflow, and
+	// capacity when a container has too many captured connections.
+	LLMCaptureTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "container_llm_errors_total",
-			Help: "Total LLM request errors by error type",
+			Name: "node_agent_llm_capture_total",
+			Help: "LLM capture outcomes, per request and per connection",
 		},
-		[]string{
-			"container_id",
-			"gen_ai_provider_name",
-			"gen_ai_request_model",
-			"error_type", // rate_limit, timeout, invalid_request, server_error, auth_error
-		},
-	)
-
-	// LLMSNITagsTotal counts successful SNI-based provider tags. Each
-	// increment means the agent caught a TLS ClientHello with an SNI that
-	// matched a known LLM provider. Useful for spotting tagging regressions
-	// independently of whether downstream HTTP/2 parsing succeeds.
-	LLMSNITagsTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "node_agent_llm_sni_tags_total",
-			Help: "Total LLM connections tagged via TLS ClientHello SNI",
-		},
-		[]string{"provider"},
-	)
-
-	// LLMHPACKDecodeErrorsTotal counts HPACK decode failures in the HTTP/2
-	// parser. When non-zero on llm-server connections, indicates the agent
-	// joined a long-lived HTTP/2 connection mid-stream and lost dynamic-table
-	// state (the classic Go-TLS-HTTP/2 mid-stream-join failure mode).
-	// The SNI path bypasses this; this counter is the early warning.
-	LLMHPACKDecodeErrorsTotal = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "node_agent_hpack_decode_errors_total",
-			Help: "Total HPACK decode errors in HTTP/2 parser (mid-stream join indicator)",
-		},
-	)
-
-	// ContainerLLMCachedTokensTotal counts input tokens served from the
-	// provider's prompt cache. Already counted in token_usage_total{type=input};
-	// this is a separate metric to make cache-hit rate computable.
-	ContainerLLMCachedTokensTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "container_llm_cached_input_tokens_total",
-			Help: "Cumulative input tokens served from the provider's prompt cache",
-		},
-		[]string{
-			"container_id",
-			"gen_ai_operation_name",
-			"gen_ai_request_model",
-			"gen_ai_provider_name",
-			"server_address",
-		},
-	)
-
-	// ContainerLLMToolCallsTotal counts tool/function-call invocations in
-	// completed responses. Useful for spotting agentic workloads and per-
-	// request tool fan-out.
-	ContainerLLMToolCallsTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "container_llm_tool_calls_total",
-			Help: "Cumulative tool/function-call invocations in LLM responses",
-		},
-		[]string{
-			"container_id",
-			"gen_ai_operation_name",
-			"gen_ai_request_model",
-			"gen_ai_provider_name",
-		},
-	)
-
-	// ContainerLLMCostUSDTotal records derived cost in USD from a static
-	// pricing table (containers/llm_pricing.go). Best-effort and excludes
-	// volume discounts; reconcile with provider invoices for billing.
-	// Series only emitted when pricing matches the model.
-	ContainerLLMCostUSDTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "container_llm_cost_usd_total",
-			Help: "Cumulative LLM cost in USD (best-effort, list prices, no volume discount)",
-		},
-		[]string{
-			"container_id",
-			"gen_ai_operation_name",
-			"gen_ai_request_model",
-			"gen_ai_provider_name",
-			"server_address",
-		},
+		[]string{"outcome"},
 	)
 )
 
-// RegisterLLMMetrics registers all LLM metrics with the provided registerer
-// and wires l7-package callbacks that increment self-observability counters.
 func RegisterLLMMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(
 		ContainerLLMRequestsTotal,
-		ContainerLLMTokenUsageTotal,
-		ContainerLLMTimeToFirstToken,
+		ContainerLLMTokensTotal,
 		ContainerLLMRequestDuration,
-		ContainerLLMTokensPerSecond,
-		ContainerLLMErrorsTotal,
-		LLMSNITagsTotal,
-		LLMHPACKDecodeErrorsTotal,
-		ContainerLLMCachedTokensTotal,
-		ContainerLLMToolCallsTotal,
-		ContainerLLMCostUSDTotal,
+		ContainerLLMTimeToFirstToken,
+		LLMCaptureTotal,
 	)
-	// Hook the HTTP/2 parser's HPACK error path so we get a counter without
-	// l7 having to import prometheus.
-	l7.OnHPACKDecodeError = func() { LLMHPACKDecodeErrorsTotal.Inc() }
 }
 
-// RecordLLMEvent is the single entry point for recording LLM metrics.
-// Both HTTP/1.1 and HTTP/2, streaming and non-streaming, use this function.
-// This replaces the old split between trackLLMRequest() and RecordLLMStreamMetrics().
-func RecordLLMEvent(event *LLMEvent) {
-	if event == nil {
-		return
-	}
-
-	containerID := event.ContainerID
-	provider := string(event.Provider)
-	model := event.Model
+func recordLLMExchange(containerID string, e *llm.Exchange) {
+	model := e.Model
 	if model == "" {
 		model = "unknown"
 	}
-	operation := event.Operation
-	if operation == "" {
-		operation = "unknown"
-	}
-
-	statusStr := strconv.Itoa(event.StatusCode)
-	if event.StatusCode == 0 {
-		statusStr = "200" // Default for non-streaming where status wasn't captured
-	}
-
-	// Request counter
-	ContainerLLMRequestsTotal.With(prometheus.Labels{
-		"container_id":              containerID,
-		"gen_ai_operation_name":     operation,
-		"gen_ai_request_model":      model,
-		"gen_ai_provider_name":      provider,
-		"server_address":            event.ServerAddress,
-		"http_response_status_code": statusStr,
-	}).Inc()
-
-	baseLabels := prometheus.Labels{
-		"container_id":          containerID,
-		"gen_ai_operation_name": operation,
-		"gen_ai_request_model":  model,
-		"gen_ai_provider_name":  provider,
-		"server_address":        event.ServerAddress,
-	}
-
-	// Token usage
-	if event.InputTokens > 0 {
-		ContainerLLMTokenUsageTotal.With(prometheus.Labels{
-			"container_id":          containerID,
-			"gen_ai_operation_name": operation,
-			"gen_ai_request_model":  model,
-			"gen_ai_provider_name":  provider,
-			"server_address":        event.ServerAddress,
-			"gen_ai_token_type":     "input",
-		}).Add(float64(event.InputTokens))
-	}
-	if event.OutputTokens > 0 {
-		ContainerLLMTokenUsageTotal.With(prometheus.Labels{
-			"container_id":          containerID,
-			"gen_ai_operation_name": operation,
-			"gen_ai_request_model":  model,
-			"gen_ai_provider_name":  provider,
-			"server_address":        event.ServerAddress,
-			"gen_ai_token_type":     "output",
-		}).Add(float64(event.OutputTokens))
-	}
-
-	// Cached input tokens (subset of input tokens served from prompt cache).
-	if event.CachedInputTokens > 0 {
-		ContainerLLMCachedTokensTotal.With(baseLabels).Add(float64(event.CachedInputTokens))
-	}
-
-	// Tool/function calls observed in the response.
-	if event.ToolCallCount > 0 {
-		ContainerLLMToolCallsTotal.With(prometheus.Labels{
-			"container_id":          containerID,
-			"gen_ai_operation_name": operation,
-			"gen_ai_request_model":  model,
-			"gen_ai_provider_name":  provider,
-		}).Add(float64(event.ToolCallCount))
-	}
-
-	// Cost in USD (best-effort from static pricing table). Only emitted when
-	// a pricing entry matches the model — absent series means "no pricing"
-	// rather than "$0".
-	if cost := CalculateCostUSD(event.Provider, event.Model,
-		event.InputTokens, event.OutputTokens, event.CachedInputTokens); cost > 0 {
-		ContainerLLMCostUSDTotal.With(baseLabels).Add(cost)
-	}
-
-	// Duration
-	if event.Duration > 0 {
-		ContainerLLMRequestDuration.With(baseLabels).Observe(event.Duration.Seconds())
-	}
-
-	// TTFT (streaming only)
-	if event.TTFT > 0 {
-		ContainerLLMTimeToFirstToken.With(baseLabels).Observe(event.TTFT.Seconds())
-	}
-
-	// Tokens per second (streaming: output_tokens / generation_time)
-	if event.OutputTokens > 0 && event.TTFT > 0 && event.Duration > event.TTFT {
-		genDuration := (event.Duration - event.TTFT).Seconds()
-		if genDuration > 0 {
-			tps := float64(event.OutputTokens) / genDuration
-			ContainerLLMTokensPerSecond.With(prometheus.Labels{
-				"container_id":          containerID,
-				"gen_ai_operation_name": operation,
-				"gen_ai_request_model":  model,
-				"gen_ai_provider_name":  provider,
-			}).Observe(tps)
+	labels := []string{containerID, string(e.Provider), model, string(e.Operation), e.ServerAddress}
+	ContainerLLMRequestsTotal.WithLabelValues(append(labels, strconv.Itoa(e.StatusCode))...).Inc()
+	for _, t := range []struct {
+		name  string
+		count int64
+	}{
+		{"input", e.Usage.Input},
+		{"cached_input", e.Usage.CachedInput},
+		{"cache_write", e.Usage.CacheWrite},
+		{"output", e.Usage.Output},
+		{"reasoning", e.Usage.Reasoning},
+	} {
+		if t.count > 0 {
+			ContainerLLMTokensTotal.WithLabelValues(append(labels, t.name)...).Add(float64(t.count))
 		}
 	}
-
-	// Errors
-	if event.StatusCode >= 400 {
-		ContainerLLMErrorsTotal.With(prometheus.Labels{
-			"container_id":         containerID,
-			"gen_ai_provider_name": provider,
-			"gen_ai_request_model": model,
-			"error_type":           categorizeHTTPError(event.StatusCode),
-		}).Inc()
+	if d := e.Duration(); d > 0 {
+		ContainerLLMRequestDuration.WithLabelValues(labels...).Observe(d.Seconds())
 	}
-}
-
-// categorizeHTTPError converts HTTP status code to error type.
-func categorizeHTTPError(statusCode int) string {
-	switch statusCode {
-	case 429:
-		return "rate_limit"
-	case 400, 422:
-		return "invalid_request"
-	case 401, 403:
-		return "auth_error"
-	case 500, 502, 503, 504:
-		return "server_error"
-	case 408:
-		return "timeout"
-	default:
-		if statusCode >= 400 && statusCode < 500 {
-			return "client_error"
-		}
-		if statusCode >= 500 {
-			return "server_error"
-		}
-		return fmt.Sprintf("http_%d", statusCode)
+	if ttft := e.TimeToFirstToken(); ttft > 0 {
+		ContainerLLMTimeToFirstToken.WithLabelValues(labels...).Observe(ttft.Seconds())
+	}
+	if e.Outcome != "" {
+		LLMCaptureTotal.WithLabelValues(string(e.Outcome)).Inc()
 	}
 }

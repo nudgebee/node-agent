@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -16,6 +17,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/features"
 
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/containers"
@@ -31,9 +35,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sys/unix"
 	"golang.org/x/time/rate"
+	"inet.af/netaddr"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 )
 
@@ -114,17 +117,34 @@ func whitelistNodeExternalNetworks() {
 	}
 }
 
-func getClientSet() (*kubernetes.Clientset, error) {
-	config, err := rest.InClusterConfig()
+func localIPs() ([]netaddr.IP, error) {
+	netdevs, err := node.NetDevices()
 	if err != nil {
-		kubeconfig :=
-			clientcmd.NewDefaultClientConfigLoadingRules().GetDefaultFilename()
-		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
-		if err != nil {
-			return nil, err
+		return nil, err
+	}
+	var ips []netaddr.IP
+	for _, iface := range netdevs {
+		for _, p := range iface.IPPrefixes {
+			ips = append(ips, p.IP())
 		}
 	}
-	return kubernetes.NewForConfig(config)
+	return ips, nil
+}
+
+func newIPResolver(hostname string) (containers.IPResolver, error) {
+	config, err := common.KubernetesConfig()
+	if err != nil {
+		return nil, fmt.Errorf("kubernetes config: %w", err)
+	}
+	if config == nil {
+		klog.Infoln("no kubernetes API found, running in standalone host mode")
+		return common.NewVMIPResolver(hostname, localIPs, *flags.ResolveDns)
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("kubernetes clientset: %w", err)
+	}
+	return common.NewK8sIPResolver(clientset, *flags.ResolveDns)
 }
 
 func main() {
@@ -148,23 +168,13 @@ func main() {
 	flag.Set("logtostderr", "false")
 	flag.Set("alsologtostderr", "false")
 	flag.Set("stderrthreshold", "FATAL")
+	// SetOutput gives every severity the same writer, and klog writes a
+	// message to its own severity's writer and every lower one's: without
+	// one_output each warning was logged twice and each error three times.
+	flag.Set("one_output", "true")
 	klog.SetOutput(&RateLimitedLogOutput{limiter: rate.NewLimiter(rate.Limit(*flags.LogPerSecond), *flags.LogBurst)})
 
 	klog.Infoln("agent version:", version)
-
-	clientset, err := getClientSet()
-	if err != nil {
-		log.Fatalf("Error getting kubernetes clientset: %v", err)
-	}
-	resolver, err := common.NewK8sIPResolver(clientset, *flags.ResolveDns)
-	if err != nil {
-		log.Fatalf("Error creating resolver: %v", err)
-	}
-	err = resolver.StartWatching()
-	if err != nil {
-		klog.Errorf("Error starting resolver: %v", err)
-	}
-	defer resolver.StopWatching()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -187,9 +197,30 @@ func main() {
 		klog.Exitln(err)
 	}
 
-	if !common.GetKernelVersion().GreaterOrEqual(common.NewVersion(4, 16, 0)) {
-		klog.Exitln("the minimum Linux kernel version required is 4.16 or later")
+	// L7 events go through a BPF ring buffer (BPF_MAP_TYPE_RINGBUF), which
+	// every program variant uses: without it the programs fail to load
+	// further on, with a less clear error. Probe for the map type rather than
+	// checking for 5.8: RHEL 8 kernels (4.18) backport it. Kernels before
+	// 5.11 charge the probe's map to RLIMIT_MEMLOCK, so raise it first, as the
+	// tracer does before loading. Only a definite "not supported" is fatal:
+	// any other probe error (missing privileges) is left for the program
+	// loader to report.
+	_ = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY})
+	if err := features.HaveMapType(ebpf.RingBuf); errors.Is(err, ebpf.ErrNotSupported) {
+		klog.Exitf("the kernel does not support BPF ring buffers (Linux 5.8 or later, or a distribution kernel that backports them, such as RHEL 8): %s", err)
+	} else if err != nil {
+		klog.Warningf("failed to probe for BPF ring buffer support: %s", err)
 	}
+
+	resolver, err := newIPResolver(hostname)
+	if err != nil {
+		log.Fatalf("Error creating resolver: %v", err)
+	}
+	err = resolver.StartWatching()
+	if err != nil {
+		klog.Errorf("Error starting resolver: %v", err)
+	}
+	defer resolver.StopWatching()
 
 	whitelistNodeExternalNetworks()
 
@@ -199,7 +230,10 @@ func main() {
 	tracing.Init(machineId, hostname, version)
 	logs.Init(machineId, hostname, version)
 
-	nodeCollector := node.NewCollector(hostname, kv)
+	// Without Kubernetes there is usually no node_exporter: export the host's
+	// filesystem, load and swap metrics under its names.
+	_, standalone := resolver.(*common.VMIPResolver)
+	nodeCollector := node.NewCollector(hostname, kv, standalone)
 
 	registry := prometheus.NewRegistry()
 
@@ -248,7 +282,7 @@ func main() {
 
 	// Metrics endpoint with timeout protection
 	http.Handle("/metrics", http.TimeoutHandler(
-		promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: logger{}, Registry: registerer}),
+		promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: logger{}, Registry: registerer, ErrorHandling: promhttp.ContinueOnError}),
 		30*time.Second,
 		"Metrics collection timeout",
 	))
@@ -265,7 +299,16 @@ func main() {
 
 	klog.Infoln("listening on:", *flags.ListenAddress)
 	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-		klog.Errorln(err)
+		if *flags.MetricsEndpoint == nil {
+			// Nothing can scrape the agent: exit non-zero so the service
+			// manager restarts it.
+			klog.Exitln(err)
+		} else {
+			// Metrics are pushed: the local endpoint is optional, so a
+			// taken port must not stop the agent.
+			klog.Errorln("local metrics endpoint unavailable, metrics are still pushed:", err)
+			<-ctx.Done()
+		}
 	}
 	klog.Infoln("shutdown complete")
 }

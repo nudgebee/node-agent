@@ -26,7 +26,8 @@ type SocketInfoOffsets struct {
 	FilePrivateDataOffset int32 // file->private_data
 
 	// socket offsets
-	SocketSkOffset int32 // socket->sk
+	SocketSkOffset   int32 // socket->sk
+	SocketTypeOffset int32 // socket->type
 
 	// sock_common offsets (connection tuple)
 	SkFamilyOffset     int32 // sock_common->skc_family
@@ -42,14 +43,8 @@ type SocketInfoOffsets struct {
 	Padding      [3]uint8
 }
 
-// discoverSocketOffsets uses BTF to discover kernel struct offsets
-func discoverSocketOffsets() (*SocketInfoOffsets, error) {
-	// Load kernel BTF
-	spec, err := btf.LoadKernelSpec()
-	if err != nil {
-		return nil, fmt.Errorf("failed to load kernel BTF: %w", err)
-	}
-
+// discoverSocketOffsets uses the kernel's BTF to discover kernel struct offsets
+func discoverSocketOffsets(spec *btf.Spec) *SocketInfoOffsets {
 	offsets := &SocketInfoOffsets{}
 
 	// Helper function to get field offset from a struct
@@ -178,6 +173,13 @@ func discoverSocketOffsets() (*SocketInfoOffsets, error) {
 		offsets.SocketSkOffset = offset
 	}
 
+	// socket->type
+	if offset, err := getOffset("socket", "type"); err != nil {
+		klog.Warningf("BTF: %v", err)
+	} else {
+		offsets.SocketTypeOffset = offset
+	}
+
 	// sock_common offsets - use deep search for anonymous union members
 	// sock_common->skc_family
 	if offset, err := getOffsetDeep("sock_common", "skc_family"); err != nil {
@@ -239,7 +241,7 @@ func discoverSocketOffsets() (*SocketInfoOffsets, error) {
 	// Mark as valid - we have fallbacks for essential offsets
 	if offsets.TaskFilesOffset > 0 && offsets.FilesFdtOffset > 0 &&
 		offsets.FdtFdOffset >= 0 && offsets.FilePrivateDataOffset > 0 &&
-		offsets.SocketSkOffset >= 0 {
+		offsets.SocketSkOffset >= 0 && offsets.SocketTypeOffset > 0 {
 		offsets.OffsetsValid = 1
 		klog.Infof("BTF socket offsets discovered: task->files=%d, files->fdt=%d, fdt->fd=%d, file->private_data=%d, socket->sk=%d, sk->daddr=%d, sk->rcv_saddr=%d, sk->dport=%d, sk->num=%d",
 			offsets.TaskFilesOffset, offsets.FilesFdtOffset, offsets.FdtFdOffset,
@@ -249,10 +251,14 @@ func discoverSocketOffsets() (*SocketInfoOffsets, error) {
 		klog.Warning("BTF socket offsets incomplete, socket info extraction may not work")
 	}
 
-	return offsets, nil
+	return offsets
 }
 
-// initSocketInfoOffsets discovers offsets and writes them to the eBPF map
+// initSocketInfoOffsets discovers offsets and writes them to the eBPF map. It
+// records whether the kernel has BTF and whether the offsets were set, which
+// node_agent_ebpf_info reports: without them the kernel cannot read a
+// socket's addresses from its fd, and the Go TLS fd walk cannot confirm what
+// it found against the kernel.
 func (t *Tracer) initSocketInfoOffsets() error {
 	// Find the map
 	m, ok := t.collection.Maps["socket_info_offsets_map"]
@@ -261,11 +267,17 @@ func (t *Tracer) initSocketInfoOffsets() error {
 		return nil
 	}
 
-	// Discover offsets using BTF
-	offsets, err := discoverSocketOffsets()
+	spec, err := btf.LoadKernelSpec()
 	if err != nil {
-		klog.Warningf("Failed to discover socket offsets: %v", err)
+		klog.Warningf("Failed to load kernel BTF, socket info extraction disabled: %v", err)
 		return nil // Not fatal, just means socket info extraction won't work
+	}
+	t.kernelBTF = true
+
+	// Discover offsets using BTF
+	offsets := discoverSocketOffsets(spec)
+	if offsets.OffsetsValid == 0 {
+		return nil
 	}
 
 	// Write offsets to map
@@ -275,6 +287,7 @@ func (t *Tracer) initSocketInfoOffsets() error {
 		return nil
 	}
 
+	t.socketOffsets = true
 	klog.Info("Socket info offsets initialized successfully")
 	return nil
 }

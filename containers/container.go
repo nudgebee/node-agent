@@ -5,9 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/coroot/coroot-node-agent/cgroup"
@@ -15,6 +15,7 @@ import (
 	"github.com/coroot/coroot-node-agent/ebpftracer"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/coroot/coroot-node-agent/flags"
+	"github.com/coroot/coroot-node-agent/llm"
 	"github.com/coroot/coroot-node-agent/logs"
 	"github.com/coroot/coroot-node-agent/node"
 	"github.com/coroot/coroot-node-agent/pinger"
@@ -40,6 +41,14 @@ const (
 	// Max per-connection HTTP/2 parsers per container.
 	// Each parser holds HPACK decoders and active request state.
 	maxHTTP2ParsersPerContainer = 50
+
+	// Max connectionsByPidFd entries per container.
+	//
+	// The map is keyed by pid+fd, so the number of entries that can legitimately
+	// be live is bounded by the container's open socket fds — hundreds in
+	// practice. This is a backstop against runaway growth between gc() runs, not
+	// a working limit; hitting it means reclamation is not keeping up.
+	maxConnectionsPerContainer = 8192
 )
 
 type ContainerID string
@@ -93,6 +102,10 @@ type ActiveConnection struct {
 	Timestamp      uint64
 	Closed         time.Time
 
+	// dst is the address the socket is connected to, before NAT. It tells
+	// this connection apart from another socket that had the same fd number.
+	dst netaddr.IPPort
+
 	BytesSent     uint64
 	BytesReceived uint64
 	Protocol      uint8
@@ -123,6 +136,7 @@ type Container struct {
 
 	processes map[uint32]*Process
 
+	createdAt time.Time // when the agent found the container
 	startedAt time.Time
 	zombieAt  time.Time
 
@@ -139,14 +153,17 @@ type Container struct {
 	l7Stats    L7Stats
 	tcpMetrics *TCPMetrics
 
-	// LLM observability pipeline
-	llmDetector *LLMDetector // Connection-level LLM detection (shared across containers via registry)
-	llmParser   *LLMParser   // Per-container LLM response parser
+	// Connections identified as LLM API connections, whose byte stream the
+	// kernel copies in full (see llm_capture.go).
+	llmCaptures map[PidFd]*llmCapture
 
 	gpuStats map[string]*GpuUsage
 
 	nodejsStats *ebpftracer.NodejsStats
 	pythonStats *ebpftracer.PythonStats
+	// tlsDrops counts TLS plaintext the kernel could not attribute to a
+	// socket for this container's processes, by reason. Guarded by lock.
+	tlsDrops map[string]float64
 
 	mounts     map[string]proc.MountInfo
 	seenMounts map[uint64]struct{}
@@ -165,9 +182,10 @@ type Container struct {
 	srcWorkload common.Workload
 	constLabels []string // [container_id, app_id, machine_id, system_uuid, az, region]
 
-	// Atomic throttling fields for lock-free access
-	collectCallCount int64
-	lastCollectTime  int64 // Unix nanoseconds
+	// collectMu serializes Collect. Several gathers can run at once (more
+	// than one scraper, or a scrape and the remote writer), and Collect
+	// updates per-container state such as the delay accounting.
+	collectMu sync.Mutex
 }
 
 func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid uint32, registry *Registry) (*Container, error) {
@@ -195,7 +213,10 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 	} else {
 		// Non-k8s containers (docker, systemd, swarm, nomad): use container name as workload
 		name := ""
-		if len(split) > 0 {
+		if strings.HasPrefix(idStr, "/swarm/") && len(split) >= 4 {
+			// /swarm/namespace/service/slot: the slot number is not a name
+			name = split[3]
+		} else if len(split) > 0 {
 			name = split[len(split)-1]
 		}
 		src_workload = common.Workload{Name: name, Kind: "container"}
@@ -230,6 +251,8 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		cgroup:   cg,
 		metadata: md,
 
+		createdAt: time.Now(),
+
 		processes: map[uint32]*Process{},
 
 		delaysByPid: map[uint32]Delays{},
@@ -258,12 +281,7 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		constLabels: constLabels,
 	}
 
-	// Initialize LLM pipeline
-	c.llmDetector = registry.llmDetector
-	c.llmParser = NewLLMParser(string(id), src_workload.Name, src_workload.Namespace,
-		func(event *LLMEvent) {
-			c.onLLMEvent(event)
-		})
+	c.llmCaptures = map[PidFd]*llmCapture{}
 
 	c.runLogParser("")
 
@@ -287,10 +305,7 @@ func (c *Container) Close() {
 	for _, p := range c.logParsers {
 		p.Stop()
 	}
-	// Stop the LLM parser
-	if c.llmParser != nil {
-		c.llmParser.Stop()
-	}
+	c.closeAllLLMCaptures()
 	close(c.done)
 }
 
@@ -306,16 +321,25 @@ func (c *Container) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *Container) Collect(ch chan<- prometheus.Metric) {
+	// Every gather gets the container's full metric set; concurrent gathers
+	// wait their turn. Answering a gather that arrives soon after another
+	// with nothing makes that scraper mark every series of the container
+	// stale, which breaks rate() and increase() over the gap.
+	c.collectMu.Lock()
+	defer c.collectMu.Unlock()
 	collectStart := time.Now()
 
-	// Throttle: prevent duplicate metric emissions within 1 second
-	currentCount := atomic.AddInt64(&c.collectCallCount, 1)
-	nowNanos := time.Now().UnixNano()
-	lastCollectNanos := atomic.LoadInt64(&c.lastCollectTime)
-	if time.Duration(nowNanos-lastCollectNanos) < 1*time.Second && currentCount > 1 {
+	if taskstatsClient != nil {
+		// Processes whose exit event was missed: without this they keep
+		// the container out of zombie state and its age wrong.
+		for pid, p := range c.updateDelays() {
+			c.onProcessExitIf(pid, p)
+		}
+	}
+
+	if minAge := *flags.MinContainerAge; minAge > 0 && c.youngerThan(minAge) {
 		return
 	}
-	atomic.StoreInt64(&c.lastCollectTime, nowNanos)
 
 	if c.metadata.image != "" || !c.metadata.systemd.IsEmpty() {
 		ch <- c.gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemd.TriggeredBy, c.metadata.systemd.Type)
@@ -332,7 +356,6 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	if taskstatsClient != nil {
-		c.updateDelays()
 		ch <- c.counter(metrics.CPUDelay, float64(c.delays.cpu)/float64(time.Second))
 		ch <- c.counter(metrics.DiskDelay, float64(c.delays.disk)/float64(time.Second))
 	}
@@ -356,12 +379,17 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 
 	if disks, err := node.GetDisks(); err == nil {
 		ioStat := c.cgroup.IOStat()
+		seenVolumes := map[string]struct{}{}
 		for majorMinor, mounts := range c.getMounts() {
 			var device string
 			if dev := disks.GetParentBlockDevice(majorMinor); dev != nil {
 				device = dev.Name
 			}
 			for mountPoint, fsStat := range mounts {
+				if _, ok := seenVolumes[mountPoint+":"+device]; ok {
+					continue
+				}
+				seenVolumes[mountPoint+":"+device] = struct{}{}
 				dls := []string{mountPoint, device, c.metadata.volumes[mountPoint]}
 				ch <- c.gauge(metrics.DiskSize, float64(fsStat.CapacityBytes), dls...)
 				ch <- c.gauge(metrics.DiskUsed, float64(fsStat.UsedBytes), dls...)
@@ -408,7 +436,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		for _, ctr := range p.parser.GetCounters() {
 			if ctr.Level == logparser.LevelCritical || ctr.Level == logparser.LevelError {
 				sample, _ := c.logSamples.LoadOrStore(ctr.Hash, common.TruncateUtf8(ctr.Sample, *flags.MaxLabelLength))
-				ch <- c.counter(metrics.LogMessages, float64(ctr.Messages), source, ctr.Level.String(), ctr.Hash, sample.(string))
+				ch <- c.counter(metrics.LogMessages, float64(ctr.Messages), source, ctr.Level.String(), ctr.Hash, sampleString(sample))
 			}
 		}
 		for _, sc := range p.parser.GetSensitiveCounters() {
@@ -448,9 +476,10 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 				}
 			}
 		}
-		if process.isGolangApp {
+		if process.golang() {
 			appTypes["golang"] = struct{}{}
 		}
+		dotNetMonitor := process.dotNet()
 		switch {
 		case proc.IsJvm(cmdline):
 			jvm, jMetrics := c.jvmMetrics(pid)
@@ -460,12 +489,12 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 					ch <- m
 				}
 			}
-		case process.dotNetMonitor != nil:
+		case dotNetMonitor != nil:
 			appTypes["dotnet"] = struct{}{}
-			appName := process.dotNetMonitor.AppName()
+			appName := dotNetMonitor.AppName()
 			if !seenDotNetApps[appName] {
 				seenDotNetApps[appName] = true
-				process.dotNetMonitor.Collect(ch)
+				dotNetMonitor.Collect(ch)
 			}
 		}
 
@@ -492,11 +521,30 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	for appType := range appTypes {
 		ch <- c.gauge(metrics.ApplicationType, 1, appType)
 	}
-	if c.pythonStats != nil {
-		ch <- c.counter(metrics.PythonThreadLockWaitTime, c.pythonStats.ThreadLockWaitTime.Seconds())
+	// Written under c.lock by updatePythonStats/updateNodejsStats on the
+	// registry's event loop; read under it here.
+	c.lock.RLock()
+	pythonStats, nodejsStats := c.pythonStats, c.nodejsStats
+	tlsDrops := make(map[string]float64, len(c.tlsDrops))
+	for reason, n := range c.tlsDrops {
+		tlsDrops[reason] = n
 	}
-	if c.nodejsStats != nil {
-		ch <- c.counter(metrics.NodejsEventLoopBlockedTime, c.nodejsStats.EventLoopBlockedTime.Seconds())
+	var pythonLockWait, nodejsBlocked float64
+	if pythonStats != nil {
+		pythonLockWait = pythonStats.ThreadLockWaitTime.Seconds()
+	}
+	if nodejsStats != nil {
+		nodejsBlocked = nodejsStats.EventLoopBlockedTime.Seconds()
+	}
+	c.lock.RUnlock()
+	if pythonStats != nil {
+		ch <- c.counter(metrics.PythonThreadLockWaitTime, pythonLockWait)
+	}
+	if nodejsStats != nil {
+		ch <- c.counter(metrics.NodejsEventLoopBlockedTime, nodejsBlocked)
+	}
+	for reason, n := range tlsDrops {
+		ch <- c.counter(metrics.TLSPlaintextDropped, n, reason)
 	}
 
 	// --- L7 metrics: push-model, own lock ---
@@ -521,12 +569,22 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 func (c *Container) onProcessStart(pid uint32) *Process {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	stats, err := TaskstatsPID(pid)
-	if err != nil {
+	startedAt := proc.GetStartTime(pid)
+	if startedAt.IsZero() {
 		return nil
 	}
+	if p := c.processes[pid]; p != nil {
+		// Already registered for this same process: a connection can be
+		// handled before the process start event (see attachTlsUprobes).
+		// Replacing it would drop its uprobes without closing them.
+		if p.StartedAt.Equal(startedAt) {
+			return p
+		}
+		// The pid was reused: the previous process exited unnoticed.
+		c.closeProcess(pid, p)
+	}
 	c.zombieAt = time.Time{}
-	p := NewProcess(pid, stats, c.registry.tracer)
+	p := NewProcess(pid, startedAt, c.registry.tracer)
 
 	if p == nil {
 		return nil
@@ -534,9 +592,9 @@ func (c *Container) onProcessStart(pid uint32) *Process {
 	c.processes[pid] = p
 
 	if c.startedAt.IsZero() {
-		c.startedAt = stats.BeginTime
+		c.startedAt = startedAt
 	} else {
-		min := stats.BeginTime
+		min := startedAt
 		for _, p := range c.processes {
 			if p.StartedAt.Before(min) {
 				min = p.StartedAt
@@ -550,11 +608,9 @@ func (c *Container) onProcessStart(pid uint32) *Process {
 	return p
 }
 
-func (c *Container) onProcessExit(pid uint32, oomKill bool) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
+func (c *Container) onProcessExitLocked(pid uint32, oomKill bool) {
 	if p := c.processes[pid]; p != nil {
-		p.Close()
+		c.closeProcess(pid, p)
 	}
 	delete(c.processes, pid)
 	if len(c.processes) == 0 {
@@ -563,6 +619,57 @@ func (c *Container) onProcessExit(pid uint32, oomKill bool) {
 	delete(c.delaysByPid, pid)
 	if oomKill {
 		c.tcpMetrics.ObserveOOMKill()
+	}
+}
+
+// dropStaleHTTP2Parser removes the HTTP/2 parser an earlier connection left on
+// pid+fd. Parsers are keyed by pid+fd alone, so a recycled fd would otherwise
+// hand the new connection the old one's HPACK dynamic table, and its headers
+// would fail to decode or decode wrong. A parser already tagged with this
+// connection's timestamp is its own, created by an L7 event that arrived
+// before the open event, and is kept.
+//
+// A parser without a timestamp is dropped too. It was created by events from
+// a socket the kernel was not tracking, such as a connection that predates
+// the agent. The connection opening now is tracked, and the kernel stamps
+// every event of a tracked connection with its timestamp, so such a parser
+// cannot be this connection's.
+func (c *Container) dropStaleHTTP2Parser(k PidFd, timestamp uint64) {
+	if p := c.googleHTTP2Parsers[k]; p != nil && p.ConnTimestamp != timestamp {
+		delete(c.googleHTTP2Parsers, k)
+	}
+}
+
+// closeProcess releases everything held for a process that is gone. The
+// caller holds c.lock.
+func (c *Container) closeProcess(pid uint32, p *Process) {
+	p.Close()
+	if p.golang() {
+		c.registry.tracer.ReleaseGoTLSOffsets(pid)
+	}
+	if p.tlsAttached {
+		// The last chance to attribute its losses: the periodic read comes
+		// too late for a short-lived process.
+		if d := c.registry.tracer.TLSPlaintextDroppedForPid(pid); len(d) > 0 {
+			c.recordTLSDropsLocked(pid, p, d)
+		}
+	}
+}
+
+func (c *Container) onProcessExit(pid uint32, oomKill bool) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.onProcessExitLocked(pid, oomKill)
+}
+
+// onProcessExitIf handles the exit of pid only if it is still registered as
+// p: between finding p gone and getting here, the pid may have been reused
+// by a new process that must not be untracked.
+func (c *Container) onProcessExitIf(pid uint32, p *Process) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	if c.processes[pid] == p {
+		c.onProcessExitLocked(pid, false)
 	}
 }
 
@@ -575,7 +682,8 @@ func (c *Container) onFileOpen(pid uint32, fd uint64, mnt uint64, log bool) {
 			return
 		}
 	}
-	mntId, logPath := resolveFd(pid, fd)
+	info := proc.GetFdInfo(pid, fd)
+	mntId, logPath := resolveFd(info)
 	func() {
 		if mntId == "" {
 			return
@@ -599,8 +707,19 @@ func (c *Container) onFileOpen(pid uint32, fd uint64, mnt uint64, log bool) {
 			c.lock.Unlock()
 		}
 	}()
-	if logPath != "" {
-		if *flags.EnableDynamicLogTailing {
+	if *flags.EnableDynamicLogTailing {
+		var logPaths []string
+		switch {
+		case logPath != "":
+			logPaths = []string{logPath}
+		case log && (info == nil || !strings.HasPrefix(info.Dest, "/var/log/")):
+			// The kernel saw a /var/log/ file opened, but the fd now points
+			// elsewhere (freopen): find the log files the process holds.
+			if c.logFilesScanDue(pid) {
+				logPaths = findLogFiles(pid)
+			}
+		}
+		for _, logPath := range logPaths {
 			c.lock.Lock()
 			c.runLogParser(logPath)
 			c.lock.Unlock()
@@ -668,17 +787,18 @@ func ignoreControlPlane(name string) bool {
 	return false
 }
 
-func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst netaddr.IPPort, timestamp uint64, failed bool, duration time.Duration) {
+// connectionKey applies the filters a connection must pass to be tracked and
+// builds its destination key. actualDst is the post-NAT destination if known,
+// zero otherwise. ok is false if the connection is not to be tracked. Both
+// ways a connection is created — its open event (onConnectionOpen) and the
+// socket tuple of an L7 event that arrived first (createConnectionFromSocketInfo)
+// — go through here, so they track the same connections with the same labels.
+func (c *Container) connectionKey(p *Process, src, dst, actualDst netaddr.IPPort) (key common.DestinationKey, srcWorkload, dstWorkload common.Workload, ok bool) {
 	if common.PortFilter.ShouldBeSkipped(dst.Port()) {
 		return
 	}
-	c.lock.RLock()
-	p := c.processes[pid]
-	c.lock.RUnlock()
-	if p == nil {
-		return
-	}
-	if dst.IP().IsLoopback() && !p.isHostNs() {
+	hostNs := p != nil && p.isHostNs()
+	if dst.IP().IsLoopback() && !hostNs {
 		return
 	}
 	if actualDst.Port() == 0 {
@@ -689,23 +809,39 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 		}
 	}
 
-	srcWorkload := c.ip_resolver.ResolveIP(src.IP().String())
+	srcWorkload = c.ip_resolver.ResolveSource(src.IP().String(), c.srcWorkload)
 	if ignoreControlPlane(srcWorkload.Name) {
 		return
 	}
-	dstWorkload := c.ip_resolver.ResolveIP(dst.IP().String())
+	dstWorkload = c.ip_resolver.ResolveIP(dst.IP().String())
 	if ignoreControlPlane(dstWorkload.Name) {
 		return
 	}
 	actualDstWorkload := c.ip_resolver.ResolveActualIP(actualDst.IP().String())
-	if actualDst.IP().IsLoopback() && !p.isHostNs() {
+	if actualDst.IP().IsLoopback() && !hostNs {
 		return
 	}
 	if common.ConnectionFilter.ShouldBeSkipped(dst.IP(), actualDst.IP()) {
 		return
 	}
+	key = common.NewDestinationKey(dst, actualDst, c.registry.getDomain(dst.IP()), dstWorkload, actualDstWorkload)
+	return key, srcWorkload, dstWorkload, true
+}
 
-	key := common.NewDestinationKey(dst, actualDst, c.registry.getDomain(dst.IP()), dstWorkload, actualDstWorkload)
+func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst netaddr.IPPort, timestamp uint64, failed bool, duration time.Duration) {
+	if common.PortFilter.ShouldBeSkipped(dst.Port()) {
+		return
+	}
+	c.lock.RLock()
+	p := c.processes[pid]
+	c.lock.RUnlock()
+	if p == nil {
+		return
+	}
+	key, srcWorkload, dstWorkload, ok := c.connectionKey(p, src, dst, actualDst)
+	if !ok {
+		return
+	}
 
 	if failed {
 		c.tcpMetrics.ObserveConnectionFailed(key.Destination(), dstWorkload)
@@ -723,6 +859,7 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 			Fd:             fd,
 			Timestamp:      timestamp,
 			srcWorkload:    srcWorkload,
+			dst:            dst,
 		}
 		c.activeConnections[ConnectionKey{src: src, dst: dst}] = connection
 		k := PidFd{Pid: pid, Fd: fd}
@@ -731,6 +868,7 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 			prev.Closed = time.Now()
 		}
 		c.connectionsByPidFd[k] = connection
+		c.dropStaleHTTP2Parser(k, timestamp)
 	}
 	c.lastConnectionAttempts[key.Destination()] = time.Now()
 }
@@ -738,60 +876,167 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 // createConnectionFromSocketInfo creates an ActiveConnection from socket info extracted in eBPF
 // This is used when TCP connection tracking fails (common for Go TLS due to goroutine thread switching)
 // but we have socket tuple info extracted directly from the fd
-func (c *Container) createConnectionFromSocketInfo(pid uint32, fd uint64, socketInfo *ebpftracer.SocketInfo) *ActiveConnection {
-	if socketInfo == nil || !socketInfo.Valid {
-		return nil
+func (c *Container) createConnectionFromSocketInfo(pid uint32, fd uint64, timestamp uint64, socketInfo *ebpftracer.SocketInfo) (conn *ActiveConnection, filtered bool) {
+	connection, filtered := c.connectionFromSocketInfo(pid, fd, timestamp, socketInfo, true)
+	if connection == nil {
+		return nil, filtered
 	}
 
-	// Parse destination IP
-	dstIP, err := netaddr.ParseIP(socketInfo.DstIP)
-	if err != nil {
-		klog.V(2).Infof("createConnectionFromSocketInfo: failed to parse dst IP %s: %v", socketInfo.DstIP, err)
-		return nil
+	// Store in connectionsByPidFd for future L7 events on same connection
+	k := PidFd{Pid: pid, Fd: fd}
+	if !c.canTrackConnection(k) {
+		ConnectionCapDropsTotal.Inc()
+		return nil, false
+	}
+	c.connectionsByPidFd[k] = connection
+
+	klog.V(3).Infof("L7_CONN_CREATED_FROM_SOCKET: pid=%d fd=%d dst=%s actual_dst=%s",
+		pid, fd, connection.dst, connection.DestinationKey.ActualDestinationIfKnown())
+
+	return connection, false
+}
+
+// connectionFromSocketInfo builds the connection an L7 event's socket tuple
+// describes, without tracking it. filtered is true for a connection the agent
+// does not track. tcp is false for a socket that may be UDP: the kernel's
+// address translations are recorded for TCP connections only.
+func (c *Container) connectionFromSocketInfo(pid uint32, fd uint64, timestamp uint64, socketInfo *ebpftracer.SocketInfo, tcp bool) (conn *ActiveConnection, filtered bool) {
+	if socketInfo == nil || !socketInfo.Valid {
+		return nil, false
+	}
+	// connectionKey applies the same filter below; checking it first skips
+	// the parsing and the kernel map lookup for the commonest case. A TLS
+	// server's accepted sockets have a client's ephemeral port as their
+	// destination, are never tracked, and come through here on every event.
+	if common.PortFilter.ShouldBeSkipped(socketInfo.DstPort) {
+		return nil, true
+	}
+
+	dst, ok := socketDestination(socketInfo)
+	if !ok {
+		klog.V(2).Infof("connectionFromSocketInfo: failed to parse dst IP %s", socketInfo.DstIP)
+		return nil, false
 	}
 
 	// Parse source IP
 	srcIP, err := netaddr.ParseIP(socketInfo.SrcIP)
 	if err != nil {
-		klog.V(2).Infof("createConnectionFromSocketInfo: failed to parse src IP %s: %v", socketInfo.SrcIP, err)
-		return nil
+		klog.V(2).Infof("connectionFromSocketInfo: failed to parse src IP %s: %v", socketInfo.SrcIP, err)
+		return nil, false
 	}
-
-	dst := netaddr.IPPortFrom(dstIP, socketInfo.DstPort)
 	src := netaddr.IPPortFrom(srcIP, socketInfo.SrcPort)
 
-	// Resolve workloads
-	srcWorkload := c.ip_resolver.ResolveIP(src.IP().String())
-	dstWorkload := c.ip_resolver.ResolveIP(dst.IP().String())
-	actualDstWorkload := c.ip_resolver.ResolveActualIP(dst.IP().String())
+	// The socket holds the address the application connected to, before any
+	// NAT: a service's ClusterIP, not the pod behind it. The kernel records the
+	// translation per local address from conntrack, as the open event's
+	// actual destination does. The table is keyed by local address alone, so
+	// for a UDP socket it can only hold an earlier TCP connection's, from
+	// whatever socket last had the same local port: DNS queries were labelled
+	// with that connection's server.
+	var actualDst netaddr.IPPort
+	if tcp {
+		actualDst, _ = c.registry.actualDestination(src)
+	}
+	// Same filters and labels as a connection seen opening: without them,
+	// traffic to ignored destinations was tracked through this path alone.
+	key, srcWorkload, _, ok := c.connectionKey(c.processes[pid], src, dst, actualDst)
+	if !ok {
+		return nil, true
+	}
 
-	// Try to get DNS domain for destination
-	domain := c.registry.getDomain(dst.IP())
-
-	// Create destination key
-	key := common.NewDestinationKey(dst, dst, domain, dstWorkload, actualDstWorkload)
-
-	// Create connection
-	connection := &ActiveConnection{
+	return &ActiveConnection{
 		DestinationKey: key,
 		Pid:            pid,
 		Fd:             fd,
-		Timestamp:      0, // We don't have timestamp from socket info
-		srcWorkload:    srcWorkload,
+		// The kernel's timestamp for this connection, from the event. Without
+		// it every later event on the connection failed the timestamp check
+		// in onL7RequestWithResult and was dropped.
+		Timestamp:   timestamp,
+		srcWorkload: srcWorkload,
+		dst:         dst,
+	}, false
+}
+
+// socketDestination returns the destination of an L7 event's socket tuple.
+func socketDestination(si *ebpftracer.SocketInfo) (netaddr.IPPort, bool) {
+	if si == nil || !si.Valid {
+		return netaddr.IPPort{}, false
 	}
+	ip, err := netaddr.ParseIP(si.DstIP)
+	if err != nil {
+		return netaddr.IPPort{}, false
+	}
+	return netaddr.IPPortFrom(ip, si.DstPort), true
+}
 
-	// Store in connectionsByPidFd for future L7 events on same connection
-	k := PidFd{Pid: pid, Fd: fd}
-	c.connectionsByPidFd[k] = connection
+// isSocket reports whether conn is the socket an L7 event's tuple, read from
+// the fd as the event happened, describes. The kernel reuses an fd number as
+// soon as its socket is closed, so the entry tracked for a pid and fd can be
+// an earlier socket's: L7 events are handled as they come, connection events
+// later. It is true when there is nothing to compare, with no tuple or with
+// a connection whose address is unknown.
+func (conn *ActiveConnection) isSocket(si *ebpftracer.SocketInfo) bool {
+	if si == nil || !si.Valid || conn.dst.IP().IsZero() {
+		return true
+	}
+	// The port is enough to tell most reuses apart without parsing the IP.
+	if si.DstPort != conn.dst.Port() {
+		return false
+	}
+	dst, ok := socketDestination(si)
+	if !ok {
+		return true
+	}
+	return dst.IP().Unmap() == conn.dst.IP().Unmap()
+}
 
-	klog.V(3).Infof("L7_CONN_CREATED_FROM_SOCKET: pid=%d fd=%d src=%s dst=%s domain=%v",
-		pid, fd, src, dst, domain)
+// canTrackConnection reports whether pid+fd k may be added to
+// connectionsByPidFd. It is a backstop against runaway growth if gc() cannot
+// keep up, not a working limit: legitimate entries are bounded by the
+// container's open socket fds. Replacing a key already present is always
+// allowed, since that frees the previous entry rather than growing the map.
+//
+// Caller must hold c.lock.
+func (c *Container) canTrackConnection(k PidFd) bool {
+	if _, exists := c.connectionsByPidFd[k]; exists {
+		return true
+	}
+	return len(c.connectionsByPidFd) < maxConnectionsPerContainer
+}
 
-	return connection
+// reclaimStaleConnections frees connectionsByPidFd entries that the
+// activeConnections sweep in gc() cannot reach.
+//
+// That sweep only visits connections registered in activeConnections, but
+// createConnectionFromSocketInfo — the fallback used when TCP connection
+// tracking misses, which is routine for Go TLS — registers a connection in
+// connectionsByPidFd and never in activeConnections. onConnectionClose only
+// stamps Closed, it does not delete. Those entries were therefore unreachable by
+// every reclamation path and survived until the container died, and because the
+// parser sweep treats "present in connectionsByPidFd" as "connection still
+// alive", they pinned their HTTP/2 parsers alive too.
+//
+// Measured across three clusters before this fix: up to 498k live entries
+// against 666 open socket fds on the node (~750x), 260MB of a 340MB heap.
+//
+// Caller must hold c.lock.
+func (c *Container) reclaimStaleConnections(now time.Time) {
+	for pidFd, conn := range c.connectionsByPidFd {
+		if _, alive := c.processes[pidFd.Pid]; !alive {
+			delete(c.connectionsByPidFd, pidFd)
+			ConnectionsReclaimedTotal.WithLabelValues("dead_pid").Inc()
+			continue
+		}
+		if conn != nil && !conn.Closed.IsZero() && now.Sub(conn.Closed) > gcInterval {
+			delete(c.connectionsByPidFd, pidFd)
+			ConnectionsReclaimedTotal.WithLabelValues("closed").Inc()
+		}
+	}
 }
 
 func (c *Container) onConnectionClose(e ebpftracer.Event) {
 	c.lock.Lock()
+	c.closeLLMCapture(e.Pid, e.Fd, e.Timestamp)
 	conn := c.connectionsByPidFd[PidFd{Pid: e.Pid, Fd: e.Fd}]
 	if conn == nil {
 		c.lock.Unlock()
@@ -842,52 +1087,6 @@ func (c *Container) updateConnectionTrafficStats(ac *ActiveConnection, sent, rec
 	}
 }
 
-// onLLMEvent is called by LLMParser when an LLM request completes (streaming or non-streaming).
-// Single code path for all LLM metrics and traces.
-func (c *Container) onLLMEvent(event *LLMEvent) {
-	if event == nil {
-		return
-	}
-
-	// Record Prometheus metrics
-	RecordLLMEvent(event)
-
-	// Emit OTel trace if tracer is available
-	if c.tracer != nil {
-		dstWorkload := common.Workload{Name: event.ServerAddress}
-		trace := c.tracer.NewTrace(
-			common.HostPortWithEmptyIP(event.ServerAddress, 443),
-			c.srcWorkload,
-			dstWorkload,
-			dstWorkload,
-		)
-		if trace != nil {
-			requestTime := time.Now().Add(-event.Duration)
-			completionTime := time.Now()
-			var firstTokenTime time.Time
-			if event.TTFT > 0 {
-				firstTokenTime = requestTime.Add(event.TTFT)
-			}
-
-			trace.LLMRequest(tracing.LLMStreamInfo{
-				Provider:       string(event.Provider),
-				Model:          event.Model,
-				Operation:      event.Operation,
-				ServerAddress:  event.ServerAddress,
-				TraceID:        event.TraceID,
-				ParentSpanID:   event.ParentSpanID,
-				RequestTime:    requestTime,
-				FirstTokenTime: firstTokenTime,
-				CompletionTime: completionTime,
-				InputTokens:    event.InputTokens,
-				OutputTokens:   event.OutputTokens,
-				StatusCode:     event.StatusCode,
-				IsError:        event.StatusCode >= 400,
-			})
-		}
-	}
-}
-
 // L7RequestResult indicates the result of processing an L7 request
 type L7RequestResult int
 
@@ -902,6 +1101,49 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	return ip2fqdn
 }
 
+// payloadSizeBucket groups a delivered payload length. The boundaries are the
+// ones that matter to the frame parser: 0 and <9 produce no frame at all, and
+// 9-16 is a bare frame header with little or no payload attached — the shape a
+// reader doing io.ReadFull(header[:9]) then a separate payload read produces.
+func payloadSizeBucket(n int) string {
+	switch {
+	case n == 0:
+		return "0"
+	case n < 9:
+		return "1-8"
+	case n < 17:
+		return "9-16"
+	case n < 257:
+		return "17-256"
+	case n < 4096:
+		return "257-4095"
+	}
+	return "4096+"
+}
+
+// frameDirection labels an HTTP/2 event by which side's frames it carries.
+// Other protocols report "-" rather than inventing a direction for them.
+func frameDirection(m l7.Method) string {
+	switch m {
+	case l7.MethodHttp2ClientFrames:
+		return "client"
+	case l7.MethodHttp2ServerFrames:
+		return "server"
+	}
+	return "-"
+}
+
+// protocolLabel renders a protocol for use as a metric label. Protocol.String()
+// falls back to "UNKNOWN:<n>" for unrecognised values, which would be unbounded
+// cardinality on a label, so those collapse to a single bucket.
+func protocolLabel(p l7.Protocol) string {
+	s := p.String()
+	if strings.HasPrefix(s, "UNKNOWN:") {
+		return "unknown"
+	}
+	return s
+}
+
 // enrichDestinationKey checks if the DestinationKey has an IP-based workload name
 // and attempts to resolve it to an FQDN using the DNS cache. Returns the original
 // key if no resolution is needed or available.
@@ -910,7 +1152,7 @@ func (c *Container) enrichDestinationKey(key common.DestinationKey) common.Desti
 	if !common.IsIpExternal(ip) {
 		return key
 	}
-	if isIPAddress(key.GetDestinationWorkload().Name) {
+	if needsFQDN(key.GetDestinationWorkload().Name) {
 		if domain := c.registry.getDomain(ip); domain != nil {
 			return key.WithResolvedDomain(domain.FQDN)
 		}
@@ -932,7 +1174,7 @@ func (c *Container) migrateConnectionKeyIfNeeded(conn *ActiveConnection) {
 	if conn == nil {
 		return
 	}
-	if !isIPAddress(conn.DestinationKey.GetDestinationWorkload().Name) {
+	if !needsFQDN(conn.DestinationKey.GetDestinationWorkload().Name) {
 		return
 	}
 	ip := conn.DestinationKey.ActualDestinationIfKnown().IP()
@@ -956,66 +1198,161 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	// not a matching timestamp. The conn lookup and timestamp-equality checks
 	// downstream both reject ClientHellos: Go's crypto/tls runs the handshake
 	// on goroutines that may not be associated with the fd by tcp_connect yet,
-	// and the eBPF event timestamp rarely matches conn.Timestamp. Handle SNI
-	// here so we don't lose the only signal that survives mid-stream-join
-	// HPACK failure on long-lived HTTP/2 connections.
+	// and the eBPF event timestamp rarely matches conn.Timestamp. The SNI is
+	// what identifies an LLM API connection, before any request is sent.
 	if r.Protocol == l7.ProtocolTLSClientHello {
-		if c.llmDetector != nil {
-			if host, err := l7.ParseSNI(r.Payload); err == nil && host != "" {
-				pidFd := PidFd{Pid: pid, Fd: fd}
-				destIP := netaddr.IP{}
-				if conn := c.connectionsByPidFd[pidFd]; conn != nil {
-					destIP = conn.DestinationKey.ActualDestinationIfKnown().IP()
-				}
-				if tag := c.llmDetector.LateTag(pidFd, host, destIP); tag != nil {
-					LLMSNITagsTotal.WithLabelValues(string(tag.Provider)).Inc()
-					klog.V(2).Infof("LLM_SNI_TAG: pid=%d fd=%d sni=%s provider=%s",
-						pid, fd, host, tag.Provider)
-				}
+		host, err := l7.ParseSNI(r.Payload)
+		if err != nil || host == "" {
+			return nil, L7RequestProcessed
+		}
+		pidFd := PidFd{Pid: pid, Fd: fd}
+		conn := c.connectionsByPidFd[pidFd]
+		if conn != nil && !conn.isSocket(socketInfo) {
+			// An earlier socket on this fd. Naming its address after this
+			// ClientHello's host is how a resolver came to be named after
+			// whatever host was connected to right after resolving it.
+			conn = nil
+		}
+		destIP := netaddr.IP{}
+		if conn != nil {
+			destIP = conn.DestinationKey.ActualDestinationIfKnown().IP()
+		}
+		// The conn lookup fails often enough on Go TLS (see above) that the
+		// socket tuple eBPF read off the fd is the only IP we get.
+		if destIP.IsZero() && socketInfo != nil && socketInfo.Valid {
+			if ip, err := netaddr.ParseIP(socketInfo.DstIP); err == nil {
+				destIP = ip
 			}
+		}
+		if provider, ok := llm.ProviderForHost(host); ok && *flags.EnableLLMCapture {
+			c.startLLMCapture(pid, fd, timestamp, llm.Tag{Provider: provider, Host: host})
+		}
+
+		// Publish SNI as the destination FQDN. The ClientHello is the first
+		// thing on the wire, so this lands before any request on the connection
+		// — which is the only way to name a destination whose IP we have never
+		// seen a DNS answer for. Applications cache DNS themselves, so for a
+		// reconnect to a new CDN/anycast edge IP no DNS packet is emitted at
+		// all and the Host header arrives too late to help the first request.
+		if !destIP.IsZero() && common.IsIpExternal(destIP) && !isIPAddress(host) {
+			if conn != nil && needsFQDN(conn.DestinationKey.GetDestinationWorkload().Name) {
+				c.migrateConnectionKeyToFQDN(conn, host)
+			}
+			return map[netaddr.IP]*common.Domain{
+				destIP: common.NewDomain(host, []netaddr.IP{destIP}),
+			}, L7RequestProcessed
 		}
 		return nil, L7RequestProcessed
 	}
 
+	if c.feedLLMCaptureFromL7(pid, fd, timestamp, r) {
+		return nil, L7RequestProcessed
+	}
+	c.detectLLMEndpoint(pid, fd, timestamp, r, socketInfo)
+
 	conn := c.connectionsByPidFd[PidFd{Pid: pid, Fd: fd}]
+	if r.Protocol == l7.ProtocolDNS && socketInfo != nil && socketInfo.Valid &&
+		(conn == nil || !conn.isSocket(socketInfo)) {
+		// DNS over UDP is never tracked: a UDP socket has no close event, so
+		// its entry would outlive it and be taken for the next socket on its
+		// fd, usually the connection to the address just resolved. For the
+		// same reason an entry on the fd that is not this socket is an
+		// earlier socket's. The query takes its connection from its own tuple.
+		// The tuple does not say UDP or TCP, and DNS over TCP that was not
+		// seen connecting is rare enough to go without its translation.
+		var filtered bool
+		if conn, filtered = c.connectionFromSocketInfo(pid, fd, timestamp, socketInfo, false); conn == nil {
+			if !filtered {
+				dropL7Event(c.id, "unknown_connection", pid, fd, r, socketInfo)
+			}
+			return nil, L7RequestProcessed
+		}
+	}
 	if conn == nil {
 		// TCP connection tracking failed - common for Go TLS due to goroutine thread switching
 		// Try to create connection from socket info extracted directly from fd in eBPF
 		if socketInfo != nil && socketInfo.Valid {
 			klog.V(3).Infof("L7_CREATING_CONN_FROM_SOCKET_INFO: pid=%d fd=%d dst=%s:%d container=%s",
 				pid, fd, socketInfo.DstIP, socketInfo.DstPort, c.id)
-			conn = c.createConnectionFromSocketInfo(pid, fd, socketInfo)
+			var filtered bool
+			if conn, filtered = c.createConnectionFromSocketInfo(pid, fd, timestamp, socketInfo); filtered {
+				// A connection the agent does not track (an ignored
+				// destination, loopback, a filtered port).
+				return nil, L7RequestProcessed
+			}
 		}
 
 		if conn == nil {
-			// For HTTP/2 TLS connections, we can still process LLM detection using
-			// the :authority header from HTTP/2 frames (fallback path)
+			// HTTP/2 frames cannot be parsed out of order, which is what a
+			// retry would deliver them as.
 			if r.Protocol == l7.ProtocolHTTP2 {
-				klog.V(3).Infof("HTTP2_CONN_NOT_FOUND: pid=%d fd=%d container=%s - attempting connectionless processing",
-					pid, fd, c.id)
-				return c.processHTTP2WithoutConnection(pid, fd, r)
+				dropL7Event(c.id, unknownConnectionReason(socketInfo), pid, fd, r, socketInfo)
+				return nil, L7RequestProcessed
 			}
 			klog.V(3).Infof("L7_EVENT_CONN_NOT_FOUND: pid=%d fd=%d container=%s num_connections=%d",
 				pid, fd, c.id, len(c.connectionsByPidFd))
 			return nil, L7RequestConnNotFound
 		}
 	}
+	if timestamp != 0 && conn.Timestamp != timestamp && timestamp > conn.Timestamp {
+		// A newer connection on a reused fd whose open event has not been
+		// handled yet: L7 events come through a ring buffer that is read at
+		// once, connection events through per-CPU buffers read on a timer.
+		// The tracked entry is its closed predecessor, so take the
+		// connection from the event's own socket tuple instead.
+		if prev := conn; socketInfo != nil && socketInfo.Valid {
+			fresh, filtered := c.createConnectionFromSocketInfo(pid, fd, timestamp, socketInfo)
+			if fresh == nil && !filtered {
+				dropL7Event(c.id, "unknown_connection", pid, fd, r, socketInfo)
+				return nil, L7RequestProcessed
+			}
+			prev.Closed = time.Now()
+			// Its HTTP/2 parser too: the new connection must not decode its
+			// headers against the old one's HPACK table.
+			delete(c.googleHTTP2Parsers, PidFd{Pid: pid, Fd: fd})
+			if filtered {
+				return nil, L7RequestProcessed
+			}
+			conn = fresh
+		} else if r.Protocol != l7.ProtocolHTTP2 {
+			// No tuple to go on: retry, the open event is on its way.
+			return nil, L7RequestConnNotFound
+		}
+	}
 	if timestamp != 0 && conn.Timestamp != timestamp {
 		klog.V(5).Infof("L7_EVENT_TIMESTAMP_MISMATCH: pid=%d fd=%d event_ts=%d conn_ts=%d protocol=%d",
 			pid, fd, timestamp, conn.Timestamp, r.Protocol)
-		// For HTTP/2, fall through to connectionless processing instead of dropping.
-		// This handles Go TLS connections (S2A, gRPC) where ensure_connection_tracked()
-		// in eBPF creates entries with different timestamps than TCP tracepoints.
-		// Pass the destination IP so DNS cache can resolve :authority when HPACK fails.
-		if r.Protocol == l7.ProtocolHTTP2 {
-			return c.processHTTP2WithoutConnection(pid, fd, r, conn.DestinationKey.ActualDestinationIfKnown().IP())
-		}
+		dropL7Event(c.id, "stale_connection", pid, fd, r, socketInfo)
 		return nil, L7RequestTimestampMismatch
 	}
 
 	// Migrate connection key from IP to FQDN if DNS is now available
 	// (fixes race condition where DNS wasn't cached at connection open time)
 	c.migrateConnectionKeyIfNeeded(conn)
+
+	// Record whether the kernel had to cut this event's payload short. eBPF caps
+	// each event at MAX_PAYLOAD_SIZE and discards the remainder, so PayloadSize
+	// exceeding the delivered length means data was lost outright rather than
+	// continued in a later event. Tracked per protocol and destination class
+	// because the consequence differs sharply: HTTP/1.1 loses trailing headers,
+	// HTTP/2 loses frame alignment.
+	{
+		destClass := "internal"
+		if common.IsIpExternal(conn.DestinationKey.ActualDestinationIfKnown().IP()) {
+			destClass = "external"
+		}
+		proto := protocolLabel(r.Protocol)
+		L7EventsTotal.WithLabelValues(proto, destClass, frameDirection(r.Method), strconv.FormatBool(r.TLS)).Inc()
+		if r.PayloadSize > uint64(len(r.Payload)) {
+			L7PayloadTruncatedTotal.WithLabelValues(proto, destClass).Inc()
+		}
+		// Scoped to HTTP/2: this exists to explain why external HTTP/2 events
+		// so rarely yield a parseable frame, and keeps label cardinality small.
+		if r.Protocol == l7.ProtocolHTTP2 {
+			Http2PayloadSizeTotal.WithLabelValues(
+				payloadSizeBucket(len(r.Payload)), destClass, frameDirection(r.Method)).Inc()
+		}
+	}
 
 	// Check if eBPF traces are disabled (upstream feature)
 	ebpfTracesDisabled := false
@@ -1026,12 +1363,19 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		}
 	}
 
-	// Create trace — migrateConnectionKeyIfNeeded already enriched the key with FQDN
+	// Create the trace late-bound to conn.DestinationKey. migrateConnectionKeyIfNeeded
+	// above resolves the key from the DNS cache, but the Host header (ProtocolHTTP) and
+	// the :authority pseudo-header (ProtocolHTTP2) are only parsed further down — after
+	// this point and before the span is emitted. Reading the key when the span is
+	// emitted rather than here lets those late resolutions reach the span, which is
+	// what l7Stats.observe already gets by running after the migration.
 	var trace *tracing.Trace
 	if !ebpfTracesDisabled {
-		destWorkload := conn.DestinationKey.GetDestinationWorkload()
-		actualDestWorkload := conn.DestinationKey.GetActualDestinationWorkload()
-		trace = c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown(), conn.srcWorkload, destWorkload, actualDestWorkload)
+		trace = c.tracer.NewTraceLateBound(conn.srcWorkload, func() (common.HostPort, common.Workload, common.Workload) {
+			return conn.DestinationKey.ActualDestinationIfKnown(),
+				conn.DestinationKey.GetDestinationWorkload(),
+				conn.DestinationKey.GetActualDestinationWorkload()
+		})
 	}
 
 	// Protocol reclassification: if previous parse attempts failed repeatedly,
@@ -1083,7 +1427,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		// If DestinationKey still has a raw IP but the HTTP Host header has an FQDN,
 		// use it to update the connection key and populate ip_to_fqdn.
 		var ip2fqdn map[netaddr.IP]*common.Domain
-		if isIPAddress(conn.DestinationKey.GetDestinationWorkload().Name) &&
+		if needsFQDN(conn.DestinationKey.GetDestinationWorkload().Name) &&
 			httpCtx.Host != "" && !isIPAddress(httpCtx.Host) {
 			ip := conn.DestinationKey.ActualDestinationIfKnown().IP()
 			if common.IsIpExternal(ip) {
@@ -1093,24 +1437,20 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			}
 		}
 
+		// --exclude-http-requests-by-path is documented as skipping metrics and
+		// traces, but was only ever applied on the HTTP/2 path below, so it
+		// silently did nothing for HTTP/1.1. Apply it here too. The FQDN
+		// migration above still runs: an excluded path is not a reason to stop
+		// learning the destination's name for the requests we do keep.
+		if common.HttpFilter.ShouldBeSkipped(httpCtx.Path) {
+			if ip2fqdn != nil {
+				return ip2fqdn, L7RequestProcessed
+			}
+			return nil, L7RequestProcessed
+		}
+
 		// Update stats with extracted trace ID (uses resolved key if migrated above)
 		c.l7Stats.observe(r.Protocol, r.Status.Http(), httpCtx.Method, httpCtx.Path, r.Duration, conn.DestinationKey, conn.srcWorkload, r, httpCtx.TraceID)
-
-		// LLM tracking via DNS-based connection detection
-		if c.llmParser != nil {
-			httpPidFd := PidFd{Pid: pid, Fd: fd}
-			destIP := conn.DestinationKey.ActualDestinationIfKnown().IP()
-			llmTag := c.llmDetector.IsLLMConnection(httpPidFd, destIP)
-			// Late-tag fallback from Host header
-			if llmTag == nil && httpCtx.Host != "" {
-				llmTag = c.llmDetector.LateTag(httpPidFd, httpCtx.Host, destIP)
-			}
-			if llmTag != nil {
-				c.llmParser.ParseHTTP1(llmTag, int(r.Status),
-					httpCtx.Path, extractHTTPBody(r.Payload), extractHTTPBody(r.Response),
-					r.Duration, httpCtx.TraceID)
-			}
-		}
 
 		// Create trace with processed context
 		if trace != nil {
@@ -1128,18 +1468,70 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			c.googleHTTP2Parsers = make(map[PidFd]*l7.Http2Parser)
 		}
 		pidFd := PidFd{Pid: pid, Fd: fd}
+		h2DestClass := "internal"
+		if common.IsIpExternal(conn.DestinationKey.ActualDestinationIfKnown().IP()) {
+			h2DestClass = "external"
+		}
 		if c.googleHTTP2Parsers[pidFd] == nil {
 			if len(c.googleHTTP2Parsers) >= maxHTTP2ParsersPerContainer {
+				Http2ParserCapDropsTotal.WithLabelValues(h2DestClass).Inc()
 				return nil, L7RequestProcessed
 			}
 			p := l7.NewHttp2Parser()
-			p.Lightweight = true
-			p.LLMHostChecker = isLLMRelevantHost
+			p.ConnTimestamp = conn.Timestamp
+			p.DestClass = h2DestClass
 			c.googleHTTP2Parsers[pidFd] = p
 		}
 		parser := c.googleHTTP2Parsers[pidFd]
+		// Parsers are keyed by pid+fd alone, so a recycled fd can hand this
+		// connection a parser whose HPACK dynamic table belongs to the previous
+		// one. Count that rather than assume it does or does not happen.
+		//
+		// Only comparable when both sides carry a real timestamp. Events from
+		// sockets the kernel never tracked carry none, and neither do
+		// connections made from them. Comparing either against a real value
+		// would report a reuse that never happened, in both directions.
+		// Undercounting is the right failure here, since this counter exists to
+		// decide whether the mechanism matters at all.
+		if conn.Timestamp != 0 {
+			if parser.ConnTimestamp != 0 && parser.ConnTimestamp != conn.Timestamp {
+				Http2ParserStaleReuseTotal.WithLabelValues(h2DestClass).Inc()
+			}
+			parser.ConnTimestamp = conn.Timestamp
+			parser.DestClass = h2DestClass
+		}
 		conn.http2Parser = parser // Keep reference on connection for compatibility
-		requests := parser.Parse(r.Method, r.Payload, uint64(r.Duration))
+		var missing uint64
+		if r.PayloadSize > uint64(len(r.Payload)) {
+			missing = r.PayloadSize - uint64(len(r.Payload))
+		}
+		// Events of this connection the kernel could not deliver (its ring
+		// buffer was full) leave a gap the parser cannot see in the bytes.
+		if r.LostBefore != 0 {
+			parser.Lost(r.LostBefore)
+		}
+		requests := parser.Parse(r.Method, r.Payload, r.KernelTime, missing)
+
+		// HTTP/2 has the weakest detection heuristic of any protocol here — it
+		// accepts arbitrary binary as a frame roughly once every 9k buffers —
+		// and eBPF caches the verdict for the connection's lifetime, so one
+		// false positive turns every later event on that connection into
+		// garbage. trackParseFail already exists for exactly this ("eBPF
+		// protocol misidentification where weak heuristics tag a connection
+		// permanently") and is wired for Postgres, ClickHouse and Zookeeper,
+		// but never was for HTTP/2. A connection yielding no structurally valid
+		// frame is either mistagged or unrecoverable; either way, further
+		// parsing only produces HPACK noise.
+		//
+		// Empty payloads are normal and are not counted as failures.
+		if len(r.Payload) > 0 {
+			if parser.SawValidFrame() {
+				conn.parseFailCount = 0
+			} else {
+				c.trackParseFail(conn, pid, fd, r.Protocol)
+			}
+		}
+
 		activeCount := parser.ActiveRequestCount()
 		if activeCount > 0 {
 			klog.V(3).Infof("HTTP2_PARSE_RESULT: pid=%d fd=%d completed=%d active=%d",
@@ -1147,7 +1539,7 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 		}
 
 		// If DestinationKey still has a raw IP, try to resolve from :authority header
-		if isIPAddress(conn.DestinationKey.GetDestinationWorkload().Name) {
+		if needsFQDN(conn.DestinationKey.GetDestinationWorkload().Name) {
 			for _, req := range requests {
 				authority := stripPort(req.Authority)
 				if authority != "" && !isIPAddress(authority) {
@@ -1162,63 +1554,9 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 			}
 		}
 
-		// Feed active streams to LLM parser if this is an LLM-tagged connection
-		destIP := conn.DestinationKey.ActualDestinationIfKnown().IP()
-		llmTag := c.llmDetector.IsLLMConnection(pidFd, destIP)
-
-		// Late-tag fallback: if not tagged yet, check :authority from parsed requests
-		if llmTag == nil {
-			for _, req := range requests {
-				authority := stripPort(req.Authority)
-				if authority != "" && !isIPAddress(authority) {
-					llmTag = c.llmDetector.LateTag(pidFd, authority, destIP)
-					if llmTag != nil {
-						break
-					}
-				}
-			}
-		}
-
-		if klog.V(4).Enabled() {
-			activeStreamsDbg := parser.GetActiveStreamsForLLM()
-			authorities := []string{}
-			respLens := []int{}
-			hasStatus := []bool{}
-			for _, u := range activeStreamsDbg {
-				authorities = append(authorities, u.Authority)
-				respLens = append(respLens, len(u.ResponsePayload))
-				hasStatus = append(hasStatus, u.HasResponseStatus)
-			}
-			tagStr := "nil"
-			if llmTag != nil {
-				tagStr = string(llmTag.Provider) + "/" + llmTag.Host
-			}
-			klog.V(4).Infof("LLM_ROUTE: pid=%d fd=%d destIP=%s llmTag=%s activeStreams=%d authorities=%v respLens=%v hasStatus=%v requestsLen=%d",
-				pid, fd, destIP, tagStr, len(activeStreamsDbg), authorities, respLens, hasStatus, len(requests))
-		}
-
-		if llmTag != nil && c.llmParser != nil {
-			activeStreams := parser.GetActiveStreamsForLLM()
-			for _, update := range activeStreams {
-				// Feed request data
-				c.llmParser.FeedHTTP2Data(llmTag, update.StreamId,
-					nil, false, update.Path, 0, update.RequestHeaders)
-
-				// Feed response status
-				if update.HasResponseStatus {
-					c.llmParser.OnHTTP2Status(update.StreamId, int(update.Status))
-				}
-
-				// Feed response data
-				if len(update.ResponsePayload) > 0 {
-					c.llmParser.FeedHTTP2Data(llmTag, update.StreamId,
-						update.ResponsePayload, true, update.Path, int(update.Status), nil)
-				}
-			}
-		}
 		for _, req := range requests {
-			klog.V(4).Infof("HTTP2_COMPLETED_REQUEST: pid=%d fd=%d method=%s path=%s status=%d req_payload_len=%d resp_payload_len=%d",
-				pid, fd, req.Method, req.Path, req.Status, len(req.RequestPayload), len(req.ResponsePayload))
+			klog.V(4).Infof("HTTP2_COMPLETED_REQUEST: pid=%d fd=%d method=%s path=%s status=%d",
+				pid, fd, req.Method, req.Path, req.Status)
 			if !common.HttpFilter.ShouldBeSkipped(req.Path) {
 				status := req.Status.Http()
 				if req.GrpcStatus >= 0 {
@@ -1230,7 +1568,6 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 				}
 			}
 
-			// HTTP/2 LLM tracking is handled by the LLM parser above via FeedHTTP2Data.
 		}
 	case l7.ProtocolPostgres:
 		// Update stats for Postgres
@@ -1294,10 +1631,11 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	case l7.ProtocolClickhouse:
 		// Update stats for Clickhouse
 		c.l7Stats.observe(r.Protocol, r.Status.String(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
-		query := l7.ParseClickhouse(r.Payload)
-		if query == "" {
+		query, ok := l7.ParseClickhouse(r.Payload)
+		switch {
+		case !ok:
 			c.trackParseFail(conn, pid, fd, r.Protocol)
-		} else {
+		case query != "":
 			conn.parseFailCount = 0
 		}
 		if trace != nil {
@@ -1318,8 +1656,26 @@ func (c *Container) onL7RequestWithResult(pid uint32, fd uint64, timestamp uint6
 	case l7.ProtocolFoundationDB:
 		// Update stats for FoundationDB
 		c.l7Stats.observe(r.Protocol, r.Status.String(), "", "", r.Duration, conn.DestinationKey, conn.srcWorkload, r, "")
+	case protocolReclassified:
+		// Deliberately emits nothing. Reaching here means the parser refused this
+		// connection's payload repeatedly and we concluded eBPF misidentified it,
+		// so we no longer know what protocol it is.
+		//
+		// The default branch below used to catch this, and passed r.Protocol —
+		// the original, wrong protocol — with a literal "unknown" status and zero
+		// duration. observe() maps HTTP2 to HTTP, so a Postgres connection
+		// misdetected as HTTP/2 kept incrementing container_http_requests_total
+		// on every subsequent event for the life of the connection. Measured on
+		// dev: 1.24M external "HTTP requests" per hour, 99.7% of them
+		// status="unknown", 97% originating from three private IPs that are
+		// actually Postgres and an egress proxy. Real external HTTP traffic was
+		// buried roughly 400:1.
+		//
+		// Giving up on a connection has to mean giving up on reporting it.
 	default:
-		// For all other protocols, update stats
+		// Genuinely unhandled protocols: count them under their own protocol.
+		// r.Protocol is correct here precisely because this is not the
+		// reclassification sentinel.
 		c.l7Stats.observe(r.Protocol, "unknown", "", "", 0, conn.DestinationKey, conn.srcWorkload, r, "")
 	}
 	return nil, L7RequestProcessed
@@ -1339,103 +1695,19 @@ func (c *Container) trackParseFail(conn *ActiveConnection, pid uint32, fd uint64
 	conn.parseFailCount++
 	if conn.parseFailCount == parseFailThreshold {
 		conn.protocolOverride = protocolReclassified
+		// Release the parsers now rather than at connection close. Reclassifying
+		// means this connection will never be parsed again, so anything they hold
+		// — HPACK decoders, partial frame buffers, prepared-statement maps — is
+		// dead weight. gc() only reclaims parsers once the connection is gone,
+		// and the connections that get here are the long-lived ones (Postgres,
+		// egress proxies), so that could be hours.
+		delete(c.googleHTTP2Parsers, PidFd{Pid: pid, Fd: fd})
+		conn.http2Parser = nil
+		conn.postgresParser = nil
+		conn.mysqlParser = nil
 		klog.Warningf("reclassified connection pid=%d fd=%d from %s to unknown after %d consecutive parse failures",
 			pid, fd, proto, conn.parseFailCount)
 	}
-}
-
-// processHTTP2WithoutConnection handles HTTP/2 events when TCP connection tracking failed.
-// This is common for Go TLS connections where goroutines switch threads between
-// TCP connect and TLS write, causing fd_by_pid_tgid lookup to fail in eBPF.
-//
-// Uses LLMDetector for fast IP-based detection. No skip-set needed — the detector
-// handles caching at the connection level.
-func (c *Container) processHTTP2WithoutConnection(pid uint32, fd uint64, r *l7.RequestData, dstIP ...netaddr.IP) (map[netaddr.IP]*common.Domain, L7RequestResult) {
-	pidFd := PidFd{Pid: pid, Fd: fd}
-
-	// Check if this is an LLM connection via IP-based detection
-	var llmTag *LLMConnectionTag
-	if len(dstIP) > 0 && !dstIP[0].IsZero() {
-		llmTag = c.llmDetector.IsLLMConnection(pidFd, dstIP[0])
-	}
-
-	// Note: do NOT early-skip when llmTag is nil. The IP cache is positive-only —
-	// Google providers (generativelanguage.googleapis.com, *-aiplatform.googleapis.com)
-	// are intentionally excluded from the cache because they share anycast IPs with
-	// non-LLM googleapis.com services. For those, detection MUST come from the
-	// HTTP/2 :authority header below. We bound overhead with Lightweight mode and
-	// per-container parser caps; non-LLM parsers are deleted after first completion.
-
-	// Parse the HTTP/2 frames
-	if c.googleHTTP2Parsers == nil {
-		c.googleHTTP2Parsers = make(map[PidFd]*l7.Http2Parser)
-	}
-	parser := c.googleHTTP2Parsers[pidFd]
-	if parser == nil {
-		if len(c.googleHTTP2Parsers) >= maxHTTP2ParsersPerContainer {
-			return nil, L7RequestProcessed
-		}
-		parser = l7.NewHttp2Parser()
-		parser.Lightweight = true
-		parser.LLMHostChecker = isLLMRelevantHost
-		c.googleHTTP2Parsers[pidFd] = parser
-	}
-
-	requests := parser.Parse(r.Method, r.Payload, uint64(r.Duration))
-
-	// Late-tag from :authority header if not yet tagged
-	if llmTag == nil {
-		for _, req := range requests {
-			if req.Authority != "" {
-				host := stripPort(req.Authority)
-				if !isIPAddress(host) {
-					ip := netaddr.IP{}
-					if len(dstIP) > 0 {
-						ip = dstIP[0]
-					}
-					llmTag = c.llmDetector.LateTag(pidFd, host, ip)
-					if llmTag != nil {
-						klog.V(2).Infof("LLM_LATETAG_FALLBACK: pid=%d fd=%d host=%s provider=%s",
-							pid, fd, host, llmTag.Provider)
-						break
-					}
-				}
-			}
-		}
-	}
-
-	// If still not LLM, nothing to do on this connectionless path
-	if llmTag == nil {
-		if len(requests) > 0 {
-			// Completed non-LLM requests — clean up parser
-			delete(c.googleHTTP2Parsers, pidFd)
-		}
-		return nil, L7RequestProcessed
-	}
-
-	// Feed completed requests to LLM parser
-	if c.llmParser != nil {
-		for _, req := range requests {
-			c.llmParser.ParseHTTP1(llmTag, int(req.Status),
-				req.Path, req.RequestPayload, req.ResponsePayload, req.Duration, "")
-		}
-
-		// Feed active streams
-		activeStreams := parser.GetActiveStreamsForLLM()
-		for _, update := range activeStreams {
-			c.llmParser.FeedHTTP2Data(llmTag, update.StreamId,
-				nil, false, update.Path, 0, update.RequestHeaders)
-			if update.HasResponseStatus {
-				c.llmParser.OnHTTP2Status(update.StreamId, int(update.Status))
-			}
-			if len(update.ResponsePayload) > 0 {
-				c.llmParser.FeedHTTP2Data(llmTag, update.StreamId,
-					update.ResponsePayload, true, update.Path, int(update.Status), nil)
-			}
-		}
-	}
-
-	return nil, L7RequestProcessed
 }
 
 // refreshActiveConnections snapshots active connections under c.lock and
@@ -1510,12 +1782,16 @@ func (c *Container) onRetransmission(src netaddr.IPPort, dst netaddr.IPPort) boo
 	return true
 }
 
-func (c *Container) updateDelays() {
+// updateDelays refreshes the per-process CPU and disk delay counters and
+// returns the processes whose pid no longer exists.
+func (c *Container) updateDelays() map[uint32]*Process {
 	// Get a snapshot of PIDs under read lock to avoid concurrent map access
 	c.lock.RLock()
 	pids := make([]uint32, 0, len(c.processes))
-	for pid := range c.processes {
+	procs := make(map[uint32]*Process, len(c.processes))
+	for pid, p := range c.processes {
 		pids = append(pids, pid)
+		procs[pid] = p
 	}
 	c.lock.RUnlock()
 
@@ -1526,9 +1802,18 @@ func (c *Container) updateDelays() {
 		diskDelay time.Duration
 	}
 	pidStats := make([]pidDelayStats, 0, len(pids))
+	var dead map[uint32]*Process
 	for _, pid := range pids {
 		stats, err := TaskstatsTGID(pid)
 		if err != nil {
+			// Only a pid that is gone is dead: a failed netlink call for a
+			// live process would otherwise close its uprobes.
+			if _, statErr := os.Stat(proc.Path(pid)); os.IsNotExist(statErr) {
+				if dead == nil {
+					dead = map[uint32]*Process{}
+				}
+				dead[pid] = procs[pid]
+			}
 			continue
 		}
 		pidStats = append(pidStats, pidDelayStats{
@@ -1549,6 +1834,26 @@ func (c *Container) updateDelays() {
 		c.delaysByPid[ps.pid] = d
 	}
 	c.lock.Unlock()
+	return dead
+}
+
+// youngerThan reports whether the container has existed for less than d,
+// counted from its earliest process start or from when the agent found it,
+// whichever is earlier, until now or until it became a zombie. Counting from
+// discovery keeps a restarted unit, whose startedAt moves to the new
+// process, from disappearing for d after every restart.
+func (c *Container) youngerThan(d time.Duration) bool {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	since := c.startedAt
+	if since.IsZero() || c.createdAt.Before(since) {
+		since = c.createdAt
+	}
+	end := time.Now()
+	if !c.zombieAt.IsZero() && c.zombieAt.Before(end) {
+		end = c.zombieAt
+	}
+	return end.Sub(since) < d
 }
 
 func (c *Container) updateNodejsStats(s NodejsStatsUpdate) {
@@ -1556,7 +1861,12 @@ func (c *Container) updateNodejsStats(s NodejsStatsUpdate) {
 	defer c.lock.Unlock()
 
 	p := c.processes[s.Pid]
-	if p == nil || p.nodejsPrevStats == nil {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.nodejsPrevStats == nil {
 		return
 	}
 	if delta := s.Stats.EventLoopBlockedTime - p.nodejsPrevStats.EventLoopBlockedTime; delta > 0 {
@@ -1573,7 +1883,12 @@ func (c *Container) updatePythonStats(s PythonStatsUpdate) {
 	defer c.lock.Unlock()
 
 	p := c.processes[s.Pid]
-	if p == nil || p.pythonPrevStats == nil {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pythonPrevStats == nil {
 		return
 	}
 	if delta := s.Stats.ThreadLockWaitTime - p.pythonPrevStats.ThreadLockWaitTime; delta > 0 {
@@ -1586,19 +1901,45 @@ func (c *Container) updatePythonStats(s PythonStatsUpdate) {
 }
 
 func (c *Container) getMounts() map[string]map[string]*proc.FSStat {
+	// c.processes and c.mounts are mutated by the handleEvents goroutine
+	// (onFileOpen), so both are read and updated under c.lock.
+	c.lock.RLock()
 	if len(c.mounts) == 0 {
+		c.lock.RUnlock()
 		return nil
 	}
-	// Copy pids under read lock — c.processes is mutated by handleEvents goroutine
-	c.lock.RLock()
 	pids := make([]uint32, 0, len(c.processes))
 	for pid := range c.processes {
 		pids = append(pids, pid)
 	}
 	c.lock.RUnlock()
 
-	res := map[string]map[string]*proc.FSStat{}
+	// Drop mounts that are gone from the container's mount namespace, so a
+	// remounted volume is not reported twice (stale + current entry).
+	var current map[string]proc.MountInfo
+	for _, pid := range pids {
+		if current = proc.GetMountInfo(pid); current != nil {
+			break
+		}
+	}
+	c.lock.Lock()
+	if len(current) > 0 {
+		for mntId := range c.mounts {
+			if mi, ok := current[mntId]; ok {
+				c.mounts[mntId] = mi
+			} else {
+				delete(c.mounts, mntId)
+			}
+		}
+	}
+	mounts := make([]proc.MountInfo, 0, len(c.mounts))
 	for _, mi := range c.mounts {
+		mounts = append(mounts, mi)
+	}
+	c.lock.Unlock()
+
+	res := map[string]map[string]*proc.FSStat{}
+	for _, mi := range mounts {
 		var stat *proc.FSStat
 		for _, pid := range pids {
 			s, err := proc.StatFS(proc.Path(pid, "root", mi.MountPoint))
@@ -1790,7 +2131,7 @@ func (c *Container) runLogParser(logPath string) {
 			return
 		}
 		ch := make(chan logparser.LogEntry)
-		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, sensitiveCfg)
+		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, !*flags.DisableJsonLogParsing, logs.PatternExtractionRateLimiter(), sensitiveCfg)
 		reader, err := logs.NewTailReader(proc.HostPath(logPath), ch)
 		if err != nil {
 			klog.Warningln(err)
@@ -1810,7 +2151,7 @@ func (c *Container) runLogParser(logPath string) {
 			klog.Warningln(err)
 			return
 		}
-		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, sensitiveCfg)
+		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, !*flags.DisableJsonLogParsing, logs.PatternExtractionRateLimiter(), sensitiveCfg)
 		stop := func() {
 			JournaldUnsubscribe(c.metadata.systemd.Unit)
 		}
@@ -1827,7 +2168,7 @@ func (c *Container) runLogParser(logPath string) {
 			delete(c.logParsers, "stdout/stderr")
 		}
 		ch := make(chan logparser.LogEntry)
-		parser := logparser.NewParser(ch, c.metadata.logDecoder, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, sensitiveCfg)
+		parser := logparser.NewParser(ch, c.metadata.logDecoder, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, !*flags.DisableJsonLogParsing, logs.PatternExtractionRateLimiter(), sensitiveCfg)
 		reader, err := logs.NewTailReader(proc.HostPath(c.metadata.logPath), ch)
 		if err != nil {
 			klog.Warningln(err)
@@ -1886,11 +2227,16 @@ func (c *Container) gc(now time.Time) {
 			}
 		}
 	}
+
+	// Must run before the parser sweep below, which treats an entry's presence in
+	// connectionsByPidFd as proof its connection is still alive.
+	c.reclaimStaleConnections(now)
+
 	// Clean up HTTP/2 parsers for closed/dead connections.
 	// Parsers hold HPACK decoders, partial frame buffers, and active request maps
 	// that accumulate memory over time if not cleaned up.
 	// Two cases: (1) connection-tracked parsers — delete when connection is gone,
-	// (2) connectionless parsers (processHTTP2WithoutConnection) — delete when pid dies.
+	// (2) parsers whose connection was never tracked — delete when pid dies.
 	if c.googleHTTP2Parsers != nil {
 		for pidFd := range c.googleHTTP2Parsers {
 			if _, hasConn := c.connectionsByPidFd[pidFd]; hasConn {
@@ -1914,14 +2260,7 @@ func (c *Container) gc(now time.Time) {
 		}
 	}
 
-	// Clean up LLM detector connection cache for dead pids
-	if c.llmDetector != nil {
-		for pidFd := range c.googleHTTP2Parsers {
-			if _, hasProc := c.processes[pidFd.Pid]; !hasProc {
-				c.llmDetector.RemoveConnection(pidFd)
-			}
-		}
-	}
+	c.gcLLMCaptures(now)
 
 	for dst, at := range c.lastConnectionAttempts {
 		_, active := establishedDst[dst]
@@ -2000,26 +2339,132 @@ func (c *Container) revalidateListens(now time.Time, actualListens map[netaddr.I
 	}
 }
 
-func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32) {
+// libssl is not always mapped by a process's first connection: .NET dlopen()s
+// it on first TLS use, and `sh -c '...; exec curl'` keeps the pid across the
+// exec. A miss is retried while the process has connections (new connects and
+// the periodic active-connection walk) instead of being final.
+const (
+	openSslMaxChecks       = 5
+	openSslRecheckInterval = 10 * time.Second
+)
+
+// tlsExeRecheckInterval bounds how often a process's executable is re-read to
+// catch an exec whose event was lost (see recheckTlsAfterExec).
+const tlsExeRecheckInterval = 10 * time.Second
+
+// ensureProcess returns the process, registering it if its start event has
+// not been handled yet. Socket and exec events often come first: they arrive
+// on other buffers or CPUs. Waiting for the start event dropped the
+// connection (onConnectionOpen ignores unknown pids) and left a short-lived
+// process's first TLS calls, often all of them, unprobed.
+func (c *Container) ensureProcess(pid uint32) *Process {
+	c.lock.RLock()
 	p := c.processes[pid]
+	c.lock.RUnlock()
+	if p != nil {
+		return p
+	}
+	return c.onProcessStart(pid)
+}
+
+// attachTlsUprobes is called for every new connection or listening socket
+// (newSocket) and periodically for processes with open connections.
+func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32, newSocket bool) {
+	p := c.processes[pid]
+	if p == nil {
+		if newSocket {
+			// ensureProcess could not register it: the process is gone.
+			countTLSAttach("-", "not_registered")
+		}
+		return
+	}
+	c.recheckTlsAfterExec(p)
+	if !p.openSslUprobesChecked && time.Since(p.openSslLastCheck) >= openSslRecheckInterval {
+		p.openSslLastCheck = time.Now()
+		p.openSslChecks++
+		links, result := tracer.AttachOpenSslUprobes(pid)
+		countTLSAttach("openssl", result)
+		p.addUprobes(links)
+		p.tlsAttached = p.tlsAttached || len(links) > 0
+		p.openSslUprobesChecked = len(links) > 0 || p.openSslChecks >= openSslMaxChecks
+	}
+	c.attachGoTls(tracer, p)
+}
+
+// attachGoTls probes the process's Go TLS functions, once per program image.
+func (c *Container) attachGoTls(tracer *ebpftracer.Tracer, p *Process) {
+	if p.goTlsUprobesChecked {
+		return
+	}
+	p.tlsExe, _ = exeIdentityOf(p.Pid)
+	p.tlsExeName, _ = os.Readlink(proc.Path(p.Pid, "exe"))
+	p.tlsExeCheckedAt = time.Now()
+	links, isGolangApp, result := tracer.AttachGoTlsUprobes(p.Pid)
+	countTLSAttach("go", result)
+	p.setGolang(isGolangApp)
+	p.addUprobes(links)
+	p.tlsAttached = p.tlsAttached || len(links) > 0
+	p.goTlsUprobesChecked = true
+}
+
+// onProcessExec handles a process replacing its image. Its Go TLS probes are
+// attached now rather than at its first connection, which a short-lived
+// program often makes before its connect event is handled. OpenSSL is left
+// to the first connection: the dynamic loader maps the libraries after the
+// exec, so they are not there yet.
+func (c *Container) onProcessExec(tracer *ebpftracer.Tracer, pid uint32) {
+	p := c.ensureProcess(pid)
 	if p == nil {
 		return
 	}
-	if !p.openSslUprobesChecked {
-		openSslUprobes := tracer.AttachOpenSslUprobes(pid)
-		p.uprobes = append(p.uprobes, openSslUprobes...)
-		p.openSslUprobesChecked = true
+	if p.goTlsUprobesChecked {
+		exe, err := exeIdentityOf(pid)
+		if err != nil || exe == p.tlsExe {
+			// Gone, or a connection was handled first and already probed
+			// this image.
+			return
+		}
+		c.resetTlsForNewImage(p)
 	}
-	if !p.goTlsUprobesChecked {
-		uprobes, isGolangApp := tracer.AttachGoTlsUprobes(pid)
-		p.isGolangApp = isGolangApp
-		p.uprobes = append(p.uprobes, uprobes...)
-		p.goTlsUprobesChecked = true
+	c.attachGoTls(tracer, p)
+}
+
+// recheckTlsAfterExec catches an exec whose event was lost (onProcessExec
+// handles the rest): a process that runs a different binary than the one it
+// was probed for is probed again.
+func (c *Container) recheckTlsAfterExec(p *Process) {
+	if !p.goTlsUprobesChecked || time.Since(p.tlsExeCheckedAt) < tlsExeRecheckInterval {
+		return
+	}
+	p.tlsExeCheckedAt = time.Now()
+	exe, err := exeIdentityOf(p.Pid)
+	if err != nil || exe == p.tlsExe {
+		return
+	}
+	c.resetTlsForNewImage(p)
+}
+
+// resetTlsForNewImage forgets what was probed for the process's previous
+// image: those probes point into a binary the process no longer runs.
+func (c *Container) resetTlsForNewImage(p *Process) {
+	p.dropUprobes()
+	if p.golang() {
+		c.registry.tracer.ReleaseGoTLSOffsets(p.Pid)
+	}
+	p.tlsAttached = false
+	p.goTlsUprobesChecked = false
+	p.openSslUprobesChecked = false
+	p.openSslChecks = 0
+	p.openSslLastCheck = time.Time{}
+}
+
+func countTLSAttach(lib string, result ebpftracer.TLSAttachResult) {
+	if result != ebpftracer.TLSAttachNotApplicable {
+		TLSAttachTotal.WithLabelValues(lib, string(result)).Inc()
 	}
 }
 
-func resolveFd(pid uint32, fd uint64) (mntId string, logPath string) {
-	info := proc.GetFdInfo(pid, fd)
+func resolveFd(info *proc.FdInfo) (mntId string, logPath string) {
 	if info == nil {
 		return
 	}
@@ -2058,4 +2503,53 @@ func (c *Container) gauge(desc *prometheus.Desc, value float64, labelValues ...s
 	allLabels = append(allLabels, c.constLabels...)
 	allLabels = append(allLabels, labelValues...)
 	return prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, value, allLabels...)
+}
+
+// sampleValue renders a log sample stored in c.logSamples as a metric label.
+//
+// The map only ever holds strings, but this is a metric-collection path that
+// runs on every scrape: a type confusion here should degrade the label, not
+// take the agent down.
+func sampleString(v interface{}) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+// logFilesScanInterval bounds how often findLogFiles runs for a process: one
+// that opens its log for every write (PHP's error_log, a shell's >>) would
+// otherwise have all its fds read on every write.
+const logFilesScanInterval = 10 * time.Second
+
+func (c *Container) logFilesScanDue(pid uint32) bool {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	p := c.processes[pid]
+	if p == nil {
+		return true
+	}
+	now := time.Now()
+	if now.Sub(p.logFilesScannedAt) < logFilesScanInterval {
+		return false
+	}
+	p.logFilesScannedAt = now
+	return true
+}
+
+func findLogFiles(pid uint32) []string {
+	fds, err := proc.ReadFds(pid)
+	if err != nil {
+		return nil
+	}
+	var res []string
+	for _, fd := range fds {
+		if !strings.HasPrefix(fd.Dest, "/var/log/") {
+			continue
+		}
+		if _, logPath := resolveFd(proc.GetFdInfo(pid, fd.Fd)); logPath != "" {
+			res = append(res, logPath)
+		}
+	}
+	return res
 }

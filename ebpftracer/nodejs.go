@@ -2,6 +2,7 @@ package ebpftracer
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"strings"
 
@@ -10,6 +11,16 @@ import (
 	"golang.org/x/exp/maps"
 	"k8s.io/klog/v2"
 )
+
+const nodejsPollSymbol = "uv__io_poll"
+
+// libuv I/O callbacks. Not every libuv build exports all of them; the attach
+// loop stops at the first one missing, matching the previous behaviour.
+var nodejsCallbackSymbols = []string{"uv__stream_io", "uv__async_io", "uv__poll_io", "uv__server_io", "uv__udp_io"}
+
+// Every symbol resolved in one pass over the ELF symbol table, so a cache miss
+// costs a single parse rather than one per symbol.
+var nodejsProbeSymbols = append([]string{nodejsPollSymbol}, nodejsCallbackSymbols...)
 
 func (t *Tracer) AttachNodejsProbes(pid uint32, exe string) []link.Link {
 	log := func(libPath, msg string, err error) {
@@ -44,24 +55,25 @@ func (t *Tracer) attachNodejsUprobes(libPath string, pid uint32) ([]link.Link, e
 	if err != nil {
 		return nil, err
 	}
-	ef, err := OpenELFFile(libPath)
-	if err != nil {
-		return nil, err
-	}
-	defer ef.Close()
 
-	s, err := ef.GetSymbol("uv__io_poll")
+	// Resolved once per binary rather than once per pid — see LookupSymbols.
+	targets, err := LookupSymbols(libPath, nodejsProbeSymbols)
 	if err != nil {
 		return nil, err
 	}
-	l, err := s.AttachUprobe(exe, t.uprobes["uv_io_poll_enter"], pid)
+
+	poll := targets[nodejsPollSymbol]
+	if !poll.Found {
+		return nil, fmt.Errorf("symbol %s not found", nodejsPollSymbol)
+	}
+	l, err := attachUprobeAt(exe, t.uprobes["uv_io_poll_enter"], pid, poll.Address)
 	if err != nil {
 		return nil, err
 	}
 	var links []link.Link
 	links = append(links, l)
 
-	ls, err := s.AttachUretprobes(exe, t.uprobes["uv_io_poll_exit"], pid)
+	ls, err := attachUretprobesAt(exe, t.uprobes["uv_io_poll_exit"], pid, poll)
 	links = append(links, ls...)
 	if err != nil {
 		for _, l := range links {
@@ -70,17 +82,17 @@ func (t *Tracer) attachNodejsUprobes(libPath string, pid uint32) ([]link.Link, e
 		return nil, err
 	}
 
-	for _, cb := range []string{"uv__stream_io", "uv__async_io", "uv__poll_io", "uv__server_io", "uv__udp_io"} {
-		s, err = ef.GetSymbol(cb)
-		if err != nil {
+	for _, cb := range nodejsCallbackSymbols {
+		target := targets[cb]
+		if !target.Found {
 			break
 		}
-		l, err = s.AttachUprobe(exe, t.uprobes["uv_io_cb_enter"], pid)
+		l, err = attachUprobeAt(exe, t.uprobes["uv_io_cb_enter"], pid, target.Address)
 		if err != nil {
 			break
 		}
 		links = append(links, l)
-		ls, err = s.AttachUretprobes(exe, t.uprobes["uv_io_cb_exit"], pid)
+		ls, err = attachUretprobesAt(exe, t.uprobes["uv_io_cb_exit"], pid, target)
 		links = append(links, ls...)
 		if err != nil {
 			break

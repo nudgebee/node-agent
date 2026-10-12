@@ -240,3 +240,57 @@ func TestResolvePodDescriptor_BareReplicaSetKeepsItsName(t *testing.T) {
 	assert.Equal(t, "standalone-rs", got.Name)
 	assert.Equal(t, "ReplicaSet", got.Kind)
 }
+
+func arcRunnerPod(labels map[string]string) *MinimalPod {
+	ref := controllerRef("arc-runners-q4t8z-runner-m2x9k", types.UID(uuid.NewString()), "EphemeralRunner")
+	ref.APIVersion = "actions.github.com/v1alpha1"
+	return &MinimalPod{
+		UID:             types.UID(uuid.NewString()),
+		Name:            "arc-runners-q4t8z-runner-m2x9k",
+		Namespace:       "arc-systems",
+		Labels:          labels,
+		OwnerReferences: []metav1.OwnerReference{ref},
+	}
+}
+
+// ARC runner pods are owned by a per-job EphemeralRunner, so publishing that
+// name minted a new workload for every CI job. They must resolve to the
+// AutoscalingRunnerSet named by the scale-set label.
+func TestResolvePodDescriptor_ARCRunnerResolvesToScaleSet(t *testing.T) {
+	disableEphemeralAggregation(t)
+
+	r := &K8sIPResolver{}
+	pod := arcRunnerPod(map[string]string{"actions.github.com/scale-set-name": "arc-runners"})
+
+	got := r.resolvePodDescriptor(pod)
+	assert.Equal(t, "arc-runners", got.Name)
+	assert.Equal(t, "AutoscalingRunnerSet", got.Kind)
+	assert.Equal(t, "arc-systems", got.Namespace)
+
+	_, cached := r.snapshot.PodDescriptors.Load(pod.UID)
+	assert.True(t, cached, "a label-derived identity is stable and should be memoized")
+}
+
+// Without the label there is nothing better to publish than the direct owner.
+func TestResolvePodDescriptor_ARCRunnerWithoutLabelKeepsOwner(t *testing.T) {
+	disableEphemeralAggregation(t)
+
+	r := &K8sIPResolver{}
+	got := r.resolvePodDescriptor(arcRunnerPod(nil))
+	assert.Equal(t, "arc-runners-q4t8z-runner-m2x9k", got.Name)
+	assert.Equal(t, "EphemeralRunner", got.Kind)
+}
+
+// The mapping is keyed on API group, so a same-named kind from another group
+// is not rewritten.
+func TestResolvePodDescriptor_LabelDerivedOwnerMatchesGroup(t *testing.T) {
+	disableEphemeralAggregation(t)
+
+	r := &K8sIPResolver{}
+	pod := arcRunnerPod(map[string]string{"actions.github.com/scale-set-name": "arc-runners"})
+	pod.OwnerReferences[0].APIVersion = "example.com/v1"
+
+	got := r.resolvePodDescriptor(pod)
+	assert.Equal(t, "arc-runners-q4t8z-runner-m2x9k", got.Name)
+	assert.Equal(t, "EphemeralRunner", got.Kind)
+}

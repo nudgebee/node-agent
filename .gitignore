@@ -39,3 +39,6 @@ coverage.html
 
 # eBPF build outputs (regenerated via ebpftracer/make build)
 ebpftracer/ebpf/*.o
+
+# Local build helper (upstream)
+/build.sh

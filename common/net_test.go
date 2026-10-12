@@ -110,6 +110,12 @@ func TestDestinationLabelValue(t *testing.T) {
 		assert.Equal(t, "10.64.3.17", destinationLabelValue(internal, ipEcho))
 		// External unresolved -> low cardinality, keep the port.
 		assert.Equal(t, "1.1.1.1:443", destinationLabelValue(external, unresolved))
+		// Standalone hosts: IP:port is kept, even when a DNS name is known,
+		// because it is what matches the destination to a host and service.
+		host := Workload{Name: "vm-1", Namespace: "vm-1", Kind: VMWorkloadKind}
+		assert.Equal(t, "10.64.3.17:8080", destinationLabelValue(internal, host))
+		private := Workload{Name: "db.internal", Namespace: PrivateWorkloadKind, Kind: PrivateWorkloadKind}
+		assert.Equal(t, "10.64.3.17:8080", destinationLabelValue(internal, private))
 	})
 
 	t.Run("collapse off", func(t *testing.T) {
@@ -135,6 +141,8 @@ func TestDestinationIPLabelValue(t *testing.T) {
 		assert.Equal(t, "10.64.3.17", DestinationIPLabelValue(private, Workload{}))
 		// Public IP -> never collapsed.
 		assert.Equal(t, "1.1.1.1", DestinationIPLabelValue(public, Workload{Name: "api.openai.com", Namespace: "external"}))
+		// Standalone-host kinds keep the IP.
+		assert.Equal(t, "10.64.3.17", DestinationIPLabelValue(private, Workload{Name: "db.internal", Namespace: PrivateWorkloadKind, Kind: PrivateWorkloadKind}))
 	})
 
 	t.Run("collapse off", func(t *testing.T) {
@@ -147,5 +155,41 @@ func BenchmarkNormalizeFQDN(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		NormalizeFQDN("ip-172-1-2-3.ec2.internal", "TypeA")
 		NormalizeFQDN("example.io.svc.default.cluster.local", "TypeA")
+	}
+}
+
+func TestPortFilter(t *testing.T) {
+	var nilFilter *portFilter
+	assert.False(t, nilFilter.ShouldBeSkipped(40000))
+
+	f, err := newPortFilter("32768-60999")
+	assert.NoError(t, err)
+	assert.False(t, f.ShouldBeSkipped(32767))
+	assert.True(t, f.ShouldBeSkipped(32768))
+	assert.True(t, f.ShouldBeSkipped(60999))
+	assert.False(t, f.ShouldBeSkipped(61000))
+	assert.False(t, f.ShouldBeSkipped(50051)) // well-known port within the range
+
+	for _, s := range []string{"1024-23768 30000-65535", "1024-23768,30000-65535", " 1024-23768 , 30000-65535 "} {
+		f, err = newPortFilter(s)
+		assert.NoError(t, err, s)
+		assert.False(t, f.ShouldBeSkipped(1023), s)
+		assert.True(t, f.ShouldBeSkipped(1024), s)
+		assert.True(t, f.ShouldBeSkipped(23768), s)
+		assert.False(t, f.ShouldBeSkipped(23769), s) // between the ranges
+		assert.False(t, f.ShouldBeSkipped(29999), s)
+		assert.True(t, f.ShouldBeSkipped(30000), s)
+		assert.True(t, f.ShouldBeSkipped(65535), s)
+		assert.False(t, f.ShouldBeSkipped(50051), s)
+	}
+
+	f, err = newPortFilter("8080-8080")
+	assert.NoError(t, err)
+	assert.True(t, f.ShouldBeSkipped(8080))
+	assert.False(t, f.ShouldBeSkipped(8081))
+
+	for _, s := range []string{"", "  ", "32768", "-", "a-b", "32768-", "-60999", "60999-32768", "32768-65536", "-1-10"} {
+		_, err = newPortFilter(s)
+		assert.Error(t, err, s)
 	}
 }

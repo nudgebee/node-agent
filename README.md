@@ -8,7 +8,8 @@ A per-node observability agent for Kubernetes and Linux hosts. The agent
 gathers container and host metrics, logs, and L7 traffic using eBPF and
 exposes them in Prometheus format.
 
-Minimum Linux kernel: **5.1** (eBPF CO-RE).
+Minimum Linux kernel: **5.8** (L7 events use a BPF ring buffer), or a distribution kernel that backports BPF ring buffers, such as RHEL 8 (4.18).
+The kernel must also be built with `CONFIG_BPF_EVENTS=y` (kprobe and tracepoint BPF programs); some embedded and vendor kernels disable it.
 
 > This project is a fork of
 > [coroot/coroot-node-agent](https://github.com/coroot/coroot-node-agent)
@@ -73,6 +74,13 @@ curl -fsSL https://raw.githubusercontent.com/nudgebee/node-agent/main/install.sh
 Pass `-v vX.Y.Z` to pin to a specific release. The script writes a
 systemd unit at `/etc/systemd/system/nudgebee-node-agent.service` and
 starts it.
+
+To install on many hosts at once, see [installing on a fleet](docs/fleet-install.md).
+
+Kubernetes is not required. With no Kubernetes API available, the agent
+names connections by systemd unit, container, host and DNS name instead
+of by pod and service; see
+[standalone hosts](docs/ip-fqdn-resolver.md#standalone-hosts-no-kubernetes).
 
 ### Container image
 

@@ -47,6 +47,9 @@ type ProcessInfo struct {
 type IPResolver interface {
 	ResolveIP(string) common.Workload
 	ResolveActualIP(string) common.Workload
+	// ResolveSource names the source of a connection from its IP and the
+	// workload of the container that opened it.
+	ResolveSource(ip string, container common.Workload) common.Workload
 	CacheDNS(string, string) common.Workload
 	StartWatching() error
 	StopWatching()
@@ -70,14 +73,17 @@ type Registry struct {
 
 	tracer *ebpftracer.Tracer
 	events chan ebpftracer.Event
+	// actualDestination is the tracer's post-NAT destination lookup for a
+	// TCP connection's local address (ebpftracer.Tracer.ActualDestination).
+	// NewRegistry always sets it.
+	actualDestination func(src netaddr.IPPort) (netaddr.IPPort, bool)
 
 	containersById         map[ContainerID]*Container
 	containersByCgroupId   map[string]*Container
 	containersByPid        map[uint32]*Container
 	containersByPidIgnored map[uint32]*time.Time
 	containerLock          sync.RWMutex // Protects container maps and registration
-	ip2fqdn                map[netaddr.IP]*common.Domain
-	ip2fqdnLock            sync.RWMutex
+	ip2fqdn                *common.FQDNCache
 
 	processInfoCh chan<- ProcessInfo
 	ip_resolver   IPResolver
@@ -93,10 +99,9 @@ type Registry struct {
 	pendingL7Events     []pendingL7Event
 	pendingL7EventsLock sync.Mutex
 
-	// llmDetector provides connection-level LLM detection from DNS cache.
-	// Shared across all containers so DNS resolutions from one container
-	// benefit LLM detection in others.
-	llmDetector *LLMDetector
+	// llmDestinations are the endpoints already marked in the kernel as LLM
+	// API destinations (Container.detectLLMEndpoint), keyed by "ip:port".
+	llmDestinations sync.Map
 }
 
 // pendingL7Event stores an L7 event that's waiting for its connection to be established
@@ -106,7 +111,7 @@ type pendingL7Event struct {
 	retryCount int
 }
 
-func NewRegistry(reg prometheus.Registerer, rawReg prometheus.Registerer, processInfoCh chan<- ProcessInfo, ip_resolver *common.K8sIPResolver, gpuProcessUsageSampleChan chan gpu.ProcessUsageSample, machineId, systemUuid, az, region string) (*Registry, error) {
+func NewRegistry(reg prometheus.Registerer, rawReg prometheus.Registerer, processInfoCh chan<- ProcessInfo, ip_resolver IPResolver, gpuProcessUsageSampleChan chan gpu.ProcessUsageSample, machineId, systemUuid, az, region string) (*Registry, error) {
 	ns, err := proc.GetSelfNetNs()
 	if err != nil {
 		return nil, err
@@ -151,18 +156,24 @@ func NewRegistry(reg prometheus.Registerer, rawReg prometheus.Registerer, proces
 		containersByCgroupId:   map[string]*Container{},
 		containersByPid:        map[uint32]*Container{},
 		containersByPidIgnored: map[uint32]*time.Time{},
-		ip2fqdn:                map[netaddr.IP]*common.Domain{},
+		ip2fqdn:                common.NewFQDNCache(),
 
 		processInfoCh: processInfoCh,
 		ip_resolver:   ip_resolver,
-		tracer:        ebpftracer.NewTracer(hostNetNs, selfNetNs, *flags.DisableL7Tracing),
+		tracer:        ebpftracer.NewTracer(hostNetNs, selfNetNs, *flags.DisableL7Tracing, *flags.EnableLLMCapture),
 
 		gpuProcessUsageSampleChan: gpuProcessUsageSampleChan,
 		nodeConstLabels:           NodeConstLabels{MachineID: machineId, SystemUUID: systemUuid, AZ: az, Region: region},
-		llmDetector:               NewLLMDetector(),
 	}
+	r.actualDestination = r.tracer.ActualDestination
 	// Register LLM metrics with the same registerer used for other container metrics
-	RegisterLLMMetrics(reg)
+	RegisterL7SelfMetrics(reg)
+	if *flags.EnableLLMCapture {
+		RegisterLLMMetrics(reg)
+	}
+	if err = reg.Register(kernelCounterCollector{tracer: r.tracer}); err != nil {
+		return nil, err
+	}
 	if err = reg.Register(r); err != nil {
 		return nil, err
 	}
@@ -186,11 +197,9 @@ func (r *Registry) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (r *Registry) Collect(ch chan<- prometheus.Metric) {
-	r.ip2fqdnLock.RLock()
-	defer r.ip2fqdnLock.RUnlock()
-	for ip, domain := range r.ip2fqdn {
+	r.ip2fqdn.ForEach(func(ip netaddr.IP, domain *common.Domain) {
 		ch <- prometheus.MustNewConstMetric(metrics.Ip2Fqdn, prometheus.GaugeValue, 1, ip.String(), domain.FQDN)
-	}
+	})
 }
 
 // containerCollector is registered on the raw Prometheus registry and collects
@@ -252,15 +261,11 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				}
 			}
 			r.containersByPidIgnored = map[uint32]*time.Time{}
-			activeIPs := map[netaddr.IP]struct{}{}
 			deadContainers := []*Container{}
 
-			// First pass: collect active IPs and identify dead containers with read lock
+			// First pass: identify dead containers with read lock
 			r.containerLock.RLock()
 			for _, c := range r.containersById {
-				for dst := range c.lastConnectionAttempts {
-					activeIPs[dst.IP()] = struct{}{}
-				}
 				if c.Dead(now) {
 					deadContainers = append(deadContainers, c)
 				}
@@ -293,16 +298,11 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				}
 				r.containerLock.Unlock()
 			}
-			r.ip2fqdnLock.Lock()
-			for ip := range r.ip2fqdn {
-				if _, ok := activeIPs[ip]; !ok {
-					delete(r.ip2fqdn, ip)
-				}
-			}
-			r.ip2fqdnLock.Unlock()
-			if r.llmDetector != nil {
-				r.llmDetector.GC(llmDetectorMaxIPCache)
-			}
+			// Expire stale IP→FQDN mappings on their own TTL. They are
+			// deliberately not tied to live connections: applications cache DNS
+			// themselves, so a reconnect to an IP whose mapping was dropped
+			// emits no DNS packet and the destination degrades to a bare IP.
+			r.ip2fqdn.GC()
 		case sample := <-r.gpuProcessUsageSampleChan:
 			r.containerLock.RLock()
 			c := r.containersByPid[sample.Pid]
@@ -336,10 +336,16 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 					}
 				}
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
+					// onProcessStart, not ensureProcess: it also replaces a
+					// registered process whose pid was reused.
 					p := c.onProcessStart(e.Pid)
 					if r.processInfoCh != nil && p != nil {
 						r.processInfoCh <- ProcessInfo{Pid: p.Pid, ContainerId: c.id, StartedAt: p.StartedAt, Flags: p.Flags}
 					}
+				}
+			case ebpftracer.EventTypeProcessExec:
+				if c := r.getOrCreateContainer(e.Pid); c != nil {
+					c.onProcessExec(r.tracer, e.Pid)
 				}
 			case ebpftracer.EventTypeProcessExit:
 				r.containerLock.RLock()
@@ -359,8 +365,9 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 
 			case ebpftracer.EventTypeListenOpen:
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
+					c.ensureProcess(e.Pid)
 					c.onListenOpen(e.Pid, e.SrcAddr, false)
-					c.attachTlsUprobes(r.tracer, e.Pid)
+					c.attachTlsUprobes(r.tracer, e.Pid, true)
 				}
 			case ebpftracer.EventTypeListenClose:
 				r.containerLock.RLock()
@@ -372,11 +379,13 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 
 			case ebpftracer.EventTypeConnectionOpen:
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
+					c.ensureProcess(e.Pid)
 					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, e.Timestamp, false, e.Duration)
-					c.attachTlsUprobes(r.tracer, e.Pid)
+					c.attachTlsUprobes(r.tracer, e.Pid, true)
 				}
 			case ebpftracer.EventTypeConnectionError:
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
+					c.ensureProcess(e.Pid)
 					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, 0, true, e.Duration)
 				}
 			case ebpftracer.EventTypeConnectionClose:
@@ -405,6 +414,13 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				klog.V(5).Infof("L7_EVENT_REGISTRY: pid=%d fd=%d protocol=%d timestamp=%d",
 					e.Pid, e.Fd, e.L7Request.Protocol, e.Timestamp)
 				r.processL7Event(e)
+			case ebpftracer.EventTypeLLMData:
+				r.containerLock.RLock()
+				c := r.containersByPid[e.Pid]
+				r.containerLock.RUnlock()
+				if c != nil {
+					c.onLLMData(e)
+				}
 			}
 			// Process any pending L7 events after handling new events
 			r.processPendingL7Events()
@@ -412,13 +428,19 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 	}
 }
 
-// processL7Event handles an L7 event, queueing it for retry if the connection isn't found yet
-const maxIP2FQDNEntries = 10000
+func containerIdOf(c *Container) ContainerID {
+	if c == nil {
+		return ""
+	}
+	return c.id
+}
 
+// processL7Event handles an L7 event, queueing it for retry if the connection isn't found yet
 func (r *Registry) processL7Event(e ebpftracer.Event) {
 	defer func() {
 		if p := recover(); p != nil {
 			klog.Errorf("recovered from panic in L7 event handler: pid=%d fd=%d protocol=%d: %v", e.Pid, e.Fd, e.L7Request.Protocol, p)
+			dropL7Event(containerIdOf(r.containersByPid[e.Pid]), "panic", e.Pid, e.Fd, e.L7Request, e.SocketInfo)
 		}
 	}()
 	if c := r.containersByPid[e.Pid]; c != nil {
@@ -431,16 +453,10 @@ func (r *Registry) processL7Event(e ebpftracer.Event) {
 			r.queueL7EventForRetry(e)
 			return
 		}
-		r.ip2fqdnLock.Lock()
 		for ip, domain := range ip2fqdn {
-			if len(r.ip2fqdn) < maxIP2FQDNEntries {
-				r.ip2fqdn[ip] = domain
-			}
+			r.ip2fqdn.Put(ip, domain)
 			r.ip_resolver.CacheDNS(ip.String(), domain.FQDN)
 		}
-		r.ip2fqdnLock.Unlock()
-		// Feed DNS resolutions to LLM detector for connection-level detection
-		r.feedDNSToLLMDetector(ip2fqdn)
 	} else if e.L7Request.Protocol == l7.ProtocolTLSClientHello {
 		// SNI events from pids not yet tracked in containersByPid (transient
 		// processes, or the race where the main /app/services pid is sending
@@ -452,15 +468,10 @@ func (r *Registry) processL7Event(e ebpftracer.Event) {
 	} else if e.L7Request.Protocol == l7.ProtocolDNS {
 		// Handle DNS queries from non-monitored processes for global ip2fqdn mapping
 		ip2fqdn := r.handleHostDNSRequest(e.L7Request)
-		r.ip2fqdnLock.Lock()
 		for ip, domain := range ip2fqdn {
-			if len(r.ip2fqdn) < maxIP2FQDNEntries {
-				r.ip2fqdn[ip] = domain
-			}
+			r.ip2fqdn.Put(ip, domain)
 			r.ip_resolver.CacheDNS(ip.String(), domain.FQDN)
 		}
-		r.ip2fqdnLock.Unlock()
-		r.feedDNSToLLMDetector(ip2fqdn)
 	}
 }
 
@@ -473,6 +484,7 @@ func (r *Registry) queueL7EventForRetry(e ebpftracer.Event) {
 	const maxPendingEvents = 500
 	if len(r.pendingL7Events) >= maxPendingEvents {
 		klog.V(3).Infof("L7_EVENT_QUEUE_FULL: dropping event pid=%d fd=%d", e.Pid, e.Fd)
+		dropL7Event(containerIdOf(r.containersByPid[e.Pid]), "retry_queue_full", e.Pid, e.Fd, e.L7Request, e.SocketInfo)
 		return
 	}
 
@@ -507,6 +519,7 @@ func (r *Registry) processPendingL7Events() {
 		// Expire old events
 		if now.Sub(p.addedAt) > maxAge {
 			klog.V(3).Infof("L7_EVENT_EXPIRED: pid=%d fd=%d age=%v", p.event.Pid, p.event.Fd, now.Sub(p.addedAt))
+			dropL7Event(containerIdOf(r.containersByPid[p.event.Pid]), "retry_expired", p.event.Pid, p.event.Fd, p.event.L7Request, p.event.SocketInfo)
 			continue
 		}
 
@@ -516,12 +529,15 @@ func (r *Registry) processPendingL7Events() {
 			if p.retryCount < maxRetries {
 				p.retryCount++
 				stillPending = append(stillPending, p)
+			} else {
+				dropL7Event("", "unknown_process", p.event.Pid, p.event.Fd, p.event.L7Request, p.event.SocketInfo)
 			}
 			continue
 		}
 
 		ip2fqdn, result, panicked := r.safeOnL7Request(c, p.event)
 		if panicked {
+			dropL7Event(c.id, "panic", p.event.Pid, p.event.Fd, p.event.L7Request, p.event.SocketInfo)
 			continue
 		}
 		if result == L7RequestConnNotFound {
@@ -531,18 +547,17 @@ func (r *Registry) processPendingL7Events() {
 				stillPending = append(stillPending, p)
 			} else {
 				klog.V(3).Infof("L7_EVENT_MAX_RETRIES: pid=%d fd=%d", p.event.Pid, p.event.Fd)
+				dropL7Event(c.id, unknownConnectionReason(p.event.SocketInfo), p.event.Pid, p.event.Fd, p.event.L7Request, p.event.SocketInfo)
 			}
 			continue
 		}
 
 		// Successfully processed
 		klog.V(3).Infof("L7_EVENT_RETRY_SUCCESS: pid=%d fd=%d retries=%d", p.event.Pid, p.event.Fd, p.retryCount)
-		r.ip2fqdnLock.Lock()
 		for ip, domain := range ip2fqdn {
-			r.ip2fqdn[ip] = domain
+			r.ip2fqdn.Put(ip, domain)
 			r.ip_resolver.CacheDNS(ip.String(), domain.FQDN)
 		}
-		r.ip2fqdnLock.Unlock()
 	}
 
 	// Re-queue still pending events
@@ -605,6 +620,10 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		r.containerLock.Lock()
 		r.containersByPid[pid] = c
 		r.containerLock.Unlock()
+		// The pid may have been mapped without its start event (e.g. a unit's
+		// new main process after a restart); register it so the container
+		// does not go zombie while the process is alive.
+		c.ensureProcess(pid)
 		return c
 	}
 	r.containerLock.RUnlock()
@@ -626,17 +645,18 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	}
 	id := calcId(cg, md)
 	if id == "" {
-		if cg.Id == "/init.scope" && pid != 1 {
+		// systemd forks a unit's process inside its own /init.scope and
+		// moves it to the unit's cgroup before exec. Caching the pid as
+		// ignored here would drop that exec, and a unit that does nothing
+		// else would never be detected. Processes in the root cgroup (hosts
+		// without systemd) are cached as before.
+		if cg.InitScope() && pid != 1 {
 			klog.V(5).InfoS("ignoring without persisting", "cg", cg.Id, "pid", pid)
 		} else {
 			klog.V(5).InfoS("ignoring", "cg", cg.Id, "pid", pid)
 			r.containerLock.Lock()
 			t := time.Now()
 			r.containersByPidIgnored[pid] = &t
-			// Clean up stale ignored PIDs while we have the lock
-			if oldT := r.containersByPidIgnored[pid]; oldT != nil && time.Since(*oldT) >= IgnoredContainersCacheTTL {
-				delete(r.containersByPidIgnored, pid)
-			}
 			r.containerLock.Unlock()
 		}
 		return nil
@@ -680,6 +700,7 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	}
 	if c := r.containersByCgroupId[cg.Id]; c != nil {
 		r.containersByPid[pid] = c
+		c.ensureProcess(pid)
 		return c
 	}
 	if c := r.containersById[id]; c != nil {
@@ -710,6 +731,7 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	r.containersByPid[pid] = c
 	r.containersByCgroupId[cg.Id] = c
 	r.containersById[id] = c
+	c.ensureProcess(pid)
 	return c
 }
 
@@ -721,10 +743,22 @@ func (r *Registry) updateEbpfStatsAndActiveConns() {
 	if !r.tracer.Ready() {
 		return
 	}
+	// TLS plaintext the kernel could not attribute to a socket, per process:
+	// counted on the process's container and logged once per binary.
+	for pid, byReason := range r.tracer.TLSPlaintextDroppedByPid() {
+		r.containerLock.RLock()
+		c := r.containersByPid[pid]
+		r.containerLock.RUnlock()
+		if c != nil {
+			c.recordTLSDrops(pid, byReason)
+		}
+	}
+
 	// Traffic stats from eBPF maps
 	iter := r.tracer.ActiveConnectionsIterator()
 	cid := ebpftracer.ConnectionId{}
 	stats := ebpftracer.Connection{}
+	tlsRechecked := map[uint32]bool{}
 	for iter.Next(&cid, &stats) {
 		r.containerLock.RLock()
 		c := r.containersByPid[cid.PID]
@@ -737,6 +771,13 @@ func (r *Registry) updateEbpfStatsAndActiveConns() {
 				BytesReceived: stats.BytesReceived,
 				Protocol:      stats.Protocol,
 			})
+			// A process that keeps one connection open never produces another
+			// connect event, so a libssl miss on its first connect would
+			// otherwise never be retried.
+			if !tlsRechecked[cid.PID] {
+				tlsRechecked[cid.PID] = true
+				c.attachTlsUprobes(r.tracer, cid.PID, false)
+			}
 		}
 	}
 	if err := iter.Err(); err != nil {
@@ -803,24 +844,7 @@ func (r *Registry) evictStaleCounterLabels() {
 }
 
 func (r *Registry) getDomain(ip netaddr.IP) *common.Domain {
-	r.ip2fqdnLock.RLock()
-	defer r.ip2fqdnLock.RUnlock()
-	return r.ip2fqdn[ip]
-}
-
-// feedDNSToLLMDetector notifies the LLM detector about DNS resolutions.
-// This builds the IP→LLM provider cache for connection-level detection.
-func (r *Registry) feedDNSToLLMDetector(ip2fqdn map[netaddr.IP]*common.Domain) {
-	if r.llmDetector == nil || len(ip2fqdn) == 0 {
-		return
-	}
-	for ip, domain := range ip2fqdn {
-		if domain == nil || domain.FQDN == "" {
-			continue
-		}
-		// OnDNS will check if it's an LLM provider internally
-		r.llmDetector.OnDNS(domain.FQDN, []netaddr.IP{ip})
-	}
+	return r.ip2fqdn.Get(ip)
 }
 
 // handleHostDNSRequest processes DNS queries from non-monitored processes
