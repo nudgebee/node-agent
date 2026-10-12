@@ -9,6 +9,7 @@ import (
 
 	"github.com/coroot/coroot-node-agent/flags"
 	"github.com/gobwas/glob"
+	"golang.org/x/net/publicsuffix"
 	"inet.af/netaddr"
 	"k8s.io/klog/v2"
 )
@@ -386,6 +387,42 @@ func NormalizeFQDN(fqdn string, requestType string) string {
 		}
 	}
 	return fqdn
+}
+
+// CollapseSearchPath names a failed lookup after the name the application
+// asked for. A resolver tries a name that is not fully qualified with each
+// search domain appended in turn (in a Kubernetes pod <ns>.svc.<cluster
+// domain>, svc.<cluster domain>, <cluster domain>, then the node's own), and
+// all but at most one attempt fail. Each failed attempt was a domain label of
+// its own, up to six series for every name an application resolved, and they
+// filled the per-container domain cap. A failed name that is already complete
+// before its last labels, at a "svc" label or at a public top-level domain, is
+// cut at the first of them; NormalizeFQDN does this for a few top-level
+// domains whatever the result. A namespace named like a top-level domain is
+// cut one label early, which still leaves one label for the name. Only failed
+// lookups are cut: a name that resolved is the one asked for.
+func CollapseSearchPath(fqdn string) string {
+	start, labels := 0, 0
+	for i := 0; i < len(fqdn)-1; i++ {
+		if fqdn[i] != '.' {
+			continue
+		}
+		label := fqdn[start:i]
+		start = i + 1
+		labels++
+		if labels >= 2 && (label == "svc" || isPublicTLD(label)) {
+			return fqdn[:i] + ".search_path_suffix"
+		}
+	}
+	return fqdn
+}
+
+// isPublicTLD reports whether label is a top-level domain of the public DNS.
+// Names under the private ones that search domains end in (local, internal)
+// are not.
+func isPublicTLD(label string) bool {
+	_, icann := publicsuffix.PublicSuffix(label)
+	return icann
 }
 
 // WithResolvedDomain swaps an IP-named destination for its DNS name. As in

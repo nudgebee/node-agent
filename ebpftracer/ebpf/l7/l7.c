@@ -116,7 +116,7 @@ struct l7_event {
     __u16 dport;         // Destination port
     __u16 addr_family;   // AF_INET (2) or AF_INET6 (10)
     __u8 socket_info_valid;  // 1 if socket info was extracted
-    __u8 padding2;
+    __u8 sock_type;          // socket->type, see struct socket_tuple
     char payload[MAX_PAYLOAD_SIZE];
     char response[MAX_PAYLOAD_SIZE];
 };
@@ -285,6 +285,7 @@ void send_event(void *ctx, struct l7_event *e, struct connection_id cid, struct 
         e->dport = tuple.dport;
         e->addr_family = tuple.family;
         e->socket_info_valid = 1;
+        e->sock_type = tuple.sock_type;
     } else {
         e->socket_info_valid = 0;
     }
