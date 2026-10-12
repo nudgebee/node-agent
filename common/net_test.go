@@ -88,13 +88,15 @@ func TestNormalizeFQDN(t *testing.T) {
 
 func TestCollapseSearchPath(t *testing.T) {
 	for _, tc := range []struct{ name, want string }{
-		// A service name with each search domain of a pod appended.
-		{"api.orders.svc.cluster.local.orders.svc.cluster.local", "api.orders.svc.search_path_suffix"},
-		{"api.orders.svc.cluster.local.svc.cluster.local", "api.orders.svc.search_path_suffix"},
-		{"api.orders.svc.cluster.local.cluster.local", "api.orders.svc.search_path_suffix"},
-		{"api.orders.svc.cluster.local.c.example-project.internal", "api.orders.svc.search_path_suffix"},
-		{"api.orders.svc.cluster.local.google.internal", "api.orders.svc.search_path_suffix"},
-		{"api.orders.svc.svc.cluster.local", "api.orders.svc.search_path_suffix"},
+		// A service name with each search domain of a pod appended. The
+		// namespace has a hyphen, so no update of the public suffix list
+		// can make it a top-level domain.
+		{"api.team-a.svc.cluster.local.team-a.svc.cluster.local", "api.team-a.svc.search_path_suffix"},
+		{"api.team-a.svc.cluster.local.svc.cluster.local", "api.team-a.svc.search_path_suffix"},
+		{"api.team-a.svc.cluster.local.cluster.local", "api.team-a.svc.search_path_suffix"},
+		{"api.team-a.svc.cluster.local.c.example-project.internal", "api.team-a.svc.search_path_suffix"},
+		{"api.team-a.svc.cluster.local.google.internal", "api.team-a.svc.search_path_suffix"},
+		{"api.team-a.svc.svc.cluster.local", "api.team-a.svc.search_path_suffix"},
 		// An external name under a top-level domain NormalizeFQDN does not know.
 		{"logs.example.in.svc.cluster.local", "logs.example.in.search_path_suffix"},
 		{"logs.example.in.default.svc.cluster.local", "logs.example.in.search_path_suffix"},
@@ -104,7 +106,7 @@ func TestCollapseSearchPath(t *testing.T) {
 		// A namespace named like a top-level domain is cut one label early.
 		{"api.shop.svc.cluster.local.cluster.local", "api.shop.search_path_suffix"},
 		// Already complete, or nothing to cut.
-		{"api.orders.svc.cluster.local", "api.orders.svc.search_path_suffix"},
+		{"api.team-a.svc.cluster.local", "api.team-a.svc.search_path_suffix"},
 		{"logs.example.in", "logs.example.in"},
 		{"redis.cluster.local", "redis.cluster.local"},
 		{"redis.c.example-project.internal", "redis.c.example-project.internal"},
