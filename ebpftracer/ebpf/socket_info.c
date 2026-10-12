@@ -55,7 +55,7 @@ struct socket_tuple {
     __u16 dport;         // Destination port
     __u16 family;        // AF_INET (2) or AF_INET6 (10)
     __u8 valid;          // 1 if extraction succeeded
-    __u8 padding;
+    __u8 sock_type;      // socket->type: SOCK_STREAM (1), SOCK_DGRAM (2), 0 if unread
 };
 
 // get_socket_from_fd returns the struct socket behind fd in the current
@@ -150,6 +150,13 @@ int get_socket_tuple_from_fd(__u32 fd, struct socket_tuple *tuple) {
     }
     if (!sk) {
         return 0;
+    }
+
+    // Whether the socket is TCP or UDP: userspace looks up a socket's address
+    // translation only for TCP, the only protocol the kernel records it for.
+    short type = 0;
+    if (!bpf_probe_read_kernel(&type, sizeof(type), (void *)socket + offsets->socket_type_offset)) {
+        tuple->sock_type = (__u8)type;
     }
 
     // Read address family

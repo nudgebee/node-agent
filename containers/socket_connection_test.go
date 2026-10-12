@@ -51,8 +51,15 @@ func newSocketTestContainer(t *testing.T, names map[string]string) *Container {
 	}
 }
 
+// socketInfo returns a TCP socket's tuple, udpSocketInfo a UDP socket's.
 func socketInfo(src string, srcPort uint16, dst string, dstPort uint16) *ebpftracer.SocketInfo {
-	return &ebpftracer.SocketInfo{SrcIP: src, SrcPort: srcPort, DstIP: dst, DstPort: dstPort, Valid: true}
+	return &ebpftracer.SocketInfo{SrcIP: src, SrcPort: srcPort, DstIP: dst, DstPort: dstPort, Type: ebpftracer.SockStream, Valid: true}
+}
+
+func udpSocketInfo(src string, srcPort uint16, dst string, dstPort uint16) *ebpftracer.SocketInfo {
+	si := socketInfo(src, srcPort, dst, dstPort)
+	si.Type = ebpftracer.SockDgram
+	return si
 }
 
 // A connection built from an L7 event's socket tuple must pass the same
@@ -166,7 +173,7 @@ func TestDNSResolverKeepsItsNameAcrossReusedFd(t *testing.T) {
 		resolver = "192.0.2.53"
 		hostIP   = "203.0.113.9"
 	)
-	dnsTuple := socketInfo("10.0.0.2", 40000, resolver, 53)
+	dnsTuple := udpSocketInfo("10.0.0.2", 40000, resolver, 53)
 	tlsTuple := socketInfo("10.0.0.2", 40001, hostIP, 443)
 
 	c.handleL7(t, 1, 7, 0, dnsResponse(t, "api.example.com", hostIP), dnsTuple)
@@ -194,7 +201,7 @@ func TestDNSResolverKeepsItsNameAcrossReusedFd(t *testing.T) {
 // earlier connection.
 func TestEarlierSocketOnFdIsNotUsed(t *testing.T) {
 	c := newL7TestContainer(t)
-	earlier, _ := c.createConnectionFromSocketInfo(1, 7, 0, socketInfo("10.0.0.2", 40000, "192.0.2.53", 53))
+	earlier, _ := c.createConnectionFromSocketInfo(1, 7, 0, udpSocketInfo("10.0.0.2", 40000, "192.0.2.53", 53))
 	if earlier == nil {
 		t.Fatal("no connection for the earlier socket")
 	}
@@ -210,8 +217,8 @@ func TestEarlierSocketOnFdIsNotUsed(t *testing.T) {
 		t.Errorf("earlier connection renamed to %q", got)
 	}
 
-	c.connectionsByPidFd[PidFd{Pid: 1, Fd: 7}], _ = c.connectionFromSocketInfo(1, 7, 100, socketInfo("10.0.0.2", 40001, "203.0.113.9", 443), true)
-	c.handleL7(t, 1, 7, 0, dnsResponse(t, "www.example.org", "198.51.100.7"), socketInfo("10.0.0.2", 40002, "192.0.2.53", 53))
+	c.connectionsByPidFd[PidFd{Pid: 1, Fd: 7}], _ = c.connectionFromSocketInfo(1, 7, 100, socketInfo("10.0.0.2", 40001, "203.0.113.9", 443))
+	c.handleL7(t, 1, 7, 0, dnsResponse(t, "www.example.org", "198.51.100.7"), udpSocketInfo("10.0.0.2", 40002, "192.0.2.53", 53))
 	if got := c.dnsLabelValues(t, "destination"); len(got) != 1 || !got["192.0.2.53:53"] {
 		t.Errorf("DNS destinations = %v, want only 192.0.2.53:53", got)
 	}
@@ -221,23 +228,45 @@ func TestEarlierSocketOnFdIsNotUsed(t *testing.T) {
 // keyed by local address. A UDP query whose local port an earlier TCP
 // connection had used found that connection's server there, and was labelled
 // with it: one more set of series for every server the container had reached.
-// A TCP connection built from its tuple still takes its translation.
+// Only a TCP socket takes a translation, whichever path builds its connection.
 func TestDNSQueryTakesNoTCPTranslation(t *testing.T) {
 	c := newL7TestContainer(t)
 	tcpServer := netaddr.MustParseIPPort("198.51.100.80:8080")
 	c.registry.actualDestination = func(netaddr.IPPort) (netaddr.IPPort, bool) { return tcpServer, true }
+	const resolver = "192.0.2.53:53"
 
-	c.handleL7(t, 1, 7, 0, dnsResponse(t, "api.example.com", "203.0.113.9"), socketInfo("10.0.0.2", 40000, "192.0.2.53", 53))
-	if got := c.dnsLabelValues(t, "actual_destination"); len(got) != 1 || !got["192.0.2.53:53"] {
-		t.Errorf("DNS actual destinations = %v, want only 192.0.2.53:53", got)
+	// A query with no connection tracked on its fd.
+	c.handleL7(t, 1, 7, 0, dnsResponse(t, "api.example.com", "203.0.113.9"), udpSocketInfo("10.0.0.2", 40000, "192.0.2.53", 53))
+	// A query whose fd has an earlier entry for the same resolver and a newer
+	// event timestamp: the connection is rebuilt from the tuple and tracked.
+	earlier, _ := c.createConnectionFromSocketInfo(1, 8, 100, udpSocketInfo("10.0.0.2", 40001, "192.0.2.53", 53))
+	if earlier == nil {
+		t.Fatal("no connection for the earlier socket")
+	}
+	c.handleL7(t, 1, 8, 200, dnsResponse(t, "www.example.org", "198.51.100.7"), udpSocketInfo("10.0.0.2", 40002, "192.0.2.53", 53))
+	if conn := c.connectionsByPidFd[PidFd{Pid: 1, Fd: 8}]; conn == earlier || conn.Timestamp != 200 {
+		t.Fatalf("the query did not rebuild the fd's connection: %+v", conn)
+	}
+	if got := c.dnsLabelValues(t, "actual_destination"); len(got) != 1 || !got[resolver] {
+		t.Errorf("DNS actual destinations = %v, want only %s", got, resolver)
 	}
 
-	conn, _ := c.createConnectionFromSocketInfo(1, 8, 100, socketInfo("10.0.0.2", 40001, "192.0.2.80", 80))
-	if conn == nil {
-		t.Fatal("no connection for the TCP socket")
-	}
-	if got := conn.DestinationKey.ActualDestinationLabelValue(); got != tcpServer.String() {
-		t.Errorf("TCP actual destination = %q, want %s", got, tcpServer)
+	for _, tc := range []struct {
+		name string
+		si   *ebpftracer.SocketInfo
+		want string
+	}{
+		{"TCP", socketInfo("10.0.0.2", 40003, "192.0.2.80", 80), tcpServer.String()},
+		{"UDP", udpSocketInfo("10.0.0.2", 40004, "192.0.2.80", 80), "192.0.2.80:80"},
+		{"unknown type", &ebpftracer.SocketInfo{SrcIP: "10.0.0.2", SrcPort: 40005, DstIP: "192.0.2.80", DstPort: 80, Valid: true}, "192.0.2.80:80"},
+	} {
+		conn, _ := c.createConnectionFromSocketInfo(1, 9, 300, tc.si)
+		if conn == nil {
+			t.Fatalf("%s: no connection", tc.name)
+		}
+		if got := conn.DestinationKey.ActualDestinationLabelValue(); got != tc.want {
+			t.Errorf("%s: actual destination = %q, want %s", tc.name, got, tc.want)
+		}
 	}
 }
 
