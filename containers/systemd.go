@@ -100,6 +100,7 @@ type SystemdProperties struct {
 	Unit        string
 	TriggeredBy string
 	Type        string
+	Git         GitSource
 }
 
 func (sp SystemdProperties) IsEmpty() bool {
@@ -147,6 +148,10 @@ func getSystemdProperties(id string) (SystemdProperties, error) {
 	}
 	if v, ok := properties["Type"]; ok {
 		props.Type, _ = v.(string)
+	}
+	if v, ok := properties["Environment"]; ok {
+		env, _ := v.([]string)
+		props.Git = gitSourceFromEnv(env)
 	}
 	return props, nil
 }
