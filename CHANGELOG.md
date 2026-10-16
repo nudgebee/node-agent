@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Oracle Cloud instance-metadata support.
 - Pressure Stall Information (PSI) cgroup metrics.
 - Fleet install guide and an Ansible playbook for installing the agent on many hosts at once.
+- `git_repo` and `git_branch` labels on `container_info`, read from a container label or a systemd
+  `Environment=` entry, so a service can declare the repository it runs
+  ([docs](docs/service-git-source.md)).
 
 ### Changed
 

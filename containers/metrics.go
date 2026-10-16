@@ -65,7 +65,7 @@ var metrics = struct {
 
 	Ip2Fqdn *prometheus.Desc
 }{
-	ContainerInfo: metric("container_info", "Meta information about the container", "image", "systemd_triggered_by", "systemd_type"),
+	ContainerInfo: metric("container_info", "Meta information about the container", "image", "systemd_triggered_by", "systemd_type", "git_repo", "git_branch"),
 
 	Restarts: metric("container_restarts_total", "Number of times the container was restarted"),
 

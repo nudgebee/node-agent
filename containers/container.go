@@ -342,7 +342,8 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	if c.metadata.image != "" || !c.metadata.systemd.IsEmpty() {
-		ch <- c.gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemd.TriggeredBy, c.metadata.systemd.Type)
+		git := c.metadata.gitSource()
+		ch <- c.gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemd.TriggeredBy, c.metadata.systemd.Type, git.Repo, git.Branch)
 	}
 
 	// --- Cgroup/procfs metrics (no c.lock needed) ---
