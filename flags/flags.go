@@ -71,6 +71,7 @@ var (
 
 	ScrapeInterval                        = kingpin.Flag("scrape-interval", "How often to gather metrics from the agent").Default("15s").Envar("SCRAPE_INTERVAL").Duration()
 	WalDir                                = kingpin.Flag("wal-dir", "Path to where the agent stores data (e.g. the metrics Write-Ahead Log)").Default("/tmp/nudgebee-node-agent").Envar("WAL_DIR").String()
+	LegacyInstanceID                      = kingpin.Flag("legacy-instance-id", "Derive the metrics `instance` label from machine-id and system UUID only, as releases before cloned-VM support did. Keeps existing series after an upgrade, but VMs cloned from one image whose system UUID is missing or identical share an instance").Default("false").Envar("LEGACY_INSTANCE_ID").Bool()
 	MaxSpoolSize                          = kingpin.Flag("max-spool-size", "Maximum size of the on-disk spool used to buffer data when it cannot be sent to collector. Supports size suffixes like KB, MB, or GB.").Default("500MB").Envar("MAX_SPOOL_SIZE").Bytes()
 	ResolveDns                            = kingpin.Flag("resolve-dns", "should resolve DNS").Default("false").Envar("RESOLVE_DNS").Bool()
 	IgnoreControlPlane                    = kingpin.Flag("ignore-control-plane", "ignore control plane like loki").Default("karpenter,loki,prometheus,grafana,kubelet,etcd,apiserver,victoria,nudgebee-agent,kube-system").Envar("IGNORE_CONTROL_PLANE").String()
