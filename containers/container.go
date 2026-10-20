@@ -2105,6 +2105,25 @@ func (c *Container) ping() map[netaddr.IP]float64 {
 	return rtt
 }
 
+// logsK8sContainer is what the log emitter needs to label a Kubernetes container's
+// records, or nil for any other container. Names come from the runtime's pod labels:
+// a CronJob container's id carries the job's name, not the pod's.
+func (c *Container) logsK8sContainer() *logs.K8sContainer {
+	if c.metadata == nil {
+		return nil
+	}
+	pod := c.metadata.labels["io.kubernetes.pod.name"]
+	if pod == "" {
+		return nil
+	}
+	namespace := c.metadata.labels["io.kubernetes.pod.namespace"]
+	k := &logs.K8sContainer{Namespace: namespace, Pod: pod, Container: c.metadata.labels["io.kubernetes.container.name"]}
+	if c.ip_resolver != nil {
+		k.Owner = func() common.Workload { return c.ip_resolver.ResolvePodOwner(pod, namespace) }
+	}
+	return k
+}
+
 func (c *Container) runLogParser(logPath string) {
 	if *flags.DisableLogParsing {
 		return
@@ -2130,7 +2149,7 @@ func (c *Container) runLogParser(logPath string) {
 			return
 		}
 		ch := make(chan logparser.LogEntry)
-		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, !*flags.DisableJsonLogParsing, logs.PatternExtractionRateLimiter(), sensitiveCfg)
+		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId, c.logsK8sContainer()), multilineCollectorTimeout, *flags.LogPatternsPerContainer, !*flags.DisableJsonLogParsing, logs.PatternExtractionRateLimiter(), sensitiveCfg)
 		reader, err := logs.NewTailReader(proc.HostPath(logPath), ch)
 		if err != nil {
 			klog.Warningln(err)
@@ -2150,7 +2169,7 @@ func (c *Container) runLogParser(logPath string) {
 			klog.Warningln(err)
 			return
 		}
-		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, !*flags.DisableJsonLogParsing, logs.PatternExtractionRateLimiter(), sensitiveCfg)
+		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId, c.logsK8sContainer()), multilineCollectorTimeout, *flags.LogPatternsPerContainer, !*flags.DisableJsonLogParsing, logs.PatternExtractionRateLimiter(), sensitiveCfg)
 		stop := func() {
 			JournaldUnsubscribe(c.metadata.systemd.Unit)
 		}
@@ -2167,7 +2186,7 @@ func (c *Container) runLogParser(logPath string) {
 			delete(c.logParsers, "stdout/stderr")
 		}
 		ch := make(chan logparser.LogEntry)
-		parser := logparser.NewParser(ch, c.metadata.logDecoder, logs.OtelLogEmitter(containerId), multilineCollectorTimeout, *flags.LogPatternsPerContainer, !*flags.DisableJsonLogParsing, logs.PatternExtractionRateLimiter(), sensitiveCfg)
+		parser := logparser.NewParser(ch, c.metadata.logDecoder, logs.OtelLogEmitter(containerId, c.logsK8sContainer()), multilineCollectorTimeout, *flags.LogPatternsPerContainer, !*flags.DisableJsonLogParsing, logs.PatternExtractionRateLimiter(), sensitiveCfg)
 		reader, err := logs.NewTailReader(proc.HostPath(c.metadata.logPath), ch)
 		if err != nil {
 			klog.Warningln(err)

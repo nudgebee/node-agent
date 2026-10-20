@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Oracle Cloud instance-metadata support.
 - Pressure Stall Information (PSI) cgroup metrics.
 - Fleet install guide and an Ansible playbook for installing the agent on many hosts at once.
+- Exported container logs carry `k8s.namespace.name`, `k8s.pod.name`,
+  `k8s.container.name`, `k8s.node.name` (new `NODE_NAME` / `--node-name`,
+  default: the host name), a Deployment, StatefulSet, DaemonSet or CronJob
+  owner's `k8s.<kind>.name`, and `log.iostream`.
+  Their record time is the line's own time from the container runtime, and
+  lines the runtime split are joined.
 
 ### Changed
 
@@ -30,3 +36,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - OpenTelemetry service name is now `nudgebee-node-agent`.
 - Default systemd unit name is `nudgebee-node-agent.service`.
 - Container image is published at `ghcr.io/nudgebee/node-agent`.
+- Logs are exported gzip-compressed (`Content-Encoding: gzip`), so the
+  `LOGS_ENDPOINT` receiver must accept gzip, as the OpenTelemetry
+  Collector's OTLP/HTTP receiver does.

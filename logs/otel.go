@@ -3,6 +3,7 @@ package logs
 import (
 	"context"
 	"encoding/binary"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -23,7 +24,73 @@ import (
 	"k8s.io/klog/v2"
 )
 
-var otelLogger otelLogs.Logger
+var (
+	otelLogger otelLogs.Logger
+	// nodeName is set on every Kubernetes container's records as k8s.node.name.
+	nodeName string
+)
+
+// ownerRefresh is how long a container's records reuse its pod's resolved owner.
+// The owner can resolve late: a pod the resolver has not indexed yet is looked up
+// through the API server, which reports it as the pod itself (kind pod) when that
+// call fails, and a CronJob's pod whose Job is not cached yet resolves to the Job.
+// So the owner is looked up again rather than kept for the container's lifetime.
+const ownerRefresh = time.Minute
+
+// K8sContainer labels a Kubernetes container's records with the attributes log
+// queries filter on: k8s.namespace.name, k8s.pod.name, k8s.container.name,
+// k8s.node.name and the top-level owner's k8s.<kind>.name.
+type K8sContainer struct {
+	Namespace string
+	Pod       string
+	Container string
+	// Owner resolves the pod's top-level owner; nil means none is known.
+	Owner func() common.Workload
+
+	owner   common.Workload
+	ownerAt time.Time
+	res     *resource.Resource
+}
+
+// ownerAttrKeys are the owner kinds with a semantic-convention attribute that log
+// queries read as the workload. Any other owner (ReplicaSet, Rollout, a bare pod)
+// sets none, and queries fall back to the pod name. So does a Job: the resolver
+// reports a standalone Job (AGGREGATE_EPHEMERAL_WORKLOADS) under an aggregated
+// name, which k8s.job.name must not carry.
+var ownerAttrKeys = map[string]attribute.Key{
+	"Deployment":  semconv.K8SDeploymentNameKey,
+	"StatefulSet": semconv.K8SStatefulSetNameKey,
+	"DaemonSet":   semconv.K8SDaemonSetNameKey,
+	"CronJob":     semconv.K8SCronJobNameKey,
+}
+
+// resource is the resource of a record emitted at now: base plus the Kubernetes
+// attributes. It is built once, and again only when the pod's resolved owner changes.
+// Called from the container's parser goroutine only.
+func (k *K8sContainer) resource(base []attribute.KeyValue, now time.Time) *resource.Resource {
+	if k.Owner != nil && now.Sub(k.ownerAt) >= ownerRefresh {
+		if owner := k.Owner(); owner != k.owner {
+			k.owner, k.res = owner, nil
+		}
+		k.ownerAt = now
+	}
+	if k.res != nil {
+		return k.res
+	}
+	attrs := append(slices.Clip(base),
+		semconv.K8SNamespaceName(k.Namespace),
+		semconv.K8SPodName(k.Pod),
+		semconv.K8SContainerName(k.Container),
+	)
+	if nodeName != "" {
+		attrs = append(attrs, semconv.K8SNodeName(nodeName))
+	}
+	if key, ok := ownerAttrKeys[k.owner.Kind]; ok && k.owner.Name != "" {
+		attrs = append(attrs, key.String(k.owner.Name))
+	}
+	k.res = resource.NewSchemaless(attrs...)
+	return k.res
+}
 
 // PatternExtractionRateLimiter caps, per log source, how many warning and
 // error messages per second get a log pattern extracted (nil: unlimited).
@@ -44,6 +111,10 @@ func Init(machineId, hostname, version string) {
 		return
 	}
 	klog.Infoln("OpenTelemetry logs collector endpoint:", endpointUrl.String())
+	nodeName = *flags.NodeName
+	if nodeName == "" {
+		nodeName = hostname
+	}
 	path := endpointUrl.Path
 	if path == "" {
 		path = "/"
@@ -53,6 +124,9 @@ func Init(machineId, hostname, version string) {
 		otlplogshttp.WithEndpoint(endpointUrl.Host),
 		otlplogshttp.WithURLPath(path),
 		otlplogshttp.WithHeaders(common.AuthHeaders()),
+		// The exporter sends each record with its own copy of its container's
+		// resource, which compresses well.
+		otlplogshttp.WithCompression(otlplogshttp.GzipCompression),
 	}
 	if endpointUrl.Scheme != "https" {
 		opts = append(opts, otlplogshttp.WithInsecure())
@@ -112,6 +186,10 @@ func normalizeTraceContextKey(k string) string {
 }
 
 const patternHashKey = "pattern.hash"
+
+// logIostreamKey is the semantic-convention record attribute for the stream a line
+// was written to ("stdout" / "stderr").
+const logIostreamKey = attribute.Key("log.iostream")
 
 func logRecordAttrs(patternHash string, attributes map[string]string) ([]attribute.KeyValue, *trace.TraceID, *trace.SpanID) {
 	var traceId *trace.TraceID
@@ -183,11 +261,21 @@ func isDatadogKey(k string) bool {
 	return strings.HasPrefix(strings.ToLower(k), "dd.")
 }
 
-func OtelLogEmitter(containerId string) logparser.OnMsgCallbackF {
+// OtelLogEmitter exports a container's messages. A record's time is the line's own
+// (the container runtime's, when the source records it); ObservedTimestamp is when
+// the agent emits it, at most a multiline timeout or so after reading it. k8s labels
+// a Kubernetes container's records; nil for others.
+func OtelLogEmitter(containerId string, k8s *K8sContainer) logparser.OnMsgCallbackF {
 	if otelLogger == nil {
 		return nil
 	}
-	return func(ts time.Time, level logparser.Level, patternHash string, msg string, attributes map[string]string) {
+	base := []attribute.KeyValue{
+		semconv.ServiceName(common.ContainerIdToOtelServiceName(containerId)),
+		semconv.ContainerID(containerId),
+	}
+	// Outside Kubernetes, every record has the same resource.
+	res := resource.NewSchemaless(base...)
+	return func(ts time.Time, level logparser.Level, patternHash string, msg string, attributes map[string]string, stream string) {
 		severityText := level.String()
 		severityNumber := otelLogs.UNSPECIFIED
 		switch level {
@@ -204,20 +292,29 @@ func OtelLogEmitter(containerId string) logparser.OnMsgCallbackF {
 		}
 
 		attrs, traceId, spanId := logRecordAttrs(patternHash, attributes)
+		if stream != "" {
+			// The runtime's stream replaces a parsed field of the same name, since a
+			// duplicate key would leave either one read.
+			attrs = slices.DeleteFunc(attrs, func(a attribute.KeyValue) bool { return a.Key == logIostreamKey })
+			attrs = append(attrs, logIostreamKey.String(stream))
+		}
+
+		now := time.Now()
+		if k8s != nil {
+			res = k8s.resource(base, now)
+		}
 
 		otelLogger.Emit(
 			otelLogs.NewLogRecord(otelLogs.LogRecordConfig{
-				ObservedTimestamp: ts,
+				Timestamp:         &ts,
+				ObservedTimestamp: now,
 				TraceId:           traceId,
 				SpanId:            spanId,
 				SeverityText:      &severityText,
 				SeverityNumber:    &severityNumber,
 				Body:              &msg,
-				Resource: resource.NewSchemaless(
-					semconv.ServiceName(common.ContainerIdToOtelServiceName(containerId)),
-					semconv.ContainerID(containerId),
-				),
-				Attributes: &attrs,
+				Resource:          res,
+				Attributes:        &attrs,
 			}),
 		)
 	}
