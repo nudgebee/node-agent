@@ -3,6 +3,7 @@ package logs
 import (
 	"context"
 	"encoding/binary"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -26,6 +27,7 @@ import (
 
 var (
 	otelLogger otelLogs.Logger
+	retrying   *retryingExporter
 	// nodeName is set on every Kubernetes container's records as k8s.node.name.
 	nodeName string
 )
@@ -115,40 +117,113 @@ func Init(machineId, hostname, version string) {
 	if nodeName == "" {
 		nodeName = hostname
 	}
-	path := endpointUrl.Path
+	if file := *flags.LogsPositionsFile; file != "" {
+		p, err := loadPositions(file, *flags.LogsMaxPositionAge)
+		if err != nil {
+			klog.Warningln(err)
+		}
+		if p != nil {
+			savedPositions = p
+			klog.Infoln("log positions file:", file)
+			go savePositionsEvery(positionsSaveInterval)
+		}
+	}
+	loggerProvider := startDelivery(newExporter(endpointUrl), resource.NewWithAttributes(
+		semconv.SchemaURL,
+		semconv.ServiceName("nudgebee-node-agent"),
+		semconv.HostName(hostname),
+		semconv.HostID(machineId),
+	))
+	otel.SetLoggerProvider(loggerProvider)
+	otelLogger = loggerProvider.Logger("nudgebee-node-agent", otelLogs.WithInstrumentationVersion(version))
+}
+
+// newExporter sends records to the OTLP/HTTP logs endpoint u.
+func newExporter(u *url.URL) sdk.LogRecordExporter {
+	path := u.Path
 	if path == "" {
 		path = "/"
 	}
-
 	opts := []otlplogshttp.Option{
-		otlplogshttp.WithEndpoint(endpointUrl.Host),
+		otlplogshttp.WithEndpoint(u.Host),
 		otlplogshttp.WithURLPath(path),
 		otlplogshttp.WithHeaders(common.AuthHeaders()),
 		// The exporter sends each record with its own copy of its container's
 		// resource, which compresses well.
 		otlplogshttp.WithCompression(otlplogshttp.GzipCompression),
+		// 429 and 503 (the collector shedding load) are retried for as long as they last.
+		otlplogshttp.WithRetry(otlplogshttp.RetryConfig{
+			Enabled:         true,
+			InitialInterval: time.Second,
+			MaxInterval:     maxRetryInterval,
+			MaxElapsedTime:  0,
+		}),
 	}
-	if endpointUrl.Scheme != "https" {
+	if u.Scheme != "https" {
 		opts = append(opts, otlplogshttp.WithInsecure())
 	} else {
 		opts = append(opts, otlplogshttp.WithTLSClientConfig(common.TlsConfig()))
 	}
-	client := otlplogshttp.NewClient(opts...)
-	exporter, _ := otlplogs.NewExporter(context.Background(), otlplogs.WithClient(client))
+	exporter, _ := otlplogs.NewExporter(context.Background(), otlplogs.WithClient(otlplogshttp.NewClient(opts...)))
+	return exporter
+}
 
-	loggerProvider := sdk.NewLoggerProvider(
-		sdk.WithBatcher(exporter),
-		sdk.WithResource(
-			resource.NewWithAttributes(
-				semconv.SchemaURL,
-				semconv.ServiceName("nudgebee-node-agent"),
-				semconv.HostName(hostname),
-				semconv.HostID(machineId),
-			),
+// startDelivery tracks the delivery of every record exported through exporter (see
+// delivery) and returns the provider to emit them with.
+func startDelivery(exporter sdk.LogRecordExporter, res *resource.Resource) *sdk.LoggerProvider {
+	dlv = newDelivery()
+	retrying = newRetryingExporter(exporter, dlv)
+	return sdk.NewLoggerProvider(
+		sdk.WithBatcher(retrying,
+			sdk.WithMaxQueueSize(queueSize),
+			sdk.WithBlocking(),
+			// retrying retries until delivered; Shutdown stops it.
+			sdk.WithExportTimeout(0),
 		),
+		sdk.WithResource(res),
 	)
-	otel.SetLoggerProvider(loggerProvider)
-	otelLogger = loggerProvider.Logger("nudgebee-node-agent", otelLogs.WithInstrumentationVersion(version))
+}
+
+const positionsSaveInterval = 10 * time.Second
+
+func savePositionsEvery(interval time.Duration) {
+	for range time.Tick(interval) {
+		if err := savedPositions.save(); err != nil {
+			klog.Warningln("failed to save log positions:", err)
+		}
+	}
+}
+
+// flushGrace lets every parser pass on the message it is still collecting once its
+// reader stops: a multiline message is passed on 1-2 s after its last line, and a
+// split line's parts are joined for up to as long again. Anything still held after
+// it is read again on the next start.
+var flushGrace = 4 * time.Second
+
+// Shutdown stops reading log files, waits up to timeout for the records already
+// read to be delivered, and saves how far each file was delivered. Lines read but
+// not delivered by then are read again on the next start.
+func Shutdown(timeout time.Duration) {
+	if dlv == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	start := time.Now()
+	dlv.stopReading()
+	select {
+	case <-time.After(flushGrace):
+	case <-ctx.Done():
+	}
+	if dlv.drain(ctx) {
+		klog.Infof("delivered all read log records in %s", time.Since(start).Round(time.Millisecond))
+	} else {
+		klog.Warningf("%d log records were not delivered within %s; their lines are read again on the next start", dlv.pendingCount(), timeout)
+	}
+	if err := savedPositions.save(); err != nil {
+		klog.Warningln("failed to save log positions:", err)
+	}
+	retrying.stop()
 }
 
 const (
@@ -264,8 +339,10 @@ func isDatadogKey(k string) bool {
 // OtelLogEmitter exports a container's messages. A record's time is the line's own
 // (the container runtime's, when the source records it); ObservedTimestamp is when
 // the agent emits it, at most a multiline timeout or so after reading it. k8s labels
-// a Kubernetes container's records; nil for others.
-func OtelLogEmitter(containerId string, k8s *K8sContainer) logparser.OnMsgCallbackF {
+// a Kubernetes container's records; nil for others. src is the file the messages are
+// read from, whose position advances as their records are delivered; nil for other
+// sources (journald).
+func OtelLogEmitter(containerId string, k8s *K8sContainer, src *Source) logparser.OnMsgCallbackF {
 	if otelLogger == nil {
 		return nil
 	}
@@ -275,7 +352,7 @@ func OtelLogEmitter(containerId string, k8s *K8sContainer) logparser.OnMsgCallba
 	}
 	// Outside Kubernetes, every record has the same resource.
 	res := resource.NewSchemaless(base...)
-	return func(ts time.Time, level logparser.Level, patternHash string, msg string, attributes map[string]string, stream string) {
+	return func(ts time.Time, level logparser.Level, patternHash string, msg string, attributes map[string]string, stream string, offset int64) {
 		severityText := level.String()
 		severityNumber := otelLogs.UNSPECIFIED
 		switch level {
@@ -304,18 +381,21 @@ func OtelLogEmitter(containerId string, k8s *K8sContainer) logparser.OnMsgCallba
 			res = k8s.resource(base, now)
 		}
 
-		otelLogger.Emit(
-			otelLogs.NewLogRecord(otelLogs.LogRecordConfig{
-				Timestamp:         &ts,
-				ObservedTimestamp: now,
-				TraceId:           traceId,
-				SpanId:            spanId,
-				SeverityText:      &severityText,
-				SeverityNumber:    &severityNumber,
-				Body:              &msg,
-				Resource:          res,
-				Attributes:        &attrs,
-			}),
-		)
+		record := otelLogs.NewLogRecord(otelLogs.LogRecordConfig{
+			Timestamp:         &ts,
+			ObservedTimestamp: now,
+			TraceId:           traceId,
+			SpanId:            spanId,
+			SeverityText:      &severityText,
+			SeverityNumber:    &severityNumber,
+			Body:              &msg,
+			Resource:          res, // schemaless, so merging it into the provider's never fails and drops the record
+			Attributes:        &attrs,
+		})
+		if dlv == nil {
+			otelLogger.Emit(record)
+			return
+		}
+		dlv.emit(src, offset, len(msg), func() { otelLogger.Emit(record) })
 	}
 }

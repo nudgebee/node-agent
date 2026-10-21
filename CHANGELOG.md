@@ -27,6 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   owner's `k8s.<kind>.name`, and `log.iostream`.
   Their record time is the line's own time from the container runtime, and
   lines the runtime split are joined.
+- `LOGS_POSITIONS_FILE` / `--logs-positions-file`: where the agent saves how
+  far each container log file has been delivered, so after a restart it resumes
+  there instead of skipping the lines written meanwhile. A log file it has not
+  seen before (a container that started while it was down, or since it found
+  the containers running when it started) is read from its start; on its first
+  run on a node, the files already there are read from their end.
+  `LOGS_POSITIONS_MAX_AGE` / `--logs-positions-max-age` (default `24h`, `0`
+  disables): a positions file saved longer ago than this is ignored, as on a
+  first run, so a long downtime does not send a burst of old lines.
 
 ### Changed
 
@@ -39,3 +48,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Logs are exported gzip-compressed (`Content-Encoding: gzip`), so the
   `LOGS_ENDPOINT` receiver must accept gzip, as the OpenTelemetry
   Collector's OTLP/HTTP receiver does.
+- Container logs are delivered at least once instead of dropped when the
+  logs endpoint is unreachable, slow or restarting: export is retried (refused
+  or reset connections, timeouts, 5xx, 429) until it succeeds, readers pause
+  while many records wait (unsent lines stay in the log files), the old file
+  is read to its end on rotation (also when it was rotated while the agent
+  was down: it is found again by its inode), and on SIGTERM the agent delivers what it
+  has read (up to 15 s) before exiting. A paused reader finishes the file it
+  has open, then reads the files rotated in between that the kubelet has not
+  gzipped yet (all but the newest), so an outage is absorbed while a
+  container's log file is rotated at most twice; files gzipped before they are
+  read are skipped, which the agent logs as a warning. After a restart the
+  oldest file with undelivered lines is read, then the current one; files
+  rotated in between are not, which the agent logs as a warning. Any other
+  error (a 4xx other than 408 and 429, or a response that is not OTLP) drops
+  the batch, since resending it would fail the same way. journald records are dropped while the endpoint is backed
+  up and once the agent is stopping; `node_agent_log_records_dropped_total`
+  counts dropped records by `reason` (`backpressure`, `shutdown`, `rejected`).
