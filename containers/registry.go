@@ -3,6 +3,7 @@ package containers
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"os"
 	"regexp"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/coroot/coroot-node-agent/flags"
 	"github.com/coroot/coroot-node-agent/gpu"
+	"github.com/coroot/coroot-node-agent/logs"
 	"github.com/coroot/coroot-node-agent/proc"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vishvananda/netns"
@@ -27,6 +29,10 @@ const (
 	MinTrafficStatsUpdateInterval = 5 * time.Second
 	IgnoredContainersCacheTTL     = 15 * time.Second
 )
+
+// eventTypeInitialScanDone, which the kernel never sends, follows the events of the
+// processes running when the agent started: their containers have been found.
+const eventTypeInitialScanDone ebpftracer.EventType = math.MaxUint32
 
 var (
 	selfNetNs                = netns.None()
@@ -188,6 +194,8 @@ func NewRegistry(reg prometheus.Registerer, rawReg prometheus.Registerer, proces
 		close(r.events)
 		return nil, err
 	}
+	// Queued after the start events of the processes running now, which Run has sent.
+	r.events <- ebpftracer.Event{Type: eventTypeInitialScanDone}
 
 	return r, nil
 }
@@ -317,6 +325,8 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				return
 			}
 			switch e.Type {
+			case eventTypeInitialScanDone:
+				logs.InitialScanDone()
 			case ebpftracer.EventTypeProcessStart:
 				r.containerLock.RLock()
 				c, seen := r.containersByPid[e.Pid]

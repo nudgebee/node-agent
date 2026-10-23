@@ -65,6 +65,8 @@ var (
 	TracesEndpoint     = kingpin.Flag("traces-endpoint", "The URL of the endpoint to send traces to").Envar("TRACES_ENDPOINT").URL()
 	TracesSampling     = kingpin.Flag("traces-sampling", "Trace sampling rate (0.0 to 1.0)").Default("1.0").Envar("TRACES_SAMPLING").Float64()
 	LogsEndpoint       = kingpin.Flag("logs-endpoint", "The URL of the endpoint to send logs to").Envar("LOGS_ENDPOINT").URL()
+	LogsPositionsFile  = kingpin.Flag("logs-positions-file", "A file, on a volume that outlives the agent's container, where the agent saves how far each container log file has been delivered to the logs endpoint, so it resumes there after a restart instead of skipping the lines written meanwhile (default: not saved)").Envar("LOGS_POSITIONS_FILE").String()
+	LogsMaxPositionAge = kingpin.Flag("logs-positions-max-age", "A positions file saved longer ago than this is ignored, as on the agent's first run on the node: after a longer downtime, or the logs endpoint disabled meanwhile, only new lines are read instead of a burst of old ones (0 disables)").Default("24h").Envar("LOGS_POSITIONS_MAX_AGE").Duration()
 	NodeName           = kingpin.Flag("node-name", "The Kubernetes node name, set on exported log records as k8s.node.name (default: the host name)").Envar("NODE_NAME").String()
 	ProfilesEndpoint   = kingpin.Flag("profiles-endpoint", "The URL of the endpoint to send profiles to").Envar("PROFILES_ENDPOINT").URL()
 	InsecureSkipVerify = kingpin.Flag("insecure-skip-verify", "whether to skip verifying the certificate or not").Envar("INSECURE_SKIP_VERIFY").Default("false").Bool()

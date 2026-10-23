@@ -49,11 +49,11 @@ func TestOtelLogEmitterKubernetesRecord(t *testing.T) {
 			return common.Workload{Name: "checkout", Namespace: "shop", Kind: "Deployment"}
 		},
 	}
-	emit := OtelLogEmitter("/k8s/shop/checkout-7d9f8b6c4-x2x9q/app", k8s)
+	emit := OtelLogEmitter("/k8s/shop/checkout-7d9f8b6c4-x2x9q/app", k8s, nil)
 	require.NotNil(t, emit)
 
 	lineTime := time.Date(2026, 10, 19, 10, 0, 0, 0, time.UTC)
-	emit(lineTime, logparser.LevelError, "h1", "connection refused", map[string]string{"order": "1"}, "stderr")
+	emit(lineTime, logparser.LevelError, "h1", "connection refused", map[string]string{"order": "1"}, "stderr", 0)
 	require.Len(t, exp.records, 1)
 	r := exp.records[0]
 
@@ -75,7 +75,7 @@ func TestOtelLogEmitterKubernetesRecord(t *testing.T) {
 	assert.Equal(t, []string{"1"}, attrs["order"])
 
 	// A parsed field named log.iostream gives way to the runtime's stream.
-	emit(lineTime, logparser.LevelInfo, "h2", "ok", map[string]string{"log.iostream": "app-value"}, "stdout")
+	emit(lineTime, logparser.LevelInfo, "h2", "ok", map[string]string{"log.iostream": "app-value"}, "stdout", 0)
 	require.Len(t, exp.records, 2)
 	assert.Equal(t, []string{"stdout"}, attrMap(*exp.records[1].Attributes())["log.iostream"])
 	assert.Equal(t, res, attrMap(exp.records[1].Resource().Attributes()), "the container's resource, reused")
@@ -93,14 +93,18 @@ func TestInitGzipsRequests(t *testing.T) {
 	endpoint, err := url.Parse(srv.URL + "/v1/logs")
 	require.NoError(t, err)
 	prevEndpoint, prevLogger, prevNode := *flags.LogsEndpoint, otelLogger, nodeName
+	prevDlv, prevRetrying := dlv, retrying
 	*flags.LogsEndpoint = endpoint
-	t.Cleanup(func() { *flags.LogsEndpoint, otelLogger, nodeName = prevEndpoint, prevLogger, prevNode })
+	t.Cleanup(func() {
+		*flags.LogsEndpoint, otelLogger, nodeName = prevEndpoint, prevLogger, prevNode
+		dlv, retrying = prevDlv, prevRetrying
+	})
 
 	Init("machine-id", "host-a", "test")
 	provider, ok := otel.GetLoggerProvider().(*sdk.LoggerProvider)
 	require.True(t, ok)
 	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
-	OtelLogEmitter("/system.slice/k3s.service", nil)(time.Now(), logparser.LevelInfo, "", "started", nil, "")
+	OtelLogEmitter("/system.slice/k3s.service", nil, nil)(time.Now(), logparser.LevelInfo, "", "started", nil, "", 0)
 	require.NoError(t, provider.ForceFlush(context.Background()))
 
 	select {
@@ -114,9 +118,9 @@ func TestInitGzipsRequests(t *testing.T) {
 // Containers outside Kubernetes keep the records they had, plus the stream.
 func TestOtelLogEmitterOtherContainer(t *testing.T) {
 	exp := withMemExporter(t, "node-a")
-	emit := OtelLogEmitter("/system.slice/k3s.service", nil)
-	emit(time.Now(), logparser.LevelInfo, "", "started", nil, "")
-	emit(time.Now(), logparser.LevelInfo, "", "ready", nil, "")
+	emit := OtelLogEmitter("/system.slice/k3s.service", nil, nil)
+	emit(time.Now(), logparser.LevelInfo, "", "started", nil, "", 0)
+	emit(time.Now(), logparser.LevelInfo, "", "ready", nil, "", 0)
 	require.Len(t, exp.records, 2)
 
 	res := attrMap(exp.records[0].Resource().Attributes())

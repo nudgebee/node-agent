@@ -2149,13 +2149,12 @@ func (c *Container) runLogParser(logPath string) {
 			return
 		}
 		ch := make(chan logparser.LogEntry)
-		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId, c.logsK8sContainer()), multilineCollectorTimeout, *flags.LogPatternsPerContainer, !*flags.DisableJsonLogParsing, logs.PatternExtractionRateLimiter(), sensitiveCfg)
 		reader, err := logs.NewTailReader(proc.HostPath(logPath), ch)
 		if err != nil {
 			klog.Warningln(err)
-			parser.Stop()
 			return
 		}
+		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId, c.logsK8sContainer(), reader.Source()), multilineCollectorTimeout, *flags.LogPatternsPerContainer, !*flags.DisableJsonLogParsing, logs.PatternExtractionRateLimiter(), sensitiveCfg)
 		klog.InfoS("started logparser for container", c.id, "log", logPath)
 		klog.InfoS("started varlog logparser", "cg", c.cgroup.Id, "log", logPath)
 		c.logParsers[logPath] = &LogParser{parser: parser, stop: reader.Stop}
@@ -2169,7 +2168,7 @@ func (c *Container) runLogParser(logPath string) {
 			klog.Warningln(err)
 			return
 		}
-		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId, c.logsK8sContainer()), multilineCollectorTimeout, *flags.LogPatternsPerContainer, !*flags.DisableJsonLogParsing, logs.PatternExtractionRateLimiter(), sensitiveCfg)
+		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId, c.logsK8sContainer(), nil), multilineCollectorTimeout, *flags.LogPatternsPerContainer, !*flags.DisableJsonLogParsing, logs.PatternExtractionRateLimiter(), sensitiveCfg)
 		stop := func() {
 			JournaldUnsubscribe(c.metadata.systemd.Unit)
 		}
@@ -2186,13 +2185,12 @@ func (c *Container) runLogParser(logPath string) {
 			delete(c.logParsers, "stdout/stderr")
 		}
 		ch := make(chan logparser.LogEntry)
-		parser := logparser.NewParser(ch, c.metadata.logDecoder, logs.OtelLogEmitter(containerId, c.logsK8sContainer()), multilineCollectorTimeout, *flags.LogPatternsPerContainer, !*flags.DisableJsonLogParsing, logs.PatternExtractionRateLimiter(), sensitiveCfg)
 		reader, err := logs.NewTailReader(proc.HostPath(c.metadata.logPath), ch)
 		if err != nil {
 			klog.Warningln(err)
-			parser.Stop()
 			return
 		}
+		parser := logparser.NewParser(ch, c.metadata.logDecoder, logs.OtelLogEmitter(containerId, c.logsK8sContainer(), reader.Source()), multilineCollectorTimeout, *flags.LogPatternsPerContainer, !*flags.DisableJsonLogParsing, logs.PatternExtractionRateLimiter(), sensitiveCfg)
 		klog.InfoS("started logparser for container", c.id, "log", c.metadata.logPath)
 		klog.InfoS("started container logparser", "cg", c.cgroup.Id)
 		c.logParsers["stdout/stderr"] = &LogParser{parser: parser, stop: reader.Stop}

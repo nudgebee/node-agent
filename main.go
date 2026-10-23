@@ -253,6 +253,7 @@ func main() {
 		klog.Exitln(err)
 	}
 	registerer.MustRegister(info("node_agent_info", version))
+	registerer.MustRegister(logs.RecordsDroppedTotal)
 
 	az := ""
 	region := ""
@@ -310,8 +311,13 @@ func main() {
 			<-ctx.Done()
 		}
 	}
+	// Before anything else stops: deliver the log lines already read and save how
+	// far each file got, within the pod's 30 s default termination grace period.
+	logs.Shutdown(logsShutdownTimeout)
 	klog.Infoln("shutdown complete")
 }
+
+const logsShutdownTimeout = 15 * time.Second
 
 func info(name, version string) prometheus.Collector {
 	g := prometheus.NewGauge(prometheus.GaugeOpts{
