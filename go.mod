@@ -3,7 +3,7 @@ module github.com/coroot/coroot-node-agent
 go 1.25.0
 
 require (
-	github.com/NVIDIA/go-nvml v0.13.3-0
+	github.com/NVIDIA/go-nvml v0.13.4-1
 	github.com/agoda-com/opentelemetry-logs-go v0.6.0
 	github.com/cilium/cilium v1.17.17
 	github.com/cilium/ebpf v0.20.0
@@ -27,7 +27,7 @@ require (
 	github.com/prometheus/common v0.61.0
 	github.com/prometheus/prometheus v0.51.2
 	github.com/pyroscope-io/dotnetdiag v1.2.1
-	github.com/stretchr/testify v1.11.1
+	github.com/stretchr/testify v1.12.1
 	github.com/vishvananda/netlink v1.3.1
 	github.com/vishvananda/netns v0.0.5
 	github.com/xin053/hsperfdata v0.2.3
@@ -155,7 +155,6 @@ require (
 	github.com/pelletier/go-toml/v2 v2.2.2 // indirect
 	github.com/petermattis/goid v0.0.0-20240813172612-4fcff4a6cae7 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/prometheus/procfs v0.15.1 // indirect
 	github.com/sagikazarmark/locafero v0.4.0 // indirect
 	github.com/sagikazarmark/slog-shim v0.1.0 // indirect
@@ -182,7 +181,7 @@ require (
 	go.uber.org/dig v1.17.1 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
-	go.yaml.in/yaml/v3 v3.0.4 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	go4.org/intern v0.0.0-20211027215823-ae77deb06f29 // indirect
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
 	go4.org/unsafe/assume-no-moving-gc v0.0.0-20230525183740-e7c30c78aeb2 // indirect
