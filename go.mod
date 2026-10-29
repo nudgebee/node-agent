@@ -52,7 +52,7 @@ require (
 
 require (
 	github.com/gobwas/glob v0.2.3
-	github.com/klauspost/compress v1.18.0
+	github.com/klauspost/compress v1.18.7
 	github.com/moby/moby/client v0.6.2
 	gotest.tools v2.2.0+incompatible
 )
