@@ -65,3 +65,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the batch, since resending it would fail the same way. journald records are dropped while the endpoint is backed
   up and once the agent is stopping; `node_agent_log_records_dropped_total`
   counts dropped records by `reason` (`backpressure`, `shutdown`, `rejected`).
+
+### Security
+
+- Docker engine client moved from `github.com/docker/docker` (no release
+  carries the fix) to `github.com/moby/moby/client`, clearing
+  CVE-2026-33997. Built with Go 1.26.10.

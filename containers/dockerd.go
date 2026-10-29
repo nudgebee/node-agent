@@ -8,7 +8,7 @@ import (
 
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/proc"
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/client"
 	"github.com/nudgebee/logparser"
 	"inet.af/netaddr"
 )
@@ -21,17 +21,17 @@ var (
 
 func DockerdInit() error {
 	c, err := client.NewClientWithOpts(
-		client.WithHost("unix://" + proc.HostPath("/run/docker.sock")),
+		client.WithHost("unix://"+proc.HostPath("/run/docker.sock")),
+		client.WithAPIVersionNegotiation(),
 	)
 	if err != nil {
 		return err
 	}
 	ctx, cancelFn := context.WithTimeout(context.Background(), dockerdTimeout)
 	defer cancelFn()
-	if _, err := c.Ping(ctx); err != nil {
+	if _, err := c.Ping(ctx, client.PingOptions{}); err != nil {
 		return err
 	}
-	c.NegotiateAPIVersion(ctx)
 	dockerdClient = c
 	return nil
 }
@@ -42,10 +42,11 @@ func DockerdInspect(containerID string) (*ContainerMetadata, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dockerdTimeout)
 	defer cancel()
-	c, err := dockerdClient.ContainerInspect(ctx, containerID)
+	r, err := dockerdClient.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
 	if err != nil {
 		return nil, err
 	}
+	c := r.Container
 	res := &ContainerMetadata{
 		name:        strings.TrimPrefix(c.Name, "/"),
 		labels:      c.Config.Labels,
@@ -69,7 +70,10 @@ func DockerdInspect(containerID string) (*ContainerMetadata, error) {
 				continue
 			}
 			for _, b := range bindings {
-				if ipp, err := netaddr.ParseIPPort(b.HostIP + ":" + b.HostPort); err == nil {
+				if !b.HostIP.IsValid() {
+					continue
+				}
+				if ipp, err := netaddr.ParseIPPort(b.HostIP.String() + ":" + b.HostPort); err == nil {
 					addrs[ipp] = struct{}{}
 				}
 			}

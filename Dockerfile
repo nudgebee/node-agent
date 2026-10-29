@@ -28,10 +28,12 @@ RUN set -eux; \
         ca-certificates curl git build-essential pkg-config libsystemd-dev; \
     rm -rf /var/lib/apt/lists/*
 
-ARG GO_VERSION=1.26.5
+ARG GO_VERSION=1.26.10
 RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz -o go.tar.gz && \
     tar -C /usr/local -xzf go.tar.gz && rm go.tar.gz
 ENV PATH="/usr/local/go/bin:${PATH}"
+# Build with exactly GO_VERSION; never let go.mod trigger a toolchain download.
+ENV GOTOOLCHAIN=local
 
 WORKDIR /tmp/src
 COPY go.mod .
