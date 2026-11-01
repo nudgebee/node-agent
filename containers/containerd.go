@@ -7,20 +7,55 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/oci"
-	"github.com/containerd/containerd/pkg/cri/constants"
+	containersapi "github.com/containerd/containerd/api/services/containers/v1"
+	versionapi "github.com/containerd/containerd/api/services/version/v1"
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/proc"
 	"github.com/nudgebee/logparser"
+	"github.com/opencontainers/runtime-spec/specs-go"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/types/known/emptypb"
 	"k8s.io/klog/v2"
 )
 
-const containerdTimeout = 30 * time.Second
+const (
+	containerdTimeout        = 30 * time.Second
+	containerdConnectTimeout = time.Second
+	containerdMaxMessageSize = 16 << 20
+
+	// The namespace CRI keeps Kubernetes containers in, and the gRPC header
+	// containerd reads it from.
+	containerdNamespace       = "k8s.io"
+	containerdNamespaceHeader = "containerd-namespace"
+)
 
 var (
-	containerdClient *containerd.Client
+	containerdClient containersapi.ContainersClient
 )
+
+func containerdConnect(socket string) (containersapi.ContainersClient, error) {
+	conn, err := grpc.NewClient("unix://"+socket,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(containerdMaxMessageSize),
+			grpc.MaxCallSendMsgSize(containerdMaxMessageSize),
+		),
+	)
+	if err != nil {
+		return nil, err
+	}
+	// grpc.NewClient connects lazily, so ask for the version to find out
+	// whether anything is listening before settling on this socket.
+	ctx, cancel := context.WithTimeout(context.Background(), containerdConnectTimeout)
+	defer cancel()
+	if _, err = versionapi.NewVersionClient(conn).Version(ctx, &emptypb.Empty{}); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return containersapi.NewContainersClient(conn), nil
+}
 
 func ContainerdInit() error {
 	sockets := []string{
@@ -31,9 +66,7 @@ func ContainerdInit() error {
 	}
 	var err error
 	for _, socket := range sockets {
-		containerdClient, err = containerd.New(proc.HostPath(socket),
-			containerd.WithDefaultNamespace(constants.K8sContainerdNamespace),
-			containerd.WithTimeout(time.Second))
+		containerdClient, err = containerdConnect(proc.HostPath(socket))
 		if err == nil {
 			klog.Infoln("using", socket)
 			break
@@ -55,11 +88,13 @@ func ContainerdInspect(containerID string) (*ContainerMetadata, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), containerdTimeout)
 	defer cancel()
+	ctx = metadata.AppendToOutgoingContext(ctx, containerdNamespaceHeader, containerdNamespace)
 
-	c, err := containerdClient.ContainerService().Get(ctx, containerID)
+	resp, err := containerdClient.Get(ctx, &containersapi.GetContainerRequest{ID: containerID})
 	if err != nil {
 		return nil, err
 	}
+	c := resp.GetContainer()
 
 	res := &ContainerMetadata{
 		labels:  c.Labels,
@@ -67,7 +102,7 @@ func ContainerdInspect(containerID string) (*ContainerMetadata, error) {
 		volumes: map[string]string{},
 	}
 
-	var spec oci.Spec
+	var spec specs.Spec
 	if err := json.Unmarshal(c.Spec.GetValue(), &spec); err != nil {
 		klog.Warningln(err)
 	} else {
