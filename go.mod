@@ -51,7 +51,7 @@ require (
 
 require (
 	github.com/containerd/containerd/api v1.8.0
-	github.com/gobwas/glob v0.2.3
+	github.com/gobwas/glob v1.1.0
 	github.com/klauspost/compress v1.18.0
 	github.com/moby/moby/client v0.6.2
 	google.golang.org/grpc v1.83.2
