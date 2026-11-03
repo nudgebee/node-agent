@@ -28,6 +28,20 @@ func TestContainerIdToServiceName(t *testing.T) {
 		f("/k8s/default/hello-28283967-khz2f/xz"),
 		"/k8s/default/hello")
 
+	// A CronJob pod within its schedule window has a /k8s-cronjob/ id
+	// (containers/registry.go); it gets the same name as the run above.
+	assert.Equal(t,
+		f("/k8s-cronjob/default/hello/xz"),
+		"/k8s/default/hello")
+
+	assert.Equal(t,
+		f("/k8s-cronjob/default/hello/sandbox"),
+		"/k8s/default/hello")
+
+	assert.Equal(t,
+		f("/k8s-cronjob/default"),
+		"/k8s-cronjob/default")
+
 	assert.Equal(t,
 		f("/system.slice/k3s.service"),
 		"/system.slice/k3s.service")
