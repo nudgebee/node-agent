@@ -68,6 +68,10 @@ type L7Stats struct {
 
 	// DNS domain label values in use; at most --max-fqdns-per-container.
 	seenFQDNs map[string]struct{}
+
+	// HTTP request series by path, admitted per destination and deleted once idle.
+	httpPaths     *common.HTTPPathSeries
+	pathCapLogged bool
 }
 
 // fqdnOverflowLabel is the domain label of DNS requests for domains beyond
@@ -81,7 +85,36 @@ func NewL7Stats(constLabels prometheus.Labels) L7Stats {
 		initialized:     make(map[l7.Protocol]bool),
 		promConstLabels: constLabels,
 		seenFQDNs:       make(map[string]struct{}),
+		httpPaths:       common.NewHTTPPathSeries(*flags.MaxHTTPPathsPerDestination, fqdnOverflowLabel),
 	}
+}
+
+// logPathCap logs, once per container, that a destination reached
+// --max-http-paths-per-destination.
+func (s *L7Stats) logPathCap(destination string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pathCapLogged {
+		return
+	}
+	s.pathCapLogged = true
+	klog.Infof("container %s: destination %s reached %d HTTP paths, new paths are counted under %s",
+		s.promConstLabels["container_id"], destination, *flags.MaxHTTPPathsPerDestination, fqdnOverflowLabel)
+}
+
+// EvictIdleHTTP deletes HTTP request series not seen for ttl.
+// Nothing else deletes them: a path requested once was exported until the
+// container or the agent restarted.
+func (s *L7Stats) EvictIdleHTTP(now time.Time, ttl time.Duration) {
+	s.mu.RLock()
+	counter := s.requests[l7.ProtocolHTTP]
+	s.mu.RUnlock()
+	if counter == nil {
+		return
+	}
+	s.httpPaths.Evict(now, ttl, func(labelValues []string) {
+		counter.DeleteLabelValues(labelValues...)
+	})
 }
 
 // dnsDomainLabel returns fqdn while the container has seen fewer than
@@ -158,12 +191,21 @@ func (s *L7Stats) observe(protocol l7.Protocol, status, method, path string, dur
 	case l7.ProtocolRabbitmq, l7.ProtocolNats:
 		counterLabelValues = append(counterLabelValues, labelInterner.intern(method))
 	case l7.ProtocolHTTP:
-		if ValidUtf8([]byte(path)) {
-			counterLabelValues = append(counterLabelValues, labelInterner.intern(common.NormalizeHTTPPath(path)))
-		} else {
-			counterLabelValues = append(counterLabelValues, "")
+		normalized := ""
+		if utf8.ValidString(path) {
+			normalized = common.NormalizeHTTPPath(path)
 		}
-		counterLabelValues = append(counterLabelValues, labelInterner.intern(method))
+		destination := destWorkload.Namespace + "/" + destWorkload.Name
+		if destWorkload.Name == "" {
+			destination = key.DestinationLabelValue()
+		}
+		var full bool
+		counterLabelValues, full = s.httpPaths.Observe(destination, normalized, time.Now(), func(pathLabel string) []string {
+			return append(counterLabelValues, labelInterner.intern(pathLabel), labelInterner.intern(method))
+		})
+		if full {
+			s.logPathCap(destination)
+		}
 	case l7.ProtocolDNS:
 		counterLabelValues = append(counterLabelValues, labelInterner.intern(dnsRequestType), labelInterner.intern(dnsDomain))
 	}

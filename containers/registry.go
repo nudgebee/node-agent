@@ -850,6 +850,7 @@ func (r *Registry) evictStaleCounterLabels() {
 	for _, c := range containers {
 		activeKeys, activeFailedDsts := c.activeCounterLabelKeys()
 		c.tcpMetrics.EvictStaleLabels(activeKeys, activeFailedDsts)
+		c.l7Stats.EvictIdleHTTP(time.Now(), *flags.HTTPPathIdleTTL)
 	}
 }
 
