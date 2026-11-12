@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `container_dns_requests_duration_seconds_total` no longer has the `domain`
+  label, so each resolved name no longer adds 14 histogram series (12 buckets,
+  sum, count). `container_dns_requests_total` keeps `domain`. The HTTP
+  histogram already leaves out `path` for the same reason.
 - Prometheus `job` label and outbound `User-Agent` are now
   `nudgebee-node-agent`. Update any dashboards or alerts that filter on
   `job="coroot-node-agent"`.
