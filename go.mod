@@ -3,7 +3,7 @@ module github.com/coroot/coroot-node-agent
 go 1.26.0
 
 require (
-	github.com/NVIDIA/go-nvml v0.13.3-0
+	github.com/NVIDIA/go-nvml v0.13.4-1
 	github.com/agoda-com/opentelemetry-logs-go v0.6.0
 	github.com/cilium/cilium v1.17.17
 	github.com/cilium/ebpf v0.20.0
