@@ -218,7 +218,7 @@ func (s *L7Stats) observe(protocol l7.Protocol, status, method, path string, dur
 
 	switch metricsProtocol {
 	case l7.ProtocolDNS:
-		histogramLabelValues = append(histogramLabelValues, labelInterner.intern(dnsRequestType), labelInterner.intern(dnsDomain))
+		histogramLabelValues = append(histogramLabelValues, labelInterner.intern(dnsRequestType))
 	}
 
 	// Map reads are safe after ensureInitialized — the protocol entry exists.
@@ -308,10 +308,13 @@ func (s *L7Stats) ensureInitialized(protocol l7.Protocol) {
 	histogramLabels := make([]string, len(baseLabels))
 	copy(histogramLabels, baseLabels)
 
-	// For DNS only, add extra labels to histogram (exclude path and method for HTTP to reduce cardinality)
+	// The histogram leaves out the counter's high-cardinality labels: each
+	// value costs 14 histogram series (12 buckets, sum, count) against 1 on
+	// the counter. HTTP drops path and method; DNS drops domain, which stays
+	// on the counter.
 	switch metricsProtocol {
 	case l7.ProtocolDNS:
-		histogramLabels = append(histogramLabels, "request_type", "domain")
+		histogramLabels = append(histogramLabels, "request_type")
 	}
 
 	if hOpts, exists := L7Latency[metricsProtocol]; exists {
