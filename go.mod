@@ -16,7 +16,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/grafana/pyroscope/ebpf v0.4.9
 	github.com/hashicorp/golang-lru/v2 v2.0.7
-	github.com/jpillora/backoff v1.0.0
+	github.com/jpillora/backoff v1.1.0
 	github.com/mdlayher/taskstats v0.0.0-20230712191918-387b3d561d14
 	github.com/nudgebee/logparser v0.0.0-20261023171829-38071d9d9983
 	github.com/opencontainers/runtime-spec v1.1.0
