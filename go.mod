@@ -11,7 +11,7 @@ require (
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/florianl/go-conntrack v0.7.0
 	github.com/go-kit/log v0.2.1
-	github.com/godbus/dbus/v5 v5.2.2
+	github.com/godbus/dbus/v5 v5.2.4
 	github.com/golang/snappy v1.0.0
 	github.com/google/uuid v1.6.0
 	github.com/grafana/pyroscope/ebpf v0.4.9
