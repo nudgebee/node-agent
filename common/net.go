@@ -448,7 +448,7 @@ func (dk DestinationKey) GetActualDestinationWorkload() Workload {
 }
 
 type httpFilter struct {
-	globs []glob.Glob
+	globs []*glob.Pattern
 }
 
 func newHttpFilter(patterns []string) (*httpFilter, error) {
