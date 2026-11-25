@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Container image carries its license files under `/licenses` and its own `name`,
+  `vendor`, `maintainer` and related labels, for Red Hat certification.
+
 ### Added
 
 - Open-source release of the Nudgebee Node Agent, forked from

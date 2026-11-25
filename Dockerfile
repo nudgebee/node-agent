@@ -46,6 +46,16 @@ RUN CGO_ENABLED=1 go build -mod=readonly -ldflags "-extldflags='-Wl,-z,lazy' -X 
 FROM registry.access.redhat.com/ubi9/ubi-minimal AS runtime
 
 ARG VERSION=unknown
+ARG IMAGE_RELEASE=1
+# Red Hat certification: name, vendor and maintainer must replace the base image's own
+# (HasNoProhibitedLabels rejects "Red Hat" there).
+LABEL name="nudgebee-node-agent" \
+      maintainer="nudgebee" \
+      vendor="nudgebee" \
+      version="${VERSION}" \
+      release="${IMAGE_RELEASE}" \
+      summary="Nudgebee Node Agent" \
+      description="Per-node eBPF collector for metrics, logs, traces and profiles, used by the Nudgebee agent."
 
 # Patch the UBI9 base to the latest package set, then install SSL/TLS libraries
 # for HTTPS LLM API tracing. microdnf update clears the fixable RedHat OS CVEs
@@ -55,5 +65,9 @@ RUN microdnf update -y && \
     microdnf clean all
 
 COPY --from=builder /tmp/src/nudgebee-node-agent /usr/bin/nudgebee-node-agent
+
+# Red Hat certification (HasLicense). The eBPF code compiled into the binary is GPL-2.0,
+# the Go code Apache-2.0.
+COPY LICENSE NOTICE LICENSES/GPL-2.0.txt /licenses/
 
 ENTRYPOINT ["/usr/bin/nudgebee-node-agent"]
