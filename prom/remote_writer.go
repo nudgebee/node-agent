@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -28,6 +29,12 @@ import (
 
 const RemoteWriteTimeout = 30 * time.Second
 
+// Values of --metrics-protocol.
+const (
+	protocolPrometheus = "prometheus"
+	protocolOTLP       = "otlp"
+)
+
 type Agent struct {
 	reg    *prometheus.Registry
 	url    *url.URL
@@ -37,13 +44,16 @@ type Agent struct {
 
 	spoolDir     string
 	maxSpoolSize int64
+
+	protocol string
 }
 
 func StartAgent(reg *prometheus.Registry, machineId, systemUuid string) error {
 	if *flags.MetricsEndpoint == nil {
 		return nil
 	}
-	klog.Infoln("metrics remote write endpoint:", (*flags.MetricsEndpoint).String())
+	protocol := *flags.MetricsProtocol
+	klog.Infof("metrics endpoint: %s (protocol: %s)", (*flags.MetricsEndpoint).Redacted(), protocol)
 
 	up := prometheus.NewGauge(prometheus.GaugeOpts{Name: "up"})
 	up.Set(1)
@@ -70,8 +80,9 @@ func StartAgent(reg *prometheus.Registry, machineId, systemUuid string) error {
 				TLSClientConfig: common.TlsConfig(),
 			},
 		},
-		spoolDir:     path.Join(*flags.WalDir, "spool"),
+		spoolDir:     path.Join(*flags.WalDir, spoolDirName(protocol)),
 		maxSpoolSize: int64(*flags.MaxSpoolSize),
+		protocol:     protocol,
 	}
 	if _, err := os.Stat(*flags.WalDir); os.IsNotExist(err) {
 		if err = os.Mkdir(*flags.WalDir, 0750); err != nil {
@@ -86,6 +97,15 @@ func StartAgent(reg *prometheus.Registry, machineId, systemUuid string) error {
 	go a.sendLoop()
 	go a.scrapeLoop()
 	return nil
+}
+
+// spoolDirName keeps each protocol's payloads apart: after a switch, files left
+// from the other one would be posted with the wrong headers and encoding.
+func spoolDirName(protocol string) string {
+	if protocol == protocolOTLP {
+		return "spool-otlp"
+	}
+	return "spool"
 }
 
 func (a *Agent) scrapeLoop() {
@@ -166,8 +186,12 @@ func (a *Agent) send(fPath string) error {
 	}
 	req.Header.Set("User-Agent", "nudgebee-node-agent")
 	req.Header.Set("Content-Type", "application/x-protobuf")
-	req.Header.Set("Content-Encoding", "snappy")
-	req.Header.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
+	if a.protocol == protocolOTLP {
+		req.Header.Set("Content-Encoding", "gzip")
+	} else {
+		req.Header.Set("Content-Encoding", "snappy")
+		req.Header.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
+	}
 	t := time.Now()
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
@@ -175,13 +199,26 @@ func (a *Agent) send(fPath string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
+		reason := responseSummary(resp.Body)
 		if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusRequestEntityTooLarge {
-			return fmt.Errorf("%w: %s", errRejectedByCollector, resp.Status)
+			return fmt.Errorf("%w: %s %s", errRejectedByCollector, resp.Status, reason)
 		}
-		return errors.New(resp.Status)
+		return fmt.Errorf("%s %s", resp.Status, reason)
+	}
+	if a.protocol == protocolOTLP {
+		logRejectedPoints(resp.Body)
 	}
 	klog.Infof("sent metrics in %s", time.Since(t).Truncate(time.Millisecond))
 	return nil
+}
+
+// responseSummary is the start of an error response, which says why it was refused.
+func responseSummary(body io.Reader) string {
+	data, err := io.ReadAll(io.LimitReader(body, 512))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(strings.ToValidUTF8(string(data), ""))
 }
 
 func (a *Agent) scrape() error {
@@ -191,19 +228,22 @@ func (a *Agent) scrape() error {
 	if err != nil {
 		return err
 	}
-	mfsByName := make(map[string]*dto.MetricFamily)
-	for _, mf := range mfs {
-		mfsByName[mf.GetName()] = mf
-	}
-	wr := buildWriteRequest(mfs, timestamp, a.labels)
-	decompressed, err := wr.Marshal()
+	payload, err := a.encode(mfs, timestamp)
 	if err != nil {
 		return err
 	}
+	return a.writeToSpool(timestamp, payload)
+}
 
-	compressed := snappy.Encode(nil, decompressed)
-	err = a.writeToSpool(timestamp, compressed)
-	return err
+func (a *Agent) encode(mfs []*dto.MetricFamily, timestamp int64) ([]byte, error) {
+	if a.protocol == protocolOTLP {
+		return encodeOTLP(mfs, timestamp, a.labels)
+	}
+	decompressed, err := buildWriteRequest(mfs, timestamp, a.labels).Marshal()
+	if err != nil {
+		return nil, err
+	}
+	return snappy.Encode(nil, decompressed), nil
 }
 
 func (a *Agent) writeToSpool(timestamp int64, payload []byte) error {

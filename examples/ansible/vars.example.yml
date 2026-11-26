@@ -7,6 +7,9 @@ node_agent_version: v0.1.9  # pin a release; "latest" follows new releases on ev
 node_agent_env:
   # Metrics: Prometheus remote-write receiver (VictoriaMetrics, Prometheus, Mimir).
   METRICS_ENDPOINT: "http://metrics.example.com:8428/api/v1/write"
+  # To send OTLP/HTTP instead (see docs/fleet-install.md for each receiver's path):
+  # METRICS_PROTOCOL: "otlp"
+  # METRICS_ENDPOINT: "http://otel.example.com:4318/v1/metrics"
   # Traces and logs: OTLP/HTTP, normally an otel-collector.
   TRACES_ENDPOINT: "http://otel.example.com:4318/v1/traces"
   LOGS_ENDPOINT: "http://otel.example.com:4318/v1/logs"

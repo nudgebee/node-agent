@@ -9,7 +9,7 @@ an SSH loop.
 - **Hosts:** Linux with systemd, amd64 or arm64, kernel 5.8 or newer. Windows and
   macOS aren't supported.
 - **Where the data goes:** the agent pushes to storage you run. Have these ready:
-  - a Prometheus remote-write receiver for metrics (`METRICS_ENDPOINT`)
+  - a Prometheus remote-write receiver for metrics, or an OTLP/HTTP one (`METRICS_ENDPOINT`)
   - an OTLP/HTTP endpoint for traces and logs (`TRACES_ENDPOINT`, `LOGS_ENDPOINT`)
   - an `API_KEY`, if your endpoints need one
 - **Network:** each host needs outbound access to GitHub to download the release, and to
@@ -29,15 +29,38 @@ The ones a fleet usually sets:
 
 | Variable | What it does |
 |---|---|
-| `METRICS_ENDPOINT` | Prometheus remote-write URL. |
+| `METRICS_ENDPOINT` | Full URL metrics are sent to. |
+| `METRICS_PROTOCOL` | `prometheus` (remote write, the default) or `otlp` (OTLP/HTTP). |
 | `TRACES_ENDPOINT`, `LOGS_ENDPOINT` | OTLP/HTTP URLs. |
 | `API_KEY` | Sent to the endpoints. |
 | `TRACES_SAMPLING` | Fraction of traces kept, `0.0` to `1.0`. Default `1.0`. |
 | `CA_FILE` | CA bundle for endpoints signed by a private CA. |
 
 Set `METRICS_ENDPOINT`, `TRACES_ENDPOINT` and `LOGS_ENDPOINT` individually. `COLLECTOR_ENDPOINT`
-sets all of them from one base URL, but it sends metrics to `<base>/v1/metrics` as Prometheus
-remote-write, which an otel-collector doesn't accept.
+sets all of them from one base URL and sends metrics to `<base>/v1/metrics`. An otel-collector
+accepts that only with `METRICS_PROTOCOL=otlp`.
+
+### Metrics over OTLP
+
+Set `METRICS_PROTOCOL=otlp` and point `METRICS_ENDPOINT` at the receiver's metrics path:
+
+| Receiver | `METRICS_ENDPOINT` |
+|---|---|
+| OpenTelemetry Collector | `http://<host>:4318/v1/metrics` |
+| Prometheus 3.x, started with `--web.enable-otlp-receiver` | `http://<host>:9090/api/v1/otlp/v1/metrics` |
+| VictoriaMetrics (single node) | `http://<host>:8428/opentelemetry/v1/metrics` |
+
+Metric names are the same as over remote write, and so are `job` and `instance`:
+
+- Names are already Prometheus names, so the default name translation in Prometheus and
+  VictoriaMetrics leaves them unchanged.
+- Counters whose name doesn't end in `_total` are sent as gauges, so no suffix is added to them.
+- VictoriaMetrics also stores `service.name` and `service.instance.id` as labels on every
+  series. Switching an existing host to OTLP therefore starts new series there.
+
+Each protocol has its own buffer under `WAL_DIR` (`spool` and `spool-otlp`). Data not yet
+delivered when you switch stays on disk and is sent only if you switch back. Delete the old
+directory to reclaim the space.
 
 When a metrics endpoint is set, the agent serves its own `/metrics` on `127.0.0.1:10300`.
 This can't be changed with `LISTEN`.

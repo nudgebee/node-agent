@@ -64,6 +64,7 @@ var (
 	CollectorEndpoint  = kingpin.Flag("collector-endpoint", "A base endpoint URL for metrics, traces, logs, and profiles").Envar("COLLECTOR_ENDPOINT").URL()
 	ApiKey             = kingpin.Flag("api-key", "API key for the upstream collector").Envar("API_KEY").String()
 	MetricsEndpoint    = kingpin.Flag("metrics-endpoint", "The URL of the endpoint to send metrics to").Envar("METRICS_ENDPOINT").URL()
+	MetricsProtocol    = kingpin.Flag("metrics-protocol", "How metrics are sent to the metrics endpoint: prometheus (remote write) or otlp (OTLP/HTTP)").Default("prometheus").Envar("METRICS_PROTOCOL").Enum("prometheus", "otlp")
 	TracesEndpoint     = kingpin.Flag("traces-endpoint", "The URL of the endpoint to send traces to").Envar("TRACES_ENDPOINT").URL()
 	TracesSampling     = kingpin.Flag("traces-sampling", "Trace sampling rate (0.0 to 1.0)").Default("1.0").Envar("TRACES_SAMPLING").Float64()
 	LogsEndpoint       = kingpin.Flag("logs-endpoint", "The URL of the endpoint to send logs to").Envar("LOGS_ENDPOINT").URL()

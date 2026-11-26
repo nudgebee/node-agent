@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `--metrics-protocol` / `METRICS_PROTOCOL`: set `otlp` to send metrics as OTLP/HTTP
+  instead of Prometheus remote write (the default). Metric names and the `job` and
+  `instance` labels are the same over both.
 - Open-source release of the Nudgebee Node Agent, forked from
   [coroot/coroot-node-agent](https://github.com/coroot/coroot-node-agent).
 - LLM observability pipeline: detects and parses LLM API traffic
