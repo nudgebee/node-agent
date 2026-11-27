@@ -54,6 +54,7 @@ require (
 	github.com/gobwas/glob v0.2.3
 	github.com/klauspost/compress v1.20.3
 	github.com/moby/moby/client v0.6.2
+	go.opentelemetry.io/proto/otlp v1.11.0
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.12
 	gotest.tools v2.2.0+incompatible
@@ -170,7 +171,6 @@ require (
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.70.0 // indirect
 	go.opentelemetry.io/otel/log v1.47.0 // indirect
 	go.opentelemetry.io/otel/metric v1.47.0 // indirect
-	go.opentelemetry.io/proto/otlp v1.11.0 // indirect
 	go.uber.org/dig v1.17.1 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
